@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "aya",
@@ -556,11 +556,11 @@ dependencies = [
 
 [[package]]
 name = "daer-common"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "daer-config"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "daer-common",
  "glob",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "daer-common",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aya",
  "aya-obj",
@@ -620,11 +620,11 @@ dependencies = [
 
 [[package]]
 name = "daer-geodata"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "daer-outbound"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "daer-routing"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aho-corasick",
  "aya-obj",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "yasna"
