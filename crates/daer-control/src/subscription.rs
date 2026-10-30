@@ -126,19 +126,39 @@ pub async fn resolve_subscriptions_with(
     // subscription that happens to repeat a tag must not shadow it.
     let mut added = 0usize;
     for entry in &resolved {
-        for (index, url) in entry.links.iter().enumerate() {
-            let tag = if entry.links.len() == 1 {
-                entry.tag.clone()
-            } else {
-                format!("{}/{index}", entry.tag)
-            };
-            config.node.push(Node {
-                tag: Some(tag),
-                url: url.clone(),
-                // The provenance `subtag(...)` matches on. Filling it here is what makes a
-                // subscription node selectable at all.
-                subscription: Some(entry.tag.clone()),
+        for (index, raw_url) in entry.links.iter().enumerate() {
+            let url = normalize_subscription_link(raw_url);
+            let fragment_tag = url.split_once('#').and_then(|(_, frag)| {
+                let decoded = percent_decode(frag);
+                let trimmed = decoded.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
             });
+
+            let tag = match fragment_tag {
+                Some(name) => format!("{}/{}", entry.tag, name),
+                None => {
+                    if entry.links.len() == 1 {
+                        entry.tag.clone()
+                    } else {
+                        format!("{}/{index}", entry.tag)
+                    }
+                }
+            };
+
+            let mut node = match Node::from_link(&url) {
+                Ok(node) => node,
+                Err(e) => {
+                    tracing::warn!(link = %url, error = %e, "unsupported subscription node link (skipped)");
+                    continue;
+                }
+            };
+            node.tag = Some(tag);
+            node.subscription = Some(entry.tag.clone());
+            config.node.push(node);
             added += 1;
         }
     }
@@ -147,6 +167,47 @@ pub async fn resolve_subscriptions_with(
         subscriptions: resolved,
         from_subscription: added,
     }
+}
+
+/// In the wild, panels often omit `&fp=` from VLESS REALITY links because mainstream clients
+/// default it to `chrome`. Normalize subscription links so `daer` accepts them without failing.
+fn normalize_subscription_link(url: &str) -> String {
+    let url = url.trim();
+    if url.starts_with("vless://") && url.contains("security=reality") && !url.contains("fp=") {
+        if let Some((before, frag)) = url.split_once('#') {
+            let sep = if before.contains('?') { "&" } else { "?" };
+            format!("{before}{sep}fp=chrome#{frag}")
+        } else {
+            let sep = if url.contains('?') { "&" } else { "?" };
+            format!("{url}{sep}fp=chrome")
+        }
+    } else {
+        url.to_owned()
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().unwrap_or(b'0');
+            let h2 = chars.next().unwrap_or(b'0');
+            let hex_str = [h1, h2];
+            if let Ok(hex_ascii) = std::str::from_utf8(&hex_str)
+                && let Ok(val) = u8::from_str_radix(hex_ascii, 16)
+            {
+                bytes.push(val);
+                continue;
+            }
+            bytes.push(b'%');
+            bytes.push(h1);
+            bytes.push(h2);
+            continue;
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -159,7 +220,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_configuration_without_subscriptions_is_untouched() {
-        let mut config = config_with("schema = 1\n[[node]]\nurl = \"socks5://127.0.0.1:1080\"\n");
+        let mut config = config_with(
+            "schema = 1\n[[node]]\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
+        );
         let before = config.node.len();
         let resolution =
             resolve_subscriptions_with(&mut config, std::path::Path::new("."), Duration::ZERO)

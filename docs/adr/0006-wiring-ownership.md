@@ -114,7 +114,7 @@ below are the ones daer actually uses". Every default is asserted against
   from a subscription stops being silently empty.
 - The configuration surface shrinks. That is a breaking change for anyone who set a
   removed key; `daer config validate` names it, which is the point.
-- `docs/deployment.md` stops promising a `tier` the daemon does not implement, and
+- `docs/how-to/deployment.md` stops promising a `tier` the daemon does not implement, and
   gains a section on which tier the current configuration is in.
 - The datagram relay being wired means UDP flows are *proxied* only over nodes that
   have a datagram transport. A REALITY node has none, so a UDP flow to it must be

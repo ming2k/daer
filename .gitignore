@@ -24,3 +24,4 @@ daer-kernel-check/
 .vscode/
 .idea/
 .DS_Store
+.cargo/config.local.toml

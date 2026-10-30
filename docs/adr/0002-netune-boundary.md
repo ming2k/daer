@@ -5,7 +5,7 @@
   for any dial **netune can perform**; REALITY is a dial netune cannot perform, so its TLS
   1.3 client lives in `daer-outbound` and nowhere else.
 - Date: 2026-01-07
-- Related: `pins/netune.toml`, `scripts/check-pins.sh`
+- Related: `Cargo.lock`
 
 ## Context
 
@@ -44,7 +44,7 @@ difference decides how both projects evolve.
    not duplicated in `daer`. `daer-outbound` decides *which* netune primitive to
    use with which parameters; it does not open codecs, sockets or handshakes of
    its own. A capability netune lacks is a netune task
-   (`docs/netune-requests.md`), not a reason to write a second implementation
+   (`../dev/netune-requests.md`), not a reason to write a second implementation
    here.
 
    The boundary inside "proxy handshakes" is `CONNECT`/SOCKS5 versus a proxy
@@ -72,13 +72,10 @@ difference decides how both projects evolve.
      product semantics and do not belong in a generic client library. One
      exception is recorded: REALITY is blocked at the TLS-stack level, not here
      (see Decision 1's note and netune ADR-0009).
-4. **The path dependency is pinned.** `Cargo.toml` keeps
-   `path = "../netune/crates/netune"` (both projects move together) *and* a
-   `version` requirement that makes a registry/tag switch a one-line change.
-   `pins/netune.toml` records the exact revision; `make pins` fails when the
-   checkout has moved without the pin being reviewed. Rationale: a netune change
-   to TLS, DNS, socket options or health-check semantics silently changes daer's
-   wire behaviour, and `daer`'s MSRV (1.95) is netune's MSRV.
+4. **The upstream dependency is locked.** `Cargo.toml` specifies the exact
+   release tag (`tag = "v0.0.4"`), and `Cargo.lock` records the exact Git commit SHA.
+   CI verifies the lock file using `--locked`. Local co-development can override
+   this cleanly using `.cargo/config.toml` (git-ignored) with `[patch]` or `paths`.
 5. **Where netune must change, the change is upstreamed and documented.** The
    `SO_MARK`-before-connect gap was closed in netune (`SocketConfig::mark`:
    manual socket, `SO_MARK`, non-blocking connect, wait-for-writable,

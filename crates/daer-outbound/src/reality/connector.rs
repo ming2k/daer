@@ -375,7 +375,68 @@ impl fmt::Debug for RealityConnector {
     }
 }
 
+/// Typed parameters for establishing a REALITY connection.
+#[derive(Debug, Clone)]
+pub struct RealityEndpointParams<'a> {
+    pub server: &'a str,
+    pub port: u16,
+    pub uuid: &'a str,
+    pub flow: Option<&'a str>,
+    pub sni: &'a str,
+    pub public_key: &'a str,
+    pub short_id: Option<&'a str>,
+    pub fingerprint: Option<&'a str>,
+    pub alpn: &'a [String],
+}
+
 impl RealityConnector {
+    /// Builds a connector directly from typed parameters.
+    pub fn new(
+        params: RealityEndpointParams<'_>,
+        options: DialerOptions,
+    ) -> Result<Self, OutboundError> {
+        let pk_bytes =
+            decode_public_key(params.public_key).map_err(OutboundError::UnsupportedLink)?;
+        let sid_bytes = match params.short_id {
+            Some(sid) if !sid.is_empty() => {
+                decode_short_id(sid).map_err(OutboundError::UnsupportedLink)?
+            }
+            _ => Vec::new(),
+        };
+        let fp = params
+            .fingerprint
+            .unwrap_or_else(|| {
+                options
+                    .tls_profile
+                    .map(|p| p.strip_suffix("-current").unwrap_or(p))
+                    .unwrap_or("chrome")
+            })
+            .to_owned();
+        let vision = matches!(params.flow, Some(f) if f == FLOW_VISION || f == "xtls-rprx-vision");
+        let alpn_bytes = params.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+
+        let link = Link {
+            user_id: params.uuid.to_owned(),
+            server: format!("{}:{}", params.server, params.port),
+            server_name: params.sni.to_owned(),
+            public_key: pk_bytes,
+            short_id: sid_bytes,
+            fingerprint: fp,
+            vision,
+            alpn: alpn_bytes,
+            tag: String::new(),
+        };
+
+        Ok(Self {
+            link,
+            tcp: TcpConnector::new()
+                .with_connect_timeout(Some(options.timeout))
+                .with_socket_config(options.socket_config()),
+            timeout: options.timeout,
+            fragment: options.fragment,
+        })
+    }
+
     /// Builds a connector from a `vless://security=reality` link.
     ///
     /// This is the **only** constructor of a REALITY session, which is what keeps the

@@ -32,7 +32,7 @@ pub const ETHERNET_MTU: usize = 1500;
 
 /// Default bound for `MAX_MATCH_SET_LEN`, the number of 32-bit match words the
 /// kernel routing program evaluates per packet. Overridable at build time in
-/// the Go implementation via `make MAX_MATCH_SET_LEN=...`.
+/// the Go implementation via `make`, or in daer via `MAX_MATCH_SET_LEN=... cargo xtask ebpf`.
 pub const MAX_MATCH_SET_LEN: usize = 1024;
 
 /// Minimum supported kernel version; `bpf_loop` and the cgroup hooks daer relies

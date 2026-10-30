@@ -648,7 +648,7 @@ async fn the_transparent_port_refuses_a_flow_that_was_not_redirected() {
 /// treated as local. Without `ip rule fwmark … table N` plus `ip route add local default dev lo
 /// table N`, the datagram reaches the `tproxy` rule and is then dropped by routing — which an
 /// earlier attempt misread as "a single network namespace cannot do this". The rule is part of
-/// the deployment contract, not of the test: `docs/deployment.md` lists it for operators.
+/// the deployment contract, not of the test: `docs/how-to/deployment.md` lists it for operators.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_redirected_datagram_is_proxied_by_the_daemon() {
     let _fixture = Fixture::acquire();

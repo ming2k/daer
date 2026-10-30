@@ -37,7 +37,7 @@ Both halves are wrong:
    reply from origin alone: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
    ```
 
-The test was green, `docs/kernel-test-plan.md` cited it as the userland half of the
+The test was green, `docs/dev/kernel-test-plan.md` cited it as the userland half of the
 proof, and the data path it claimed to cover had never executed once.
 
 This is not an isolated slip; it is a category. `scripts/kernel-check.sh` proves the
@@ -89,7 +89,7 @@ rather than listing the gap in a footnote while the headline says otherwise.
 
 - builds the object and asserts the ABI against it (already true);
 - runs the kernel tests under `unshare` when available;
-- runs `make pins` and `make schema-check` (already true);
+- asserts schema consistency and configuration key consumption as native tests (already true);
 - **fails when a configuration in `daer.example.toml` cannot route a flow through
   its own declared group**, which is the check that would have caught a default
   policy selecting no node.

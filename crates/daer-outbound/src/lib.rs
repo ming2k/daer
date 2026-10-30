@@ -22,7 +22,7 @@
 //!   node list, so `[[subscription]]` produces nodes instead of an empty group.
 //!
 //! Protocol dialers for `vmess` / `vless` and the QUIC families are not implemented;
-//! `docs/roadmap.md` records that with the reason each is blocked on, rather than
+//! `docs/dev/roadmap.md` records that with the reason each is blocked on, rather than
 //! listing them as "next up".
 
 mod alive;

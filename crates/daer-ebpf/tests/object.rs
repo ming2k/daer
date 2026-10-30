@@ -3,7 +3,7 @@
 //! Checks the compiled datapath object against the names and ABI this crate
 //! references.
 //!
-//! The object is built by `make ebpf` (see `scripts/build-ebpf.sh`). Without it
+//! The object is built by `cargo xtask ebpf`. Without it
 //! these tests skip rather than fail, so `cargo test` stays usable on a machine
 //! that has no kernel headers.
 
@@ -32,7 +32,7 @@ fn parsed_object() -> Option<Object> {
 #[test]
 fn object_contains_every_map_we_reference() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `make ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
         return;
     };
     for name in daer_ebpf::names::map::ALL {
@@ -43,7 +43,7 @@ fn object_contains_every_map_we_reference() {
 #[test]
 fn object_contains_every_program_we_reference() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `make ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
         return;
     };
     for name in daer_ebpf::names::program::ALL {
@@ -54,7 +54,7 @@ fn object_contains_every_program_we_reference() {
 #[test]
 fn object_is_licensed_for_the_kernel() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `make ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
         return;
     };
     // GPL-compatible helpers (bpf_loop, bpf_get_current_task) require this.

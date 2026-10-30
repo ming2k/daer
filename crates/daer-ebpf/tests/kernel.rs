@@ -14,7 +14,7 @@
 //! sudo cargo test -p daer-ebpf --test kernel -- --include-ignored --nocapture
 //! ```
 //!
-//! A rebuild of the object is needed first (`make ebpf`).
+//! A rebuild of the object is needed first (`cargo xtask ebpf`).
 
 use std::path::PathBuf;
 
@@ -44,7 +44,10 @@ fn param() -> RuntimeParam {
 fn the_object_loads_and_verifies() {
     let path = object_path();
     if !path.exists() {
-        eprintln!("skipped: {} is missing; run `make ebpf`", path.display());
+        eprintln!(
+            "skipped: {} is missing; run `cargo xtask ebpf`",
+            path.display()
+        );
         return;
     }
     // Loading is what runs the verifier. A failure here is a real kernel-side problem:
@@ -65,7 +68,10 @@ fn every_program_we_reference_is_in_the_object() {
     // ELF; this asserts the *loader* agrees, which is the path production takes.
     let path = object_path();
     if !path.exists() {
-        eprintln!("skipped: {} is missing; run `make ebpf`", path.display());
+        eprintln!(
+            "skipped: {} is missing; run `cargo xtask ebpf`",
+            path.display()
+        );
         return;
     }
     let ebpf = daer_ebpf::load_path(&path, &param()).expect("the object must load");
@@ -87,7 +93,10 @@ fn a_tc_program_attaches_to_loopback() {
 
     let path = object_path();
     if !path.exists() {
-        eprintln!("skipped: {} is missing; run `make ebpf`", path.display());
+        eprintln!(
+            "skipped: {} is missing; run `cargo xtask ebpf`",
+            path.display()
+        );
         return;
     }
     let mut ebpf = daer_ebpf::load_path(&path, &param()).expect("the object must load");

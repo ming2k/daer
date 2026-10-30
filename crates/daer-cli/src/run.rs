@@ -23,7 +23,7 @@
 //! `SIGHUP` re-reads the configuration and publishes a new generation. A generation that
 //! fails to build publishes nothing, so a typo cannot stop a working proxy.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -134,9 +134,10 @@ async fn attach(
     wan: &[String],
     so_mark: Option<u32>,
 ) -> anyhow::Result<aya::Ebpf> {
-    if !options.object.exists() {
+    let object_path = resolve_object_path(&options.object);
+    if !object_path.exists() {
         return Err(anyhow::anyhow!(
-            "datapath object {} does not exist; build it with `make ebpf`, or run with \
+            "datapath object {} does not exist; build it with `cargo xtask ebpf`, or run with \
              --no-datapath to serve without it",
             options.object.display()
         ));
@@ -169,7 +170,7 @@ async fn attach(
     };
 
     let ebpf = datapath::attach(
-        &options.object,
+        &object_path,
         &param,
         lan,
         wan,
@@ -186,9 +187,29 @@ async fn attach(
         peer = PEER,
         ?lan,
         ?wan,
+        object = %object_path.display(),
         "datapath attached: redirected flows will be proxied"
     );
     Ok(ebpf)
+}
+
+fn resolve_object_path(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    // If the path was the default relative path and does not exist in the working directory,
+    // look in standard system-wide installation locations before failing.
+    for candidate in [
+        "/usr/lib/daer/datapath.o",
+        "/usr/local/lib/daer/datapath.o",
+        "/usr/share/daer/datapath.o",
+    ] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return p.to_path_buf();
+        }
+    }
+    path.to_path_buf()
 }
 
 /// The mark used when `global.so-mark` is absent.
@@ -413,4 +434,21 @@ pub async fn drain(daemon: &Daemon, timeout: Duration) -> bool {
     tokio::time::timeout(timeout, daemon.supervisor.drain())
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_object_path_returns_existing_path() {
+        let cargo_toml = Path::new("Cargo.toml");
+        assert_eq!(resolve_object_path(cargo_toml), cargo_toml);
+    }
+
+    #[test]
+    fn resolve_object_path_preserves_non_existing_when_no_candidates() {
+        let non_existing = Path::new("/non/existing/datapath.o");
+        assert_eq!(resolve_object_path(non_existing), non_existing);
+    }
 }

@@ -11,6 +11,7 @@ members = [
     "crates/daer-outbound",
     "crates/daer-routing",
     "crates/daer-sniff",
+    "crates/xtask",
 ]
 
 [workspace.package]
@@ -63,9 +64,8 @@ rand_core = "0.6.4"
 glob = "0.3"
 ipnet = "2.11"
 libc = "0.2"
-# Pinned by path so both projects can move together; `pins/netune.toml` records the
-# exact revision and `make pins` fails when the checkout drifts. The `version`
-# requirement is what makes the switch to a registry/tag dependency a one-liner.
+# Upstream transport library, locked via Cargo.lock.
+# For local co-development, use `.cargo/config.toml` (ignored by git) with `[patch]` or `paths`.
 netune = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.4", default-features = false }
 netune-trace = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.4" }
 aho-corasick = "1.1"

@@ -84,7 +84,7 @@ it asserts were correct. The ABI was fine; the *parse* was not.
 - If upstream renames a program or map, the test fails at the ABI assertion, not
   with a verifier error at runtime.
 - Follow-up, in order: (a) own the datapath source — vendor it, rename its
-  identifiers to `daer*`, and revalidate the object with `make ebpf`; (b) generate
+  identifiers to `daer*`, and revalidate the object with `cargo xtask ebpf`; (b) generate
   `names.rs` from the datapath's sync spec and fail CI on drift. Until (a) lands,
   a handful of string values still carry the old prefix, and that is visible rather
   than hidden.

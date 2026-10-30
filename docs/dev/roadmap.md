@@ -36,7 +36,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | DNS: cache (TTL, stale-while-revalidate, negative answers, bounds) | ✅ |
 | DNS: answer pipeline (routing → cache → transport → response routing) | ✅ |
 | DNS: upstream syntax + DNS over TCP | ✅ |
-| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` is a plain `UdpSocket`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. **No netune change was needed** — the earlier entries in `docs/netune-requests.md` that blamed netune for these were wrong and are corrected there |
+| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` is a plain `UdpSocket`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. **No netune change was needed** — the earlier entries in [`netune-requests.md`](netune-requests.md) that blamed netune for these were wrong and are corrected there |
 | DNS: UDP and TCP server sockets | ✅ |
 | DNS: `daer dns serve` / `daer dns check` | ✅ |
 | DNS: bootstrap resolver | ⬜ |
@@ -46,7 +46,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | UDP: relay wired and driven | ✅ `Daemon::serve` runs the datagram service, one session per peer, replies routed back to the right peer, counters readable |
 | UDP: proven through `tproxy` | ⬜ needs the origin in a **second network namespace** (`TPROXY` matches on the ingress interface); a sandbox without mount privileges cannot create one. The test states this and skips with the reason rather than passing |
 | Daemon runtime: spawned tasks are scheduled | ✅ `daer run` uses a multi-threaded runtime. A current-thread runtime starved the spawned datagram forward — session opened, reply never sent — which took a debugging pass to attribute to the runtime rather than the relay (`crates/daer-cli/tests/runtime.rs`) |
-| Configuration: every accepted key has a consumer | ✅ enforced by `make keys` |
+| Configuration: every accepted key has a consumer | ✅ enforced by `daer-config::tests::config_keys` |
 | Control plane: transparent accept, relay, accept loop with metrics | ✅ |
 | Control plane: routing verdict + outbound dialing per flow | ✅ |
 | Control plane: reload generations (atomic swap, reports, rejection) | ✅ |
@@ -58,7 +58,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 `crates/daer-control/src/daemon.rs`, `datapath.rs`, and `crates/daer-cli/src/run.rs` — loads
 the object, creates and attaches `daer0`/`daer0peer`, binds the transparent port, and serves.
 `tests/transparent.rs` proves it with `nftables tproxy` into a real origin, and
-`docs/deployment.md` is the operator's side. What remains is map *writes* per reload (the
+[`docs/how-to/deployment.md`](../how-to/deployment.md) is the operator's side. What remains is map *writes* per reload (the
 publish sequence of ADR-0004 exists and is tested against a `MapWriter` trait; the `tc`
 side of a live policy swap is not wired).
 
@@ -247,7 +247,7 @@ invisible — a request for `example.com` came back with a real HTTP reply from 
 a test that only asserted "a reply arrived" passed on it.
 
 **Vision is done and live-verified**, after three more defects that only a local
-`xray run` could show (see [`docs/vision-lab.md`](vision-lab.md) for the harness):
+`xray run` could show (see [`docs/how-to/vision-lab.md`](../how-to/vision-lab.md) for the harness):
 
 6. The VLESS request header wrote the port **twice** — once from `PortThenAddress` and once
    from the shadowsocks address encoder it was reusing — so the node read the address two
@@ -296,7 +296,7 @@ consumer, per-flow traces, and the `trace` feature (needs
 
 | Decision | Impact | Where |
 | --- | --- | --- |
-| Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | `docs/netune-requests.md` |
+| Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | [`netune-requests.md`](netune-requests.md) |
 | QUIC implementation for hysteria2/tuic | new dependency, affects the "no third-party HTTP/TLS" rule | milestone 5 |
 | Matcher data structures | performance ceiling of the data path | milestone 6 |
 | Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/transparent.rs`, `scripts/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |

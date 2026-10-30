@@ -63,6 +63,7 @@
 //! ```
 
 pub mod cache;
+pub mod fake_ip;
 pub mod resolver;
 pub mod routing;
 pub mod server;
@@ -70,6 +71,7 @@ pub mod transport;
 pub mod wire;
 
 pub use cache::{Cache, CacheConfig, Cached, Key, Skipped};
+pub use fake_ip::{DnsSnooper, FakeIpPool};
 pub use resolver::{
     ExchangeFuture, Resolution, Resolver, ResolverError, Stats, StatsSnapshot, Upstream,
     UpstreamError,

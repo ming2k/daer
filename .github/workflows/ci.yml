@@ -17,23 +17,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # netune is a path dependency; without it nothing builds. It is pinned by
-      # revision in pins/netune.toml and verified below.
-      - name: Check out netune at the pinned revision
-        run: |
-          rev="$(sed -n 's/^rev[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' pins/netune.toml)"
-          git clone https://github.com/ming2k/netune ../netune
-          git -C ../netune checkout "$rev"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Pins
-        run: make pins
-      - name: JSON Schema is up to date
-        run: make schema-check
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # The datapath is C from upstream; the object test is the ABI contract with it.
   # It is a separate job because it needs clang and the kernel headers, which the
@@ -47,6 +36,6 @@ jobs:
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Build the datapath object
-        run: make ebpf
+        run: cargo xtask ebpf
       - name: Check the ABI against it
         run: cargo test -p daer-ebpf --test object

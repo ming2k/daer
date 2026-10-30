@@ -104,7 +104,7 @@ fi
 section "2. datapath object"
 object="${DAER_OBJECT:-target/ebpf/datapath.o}"
 if [[ ! -f "$object" ]]; then
-    bad "$object missing; run 'make ebpf' first"
+    bad "$object missing; run 'cargo xtask ebpf' first"
     printf '\n%sCannot continue without the object.%s\n' "$RED" "$OFF"
     exit 1
 fi

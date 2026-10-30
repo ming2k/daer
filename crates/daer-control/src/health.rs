@@ -675,7 +675,7 @@ mod tests {
         // A domain-named node would need its own resolution; a probe that resolved
         // differently from the data path would measure the wrong destination.
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\nurl = \"socks5://example.com:1080\"\n\n\
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"example.com\"\nport = 1080\n\n\
              [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
@@ -707,8 +707,10 @@ mod tests {
             }
         });
 
+        let ip = address.ip();
+        let port = address.port();
         let router = router(&format!(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\nurl = \"socks5://{address}\"\n\n\
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
              [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n"
         ));
@@ -756,8 +758,10 @@ mod tests {
             }
         });
 
+        let ip = address.ip();
+        let port = address.port();
         let router = router(&format!(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\nurl = \"socks5://{address}\"\n\n\
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
              [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n"
         ));
@@ -781,7 +785,7 @@ mod tests {
         // Recording a failure is what removes a node from selection; skipping it would
         // leave a dead node alive forever.
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\nurl = \"socks5://127.0.0.1:9\"\n\n\
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
@@ -802,7 +806,7 @@ mod tests {
     #[tokio::test]
     async fn a_zero_interval_disables_probing_entirely() {
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\nurl = \"socks5://127.0.0.1:9\"\n\n\
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
@@ -838,10 +842,14 @@ mod tests {
 
         let router = router(&format!(
             "schema = 1\n\n\
-             [[node]]\ntag = \"a\"\nurl = \"socks5://{a}\"\n\
-             [[node]]\ntag = \"b\"\nurl = \"socks5://{b}\"\n\n\
+             [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\
+             [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
              [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
-             [routing]\nrules = []\nfallback = \"g\"\n"
+             [routing]\nrules = []\nfallback = \"g\"\n",
+            a.ip(),
+            a.port(),
+            b.ip(),
+            b.port()
         ));
         let scheduler = Scheduler::new(Arc::clone(&router), Duration::from_secs(30));
         let results = scheduler.sweep().await;

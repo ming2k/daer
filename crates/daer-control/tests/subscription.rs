@@ -124,11 +124,11 @@ async fn a_base64_subscription_becomes_a_node_pool() {
     }
     // And every fetched link must be one the production parser accepts.
     for node in &configuration.node {
-        daer_outbound::NodeDialer::from_link(
-            &node.url,
+        daer_outbound::NodeDialer::from_node(
+            node,
             daer_outbound::DialerOptions::new(None, Duration::from_secs(1)),
         )
-        .expect("the fetched link is usable");
+        .expect("the fetched node is usable");
     }
 
     // The fetch was persisted, so the next start survives the endpoint going away.
@@ -161,7 +161,7 @@ async fn a_sip008_subscription_becomes_shadowsocks_nodes() {
     );
     assert_eq!(configuration.node.len(), 2);
     for node in &configuration.node {
-        let property = daer_outbound::Property::from_link(&node.url, &node.url, "");
+        let property = daer_outbound::Property::from_node(node);
         assert_eq!(property.protocol, daer_outbound::Protocol::ShadowSocks);
     }
     let _ = std::fs::remove_dir_all(&directory);
@@ -246,13 +246,13 @@ async fn a_subscription_with_no_usable_node_is_not_a_silent_empty_group() {
     assert!(resolution.all_usable());
     for node in &configuration.node {
         assert!(
-            daer_outbound::NodeDialer::from_link(
-                &node.url,
+            daer_outbound::NodeDialer::from_node(
+                node,
                 daer_outbound::DialerOptions::new(None, Duration::from_secs(1)),
             )
             .is_err(),
-            "this build must not claim to speak {}",
-            node.url
+            "this build must not claim to speak {:?}",
+            node.endpoint
         );
     }
     let _ = std::fs::remove_dir_all(&directory);

@@ -157,6 +157,13 @@ impl Policy {
         self.equivalent
     }
 
+    /// True when the policy is partitioned: prefix rules are active in kernel,
+    /// and downstream rules defer to the control plane.
+    #[must_use]
+    pub fn is_partitioned(&self) -> bool {
+        !self.equivalent && self.entries.len() > 1
+    }
+
     /// The rule count the datapath bounds-checks against.
     #[must_use]
     pub fn rules_len(&self) -> u32 {
@@ -276,81 +283,148 @@ impl OutboundIds {
 /// every caller converts into `TC_ACT_SHOT`.
 #[must_use]
 pub fn compile(sets: &[MatchSet], fallback: &Outbound, rule_of: impl Fn(usize) -> usize) -> Policy {
-    let mut reasons = Vec::new();
-
-    // The fallback is one extra entry, so the bound applies to `sets.len() + 1`.
-    let total = sets.len() + 1;
-    if total > MAX_MATCH_SET_LEN {
-        reasons.push(DeferReason::TooManySets {
-            sets: total,
-            bound: MAX_MATCH_SET_LEN,
-        });
-    }
-    for (index, set) in sets.iter().enumerate() {
-        match &set.value {
-            MatchValue::Domain(_) => reasons.push(DeferReason::Domain {
-                rule: rule_of(index),
-            }),
-            MatchValue::ProcessName(_) => reasons.push(DeferReason::ProcessName {
-                rule: rule_of(index),
-            }),
-            // Every other predicate has a `MatchType`, so it is representable. Listed
-            // explicitly rather than with `_ => {}` so adding a `MatchValue` variant is a
-            // compile error here instead of a silently deferred rule.
-            MatchValue::IpSet(_)
-            | MatchValue::SourceIpSet(_)
-            | MatchValue::Mac(_)
-            | MatchValue::Port(_)
-            | MatchValue::SourcePort(_)
-            | MatchValue::L4Proto(_)
-            | MatchValue::IpVersion(_)
-            | MatchValue::Dscp(_) => {}
+    // 1. Group match sets into discrete rules (terminated by a non-logical target).
+    let mut rule_slices: Vec<(usize, usize)> = Vec::new();
+    let mut slice_start = 0;
+    for (i, set) in sets.iter().enumerate() {
+        if !set.target.is_logical() {
+            rule_slices.push((slice_start, i + 1));
+            slice_start = i + 1;
         }
     }
-
-    if !reasons.is_empty() {
-        return Policy::defer(reasons);
+    if slice_start < sets.len() {
+        rule_slices.push((slice_start, sets.len()));
     }
 
     let mut ids = OutboundIds::default();
-    let mut entries = Vec::with_capacity(total);
+    let mut entries = Vec::with_capacity(sets.len() + 1);
     let mut lpms: Vec<(u32, Vec<LpmKey>)> = Vec::new();
+    let mut reasons = Vec::new();
+    let mut partitioned = false;
 
-    for (index, set) in sets.iter().enumerate() {
-        let index = u32::try_from(index).expect("bounded by MAX_MATCH_SET_LEN above");
-        match encode_set(set, index, &mut ids, &mut lpms) {
-            Some(entry) => entries.push(entry),
-            None => {
-                reasons.push(DeferReason::Unsupported {
-                    rule: rule_of(index as usize),
-                    what: format!("{:?}", set.value),
-                });
-                return Policy::defer(reasons);
+    for (start, end) in rule_slices {
+        let slice = &sets[start..end];
+        let rule_index = rule_of(start);
+
+        if partitioned {
+            // Already past the partition boundary: collect deferral reasons for downstream rules.
+            for set in slice {
+                match &set.value {
+                    MatchValue::Domain(_) => {
+                        reasons.push(DeferReason::Domain { rule: rule_index });
+                        break;
+                    }
+                    MatchValue::ProcessName(_) => {
+                        reasons.push(DeferReason::ProcessName { rule: rule_index });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        // Check if this rule is encodable in kernel space.
+        let mut slice_reason = None;
+        for set in slice {
+            match &set.value {
+                MatchValue::Domain(_) => {
+                    slice_reason = Some(DeferReason::Domain { rule: rule_index });
+                    break;
+                }
+                MatchValue::ProcessName(_) => {
+                    slice_reason = Some(DeferReason::ProcessName { rule: rule_index });
+                    break;
+                }
+                _ => {}
             }
         }
+
+        // Check boundary limits: entries + slice.len() + 1 (for gate/fallback) <= MAX_MATCH_SET_LEN
+        if slice_reason.is_none() && entries.len() + slice.len() + 1 > MAX_MATCH_SET_LEN {
+            slice_reason = Some(DeferReason::TooManySets {
+                sets: entries.len() + slice.len() + 1,
+                bound: MAX_MATCH_SET_LEN,
+            });
+        }
+
+        if let Some(reason) = slice_reason {
+            partitioned = true;
+            reasons.push(reason);
+            continue;
+        }
+
+        // Try encoding each set in this rule slice.
+        let mut slice_entries = Vec::with_capacity(slice.len());
+        let mut slice_lpms = Vec::new();
+        let mut encode_failed = false;
+
+        for (offset, set) in slice.iter().enumerate() {
+            let index = (entries.len() + offset) as u32;
+            match encode_set(set, index, &mut ids, &mut slice_lpms) {
+                Some(entry) => slice_entries.push(entry),
+                None => {
+                    reasons.push(DeferReason::Unsupported {
+                        rule: rule_index,
+                        what: format!("{:?}", set.value),
+                    });
+                    encode_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if encode_failed {
+            partitioned = true;
+            continue;
+        }
+
+        // Commit this rule's entries and lpms.
+        entries.extend(slice_entries);
+        lpms.extend(slice_lpms);
     }
 
-    // The fallback entry: `MatchType_Fallback` matches unconditionally.
-    let Some(fallback_id) = ids.id_for(fallback) else {
-        return Policy::defer(vec![DeferReason::TooManyOutbounds {
-            count: ids.names().len() + 1,
-        }]);
-    };
-    entries.push(KernelMatchSet {
-        operand: [0; 16],
-        negated: false,
-        kind: match_type::FALLBACK,
-        outbound: fallback_id,
-        must: fallback.must,
-        mark: fallback.mark,
-    });
+    if partitioned {
+        // Append Deferral Gate at the partition boundary.
+        entries.push(KernelMatchSet {
+            operand: [0; 16],
+            negated: false,
+            kind: match_type::FALLBACK,
+            outbound: kernel_outbound::CONTROL_PLANE_ROUTING,
+            must: false,
+            mark: 0,
+        });
 
-    Policy {
-        entries,
-        lpms,
-        outbounds: ids,
-        equivalent: true,
-        reasons: Vec::new(),
+        Policy {
+            entries,
+            lpms,
+            outbounds: ids,
+            equivalent: false,
+            reasons,
+        }
+    } else {
+        // All rules compiled: append the configured fallback entry.
+        let Some(fallback_id) = ids.id_for(fallback) else {
+            return Policy::defer(vec![DeferReason::TooManyOutbounds {
+                count: ids.names().len() + 1,
+            }]);
+        };
+        entries.push(KernelMatchSet {
+            operand: [0; 16],
+            negated: false,
+            kind: match_type::FALLBACK,
+            outbound: fallback_id,
+            must: fallback.must,
+            mark: fallback.mark,
+        });
+
+        Policy {
+            entries,
+            lpms,
+            outbounds: ids,
+            equivalent: true,
+            reasons: Vec::new(),
+        }
     }
 }
 

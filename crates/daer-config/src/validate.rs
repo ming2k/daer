@@ -252,15 +252,9 @@ fn check_endpoints(config: &Config) -> Result<(), ConfigError> {
         }
     }
     for node in &config.node {
-        if node.url.trim().is_empty() {
-            return Err(ConfigError::new(
-                "node.url",
-                format!(
-                    "empty URL for node {:?}",
-                    node.tag.as_deref().unwrap_or("<untagged>")
-                ),
-            ));
-        }
+        node.endpoint
+            .validate()
+            .map_err(|e| ConfigError::new("node", e))?;
     }
     Ok(())
 }

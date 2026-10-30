@@ -187,13 +187,7 @@ pub fn group_mentions_node(group: &daer_config::Group, node: &daer_config::Node)
     if group.filters.is_empty() {
         return true;
     }
-    let property = daer_outbound::Property::from_link(
-        node.tag.clone().unwrap_or_else(|| node.url.clone()),
-        &node.url,
-        // Same provenance the daemon uses; passing `""` made this validator disagree with the
-        // run path about which nodes a `subtag(...)` group contains.
-        node.subscription_tag(),
-    );
+    let property = daer_outbound::Property::from_node(node);
     let filters: Vec<Vec<daer_config::Function>> = group
         .filters
         .iter()

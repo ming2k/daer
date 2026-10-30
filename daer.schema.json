@@ -6,6 +6,12 @@
     "dns": {
       "$ref": "#/$defs/Dns",
       "default": {
+        "fake-ip": {
+          "enabled": false,
+          "exclude": [],
+          "inet": "198.18.0.0/15",
+          "pool-size": 65535
+        },
         "ipversion-prefer": 0,
         "max-cache-size": 65536,
         "optimistic-cache": true,
@@ -105,6 +111,15 @@
             "null"
           ]
         },
+        "fake-ip": {
+          "$ref": "#/$defs/FakeIpConfig",
+          "default": {
+            "enabled": false,
+            "exclude": [],
+            "inet": "198.18.0.0/15",
+            "pool-size": 65535
+          }
+        },
         "fixed-domain-ttl": {
           "description": "`[dns.fixed-domain-ttl]` — domain to TTL in seconds.",
           "type": "object",
@@ -176,6 +191,34 @@
           "items": {
             "type": "string"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "FakeIpConfig": {
+      "description": "`[dns.fake-ip]` — synthetic IP pool configuration (ADR-0012).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "exclude": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "inet": {
+          "type": "string",
+          "default": "198.18.0.0/15"
+        },
+        "pool-size": {
+          "type": "integer",
+          "format": "uint",
+          "default": 65535,
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -440,11 +483,17 @@
       ]
     },
     "Node": {
-      "description": "`node = [\"link\"]` or `[[node]] tag/url`.",
-      "anyOf": [
-        {
-          "type": "string"
-        },
+      "description": "One `[[node]]` entry.",
+      "type": "object",
+      "properties": {
+        "tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "oneOf": [
         {
           "type": "object",
           "properties": {
@@ -454,14 +503,260 @@
                 "null"
               ]
             },
-            "url": {
+            "type": {
+              "type": "string",
+              "const": "direct"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "password": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "socks5"
+            },
+            "username": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "password": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "http"
+            },
+            "username": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "shadowsocks"
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port",
+            "method",
+            "password"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow-insecure": {
+              "type": "boolean"
+            },
+            "password": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "sni": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "trojan"
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port",
+            "password"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "flow": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "reality": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RealityConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "server": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "vless"
+            },
+            "uuid": {
               "type": "string"
             }
           },
           "required": [
-            "url"
+            "type",
+            "server",
+            "port",
+            "uuid"
           ]
         }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RealityConfig": {
+      "type": "object",
+      "properties": {
+        "alpn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public-key": {
+          "type": "string"
+        },
+        "short-id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sni": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sni",
+        "public-key"
       ]
     },
     "Routing": {

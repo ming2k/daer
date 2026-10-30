@@ -199,6 +199,33 @@ pub struct ShadowSocksConnector {
 }
 
 impl ShadowSocksConnector {
+    /// Builds a connector directly from typed parameters.
+    pub fn new(
+        server: &str,
+        port: u16,
+        method: &str,
+        password: &str,
+        options: DialerOptions,
+    ) -> Result<Self, OutboundError> {
+        let cipher =
+            Cipher::parse(method).map_err(|e| OutboundError::UnsupportedLink(e.to_string()))?;
+        let master = master_key(cipher, password);
+        let server = format!("{server}:{port}");
+        Ok(Self {
+            cipher,
+            master,
+            server,
+            connector: TcpConnector::new()
+                .with_socket_config(match options.so_mark {
+                    Some(mark) => SocketConfig::default().with_mark(mark),
+                    None => SocketConfig::default(),
+                })
+                .with_connect_timeout(Some(options.timeout)),
+            timeout: options.timeout,
+            so_mark: options.so_mark,
+        })
+    }
+
     /// Builds a connector from a link.
     ///
     /// # Errors

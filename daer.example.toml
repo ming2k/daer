@@ -69,14 +69,43 @@ tolerance = "0s"
 
 # Nodes, also merged into the pool.
 #
+# Nodes in configuration must be declared as structured tables (with explicit
+# type checking and editor schema validation). To convert an existing URI link
+# (vless://, ss://, trojan://, etc.) to a structured table, run:
+#     daer node convert "<URI>"
+#
 # A chain (`a -> b`) is NOT supported by this build: it is rejected at validation
 # rather than silently truncated to its first hop. Listing one here is an error.
+#
+# Structured VLESS with REALITY example:
 #[[node]]
 #tag = "edge"
-#url = "vless://…"
+#type = "vless"
+#server = "198.51.100.1"
+#port = 443
+#uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+#flow = "xtls-rprx-vision"
+#[node.reality]
+#sni = "example.com"
+#public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
+#short-id = "ab01cd02"
+#fingerprint = "chrome"
 #
+# Structured Shadowsocks example:
 #[[node]]
-#url = "socks5://127.0.0.1:1080"
+#tag = "ss"
+#type = "shadowsocks"
+#server = "198.51.100.2"
+#port = 8388
+#method = "chacha20-ietf-poly1305"
+#password = "secret"
+#
+# Structured SOCKS5 example:
+#[[node]]
+#tag = "local"
+#type = "socks5"
+#server = "127.0.0.1"
+#port = 1080
 
 # A group selects nodes from the pool and picks one per connection.
 [[group]]

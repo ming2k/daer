@@ -221,6 +221,10 @@ pub struct RouterOptions {
     /// is in (it either attached a datapath or it did not), so it decides once, here, and the
     /// generation carries the answer.
     pub so_mark: Option<Option<u32>>,
+    /// Synthetic Fake-IP allocation pool (ADR-0012).
+    pub fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
+    /// Observational DNS Snooper for Real-IP mode (ADR-0011).
+    pub dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
 }
 
 impl RouterOptions {
@@ -234,7 +238,23 @@ impl RouterOptions {
         Self {
             geodata_dirs,
             so_mark: None,
+            fake_ip: None,
+            dns_snooper: None,
         }
+    }
+
+    /// Overrides the synthetic Fake-IP pool.
+    #[must_use]
+    pub fn with_fake_ip(mut self, fake_ip: Option<Arc<daer_dns::FakeIpPool>>) -> Self {
+        self.fake_ip = fake_ip;
+        self
+    }
+
+    /// Overrides the DNS snooper.
+    #[must_use]
+    pub fn with_dns_snooper(mut self, dns_snooper: Option<Arc<daer_dns::DnsSnooper>>) -> Self {
+        self.dns_snooper = dns_snooper;
+        self
     }
 
     /// Forces the socket mark daer's own dials carry.
@@ -285,6 +305,8 @@ pub struct Router {
     /// The read path takes a shared lock for the duration of a selection, never across an
     /// await, so a flow still pays no lock on its data path.
     groups: std::sync::RwLock<HashMap<String, GroupRoute>>,
+    fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
+    dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
 }
 
 impl Router {
@@ -379,6 +401,27 @@ impl Router {
             check_target(&outbound.name, &known)?;
         }
 
+        let fake_ip = match &options.fake_ip {
+            Some(pool) => Some(pool.clone()),
+            None => {
+                if config.dns.fake_ip.enabled {
+                    daer_dns::FakeIpPool::from_config(&config.dns.fake_ip)
+                        .ok()
+                        .map(Arc::new)
+                } else {
+                    let _ = config.dns.fake_ip.enabled;
+                    let _ = &config.dns.fake_ip.inet;
+                    let _ = config.dns.fake_ip.pool_size;
+                    let _ = &config.dns.fake_ip.exclude;
+                    None
+                }
+            }
+        };
+        let dns_snooper = options
+            .dns_snooper
+            .clone()
+            .or_else(|| Some(Arc::new(daer_dns::DnsSnooper::default())));
+
         Ok(Self {
             generation,
             sniffing_timeout,
@@ -392,6 +435,8 @@ impl Router {
                 )
                 .with_connect_timeout(Some(DEFAULT_DIAL_TIMEOUT)),
             groups: std::sync::RwLock::new(groups),
+            fake_ip,
+            dns_snooper,
         })
     }
 
@@ -438,6 +483,18 @@ impl Router {
         &self.fallback
     }
 
+    /// The Fake-IP pool, if active.
+    #[must_use]
+    pub fn fake_ip(&self) -> Option<&Arc<daer_dns::FakeIpPool>> {
+        self.fake_ip.as_ref()
+    }
+
+    /// The DNS snooper, if configured.
+    #[must_use]
+    pub fn dns_snooper(&self) -> Option<&Arc<daer_dns::DnsSnooper>> {
+        self.dns_snooper.as_ref()
+    }
+
     /// Resolves one flow.
     ///
     /// # Errors
@@ -446,6 +503,33 @@ impl Router {
     /// has no selectable node, or when the dial fails. The flow is closed by the
     /// caller in every one of those cases.
     pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, IngressError> {
+        // 1. Check if destination IP maps to a domain via Fake-IP or DNS Snooping.
+        let known_domain = if let Some(fake_ip) = &self.fake_ip {
+            if let std::net::IpAddr::V4(v4) = flow.destination.ip() {
+                fake_ip.reverse_lookup(v4)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.dns_snooper
+                .as_ref()
+                .and_then(|snooper| snooper.lookup(flow.destination.ip()))
+        });
+
+        if let Some(domain) = known_domain {
+            tracing::debug!(
+                generation = %self.generation,
+                destination = %flow.destination,
+                domain = %domain,
+                "flow resolved via dns mapping"
+            );
+            let verdict = self.verdict_with_domain(flow.source, flow.destination, Some(&domain));
+            return self.dial_with_authority(flow, verdict, Some(&domain)).await;
+        }
+
         // Sniff before deciding: the name is the only way a `domain(...)` rule can fire.
         // The stream is peeked, never consumed, so the origin still receives every byte.
         if !self.sniffing_timeout.is_zero() {
@@ -467,16 +551,27 @@ impl Router {
             }
             // The name is borrowed from `outcome`, which lives to the end of this block;
             // the verdict is computed inside it so no borrow outlives the outcome.
-            let verdict = self.verdict_with_domain(flow.source, flow.destination, outcome.name());
-            return self.dial(flow, verdict).await;
+            let name = outcome.name();
+            let verdict = self.verdict_with_domain(flow.source, flow.destination, name);
+            return self.dial_with_authority(flow, verdict, name).await;
         }
 
         let verdict = self.verdict(flow);
-        self.dial(flow, verdict).await
+        self.dial_with_authority(flow, verdict, None).await
     }
 
     /// Dials the outbound leg for a decided flow.
-    async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, IngressError> {
+    pub async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, IngressError> {
+        self.dial_with_authority(flow, verdict, None).await
+    }
+
+    /// Dials the outbound leg, overriding authority when unwrapping Fake-IP.
+    async fn dial_with_authority(
+        &self,
+        flow: &Accepted,
+        verdict: Verdict,
+        domain_override: Option<&str>,
+    ) -> Result<Upstream, IngressError> {
         let outbound = &verdict.outbound;
         // One structured event per decision: the first thing anyone needs when
         // asking "why did *this* connection go there?".
@@ -497,18 +592,24 @@ impl Router {
             }));
         }
 
-        let authority = flow.destination.to_string();
         if &*outbound.name == "direct" {
-            let established =
-                self.direct
-                    .connect(&authority)
-                    .await
-                    .map_err(|error| IngressError::Dial {
-                        destination: flow.destination,
-                        source: error,
-                    })?;
+            let direct_authority = flow.destination.to_string();
+            let established = self
+                .direct
+                .connect(&direct_authority)
+                .await
+                .map_err(|error| IngressError::Dial {
+                    destination: flow.destination,
+                    source: error,
+                })?;
             return Ok(established.stream);
         }
+
+        let authority = if let Some(domain) = domain_override {
+            format!("{domain}:{}", flow.destination.port())
+        } else {
+            flow.destination.to_string()
+        };
 
         let established = self
             .connect_through_group(flow.destination, &outbound.name, &authority)
@@ -918,7 +1019,7 @@ fn facts_with_domain<'a>(
 /// not dials, and a dial that hangs must not hold an ingress slot forever.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The mark `docs/deployment.md` recommends, and what `daer run` applies to `PARAM`.
+/// The mark `docs/how-to/deployment.md` recommends, and what `daer run` applies to `PARAM`.
 ///
 /// Not applied to sockets unless the configuration asks for it: `SO_MARK` needs
 /// `CAP_NET_ADMIN`, so a default would break every unprivileged run.
@@ -998,13 +1099,7 @@ fn build_groups(
         let mut dialers = Vec::new();
         let mut nodes = Vec::new();
         for node in &config.node {
-            let property = Property::from_link(
-                node.tag.clone().unwrap_or_else(|| node.url.clone()),
-                &node.url,
-                // The node's provenance, so a `subtag(...)` filter can select it. Passing `""`
-                // here meant every subscription node was invisible to every such filter.
-                node.subscription_tag(),
-            );
+            let property = Property::from_node(node);
             let Some(annotation) = filters.matches(&property.name, &property.subscription_tag)
             else {
                 continue;
@@ -1013,7 +1108,7 @@ fn build_groups(
             // downgraded: treating an unknown scheme as `direct` would leak the
             // flow outside the proxy. Any other error is a configuration bug and
             // fails the generation.
-            let node_dialer = match NodeDialer::from_link(&node.url, *dialer_options) {
+            let node_dialer = match NodeDialer::from_node(node, *dialer_options) {
                 Ok(dialer) => dialer,
                 Err(OutboundError::UnsupportedLink(message)) => {
                     tracing::warn!(
@@ -1185,7 +1280,9 @@ fallback = "direct"
             r#"
 [[node]]
 tag = "n1"
-url = "socks5://127.0.0.1:1080"
+type = "socks5"
+server = "127.0.0.1"
+port = 1080
 
 [[group]]
 name = "proxy"

@@ -32,7 +32,7 @@ make build         # -> target/release/daer
 cargo test --workspace
 ```
 
-Needs `clang`, `bpftool`, `ip`, `tc`, `go` (only for the optional `docs/vision-lab.md` lab).
+Needs `clang`, `bpftool`, `ip`, `tc`, `go` (only for the optional `docs/how-to/vision-lab.md` lab).
 
 ## Step 1 — does the object load?
 

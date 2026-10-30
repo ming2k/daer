@@ -118,7 +118,7 @@ impl RuntimeParam {
 /// #endif
 /// ```
 ///
-/// The object is compiled with `-DMAX_MATCH_SET_LEN=…` (see `scripts/build-ebpf.sh`, whose
+/// The object is compiled with `-DMAX_MATCH_SET_LEN=…` (see `cargo xtask ebpf`, whose
 /// default is 1024), so this value is a **build-time agreement**, not a constant of the ABI.
 /// `tests/object.rs` reads the real bound out of the compiled object's `routing_map`
 /// `max_entries` and fails when the two disagree; that check is what keeps a rebuild with a

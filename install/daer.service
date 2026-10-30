@@ -1,0 +1,48 @@
+[Unit]
+Description=daer transparent proxy daemon
+Documentation=https://github.com/ming2k/daer
+After=network-online.target
+Wants=network-online.target
+# Bound crash loops: give up after 5 restarts within 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+
+# Resource limits
+LimitNPROC=4096
+LimitNOFILE=1048576
+
+# OOM score adjustment: -1000 (never kill) to 1000 (always kill first)
+# -100 means daer is less likely to be killed than normal processes
+OOMScoreAdjust=-100
+
+# Validate configuration before starting. A broken configuration exits with non-zero
+# and prevents starting or restarting with an invalid state.
+ExecStartPre=/usr/bin/daer config validate -c /etc/daer/config.toml
+ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Timeout configuration
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# Capability bounding and ambient capabilities: drop everything except CAP_BPF and CAP_NET_ADMIN
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN
+
+# Security sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

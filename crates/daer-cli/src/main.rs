@@ -48,6 +48,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Convert or inspect outbound nodes.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
     /// Explain what daer would do with a flow, without running it.
     Route {
         #[command(subcommand)]
@@ -110,6 +115,16 @@ enum RouteCommand {
     Nodes {
         #[arg(short, long, value_name = "PATH")]
         config: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCommand {
+    /// Convert an outbound URI link (vless://, ss://, trojan://, socks5://, http://, direct://)
+    /// into a structured [[node]] TOML table.
+    Convert {
+        /// Outbound URI link to convert. If omitted, reads lines from standard input.
+        link: Option<String>,
     },
 }
 
@@ -184,7 +199,7 @@ fn block_on_daemon<F: std::future::Future>(future: F) -> F::Output {
 /// A binary owns its process-wide state, and a library that installs a subscriber takes that
 /// decision away from the program that links it. Every `tracing::info!` in `daer-control` and
 /// `daer-dns` was written expecting *someone* to install one; before this existed they were
-/// all silently dropped, including the reload and per-flow fields `docs/diagnostics.md`
+/// all silently dropped, including the reload and per-flow fields `docs/how-to/diagnostics.md`
 /// documents as the way to answer "why did this flow go there".
 fn init_logging(level: &str) {
     use tracing_subscriber::EnvFilter;
@@ -218,6 +233,9 @@ fn main() -> ExitCode {
                 println!("{}", daer_config::schema::json_schema());
                 Ok(())
             }
+        },
+        Command::Node { command } => match command {
+            NodeCommand::Convert { link } => convert_node(link.as_deref()),
         },
         Command::Route { command } => match command {
             RouteCommand::Explain {
@@ -462,6 +480,43 @@ async fn validate(path: &Path) -> anyhow::Result<()> {
 fn fmt(path: &Path) -> anyhow::Result<()> {
     let loaded = load_config(path)?;
     print!("{}", daer_config::toml_config::to_string(&loaded.config));
+    Ok(())
+}
+
+fn convert_node(link: Option<&str>) -> anyhow::Result<()> {
+    if let Some(link) = link {
+        let structured =
+            daer_config::StructuredNode::from_link(link).map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(
+            "{}",
+            structured
+                .to_toml_node()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        );
+    } else {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut count = 0;
+        for line in stdin.lock().lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            let structured = daer_config::StructuredNode::from_link(line)
+                .map_err(|e| anyhow::anyhow!("{line:?}: {e}"))?;
+            println!(
+                "{}",
+                structured
+                    .to_toml_node()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            );
+            count += 1;
+        }
+        if count == 0 {
+            anyhow::bail!("no links provided via stdin");
+        }
+    }
     Ok(())
 }
 
@@ -738,13 +793,21 @@ fn validate_runtime(config: &Config, warnings: &mut Vec<String>) -> anyhow::Resu
     // fails.
     let mut unusable = Vec::new();
     for node in &config.node {
-        let label = node.tag.as_deref().unwrap_or(&node.url);
-        match daer_outbound::NodeDialer::from_link(
-            &node.url,
+        let label = node.label();
+        match daer_outbound::NodeDialer::from_node(
+            node,
             daer_outbound::DialerOptions::new(None, std::time::Duration::from_secs(1)),
         ) {
             Ok(_) => {}
-            Err(error) => unusable.push(format!("{label}: {error}")),
+            Err(error) => {
+                if node.subscription.is_some() {
+                    warnings.push(format!(
+                        "subscription node {label:?} is not selectable by this build (skipped): {error}"
+                    ));
+                } else {
+                    unusable.push(format!("{label}: {error}"));
+                }
+            }
         }
     }
     if !unusable.is_empty() {
@@ -900,7 +963,7 @@ mod tests {
         // And a node added to the pool must make the group selectable under the default policy,
         // which is the part that regressed (`min-moving-avg` selected nothing until a probe ran).
         let text = format!(
-            "{}\n[[node]]\ntag = \"example\"\nurl = \"socks5://127.0.0.1:1080\"\n",
+            "{}\n[[node]]\ntag = \"example\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
             EXAMPLE_TOML
         );
         let config_with_node = dir.write("with-node.toml", text.as_bytes());
@@ -987,14 +1050,12 @@ fallback = "proxy"
 
     #[test]
     fn rejects_a_node_whose_protocol_this_build_cannot_speak() {
-        // Previously this validated clean and then produced a group with no
-        // selectable node: a green light for a configuration that cannot serve.
         let dir = TempDir::new("badproto");
         let config = dir.write(
             "config.toml",
             br#"[[node]]
 tag = "v"
-url = "vmess://eyJhZGQiOiJ4In0"
+type = "vmess"
 
 [[group]]
 name = "g"
@@ -1007,27 +1068,13 @@ fallback = "g"
         let error = block_on(validate_config(&config)).expect_err("must fail");
         let message = format!("{error:#}");
         assert!(message.contains("vmess"), "{message}");
-        assert!(message.contains('v'), "the node must be named: {message}");
     }
 
     #[test]
     fn rejects_a_chained_link_rather_than_truncating_it() {
-        let dir = TempDir::new("chain");
-        let config = dir.write(
-            "config.toml",
-            br#"[[node]]
-url = "socks5://127.0.0.1:1080 -> socks5://127.0.0.1:1081"
-
-[[group]]
-name = "g"
-policy = "min"
-
-[routing]
-fallback = "g"
-"#,
-        );
-        let error = block_on(validate_config(&config)).expect_err("must fail");
-        assert!(format!("{error:#}").contains("chained links"), "{error:#}");
+        let err = convert_node(Some("socks5://127.0.0.1:1080 -> socks5://127.0.0.1:1081"))
+            .expect_err("chained link must fail");
+        assert!(format!("{err:#}").contains("chained links"), "{err:#}");
     }
 
     #[test]
@@ -1097,7 +1144,9 @@ filters = [
             "config.toml",
             br#"[[node]]
 tag = "n1"
-url = "socks5://127.0.0.1:1080"
+type = "socks5"
+server = "127.0.0.1"
+port = 1080
 
 [[group]]
 name = "proxy"
@@ -1189,33 +1238,34 @@ fallback = "direct"
     #[test]
     fn route_nodes_lists_the_security_identity_of_every_node() {
         let dir = TempDir::new("nodes");
-        let credentials = {
-            // `aes-256-gcm:secret` in base64, written out so the test does not depend on a
-            // helper the CLI does not have.
-            "YWVzLTI1Ni1nY206c2VjcmV0"
-        };
         let config = dir.write(
             "config.toml",
-            format!(
-                r#"
+            br#"
 [[node]]
 tag = "ss"
-url = "ss://{credentials}@1.2.3.4:8388"
+type = "shadowsocks"
+server = "1.2.3.4"
+port = 8388
+method = "aes-256-gcm"
+password = "secret"
 
 [[node]]
 tag = "tj"
-url = "trojan://pw@node.example.com:443"
+type = "trojan"
+server = "node.example.com"
+port = 443
+password = "pw"
 
 [[node]]
 tag = "plain"
-url = "socks5://127.0.0.1:1080"
+type = "socks5"
+server = "127.0.0.1"
+port = 1080
 
 [[group]]
 name = "proxy"
 policy = "fixed(0)"
-"#
-            )
-            .as_bytes(),
+"#,
         );
 
         let loaded = load_config(&config).expect("loads");
@@ -1259,7 +1309,10 @@ policy = "fixed(0)"
             "config.toml",
             br#"[[node]]
 tag = "tj"
-url = "trojan://pw@node.example.com:443"
+type = "trojan"
+server = "node.example.com"
+port = 443
+password = "pw"
 
 [[group]]
 name = "proxy"
@@ -1286,6 +1339,169 @@ fallback = "direct"
         assert!(rendered.contains("node       : proxy: tj"), "{rendered}");
         assert!(rendered.contains("tls sni=node.example.com"), "{rendered}");
         assert!(!rendered.contains("pw@"), "no credential in the output");
+    }
+
+    #[test]
+    fn structured_nodes_integrate_with_routing_and_diagnostics() {
+        let dir = TempDir::new("structured-nodes");
+        let config = dir.write(
+            "config.toml",
+            br#"
+schema = 1
+
+[[node]]
+tag = "hk-vless"
+type = "vless"
+server = "198.51.100.1"
+port = 443
+uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+flow = "xtls-rprx-vision"
+[node.reality]
+sni = "impersonate.example.com"
+public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
+short-id = "ab01cd02"
+fingerprint = "chrome"
+
+[[node]]
+tag = "us-ss"
+type = "shadowsocks"
+server = "198.51.100.2"
+port = 8388
+method = "chacha20-ietf-poly1305"
+password = "super-secret-password"
+
+[[group]]
+name = "proxy"
+policy = "fixed(0)"
+
+[routing]
+rules = []
+fallback = "proxy"
+"#,
+        );
+
+        let report = block_on(validate_config(&config)).expect("validates structured node config");
+        assert_eq!(report.files, 1);
+
+        let loaded = load_config(&config).expect("loads");
+        assert_eq!(loaded.config.node.len(), 2);
+        let options = daer_control::RouterOptions::with_assets_beside(&config);
+        let generations = daer_control::Generations::new(&loaded.config, &options).expect("builds");
+        let nodes = generations.current().router().nodes();
+        assert_eq!(nodes.len(), 2);
+
+        let vless = nodes
+            .iter()
+            .find(|n| n.node == "hk-vless")
+            .expect("vless node");
+        assert_eq!(vless.protocol, daer_outbound::Protocol::Reality);
+        assert!(vless.security.is_confidential());
+        assert!(vless.describe().contains("reality"));
+
+        let ss = nodes.iter().find(|n| n.node == "us-ss").expect("ss node");
+        assert_eq!(ss.protocol, daer_outbound::Protocol::ShadowSocks);
+        assert!(ss.security.is_confidential());
+        assert!(!ss.describe().contains("super-secret-password"));
+
+        // Explain route verification
+        let explanation = block_on(explain(
+            &config,
+            "10.0.0.2:40000",
+            "93.184.216.34:443",
+            None,
+        ))
+        .expect("explains");
+        let selected = explanation.selected.expect("node selected");
+        assert_eq!(selected.node, "hk-vless");
+    }
+
+    #[test]
+    fn convert_node_command_converts_uri_to_structured_toml() {
+        let vless_link = "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f#US%20VIP%2001";
+        assert!(convert_node(Some(vless_link)).is_ok());
+
+        let ss_link =
+            "ss://YWVzLTEyOC1ncm06bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
+        assert!(convert_node(Some(ss_link)).is_ok());
+    }
+
+    #[test]
+    fn subscription_node_filtering_and_selection() {
+        let dir = TempDir::new("sub-filter");
+        // Persist cache fixture with links from a real subscription
+        let persist_dir = dir.0.join("persist.d");
+        let cache = daer_outbound::subscription::Cache::new(persist_dir, "mysub");
+        let _ = cache.write(&[
+            "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f#US%20VIP%2001".to_owned(),
+            "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkjp1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.titech.ac.jp&pbk=VAqawSsDR9SnBoN8ucLfUXIZO3Ugkd27HN7TOqh1AXo&sid=f0#Japan%20VIP%2001".to_owned(),
+            "hysteria2://df4af3d0-030e-4062-baa6-eb9dd45298ef@151.242.183.252:20443?sni=apple.com#HK%2001".to_owned(),
+        ]);
+
+        let sub_url = "https://example.com/api/subscribe?token=test";
+        let config_toml = format!(
+            r#"
+schema = 1
+
+[[subscription]]
+tag = "mysub"
+url = "{sub_url}"
+persist = true
+
+[[group]]
+name = "fastest-jp"
+policy = "min-moving-avg"
+filters = [
+    "subtag(mysub) && name(keyword: 'Japan')"
+]
+
+[routing]
+rules = ["dport(443) -> fastest-jp"]
+fallback = "direct"
+"#
+        );
+        let config = dir.write("config.toml", config_toml.as_bytes());
+
+        let resolved = block_on(load_resolved(&config)).expect("resolves subscription");
+        assert_eq!(resolved.config.node.len(), 3);
+
+        // Verify group mentions node
+        let jp_node = resolved
+            .config
+            .node
+            .iter()
+            .find(|n| n.label().contains("Japan"))
+            .expect("jp node");
+        let us_node = resolved
+            .config
+            .node
+            .iter()
+            .find(|n| n.label().contains("US"))
+            .expect("us node");
+        let jp_group = &resolved.config.group[0];
+
+        assert!(daer_control::group_mentions_node(jp_group, jp_node));
+        assert!(!daer_control::group_mentions_node(jp_group, us_node));
+
+        // Validate config should succeed (unsupported hysteria2 from subscription produces a warning, not failure)
+        let report = block_on(validate_config(&config)).expect("validates");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("cannot be selected") || w.contains("is not selectable"))
+        );
+
+        // Generates router and selects Japan node
+        let options = daer_control::RouterOptions::with_assets_beside(&config);
+        let generations =
+            daer_control::Generations::new(&resolved.config, &options).expect("builds router");
+        let selected_node = generations
+            .current()
+            .router()
+            .node_identity("fastest-jp")
+            .expect("node selected");
+        assert_eq!(selected_node.group, "fastest-jp");
+        assert!(selected_node.node.contains("Japan"));
     }
 
     #[test]

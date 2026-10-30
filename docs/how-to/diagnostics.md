@@ -209,7 +209,7 @@ The configuration layer reports before anything runs:
   filters. Errors carry `line:column` and a caret, including inside a rule
   expression.
 * `daer config schema` — the JSON Schema, so an editor flags a typo before the
-  validator ever runs. `make schema-check` fails if the checked-in schema drifts
+  validator ever runs. Automated test `schema_is_up_to_date` fails if the checked-in schema drifts
   from the model.
 
 ```

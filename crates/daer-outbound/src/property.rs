@@ -174,6 +174,78 @@ impl Security {
 }
 
 impl Property {
+    /// Builds properties directly from a typed configuration [`daer_config::Node`].
+    pub fn from_node(node: &daer_config::Node) -> Self {
+        let name = node.tag.clone().unwrap_or_else(|| node.default_name());
+        let (protocol, address, udp, security) = match &node.endpoint {
+            daer_config::NodeEndpoint::Direct(_) => {
+                (Protocol::Direct, String::new(), true, Security::None)
+            }
+            daer_config::NodeEndpoint::Socks5(n) => (
+                Protocol::Socks5,
+                format!("{}:{}", n.server, n.port),
+                true,
+                Security::Plaintext,
+            ),
+            daer_config::NodeEndpoint::Http(n) => (
+                Protocol::Http,
+                format!("{}:{}", n.server, n.port),
+                false,
+                Security::Plaintext,
+            ),
+            daer_config::NodeEndpoint::Shadowsocks(n) => (
+                Protocol::ShadowSocks,
+                format!("{}:{}", n.server, n.port),
+                false,
+                Security::Cipher {
+                    name: n.method.clone(),
+                    authenticated: true,
+                },
+            ),
+            daer_config::NodeEndpoint::Trojan(n) => (
+                Protocol::Trojan,
+                format!("{}:{}", n.server, n.port),
+                false,
+                Security::Tls {
+                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.allow_insecure,
+                },
+            ),
+            daer_config::NodeEndpoint::Vless(n) => (
+                Protocol::Reality,
+                format!("{}:{}", n.server, n.port),
+                false,
+                Security::Reality {
+                    server_name: n
+                        .reality
+                        .as_ref()
+                        .map(|r| r.sni.clone())
+                        .unwrap_or_else(|| n.server.clone()),
+                    fingerprint: n
+                        .reality
+                        .as_ref()
+                        .and_then(|r| r.fingerprint.clone())
+                        .unwrap_or_else(|| "chrome".to_owned()),
+                },
+            ),
+            daer_config::NodeEndpoint::Unsupported { scheme, .. } => (
+                Protocol::Other(scheme.clone()),
+                String::new(),
+                false,
+                Security::None,
+            ),
+        };
+
+        Self {
+            name,
+            address,
+            protocol,
+            udp,
+            subscription_tag: node.subscription_tag().to_owned(),
+            security,
+        }
+    }
+
     /// Derives the static properties of a node link (`node { name: link }`).
     ///
     /// The address is the proxy's `host:port`; a link this build does not speak

@@ -446,7 +446,8 @@ mod tests {
     #[test]
     fn rendering_round_trips() {
         let config = load_str(
-            "[global]\ntproxy-port = 1234\n[[node]]\ntag = \"n\"\nurl = \"ss://x\"\n\
+            "[global]\ntproxy-port = 1234\n[[node]]\ntag = \"n\"\ntype = \"shadowsocks\"\n\
+             server = \"1.2.3.4\"\nport = 8388\nmethod = \"aes-256-gcm\"\npassword = \"x\"\n\
              [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"direct\"\n",
         )
         .expect("valid");

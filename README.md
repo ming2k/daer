@@ -20,15 +20,15 @@ packet enters the TCP/IP stack, so direct traffic never touches userspace.
 > Vision is the one node protocol interop-tested against a live server.
 >
 > The honest gaps, all of them named where they matter:
-> `docs/roadmap.md` lists what is missing; UDP is relayed but not yet proven on the wire through
-> `tproxy` (`docs/deployment.md` says exactly why); the vmess family, the QUIC families and the
+> `docs/dev/roadmap.md` lists what is missing; UDP is relayed but not yet proven on the wire through
+> `tproxy` (`docs/how-to/deployment.md` says exactly why); the vmess family, the QUIC families and the
 > event ring are not implemented.
 >
 > Getting here found eleven defects that unit tests had missed, all of them invisible from
 > the Rust side: a ClientHello that was not valid TLS, a REALITY tag sealed with the wrong
 > salt and key, a missing `X25519MLKEM768` share that a current node refuses to authenticate
 > without, a VLESS header that wrote the destination port twice, and a Vision block that
-> never said `End`. [`docs/vision-lab.md`](docs/vision-lab.md) is the local `xray run`
+> never said `End`. [`docs/how-to/vision-lab.md`](docs/how-to/vision-lab.md) is the local `xray run`
 > harness that made the last three observable.
 
 ## What the kernel tier means for you
@@ -66,7 +66,7 @@ Network capabilities above the socket — TLS, HTTP, DNS resolution, proxy
 handshakes, socket options, RTT sampling, and everything datagram-shaped — belong
 to [netune](../netune), which `daer` consumes as a pinned dependency. What
 `daer` needs from it is tracked in
-[`docs/netune-requests.md`](docs/netune-requests.md)
+[`docs/dev/netune-requests.md`](docs/dev/netune-requests.md)
 ([ADR-0002](docs/adr/0002-netune-boundary.md)).
 
 ## Configuration
@@ -160,7 +160,7 @@ found, which is the only way to verify a `domain(...)` rule from the command lin
 matched but were shadowed, and the selected node's security identity
 (`cipher aes-256-gcm`, `tls sni=…`) is printed with the decision.
 `daer route nodes` lists every node the same way, subscriptions resolved. See
-[`docs/diagnostics.md`](./docs/diagnostics.md).
+[`docs/how-to/diagnostics.md`](docs/how-to/diagnostics.md).
 
 ### Running the DNS resolver
 
@@ -212,18 +212,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-or `make ci`, which also runs `make pins`. MSRV is 1.95.
-
-`make pins` verifies that the path dependency on `../netune` still matches the
-revision recorded in [`pins/netune.toml`](./pins/netune.toml): a netune change to
-TLS, DNS, socket options or health-check semantics changes `daer`'s wire
-behaviour, so its checkout may not drift unreviewed.
+or `cargo xtask ci`. MSRV is 1.95.
 
 Building the datapath object is optional and needs clang plus a `vmlinux.h` tree:
 
 ```sh
-DAER_DATAPATH_SRC=… DAER_BPF_HEADERS=… make ebpf   # -> target/ebpf/datapath.o
-cargo test -p daer-ebpf                            # ABI assertions against it
+DAER_DATAPATH_SRC=… DAER_BPF_HEADERS=… cargo xtask ebpf   # -> target/ebpf/datapath.o
+cargo test -p daer-ebpf                                  # ABI assertions against it
 ```
 
 Without an object the object tests skip; with one they are the ABI contract.
@@ -244,7 +239,7 @@ Architecture decisions are recorded, not implied:
   userspace. It never invents a third answer and never leaves the table empty.
 - [ADR-0006](docs/adr/0006-wiring-ownership.md) — a subsystem is done only when `daer run`
   reaches it, and a configuration key the schema accepts must either take effect or not exist.
-  `make keys` fails the build otherwise.
+  `cargo test` fails otherwise.
 - [ADR-0007](docs/adr/0007-verification.md) — a test that cannot fail is a liability. Every
   end-to-end claim names its falsifier, including a negative control.
 - [ADR-0010](docs/adr/0010-reality-client-ownership.md) — REALITY and the minimal TLS 1.3

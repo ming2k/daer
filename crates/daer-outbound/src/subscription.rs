@@ -147,12 +147,21 @@ pub async fn fetch_body(url: &str, timeout: Duration) -> Result<Vec<u8>, Subscri
 
     let target = match scheme.to_ascii_lowercase().as_str() {
         "https" => {
-            let host = authority
-                .rsplit_once(':')
-                .map_or(authority, |(host, _port)| host);
-            Target::tls(authority, host.to_owned())
+            let (endpoint, host) = if let Some((host, _port)) = authority.rsplit_once(':') {
+                (authority.to_owned(), host.to_owned())
+            } else {
+                (format!("{authority}:443"), authority.to_owned())
+            };
+            Target::tls(endpoint, host)
         }
-        "http" => Target::plain(authority),
+        "http" => {
+            let endpoint = if authority.contains(':') {
+                authority.to_owned()
+            } else {
+                format!("{authority}:80")
+            };
+            Target::plain(endpoint)
+        }
         other => {
             return Err(SubscriptionError::Fetch(format!(
                 "unsupported subscription scheme {other:?}; expected http or https"

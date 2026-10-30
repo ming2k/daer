@@ -213,6 +213,8 @@ pub struct Resolver {
     /// from a mixed answer*, which is what an operator on a single-stack uplink wants: the
     /// answers a client will pick from are the ones it can actually reach.
     ipversion_prefer: IpVersionPreference,
+    fake_ip: Arc<crate::fake_ip::FakeIpPool>,
+    snooper: Arc<crate::fake_ip::DnsSnooper>,
 }
 
 /// `dns.ipversion-prefer`, as a type rather than a raw `i32`.
@@ -313,6 +315,12 @@ impl Resolver {
         let ipversion_prefer = IpVersionPreference::parse(config.dns.ipversion_prefer)
             .map_err(ResolverError::Upstream)?;
 
+        let fake_ip = Arc::new(
+            crate::fake_ip::FakeIpPool::from_config(&config.dns.fake_ip)
+                .map_err(ResolverError::Upstream)?,
+        );
+        let snooper = Arc::new(crate::fake_ip::DnsSnooper::default());
+
         Ok(Self {
             request,
             response,
@@ -320,6 +328,8 @@ impl Resolver {
             cache: Mutex::new(Cache::new(cache_config)),
             stats: Stats::default(),
             ipversion_prefer,
+            fake_ip,
+            snooper,
         })
     }
 
@@ -350,6 +360,18 @@ impl Resolver {
     #[must_use]
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// The Fake-IP pool (ADR-0012).
+    #[must_use]
+    pub fn fake_ip(&self) -> &Arc<crate::fake_ip::FakeIpPool> {
+        &self.fake_ip
+    }
+
+    /// The DNS Snooper (ADR-0011).
+    #[must_use]
+    pub fn snooper(&self) -> &Arc<crate::fake_ip::DnsSnooper> {
+        &self.snooper
     }
 
     /// Answers `query`.
@@ -387,6 +409,25 @@ impl Resolver {
             }
             Decision::Upstream(tag) => tag,
         };
+
+        if self.fake_ip.is_enabled()
+            && !query.questions.is_empty()
+            && query.questions[0].qtype == RecordType::A
+        {
+            let qname = query.questions[0].name.to_string();
+            if !self.fake_ip.is_excluded(&qname) {
+                let fake_addr = self.fake_ip.allocate(&qname);
+                let mut reply = Message::reply_to(query, ResponseCode::NOERROR);
+                reply.answers.push(crate::wire::Record {
+                    name: query.questions[0].name.clone(),
+                    rtype: RecordType::A,
+                    class: query.questions[0].qclass,
+                    ttl: 60,
+                    rdata: fake_addr.octets().to_vec(),
+                });
+                return Ok(Resolution::Answer(reply));
+            }
+        }
 
         let key = Key::of(query);
         if let Some(key) = &key {
@@ -432,6 +473,24 @@ impl Resolver {
                 // every hit and, worse, leave a stale cache holding records the configuration
                 // says to drop.
                 self.ipversion_prefer.apply(&mut answer);
+                if !query.questions.is_empty() {
+                    let qname = query.questions[0].name.to_string();
+                    for record in &answer.answers {
+                        if let Some(v4) = record.as_ipv4() {
+                            self.snooper.record(
+                                std::net::IpAddr::V4(v4),
+                                &qname,
+                                u64::from(record.ttl),
+                            );
+                        } else if let Some(v6) = record.as_ipv6() {
+                            self.snooper.record(
+                                std::net::IpAddr::V6(v6),
+                                &qname,
+                                u64::from(record.ttl),
+                            );
+                        }
+                    }
+                }
                 answer
             }
             ResponseAction::Reject => {

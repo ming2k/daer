@@ -3,7 +3,7 @@
 //! Loading the datapath object and wiring its runtime parameters.
 //!
 //! The object is compiled from `control/kern/tproxy.c` by
-//! `scripts/build-ebpf.sh`; this module does not compile it, so building daer
+//! `cargo xtask ebpf`; this module does not compile it, so building daer
 //! never needs a clang toolchain or the kernel headers.
 //!
 //! Attachment needs `CAP_BPF`/`CAP_NET_ADMIN`, so the tests that attach are

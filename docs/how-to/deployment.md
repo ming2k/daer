@@ -9,17 +9,17 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 | Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
 | `CAP_BPF`, `CAP_NET_ADMIN` | load and attach the datapath; `IP_TRANSPARENT` on the listener |
 | `ip` | creates the `daer0`/`daer0peer` pair |
-| the datapath object | `make ebpf`, or one shipped with the package |
+| the datapath object | `cargo xtask ebpf`, or one shipped with the package |
 | `geoip.dat` / `geosite.dat` | only when a rule says `geoip:` / `geosite:` |
 
 ## Build
 
 ```sh
-make ebpf        # -> target/ebpf/datapath.o  (needs clang + a vmlinux.h tree)
-make build       # -> target/release/daer
+cargo xtask ebpf           # -> target/ebpf/datapath.o  (needs clang + a vmlinux.h tree)
+cargo build --release      # -> target/release/daer
 ```
 
-`make ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
+`cargo xtask ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
 (defaults to `ebpf/headers`). `ebpf/headers/vmlinux.h` is per-kernel and is not vendored;
 generate it where the object is built:
 
@@ -45,7 +45,16 @@ lan-interface = ["eth0"]      # the network you are proxying traffic *from*
 so-mark = 0x0dae
 
 [[node]]
-url = "vless://…#edge"
+tag = "edge"
+type = "vless"
+server = "example.com"
+port = 443
+uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+flow = "xtls-rprx-vision"
+[node.reality]
+sni = "impersonate.example.com"
+public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
+fingerprint = "chrome"
 
 [[group]]
 name = "proxy"
@@ -133,18 +142,41 @@ Two things are easy to get wrong:
 
 ## systemd
 
+A unit file is shipped at `install/daer.service`:
+
 ```ini
 [Unit]
-Description=daer transparent proxy
+Description=daer transparent proxy daemon
+Documentation=https://github.com/ming2k/daer
 After=network-online.target
 Wants=network-online.target
+# Bound crash loops: give up after 5 restarts within 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/daer run -c /etc/daer/config.toml
+User=root
+
+# Resource limits
+LimitNPROC=4096
+LimitNOFILE=1048576
+OOMScoreAdjust=-100
+
+# Validate configuration before starting. A broken configuration exits with non-zero
+# and prevents starting or restarting with an invalid state.
+ExecStartPre=/usr/bin/daer config validate -c /etc/daer/config.toml
+ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
 ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
 Restart=on-failure
-RestartSec=5
+RestartSec=5s
+
+# Timeout configuration
+TimeoutStartSec=120
+TimeoutStopSec=30
+
 # The two capabilities the datapath needs; everything else is dropped.
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN
@@ -157,6 +189,14 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
+```
+
+To install and enable it:
+
+```sh
+sudo cp install/daer.service /etc/systemd/system/daer.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now daer
 ```
 
 `ExecReload` is what makes SIGHUP usable: `systemctl reload daer` then swaps the policy
@@ -185,7 +225,7 @@ A failure there is almost always one of:
 | --- | --- |
 | `PermissionDenied` creating a map | no `CAP_BPF` — a "root" user namespace is not enough, `unprivileged_bpf_disabled` blocks it |
 | a struct offset or a `bpf_*` helper | `vmlinux.h` came from a different kernel than the target |
-| `InvalidProgramSection` | the object was built without `scripts/build-ebpf.sh`, which normalizes `ebpf-go` section syntax |
+| `InvalidProgramSection` | the object was built without `cargo xtask ebpf`, which normalizes `ebpf-go` section syntax |
 
 Userspace tests cannot catch any of those, which is why this script exists.
 
@@ -207,7 +247,7 @@ systemctl reload daer
 ```
 
 `RUST_LOG=daer=debug` overrides `log-level` for a one-off investigation, which is what makes
-`docs/diagnostics.md` usable without editing the configuration.
+[Diagnostics Guide](diagnostics.md) usable without editing the configuration.
 
 ## What is not implemented
 

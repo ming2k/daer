@@ -7,7 +7,7 @@
 //! `xray run` inbound with `security: tls` and `flow=xtls-rprx-vision` — so a failure can
 //! only be the Vision frame.
 //!
-//! Start the server first (see `docs/vision-lab.md`):
+//! Start the server first (see `docs/how-to/vision-lab.md`):
 //!
 //! ```sh
 //! /tmp/xray run -c /tmp/lab/server_tls.json
@@ -60,7 +60,7 @@ fn vless_header(host: &str, port: u16, vision: bool) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "needs a local xray inbound; see docs/vision-lab.md"]
+#[ignore = "needs a local xray inbound; see docs/how-to/vision-lab.md"]
 async fn vision_uplink_reaches_a_real_xray_inbound() {
     let server = std::env::var("DAER_VISION_SERVER").unwrap_or_else(|_| "127.0.0.1:18443".into());
 

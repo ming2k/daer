@@ -552,7 +552,7 @@ fn outbound_ids_stay_inside_the_datapaths_window() {
 #[test]
 fn the_encoded_bytes_are_the_objects_layout() {
     let Some(object) = object() else {
-        eprintln!("skipping the object half: build it with `make ebpf`");
+        eprintln!("skipping the object half: build it with `cargo xtask ebpf`");
         return;
     };
 
@@ -618,6 +618,94 @@ fn a_port_operand_is_two_native_u16s() {
     expected[2..4].copy_from_slice(&8000u16.to_ne_bytes());
     assert_eq!(&entry.operand[..4], &expected);
     assert_eq!(PortRange::new(8000, 8100).start, 8000);
+}
+
+/// ADR-0011 ([INV-PARTITION-01]): prefix rules execute in kernel; unencodable rules defer.
+#[test]
+fn a_partitioned_policy_executes_prefix_in_kernel_and_defers_suffix() {
+    let rules = &[
+        "dport(22) -> direct",
+        "dip(192.168.0.0/16) -> direct",
+        "domain(suffix: example.com) -> proxy",
+        "dip(10.0.0.0/8) -> block",
+    ];
+    let (_sets, _fallback, compiled) = compile(rules, "proxy");
+    let policy = &compiled.policy;
+
+    // Policy is partitioned: not globally equivalent, but has active prefix entries.
+    assert!(!policy.equivalent);
+    assert!(policy.is_partitioned());
+    assert_eq!(policy.reasons.len(), 1);
+    assert!(matches!(policy.reasons[0], DeferReason::Domain { rule: 2 }));
+
+    // Rule 0 (dport 22) + Rule 1 (dip 192.168.0.0/16) + Deferral Gate = 3 entries.
+    assert_eq!(policy.entries.len(), 3);
+    assert_eq!(policy.entries[2].kind, match_type::FALLBACK);
+    assert_eq!(policy.entries[2].outbound, outbound::CONTROL_PLANE_ROUTING);
+
+    // 1. Flow matching Rule 0 (dport 22): must be routed directly in kernel!
+    let flow_ssh = Flow {
+        saddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        daddr: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        sport: 40000,
+        dport: 22,
+        l4proto: L4_TCP,
+        ip_version: 1,
+        dscp: 0,
+        mac: MacAddr::UNSPECIFIED,
+        pname: ProcessName::default(),
+    };
+    match kernel_eval(policy, &flow_ssh) {
+        Verdict::Routed { outbound: id, .. } => {
+            assert_eq!(
+                id,
+                outbound::DIRECT,
+                "SSH traffic must route direct in kernel"
+            );
+        }
+        other => panic!("expected kernel Routed, got {other:?}"),
+    }
+
+    // 2. Flow matching Rule 1 (192.168.1.100:80): must be routed directly in kernel!
+    let flow_lan = Flow {
+        saddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        daddr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+        sport: 40000,
+        dport: 80,
+        l4proto: L4_TCP,
+        ip_version: 1,
+        dscp: 0,
+        mac: MacAddr::UNSPECIFIED,
+        pname: ProcessName::default(),
+    };
+    match kernel_eval(policy, &flow_lan) {
+        Verdict::Routed { outbound: id, .. } => {
+            assert_eq!(
+                id,
+                outbound::DIRECT,
+                "LAN traffic must route direct in kernel"
+            );
+        }
+        other => panic!("expected kernel Routed, got {other:?}"),
+    }
+
+    // 3. Flow not matching Rule 0 or Rule 1 (1.1.1.1:443): must hit deferral gate!
+    let flow_wan = Flow {
+        saddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        daddr: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        sport: 40000,
+        dport: 443,
+        l4proto: L4_TCP,
+        ip_version: 1,
+        dscp: 0,
+        mac: MacAddr::UNSPECIFIED,
+        pname: ProcessName::default(),
+    };
+    assert_eq!(
+        kernel_eval(policy, &flow_wan),
+        Verdict::Defer,
+        "traffic passing prefix rules must hit deferral gate"
+    );
 }
 
 fn object() -> Option<aya_obj::Object> {

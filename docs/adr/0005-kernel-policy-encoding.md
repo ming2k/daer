@@ -142,7 +142,7 @@ then show the kernel deferring for *every* flow rather than for some.
   makes `daer run` safe to start at all.
 - The fast path (direct traffic never leaving the kernel) is available for
   configurations whose rules the kernel can represent, and unavailable — but
-  correct — for the rest. `docs/deployment.md` states which is which.
+  correct — for the rest. `docs/how-to/deployment.md` states which is which.
 - `domain(...)` rules are the common case in real configurations, so the honest
   expectation today is `tier=defer` for most deployments. Making it `split` needs
   the DNS-derived `domain_routing_map` (a follow-up, and it is only worth doing once

@@ -146,6 +146,67 @@ fn chain_head_scheme(link: &str) -> Option<&str> {
 }
 
 impl NodeDialer {
+    /// Builds the transport directly from a typed configuration [`daer_config::Node`].
+    pub fn from_node(
+        node: &daer_config::Node,
+        options: DialerOptions,
+    ) -> Result<Self, OutboundError> {
+        match &node.endpoint {
+            daer_config::NodeEndpoint::Direct(_) => Ok(Self::Direct(DirectTransport::new(options))),
+            daer_config::NodeEndpoint::Socks5(n) => {
+                let link = n.to_link();
+                let proxy = Proxy::parse(&link)
+                    .map_err(|e| OutboundError::UnsupportedLink(e.to_string()))?;
+                Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
+            }
+            daer_config::NodeEndpoint::Http(n) => {
+                let link = n.to_link();
+                let proxy = Proxy::parse(&link)
+                    .map_err(|e| OutboundError::UnsupportedLink(e.to_string()))?;
+                Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
+            }
+            daer_config::NodeEndpoint::Shadowsocks(n) => {
+                let connector =
+                    ShadowSocksConnector::new(&n.server, n.port, &n.method, &n.password, options)?;
+                Ok(Self::ShadowSocks(ShadowSocksTransport { connector }))
+            }
+            daer_config::NodeEndpoint::Trojan(n) => {
+                let connector = TrojanConnector::new(
+                    &n.server,
+                    n.port,
+                    &n.password,
+                    n.sni.as_deref(),
+                    n.allow_insecure,
+                    options,
+                )?;
+                Ok(Self::Trojan(TrojanTransport { connector }))
+            }
+            daer_config::NodeEndpoint::Vless(n) => {
+                let reality = n.reality.as_ref().ok_or_else(|| {
+                    OutboundError::UnsupportedLink("vless node requires [node.reality]".to_owned())
+                })?;
+                let connector = RealityConnector::new(
+                    crate::reality::connector::RealityEndpointParams {
+                        server: &n.server,
+                        port: n.port,
+                        uuid: &n.uuid,
+                        flow: n.flow.as_deref(),
+                        sni: &reality.sni,
+                        public_key: &reality.public_key,
+                        short_id: reality.short_id.as_deref(),
+                        fingerprint: reality.fingerprint.as_deref(),
+                        alpn: &reality.alpn,
+                    },
+                    options,
+                )?;
+                Ok(Self::Reality(RealityTransport { connector }))
+            }
+            daer_config::NodeEndpoint::Unsupported { scheme, .. } => Err(
+                OutboundError::UnsupportedLink(format!("unsupported protocol {scheme:?}")),
+            ),
+        }
+    }
+
     /// Builds the transport a node link describes.
     ///
     /// # Chains
@@ -194,11 +255,16 @@ impl NodeDialer {
             return Ok(Self::Reality(RealityTransport { connector }));
         }
 
+        let (link_clean, _fragment) = match link.split_once('#') {
+            Some((before, frag)) => (before, Some(frag)),
+            None => (link, None),
+        };
+
         let normalized = match scheme.to_ascii_lowercase().as_str() {
             "socks" | "socks5" | "socks5h" => {
-                format!("socks5://{}", &link[scheme.len() + 3..])
+                format!("socks5://{}", &link_clean[scheme.len() + 3..])
             }
-            "http" => link.to_owned(),
+            "http" => link_clean.to_owned(),
             "https" => {
                 return Err(OutboundError::UnsupportedLink(
                     "https proxies (TLS to the proxy) are not supported yet; \

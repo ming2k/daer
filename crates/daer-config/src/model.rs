@@ -424,58 +424,853 @@ impl<'de> Deserialize<'de> for Subscription {
 
 /// One `[[node]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Node {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    pub url: String,
+    #[serde(flatten)]
+    pub endpoint: NodeEndpoint,
     /// The subscription this node came from, filled in by the resolver.
-    ///
-    /// Deliberately **not** deserialized: it is not part of the file format, it is derived from
-    /// which `[[subscription]]` produced the link. `subtag(...)` filters read it, and leaving it
-    /// empty (as the daemon did) made every subscription node unselectable while `daer route
-    /// nodes` still listed it — the two diagnostics disagreed and the group silently had no
-    /// members.
     #[serde(skip)]
     pub subscription: Option<String>,
 }
 
 impl Node {
+    /// Creates a node with an optional tag and an endpoint.
+    pub fn new(tag: Option<String>, endpoint: NodeEndpoint) -> Self {
+        Self {
+            tag,
+            endpoint,
+            subscription: None,
+        }
+    }
+
+    /// Creates a node with a subscription tag provenance.
+    pub fn with_subscription(
+        tag: Option<String>,
+        endpoint: NodeEndpoint,
+        subscription: Option<String>,
+    ) -> Self {
+        Self {
+            tag,
+            endpoint,
+            subscription,
+        }
+    }
+
+    /// Creates a node from an endpoint, extracting any tag declared on it.
+    pub fn from_endpoint(endpoint: NodeEndpoint) -> Self {
+        let tag = endpoint.tag().map(str::to_owned);
+        Self::new(tag, endpoint)
+    }
+
+    /// Alias for `from_endpoint`.
+    pub fn from_structured(structured: NodeEndpoint) -> Self {
+        Self::from_endpoint(structured)
+    }
+
     /// The tag `subtag(...)` matches against, or `""` for an inline node.
     #[must_use]
     pub fn subscription_tag(&self) -> &str {
         self.subscription.as_deref().unwrap_or("")
     }
+
+    /// Default name for this node when tag is omitted.
+    #[must_use]
+    pub fn default_name(&self) -> String {
+        self.endpoint.default_name()
+    }
+
+    /// Display label for this node.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.tag.clone().unwrap_or_else(|| self.default_name())
+    }
+
+    /// Formats this node as a URI link.
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        self.endpoint.to_link()
+    }
+
+    /// Parses an outbound URI link (vless://, ss://, trojan://, socks5://, http://, direct://)
+    /// into a typed `Node`.
+    pub fn from_link(link: &str) -> Result<Self, String> {
+        let endpoint = NodeEndpoint::from_link(link)?;
+        let tag = endpoint.tag().map(str::to_owned);
+        Ok(Self {
+            tag,
+            endpoint,
+            subscription: None,
+        })
+    }
+
+    /// Renders this node as a formatted `[[node]]` TOML block.
+    pub fn to_toml_node(&self) -> Result<String, String> {
+        let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        Ok(format!("[[node]]\n{body}"))
+    }
+}
+
+/// A structured outbound node definition with dedicated fields per protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum NodeEndpoint {
+    Direct(DirectNode),
+    #[serde(alias = "socks")]
+    Socks5(Socks5Node),
+    Http(HttpNode),
+    #[serde(alias = "ss")]
+    Shadowsocks(ShadowsocksNode),
+    Trojan(TrojanNode),
+    Vless(VlessNode),
+    #[serde(skip_deserializing)]
+    Unsupported {
+        scheme: String,
+        link: String,
+    },
+}
+
+pub type StructuredNode = NodeEndpoint;
+pub type DirectEndpoint = DirectNode;
+pub type Socks5Endpoint = Socks5Node;
+pub type HttpEndpoint = HttpNode;
+pub type ShadowsocksEndpoint = ShadowsocksNode;
+pub type TrojanEndpoint = TrojanNode;
+pub type VlessEndpoint = VlessNode;
+
+impl NodeEndpoint {
+    /// Validates the semantic constraints of the structured node.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Socks5(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("socks5: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("socks5: 'port' must not be 0".to_owned());
+                }
+                Ok(())
+            }
+            Self::Http(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("http: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("http: 'port' must not be 0".to_owned());
+                }
+                Ok(())
+            }
+            Self::Shadowsocks(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("shadowsocks: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("shadowsocks: 'port' must not be 0".to_owned());
+                }
+                if node.password.is_empty() {
+                    return Err("shadowsocks: 'password' must not be empty".to_owned());
+                }
+                validate_ss_method(&node.method)?;
+                Ok(())
+            }
+            Self::Trojan(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("trojan: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("trojan: 'port' must not be 0".to_owned());
+                }
+                if node.password.is_empty() {
+                    return Err("trojan: 'password' must not be empty".to_owned());
+                }
+                Ok(())
+            }
+            Self::Vless(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("vless: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("vless: 'port' must not be 0".to_owned());
+                }
+                if node.uuid.trim().is_empty() {
+                    return Err("vless: 'uuid' must not be empty".to_owned());
+                }
+                let Some(reality) = &node.reality else {
+                    return Err(
+                        "vless: missing [node.reality] configuration; daer only supports VLESS with REALITY"
+                            .to_owned(),
+                    );
+                };
+                if reality.sni.trim().is_empty() {
+                    return Err("vless.reality: 'sni' must not be empty".to_owned());
+                }
+                if reality.public_key.trim().is_empty() {
+                    return Err("vless.reality: 'public-key' must not be empty".to_owned());
+                }
+                if reality
+                    .fingerprint
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
+                    return Err(
+                        "vless.reality: 'fingerprint' is required (e.g. fingerprint = \"chrome\")"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Unsupported { scheme, .. } => {
+                Err(format!("unsupported node protocol {scheme:?}"))
+            }
+        }
+    }
+
+    /// The optional tag of this node.
+    #[must_use]
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            Self::Direct(n) => n.tag.as_deref(),
+            Self::Socks5(n) => n.tag.as_deref(),
+            Self::Http(n) => n.tag.as_deref(),
+            Self::Shadowsocks(n) => n.tag.as_deref(),
+            Self::Trojan(n) => n.tag.as_deref(),
+            Self::Vless(n) => n.tag.as_deref(),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Default name for this node when tag is omitted.
+    #[must_use]
+    pub fn default_name(&self) -> String {
+        match self {
+            Self::Direct(_) => "direct".to_owned(),
+            Self::Socks5(n) => format!("{}:{}", n.server, n.port),
+            Self::Http(n) => format!("{}:{}", n.server, n.port),
+            Self::Shadowsocks(n) => format!("{}:{}", n.server, n.port),
+            Self::Trojan(n) => format!("{}:{}", n.server, n.port),
+            Self::Vless(n) => format!("{}:{}", n.server, n.port),
+            Self::Unsupported { link, .. } => link.clone(),
+        }
+    }
+
+    /// Converts the structured node into its canonical URI link.
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        match self {
+            Self::Direct(n) => n.to_link(),
+            Self::Socks5(n) => n.to_link(),
+            Self::Http(n) => n.to_link(),
+            Self::Shadowsocks(n) => n.to_link(),
+            Self::Trojan(n) => n.to_link(),
+            Self::Vless(n) => n.to_link(),
+            Self::Unsupported { link, .. } => link.clone(),
+        }
+    }
+
+    /// Renders this structured node as a formatted `[[node]]` TOML block.
+    pub fn to_toml_node(&self) -> Result<String, String> {
+        let node = Node::from_structured(self.clone());
+        let body = toml::to_string_pretty(&node).map_err(|e| e.to_string())?;
+        Ok(format!("[[node]]\n{body}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DirectNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+}
+
+impl DirectNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        "direct://".to_owned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Socks5Node {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl Socks5Node {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let auth = match (&self.username, &self.password) {
+            (Some(user), Some(pass)) => {
+                format!("{}:{}@", percent_encode(user), percent_encode(pass))
+            }
+            (Some(user), None) => format!("{}@", percent_encode(user)),
+            (None, Some(pass)) => format!(":{}@", percent_encode(pass)),
+            (None, None) => String::new(),
+        };
+        format!("socks5://{auth}{server}:{}", self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HttpNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl HttpNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let auth = match (&self.username, &self.password) {
+            (Some(user), Some(pass)) => {
+                format!("{}:{}@", percent_encode(user), percent_encode(pass))
+            }
+            (Some(user), None) => format!("{}@", percent_encode(user)),
+            (None, Some(pass)) => format!(":{}@", percent_encode(pass)),
+            (None, None) => String::new(),
+        };
+        format!("http://{auth}{server}:{}", self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ShadowsocksNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub method: String,
+    pub password: String,
+}
+
+impl ShadowsocksNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let creds = format!("{}:{}", self.method, self.password);
+        let userinfo = encode_base64(creds.as_bytes());
+        format!("ss://{userinfo}@{server}:{}", self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TrojanNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+}
+
+impl TrojanNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let mut query = Vec::new();
+        if let Some(sni) = &self.sni
+            && !sni.is_empty()
+        {
+            query.push(format!("sni={}", percent_encode(sni)));
+        }
+        if self.allow_insecure {
+            query.push("allowInsecure=1".to_owned());
+        }
+        let query_str = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        format!(
+            "trojan://{}@{server}:{}{query_str}",
+            self.password, self.port
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct VlessNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub uuid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reality: Option<RealityConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RealityConfig {
+    pub sni: String,
+    pub public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
+}
+
+impl VlessNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let mut query = vec!["encryption=none".to_owned(), "security=reality".to_owned()];
+        if let Some(reality) = &self.reality {
+            query.push(format!("sni={}", percent_encode(&reality.sni)));
+            query.push(format!("pbk={}", percent_encode(&reality.public_key)));
+            if let Some(sid) = &reality.short_id
+                && !sid.is_empty()
+            {
+                query.push(format!("sid={}", percent_encode(sid)));
+            }
+            if let Some(fp) = &reality.fingerprint
+                && !fp.is_empty()
+            {
+                query.push(format!("fp={}", percent_encode(fp)));
+            }
+            if !reality.alpn.is_empty() {
+                query.push(format!("alpn={}", reality.alpn.join(",")));
+            }
+        }
+        if let Some(flow) = &self.flow
+            && !flow.is_empty()
+        {
+            query.push(format!("flow={}", percent_encode(flow)));
+        }
+        format!(
+            "vless://{}@{server}:{}?{}",
+            self.uuid,
+            self.port,
+            query.join("&")
+        )
+    }
+}
+
+fn format_host(server: &str) -> String {
+    let server = server.trim();
+    if server.contains(':') && !server.starts_with('[') && !server.ends_with(']') {
+        format!("[{server}]")
+    } else {
+        server.to_owned()
+    }
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn validate_ss_method(method: &str) -> Result<(), String> {
+    match method.trim().to_ascii_lowercase().as_str() {
+        "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305" | "xchacha20-ietf-poly1305" => {
+            Ok(())
+        }
+        legacy @ ("aes-128-cfb" | "aes-192-cfb" | "aes-256-cfb" | "aes-128-ctr" | "aes-192-ctr"
+        | "aes-256-ctr" | "rc4-md5" | "chacha20" | "chacha20-ietf" | "salsa20"
+        | "bf-cfb" | "camellia-128-cfb" | "camellia-192-cfb" | "camellia-256-cfb"
+        | "des-cfb" | "table") => Err(format!(
+            "shadowsocks: method '{legacy}' is an insecure legacy cipher and is not supported (use an AEAD cipher like chacha20-ietf-poly1305 or aes-256-gcm)"
+        )),
+        other => Err(format!(
+            "shadowsocks: unknown method '{other}'; supported AEAD ciphers are chacha20-ietf-poly1305, aes-128-gcm, aes-256-gcm, xchacha20-ietf-poly1305"
+        )),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().unwrap_or(b'0');
+            let h2 = chars.next().unwrap_or(b'0');
+            let hex_str = [h1, h2];
+            if let Ok(hex_ascii) = std::str::from_utf8(&hex_str)
+                && let Ok(val) = u8::from_str_radix(hex_ascii, 16)
+            {
+                bytes.push(val);
+                continue;
+            }
+            bytes.push(b'%');
+            bytes.push(h1);
+            bytes.push(h2);
+            continue;
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn decode_base64(text: &str) -> Result<String, String> {
+    fn value(byte: u8) -> Option<u8> {
+        Some(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        })
+    }
+
+    let text: Vec<u8> = text
+        .bytes()
+        .filter(|byte| *byte != b'=' && !byte.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    for chunk in text.chunks(4) {
+        if chunk.len() == 1 {
+            return Err("base64: invalid trailing byte".to_owned());
+        }
+        let mut accumulator = 0u32;
+        for (index, byte) in chunk.iter().enumerate() {
+            let value = value(*byte).ok_or_else(|| {
+                format!("base64: byte {:?} is not in the alphabet", *byte as char)
+            })?;
+            accumulator |= u32::from(value) << (18 - 6 * index);
+        }
+        let bytes = accumulator.to_be_bytes();
+        out.push(bytes[1]);
+        if chunk.len() > 2 {
+            out.push(bytes[2]);
+        }
+        if chunk.len() > 3 {
+            out.push(bytes[3]);
+        }
+    }
+    String::from_utf8(out).map_err(|_| "base64 payload is not UTF-8".to_owned())
+}
+
+fn parse_host_port(authority: &str) -> Result<(String, u16), String> {
+    let authority = authority.trim();
+    let authority = match authority.split_once('?') {
+        Some((auth, _query)) => auth,
+        None => authority,
+    };
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{authority:?} has an unclosed '['"))?;
+        let port = tail
+            .strip_prefix(':')
+            .ok_or_else(|| format!("{authority:?} has no port"))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("{authority:?} has an invalid port"))?;
+        return Ok((host.to_owned(), port));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{authority:?} has no port"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{authority:?} has an invalid port"))?;
+    Ok((host.to_owned(), port))
+}
+
+impl StructuredNode {
+    /// Parses an outbound URI link (`vless://`, `ss://`, `trojan://`, `socks5://`, `http://`,
+    /// `direct://`) into a structured node representation.
+    pub fn from_link(link: &str) -> Result<Self, String> {
+        let link = link.trim();
+        if link.is_empty() || link == "direct" || link == "direct://" {
+            return Ok(Self::Direct(DirectNode { tag: None }));
+        }
+
+        if link.contains("->") {
+            return Err("chained links ('a -> b') are not implemented".to_owned());
+        }
+
+        let Some((scheme, rest)) = link.split_once("://") else {
+            return Err(format!("{link:?} has no '://' scheme separator"));
+        };
+
+        // Split off #fragment as tag
+        let (before_fragment, tag) = match rest.split_once('#') {
+            Some((before, fragment)) => {
+                let tag = percent_decode(fragment);
+                let tag = if tag.is_empty() { None } else { Some(tag) };
+                (before, tag)
+            }
+            None => (rest, None),
+        };
+
+        match scheme.to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct(DirectNode { tag })),
+            "socks" | "socks5" | "socks5h" => {
+                let (auth, authority) = match before_fragment.rsplit_once('@') {
+                    Some((auth, hostport)) => (Some(auth), hostport),
+                    None => (None, before_fragment),
+                };
+                let (username, password) = match auth {
+                    Some(auth) => match auth.split_once(':') {
+                        Some((u, p)) => (Some(percent_decode(u)), Some(percent_decode(p))),
+                        None => (Some(percent_decode(auth)), None),
+                    },
+                    None => (None, None),
+                };
+                let (server, port) = parse_host_port(authority)?;
+                Ok(Self::Socks5(Socks5Node {
+                    tag,
+                    server,
+                    port,
+                    username,
+                    password,
+                }))
+            }
+            "http" => {
+                let (auth, authority) = match before_fragment.rsplit_once('@') {
+                    Some((auth, hostport)) => (Some(auth), hostport),
+                    None => (None, before_fragment),
+                };
+                let (username, password) = match auth {
+                    Some(auth) => match auth.split_once(':') {
+                        Some((u, p)) => (Some(percent_decode(u)), Some(percent_decode(p))),
+                        None => (Some(percent_decode(auth)), None),
+                    },
+                    None => (None, None),
+                };
+                let (server, port) = parse_host_port(authority)?;
+                Ok(Self::Http(HttpNode {
+                    tag,
+                    server,
+                    port,
+                    username,
+                    password,
+                }))
+            }
+            "ss" | "shadowsocks" => {
+                let (creds, authority) = match before_fragment.rsplit_once('@') {
+                    Some((userinfo, hostport)) => (decode_base64(userinfo)?, hostport.to_owned()),
+                    None => {
+                        let decoded = decode_base64(before_fragment)?;
+                        let (creds, hostport) = decoded.rsplit_once('@').ok_or_else(|| {
+                            "ss link has no '@' separating credentials from server".to_owned()
+                        })?;
+                        (creds.to_owned(), hostport.to_owned())
+                    }
+                };
+                let (method, password) = creds.split_once(':').ok_or_else(|| {
+                    "ss credentials are not in 'method:password' format".to_owned()
+                })?;
+                let (server, port) = parse_host_port(&authority)?;
+                Ok(Self::Shadowsocks(ShadowsocksNode {
+                    tag,
+                    server,
+                    port,
+                    method: method.to_owned(),
+                    password: password.to_owned(),
+                }))
+            }
+            "trojan" | "trojan-go" => {
+                let (authority, query) = match before_fragment.split_once('?') {
+                    Some((auth, q)) => (auth, q),
+                    None => (before_fragment, ""),
+                };
+                let (password, hostport) = authority
+                    .rsplit_once('@')
+                    .ok_or_else(|| "trojan link has no 'password@server:port'".to_owned())?;
+                let (server, port) = parse_host_port(hostport)?;
+
+                let mut sni = None;
+                let mut allow_insecure = false;
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    let (k, v) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    match k {
+                        "sni" | "peer" if !v.is_empty() => {
+                            sni = Some(percent_decode(v));
+                        }
+                        "allowInsecure" | "allow_insecure" => {
+                            allow_insecure = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Self::Trojan(TrojanNode {
+                    tag,
+                    server,
+                    port,
+                    password: password.to_owned(),
+                    sni,
+                    allow_insecure,
+                }))
+            }
+            "vless" => {
+                let (user_part, rest) = before_fragment
+                    .split_once('@')
+                    .ok_or_else(|| "vless link has no 'uuid@server:port'".to_owned())?;
+                let (authority, query) = match rest.split_once('?') {
+                    Some((auth, q)) => (auth, q),
+                    None => (rest, ""),
+                };
+                let (server, port) = parse_host_port(authority)?;
+
+                let mut sni = None;
+                let mut public_key = None;
+                let mut short_id = None;
+                let mut fingerprint = None;
+                let mut flow = None;
+                let mut alpn = Vec::new();
+
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    let (k, v) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    let decoded_v = percent_decode(v);
+                    match k {
+                        "sni" | "peer" if !decoded_v.is_empty() => sni = Some(decoded_v),
+                        "pbk" if !decoded_v.is_empty() => public_key = Some(decoded_v),
+                        "sid" if !decoded_v.is_empty() => short_id = Some(decoded_v),
+                        "fp" if !decoded_v.is_empty() => fingerprint = Some(decoded_v),
+                        "flow" if !decoded_v.is_empty() => flow = Some(decoded_v),
+                        "alpn" if !decoded_v.is_empty() => {
+                            alpn = decoded_v.split(',').map(str::to_owned).collect();
+                        }
+                        _ => {}
+                    }
+                }
+
+                let reality = match (sni, public_key) {
+                    (Some(sni), Some(public_key)) => Some(RealityConfig {
+                        sni,
+                        public_key,
+                        short_id,
+                        fingerprint: Some(fingerprint.unwrap_or_else(|| "chrome".to_owned())),
+                        alpn,
+                    }),
+                    _ => None,
+                };
+
+                Ok(Self::Vless(VlessNode {
+                    tag,
+                    server,
+                    port,
+                    uuid: user_part.to_owned(),
+                    flow,
+                    reality,
+                }))
+            }
+            other => Ok(Self::Unsupported {
+                scheme: other.to_owned(),
+                link: link.to_owned(),
+            }),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Node {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Url(String),
-            Table(Table),
-        }
+        let value = toml::Value::deserialize(d)?;
+        match value {
+            toml::Value::String(_) => Err(D::Error::custom(
+                "bare URL strings in 'node' have been retired; configure nodes as [[node]] structured tables, or use [[subscription]] to fetch URL lists",
+            )),
+            toml::Value::Table(table) => {
+                if table.contains_key("url") {
+                    return Err(D::Error::custom(
+                        "the 'url' field in [[node]] has been retired in favor of structured configuration tables; \
+                         declare node fields directly (e.g. type = \"vless\", server = ..., port = ...) or run 'daer node convert <url>' to convert your link",
+                    ));
+                }
+                if !table.contains_key("type") {
+                    return Err(D::Error::custom(
+                        "missing 'type' in [[node]] table (expected e.g. type = \"vless\", \"shadowsocks\", \"trojan\", \"socks5\", \"http\", \"direct\")",
+                    ));
+                }
 
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-        struct Table {
-            tag: Option<String>,
-            url: String,
-        }
+                #[derive(Deserialize)]
+                #[serde(rename_all = "kebab-case")]
+                struct NodeHelper {
+                    tag: Option<String>,
+                    #[serde(flatten)]
+                    endpoint: NodeEndpoint,
+                }
 
-        Ok(match Repr::deserialize(d)? {
-            Repr::Url(url) => Self {
-                tag: None,
-                url,
-                subscription: None,
-            },
-            Repr::Table(table) => Self {
-                tag: table.tag,
-                url: table.url,
-                subscription: None,
-            },
-        })
+                let helper =
+                    NodeHelper::deserialize(toml::Value::Table(table)).map_err(D::Error::custom)?;
+                helper.endpoint.validate().map_err(D::Error::custom)?;
+                Ok(Self {
+                    tag: helper.tag,
+                    endpoint: helper.endpoint,
+                    subscription: None,
+                })
+            }
+            other => Err(D::Error::custom(format!(
+                "expected [[node]] to be a structured table, got {}",
+                other.type_str()
+            ))),
+        }
     }
 }
 
@@ -594,6 +1389,28 @@ pub struct DnsRouting {
     pub fallback: Option<FunctionOrString>,
 }
 
+/// `[dns.fake-ip]` — synthetic IP pool configuration (ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct FakeIpConfig {
+    pub enabled: bool,
+    pub inet: String,
+    pub pool_size: usize,
+    pub exclude: Vec<String>,
+}
+
+impl Default for FakeIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            inet: "198.18.0.0/15".to_owned(),
+            pool_size: 65535,
+            exclude: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
@@ -610,6 +1427,7 @@ pub struct Dns {
     pub optimistic_cache_ttl: i32,
     pub optimistic_stale_reply_ttl: i32,
     pub max_cache_size: i32,
+    pub fake_ip: FakeIpConfig,
     pub request: DnsRouting,
     pub response: DnsRouting,
 }
@@ -625,6 +1443,7 @@ impl Default for Dns {
             optimistic_cache_ttl: 60,
             optimistic_stale_reply_ttl: 30,
             max_cache_size: 65_536,
+            fake_ip: FakeIpConfig::default(),
             request: DnsRouting::default(),
             response: DnsRouting::default(),
         }
@@ -747,21 +1566,85 @@ mod tests {
     }
 
     #[test]
-    fn subscriptions_and_nodes_accept_both_shapes() {
-        // An array of strings and an array of tables cannot coexist in one TOML
-        // document, so a file picks one shape.
-        let plain = config("subscription = [\"https://a/sub\"]\nnode = [\"ss://x\"]\n");
+    fn subscriptions_accept_both_shapes_and_nodes_require_structured_tables() {
+        let plain = config("subscription = [\"https://a/sub\"]\n");
         assert_eq!(plain.subscription[0].tag, None);
         assert!(!plain.subscription[0].persist);
-        assert_eq!(plain.node[0].url, "ss://x");
 
         let tables = config(
             "[[subscription]]\ntag = \"b\"\nurl = \"https://b/sub\"\npersist = true\n\
-             [[node]]\ntag = \"n1\"\nurl = \"ss://...\"\n",
+             [[node]]\ntag = \"n1\"\ntype = \"direct\"\n",
         );
         assert_eq!(tables.subscription[0].tag.as_deref(), Some("b"));
         assert!(tables.subscription[0].persist);
         assert_eq!(tables.node[0].tag.as_deref(), Some("n1"));
+
+        // Legacy bare URL strings in node are rejected with clear explanation
+        let err = toml::from_str::<Config>("node = [\"ss://x\"]\n")
+            .expect_err("bare url array must fail");
+        assert!(
+            err.to_string()
+                .contains("bare URL strings in 'node' have been retired"),
+            "{err}"
+        );
+
+        // Legacy `url = "..."` in [[node]] is rejected with clear explanation
+        let err = toml::from_str::<Config>("[[node]]\ntag = \"n1\"\nurl = \"ss://x\"\n")
+            .expect_err("url in node must fail");
+        assert!(
+            err.to_string()
+                .contains("the 'url' field in [[node]] has been retired"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structured_node_from_link_converts_real_world_links() {
+        // Real-world VLESS REALITY link from user's subscription (note: omits fp=, should default to chrome)
+        let vless_link = "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f&type=tcp&udp=1&tfo=1#US%20VIP%2001";
+        let structured = StructuredNode::from_link(vless_link).expect("converts vless link");
+        match structured {
+            StructuredNode::Vless(vless) => {
+                assert_eq!(vless.tag.as_deref(), Some("US VIP 01"));
+                assert_eq!(vless.server, "fkus1keria.itknowledgeblog.com");
+                assert_eq!(vless.port, 443);
+                assert_eq!(vless.uuid, "df4af3d0-030e-4062-baa6-eb9dd45298ef");
+                assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
+                let reality = vless.reality.expect("reality config");
+                assert_eq!(reality.sni, "portal.citygrainla.com");
+                assert_eq!(
+                    reality.public_key,
+                    "9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E"
+                );
+                assert_eq!(reality.short_id.as_deref(), Some("672f"));
+                assert_eq!(reality.fingerprint.as_deref(), Some("chrome"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Real-world Shadowsocks link with base64 userinfo
+        let ss_link =
+            "ss://YWVzLTEyOC1ncm06bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
+        let structured = StructuredNode::from_link(ss_link).expect("converts ss link");
+        match structured {
+            StructuredNode::Shadowsocks(ss) => {
+                assert_eq!(ss.tag.as_deref(), Some("Website: user.totorofree.com"));
+                assert_eq!(ss.server, "127.0.0.1");
+                assert_eq!(ss.port, 1080);
+                assert_eq!(ss.method, "aes-128-grm");
+                assert_eq!(ss.password, "none");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // SOCKS5 and Trojan
+        let socks_link = "socks5://user:pass@127.0.0.1:1080#my-socks";
+        let structured = StructuredNode::from_link(socks_link).expect("converts socks link");
+        assert_eq!(structured.tag(), Some("my-socks"));
+
+        let trojan_link = "trojan://password@node.example.com:443?sni=sni.example.com#my-trojan";
+        let structured = StructuredNode::from_link(trojan_link).expect("converts trojan link");
+        assert_eq!(structured.tag(), Some("my-trojan"));
     }
 
     #[test]
@@ -773,6 +1656,180 @@ mod tests {
         assert_eq!(parsed.group[0].filters.len(), 2);
         assert_eq!(parsed.group[0].filters[0].functions.len(), 2);
         assert_eq!(parsed.group[0].filters[1].annotate[0].key, "mark");
+    }
+
+    #[test]
+    fn structured_nodes_parse_validate_and_generate_canonical_links() {
+        let toml_str = r#"
+[[node]]
+tag = "hk-vless"
+type = "vless"
+server = "198.51.100.1"
+port = 443
+uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+flow = "xtls-rprx-vision"
+[node.reality]
+sni = "example.com"
+public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
+short-id = "ab01cd02"
+fingerprint = "chrome"
+
+[[node]]
+tag = "us-ss"
+type = "shadowsocks"
+server = "198.51.100.2"
+port = 8388
+method = "chacha20-ietf-poly1305"
+password = "secret-password"
+
+[[node]]
+tag = "jp-trojan"
+type = "trojan"
+server = "198.51.100.3"
+port = 443
+password = "my-password"
+sni = "trojan.example.com"
+allow-insecure = true
+
+[[node]]
+tag = "local-socks5"
+type = "socks5"
+server = "127.0.0.1"
+port = 1080
+username = "admin"
+password = "123"
+
+[[node]]
+tag = "local-http"
+type = "http"
+server = "127.0.0.1"
+port = 8080
+
+[[node]]
+tag = "direct-node"
+type = "direct"
+"#;
+        let parsed = config(toml_str);
+        assert_eq!(parsed.node.len(), 6);
+
+        // hk-vless
+        let n0 = &parsed.node[0];
+        assert_eq!(n0.tag.as_deref(), Some("hk-vless"));
+        assert!(matches!(n0.endpoint, NodeEndpoint::Vless(_)));
+        let link0 = n0.to_link();
+        assert!(
+            link0.starts_with("vless://b831381d-6324-4d53-ad4f-8cda48b30811@198.51.100.1:443?"),
+            "link: {}",
+            link0
+        );
+        assert!(link0.contains("security=reality"));
+        assert!(link0.contains("sni=example.com"));
+        assert!(link0.contains("pbk=f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"));
+        assert!(link0.contains("sid=ab01cd02"));
+        assert!(link0.contains("fp=chrome"));
+        assert!(link0.contains("flow=xtls-rprx-vision"));
+
+        // us-ss
+        let n1 = &parsed.node[1];
+        assert_eq!(n1.tag.as_deref(), Some("us-ss"));
+        assert!(matches!(n1.endpoint, NodeEndpoint::Shadowsocks(_)));
+        let link1 = n1.to_link();
+        assert!(link1.starts_with("ss://"));
+        assert!(link1.contains("@198.51.100.2:8388"));
+
+        // jp-trojan
+        let n2 = &parsed.node[2];
+        assert_eq!(n2.tag.as_deref(), Some("jp-trojan"));
+        assert!(matches!(n2.endpoint, NodeEndpoint::Trojan(_)));
+        assert_eq!(
+            n2.to_link(),
+            "trojan://my-password@198.51.100.3:443?sni=trojan.example.com&allowInsecure=1"
+        );
+
+        // local-socks5
+        let n3 = &parsed.node[3];
+        assert_eq!(n3.tag.as_deref(), Some("local-socks5"));
+        assert!(matches!(n3.endpoint, NodeEndpoint::Socks5(_)));
+        assert_eq!(n3.to_link(), "socks5://admin:123@127.0.0.1:1080");
+
+        // local-http
+        let n4 = &parsed.node[4];
+        assert_eq!(n4.tag.as_deref(), Some("local-http"));
+        assert!(matches!(n4.endpoint, NodeEndpoint::Http(_)));
+        assert_eq!(n4.to_link(), "http://127.0.0.1:8080");
+
+        // direct-node
+        let n5 = &parsed.node[5];
+        assert_eq!(n5.tag.as_deref(), Some("direct-node"));
+        assert!(matches!(n5.endpoint, NodeEndpoint::Direct(_)));
+        assert_eq!(n5.to_link(), "direct://");
+
+        // Serialization roundtrip preserves structured representation
+        let rendered = toml::to_string(&parsed).expect("serializes");
+        let reparsed = config(&rendered);
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn structured_node_negative_controls() {
+        // Unknown field on node table fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"socks5\"\nserver = \"1.1.1.1\"\nport = 1080\nunknown_field = 1\n",
+        )
+        .expect_err("unknown field must fail");
+        assert!(err.to_string().contains("unknown_field"), "{err}");
+
+        // Unknown field inside [node.reality] fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"u\"\n[node.reality]\nsni = \"s\"\npublic-key = \"k\"\nextra = \"bad\"\n",
+        )
+        .expect_err("unknown field in reality must fail");
+        assert!(err.to_string().contains("extra"), "{err}");
+
+        // Having 'url' fails with retirement explanation
+        let err = toml::from_str::<Config>("[[node]]\nurl = \"socks5://1.1.1.1:1080\"\n")
+            .expect_err("url field must fail");
+        assert!(
+            err.to_string()
+                .contains("the 'url' field in [[node]] has been retired"),
+            "{err}"
+        );
+
+        // Missing type fails
+        let err = toml::from_str::<Config>("[[node]]\ntag = \"lonely\"\n")
+            .expect_err("missing type must fail");
+        assert!(
+            err.to_string().contains("missing 'type' in [[node]] table"),
+            "{err}"
+        );
+
+        // Port 0 fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"socks5\"\nserver = \"1.1.1.1\"\nport = 0\n",
+        )
+        .expect_err("port 0 must fail");
+        assert!(err.to_string().contains("port"), "{err}");
+
+        // Empty server fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"socks5\"\nserver = \"   \"\nport = 1080\n",
+        )
+        .expect_err("empty server must fail");
+        assert!(err.to_string().contains("server"), "{err}");
+
+        // Vless without reality fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"u\"\n",
+        )
+        .expect_err("vless without reality must fail");
+        assert!(err.to_string().contains("reality"), "{err}");
+
+        // Shadowsocks with legacy cipher fails with clear explanation
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"aes-128-cfb\"\npassword = \"p\"\n",
+        )
+        .expect_err("legacy cipher must fail");
+        assert!(err.to_string().contains("insecure legacy cipher"), "{err}");
     }
 
     #[test]

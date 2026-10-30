@@ -66,18 +66,8 @@ pub mod mirror {
         },
     }
 
-    /// `node = ["link"]` or `[[node]] tag/url`.
-    #[derive(Debug, Serialize, JsonSchema)]
-    #[serde(untagged)]
-    #[schemars(untagged)]
-    pub enum Node {
-        Url(String),
-        Table {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            tag: Option<String>,
-            url: String,
-        },
-    }
+    /// `[[node]] tag/type/...`.
+    pub type Node = crate::model::Node;
 
     /// A `group.filters` entry: an expression, or an expression plus values the
     /// selected node inherits.

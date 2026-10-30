@@ -226,11 +226,15 @@ fallback = "block"
 async fn a_group_rule_dials_through_the_node() {
     let upstream = echo_server().await;
     let proxy = socks5_server(upstream).await;
+    let proxy_str = proxy.to_string();
+    let (server, port) = proxy_str.split_once(':').unwrap();
     let config = format!(
         r#"
 [[node]]
 tag = "n1"
-url = "socks5://{proxy}"
+type = "socks5"
+server = "{server}"
+port = {port}
 
 [[group]]
 name = "proxy"
@@ -274,9 +278,7 @@ fallback = "nope"
 async fn a_group_with_no_selectable_node_fails_the_flow_loudly() {
     // A node whose protocol this build cannot speak must not be used as `direct`.
     let config = r#"
-[[node]]
-tag = "n1"
-url = "vless://uuid@example.com:443"
+subscription = ["vless://uuid@example.com:443"]
 
 [[group]]
 name = "proxy"

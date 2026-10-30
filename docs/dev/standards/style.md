@@ -1,0 +1,33 @@
+# Documentation Style & Hyperlink Standards
+
+This document specifies the style guide, markdown conventions, and hyperlink standards for all documentation in `daer`.
+
+---
+
+## 1. Hyperlink Standards
+
+1. **Relative Paths**: All cross-references between documentation files must use explicit relative paths (e.g. `[Deployment Guide](../how-to/deployment.md)`).
+2. **Never Use Absolute Locators**: Never write hardcoded local paths (e.g. `/home/...` or `file://...`) or absolute repo URLs that break across forks or offline workflows.
+3. **Target Existence**: Every relative link must resolve to a valid file on disk. Dead links or broken targets degrade epistemic trust and fail validation.
+4. **Anchor Hygiene**: When linking to section headers, use clean kebab-case anchors matching the heading text.
+
+---
+
+## 2. Formatting & Markdown Conventions
+
+1. **Header Hierarchy**:
+   - Exactly one `# Level 1 Heading` per file at line 1.
+   - Subsections descend logically: `## Level 2`, followed by `### Level 3`. Avoid skipping heading levels arbitrarily.
+2. **Typed Code Blocks**:
+   - Always declare an explicit language identifier on fenced code blocks (e.g. ````rust````, ````bash````, ````toml````, ````ini````, ````text````). Never leave fences untyped.
+3. **Lists and Tables**:
+   - Use clean Markdown tables with aligned delimiters.
+   - For lists, prefer `-` for unordered bullet points and `1.` for sequential procedures.
+
+---
+
+## 3. Tone and Vocabulary
+
+1. **Pragmatic and Objective**: Write in active, direct, and unambiguous language. State the facts and system properties clearly.
+2. **Mechanisms Over Aspirations**: When describing behavioral constraints, describe the concrete enforcing mechanism (compiler proof, type, test assertion, or CI gate) rather than vague prose.
+3. **Negative Knowledge**: Explicitly document discarded alternatives and known kernel failure modes.

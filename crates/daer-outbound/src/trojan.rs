@@ -238,6 +238,41 @@ impl fmt::Debug for TrojanConnector {
 }
 
 impl TrojanConnector {
+    /// Builds a connector directly from typed parameters.
+    pub fn new(
+        server: &str,
+        port: u16,
+        password: &str,
+        sni: Option<&str>,
+        allow_insecure: bool,
+        options: DialerOptions,
+    ) -> Result<Self, OutboundError> {
+        let server_name = sni.unwrap_or(server).to_owned();
+        let link = Link {
+            password: password.to_owned(),
+            server: format!("{server}:{port}"),
+            server_name,
+            tag: None,
+            allow_insecure,
+        };
+        let socket = match options.so_mark {
+            Some(mark) => SocketConfig::default().with_mark(mark),
+            None => SocketConfig::default(),
+        };
+        let tcp = TcpConnector::new()
+            .with_socket_config(socket)
+            .with_connect_timeout(Some(options.timeout));
+        let tls = TlsConnector::platform(tcp)
+            .map_err(|error| OutboundError::Connect(error.to_string()))?;
+
+        Ok(Self {
+            link,
+            tls: Arc::new(tls),
+            timeout: options.timeout,
+            tls_profile: options.tls_profile,
+        })
+    }
+
     /// Builds a connector from a `trojan://` link.
     ///
     /// # Errors
