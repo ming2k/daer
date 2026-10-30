@@ -1,0 +1,69 @@
+[package]
+name = "daer-outbound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Outbound dialers, groups and health checks for daer"
+autotests = false
+
+[dependencies]
+daer-common.workspace = true
+libc.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+daer-config.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+fastrand.workspace = true
+getrandom.workspace = true
+netune.workspace = true
+netune-trace.workspace = true
+regex.workspace = true
+tokio.workspace = true
+ml-kem.workspace = true
+rand_core.workspace = true
+
+# `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
+# targets explicitly is what keeps cargo from compiling it as a binary of its own.
+[[test]]
+name = "shadowsocks_interop"
+
+[[test]]
+name = "trojan_interop"
+
+[[test]]
+name = "reality_live"
+
+[[test]]
+name = "client_hello_probe"
+
+
+
+[[test]]
+name = "reality_tag_audit"
+
+
+[[test]]
+name = "vision_lab"
+
+
+
+
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# A real TLS server for the Trojan interop test: a certificate has to come from somewhere, and
+# a hard-coded one would expire.
+rcgen = "0.14"
+tokio-rustls = "0.26"

@@ -1,0 +1,19 @@
+[package]
+name = "daer-sniff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "TLS and HTTP domain sniffing for daer"
+
+[dependencies]
+daer-common.workspace = true
+aes.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

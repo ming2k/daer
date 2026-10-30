@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.o
+*.d
+crates/daer-ebpf/ebpf-out/
+
+# eBPF build artifacts and generated headers
+/ebpf/headers
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / debug logs and check artifacts
+daer-kernel-check/
+*.log
+
+# Editor and environment
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,25 @@
+[package]
+name = "daer-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "DNS controller, transports and cache for daer"
+
+[dependencies]
+daer-common.workspace = true
+daer-config.workspace = true
+daer-routing.workspace = true
+bytes.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+netune.workspace = true
+netune-trace.workspace = true
+regex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

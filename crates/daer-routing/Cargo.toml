@@ -1,0 +1,28 @@
+[package]
+name = "daer-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Routing rule lowering, matching and policy identity for daer"
+
+[dependencies]
+daer-common.workspace = true
+daer-config.workspace = true
+daer-ebpf.workspace = true
+daer-geodata.workspace = true
+aho-corasick.workspace = true
+ipnet.workspace = true
+regex.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Unit tests exercise the routing DSL through the legacy parser.
+# `aya-obj` reads the compiled object so the layout assertions can pin the encoder
+# against the real `struct match_set` rather than against a comment (ADR-0005).
+aya-obj = "0.3"
+
+[lints]
+workspace = true

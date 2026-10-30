@@ -1,0 +1,547 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "dns": {
+      "$ref": "#/$defs/Dns",
+      "default": {
+        "ipversion-prefer": 0,
+        "max-cache-size": 65536,
+        "optimistic-cache": true,
+        "optimistic-cache-ttl": 60,
+        "optimistic-stale-reply-ttl": 30,
+        "request": {
+          "rules": []
+        },
+        "response": {
+          "rules": []
+        },
+        "upstream": []
+      }
+    },
+    "global": {
+      "$ref": "#/$defs/Global",
+      "default": {
+        "allow-insecure": false,
+        "auto-sniff-punt": true,
+        "disable-waiting-network": false,
+        "health-check": {
+          "interval": "30s",
+          "tcp-method": "HEAD",
+          "tcp-url": [
+            "http://cp.cloudflare.com",
+            "1.1.1.1",
+            "2606:4700:4700::1111"
+          ],
+          "tolerance": "0s",
+          "udp-dns": [
+            "dns.google:53",
+            "8.8.8.8",
+            "2001:4860:4860::8888"
+          ]
+        },
+        "lan-interface": [],
+        "log-level": "info",
+        "sniffing-timeout": "30ms",
+        "tls": {
+          "fragment": false,
+          "fragment-interval": "10-20",
+          "fragment-length": "50-100"
+        },
+        "tproxy-port": 12345,
+        "tproxy-port-protect": true,
+        "wan-interface": []
+      }
+    },
+    "group": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Group"
+      }
+    },
+    "include": {
+      "description": "Globs, relative to the directory of the file that names them.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "node": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Node"
+      }
+    },
+    "routing": {
+      "$ref": "#/$defs/Routing",
+      "default": {
+        "fallback": "direct",
+        "rules": []
+      }
+    },
+    "schema": {
+      "description": "Schema version. Bumped when a change cannot be expressed as a default.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "minimum": 0
+    },
+    "subscription": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Subscription"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Dns": {
+      "type": "object",
+      "properties": {
+        "bind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fixed-domain-ttl": {
+          "description": "`[dns.fixed-domain-ttl]` — domain to TTL in seconds.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "ipversion-prefer": {
+          "description": "`4`, `6`, or `0` for no preference.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "max-cache-size": {
+          "type": "integer",
+          "format": "int32",
+          "default": 65536
+        },
+        "optimistic-cache": {
+          "type": "boolean",
+          "default": true
+        },
+        "optimistic-cache-ttl": {
+          "type": "integer",
+          "format": "int32",
+          "default": 60
+        },
+        "optimistic-stale-reply-ttl": {
+          "type": "integer",
+          "format": "int32",
+          "default": 30
+        },
+        "request": {
+          "$ref": "#/$defs/DnsRouting",
+          "default": {
+            "rules": []
+          }
+        },
+        "response": {
+          "$ref": "#/$defs/DnsRouting",
+          "default": {
+            "rules": []
+          }
+        },
+        "upstream": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DnsRouting": {
+      "description": "`[dns.request]` / `[dns.response]`.",
+      "type": "object",
+      "properties": {
+        "fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Filter": {
+      "description": "A `group.filters` entry: an expression, or an expression plus values the\nselected node inherits.",
+      "anyOf": [
+        {
+          "description": "`subtag(sub) && !name(keyword: 'ExpireAt:')`",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "annotate": {
+              "description": "Values copied into the selected node's properties.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
+            "match": {
+              "description": "The predicate conjunction.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "match"
+          ]
+        }
+      ]
+    },
+    "Global": {
+      "type": "object",
+      "properties": {
+        "allow-insecure": {
+          "type": "boolean",
+          "default": false
+        },
+        "auto-sniff-punt": {
+          "type": "boolean",
+          "default": true
+        },
+        "disable-waiting-network": {
+          "type": "boolean",
+          "default": false
+        },
+        "health-check": {
+          "$ref": "#/$defs/HealthCheck",
+          "default": {
+            "interval": "30s",
+            "tcp-method": "HEAD",
+            "tcp-url": [
+              "http://cp.cloudflare.com",
+              "1.1.1.1",
+              "2606:4700:4700::1111"
+            ],
+            "tolerance": "0s",
+            "udp-dns": [
+              "dns.google:53",
+              "8.8.8.8",
+              "2001:4860:4860::8888"
+            ]
+          }
+        },
+        "lan-interface": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "log-level": {
+          "description": "`tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.",
+          "type": "string",
+          "default": "info"
+        },
+        "sniffing-timeout": {
+          "type": "string",
+          "default": "30ms"
+        },
+        "so-mark": {
+          "description": "Socket mark for daer-originated traffic.\n\nOmitted, a privileged run picks [`crate::DEFAULT_SOCKET_MARK`] and an unprivileged one\nmarks nothing; the datapath and the redirect rule have to agree with whichever it is, so\nthe daemon decides once and reports the value it used.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tls": {
+          "$ref": "#/$defs/Tls",
+          "default": {
+            "fragment": false,
+            "fragment-interval": "10-20",
+            "fragment-length": "50-100"
+          }
+        },
+        "tproxy-port": {
+          "description": "Transparent-proxy port. Not an HTTP/SOCKS port: the eBPF program\nredirects here.",
+          "type": "integer",
+          "format": "uint16",
+          "default": 12345,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "tproxy-port-protect": {
+          "description": "Reject traffic that did not go through the eBPF program.\n\nEnforced by [`crate::validate`] against the listener's shape: with this on, a flow whose\noriginal destination *is* the transparent port is refused, because such a flow was not\nredirected. `false` weakens that to what the socket can observe, and exists only for a\ndebugging session on a box nobody else can reach.",
+          "type": "boolean",
+          "default": true
+        },
+        "wan-interface": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Group": {
+      "type": "object",
+      "properties": {
+        "filters": {
+          "description": "Multiple filters are OR-ed; each filter is a conjunction.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Filter"
+          }
+        },
+        "health-check": {
+          "$ref": "#/$defs/HealthCheckOverride"
+        },
+        "name": {
+          "type": "string"
+        },
+        "policy": {
+          "description": "`min_moving_avg`, `fixed(0)`, … `None` means\n[`daer_common::SelectionPolicy`]'s default.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "policy"
+      ]
+    },
+    "HealthCheck": {
+      "description": "The health-check knobs, shared by `[global.health-check]` (the defaults) and\nevery `[[group.health-check]]` (the overrides).",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "description": "`check-interval`.",
+          "type": "string",
+          "default": "30s"
+        },
+        "tcp-method": {
+          "description": "`tcp-check-http-method`.",
+          "$ref": "#/$defs/HttpMethod",
+          "default": "HEAD"
+        },
+        "tcp-url": {
+          "description": "`tcp-check-url`: URL first, then optional direct IP addresses.",
+          "type": "array",
+          "default": [
+            "http://cp.cloudflare.com",
+            "1.1.1.1",
+            "2606:4700:4700::1111"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tolerance": {
+          "description": "`check-tolerance`: shifts the switch threshold of moving averages.",
+          "type": "string",
+          "default": "0s"
+        },
+        "udp-dns": {
+          "description": "`udp-check-dns`: DNS endpoints used for the UDP probe.",
+          "type": "array",
+          "default": [
+            "dns.google:53",
+            "8.8.8.8",
+            "2001:4860:4860::8888"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HealthCheckOverride": {
+      "description": "A group's partial override of [`HealthCheck`].",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "tcp-method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpMethod"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tcp-url": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "tolerance": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "udp-dns": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpMethod": {
+      "description": "Every HTTP method a health-check probe may use.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "HEAD"
+          ]
+        },
+        {
+          "description": "The two a probe can issue: it reads no body and discards the response, so anything\nelse would need a body or cannot be framed by this client. Advertising a method that\nsilently becomes `HEAD` is the \"accepted and ignored\" failure ADR-0006 removed.",
+          "type": "string",
+          "const": "GET"
+        }
+      ]
+    },
+    "Node": {
+      "description": "`node = [\"link\"]` or `[[node]] tag/url`.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      ]
+    },
+    "Routing": {
+      "type": "object",
+      "properties": {
+        "fallback": {
+          "type": "string",
+          "default": "direct"
+        },
+        "rules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Subscription": {
+      "description": "`subscription = [\"url\"]` or `[[subscription]] tag/url/persist`.",
+      "anyOf": [
+        {
+          "description": "A bare URL, no tag.",
+          "type": "string"
+        },
+        {
+          "description": "A tagged subscription.",
+          "type": "object",
+          "properties": {
+            "persist": {
+              "description": "Cache the last successful fetch next to the configuration.",
+              "type": "boolean",
+              "default": false
+            },
+            "tag": {
+              "description": "Tag used by `subtag()` filters.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      ]
+    },
+    "Tls": {
+      "description": "TLS identity and fragmentation.\n\n`profile` names a TLS fingerprint preset owned by netune; an unknown name\nfails at load time rather than silently falling back to the default identity,\nbecause a silently different ClientHello defeats the point of the option.",
+      "type": "object",
+      "properties": {
+        "fragment": {
+          "description": "Split the ClientHello across TCP segments.",
+          "type": "boolean",
+          "default": false
+        },
+        "fragment-interval": {
+          "description": "Millisecond range for the delay between fragments, e.g. `10-20`.",
+          "type": "string",
+          "default": "10-20"
+        },
+        "fragment-length": {
+          "description": "Byte range for `fragment`, e.g. `50-100`.",
+          "type": "string",
+          "default": "50-100"
+        },
+        "profile": {
+          "description": "TLS fingerprint preset name, e.g. `chrome`. `None` uses netune's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

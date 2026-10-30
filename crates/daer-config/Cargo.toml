@@ -1,0 +1,26 @@
+[package]
+name = "daer-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "TOML schema, rule expression language and loader for daer"
+
+[features]
+default = []
+# JSON Schema export: editor completion and CI validation without running daer.
+# Off by default so the schema machinery is not in a daemon build.
+schema = ["dep:schemars", "dep:serde_json"]
+
+[dependencies]
+daer-common.workspace = true
+glob.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+toml.workspace = true
+
+[lints]
+workspace = true

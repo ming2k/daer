@@ -1,0 +1,96 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/daer-cli",
+    "crates/daer-common",
+    "crates/daer-config",
+    "crates/daer-control",
+    "crates/daer-dns",
+    "crates/daer-ebpf",
+    "crates/daer-geodata",
+    "crates/daer-outbound",
+    "crates/daer-routing",
+    "crates/daer-sniff",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+authors = ["daeuniverse Organization <dae@v2raya.org>"]
+repository = "https://github.com/daeuniverse/daer"
+description = "An eBPF transparent proxy for Linux, with a Rust userspace"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+[workspace.dependencies]
+daer-common = { path = "crates/daer-common" }
+daer-config = { path = "crates/daer-config" }
+daer-control = { path = "crates/daer-control" }
+daer-dns = { path = "crates/daer-dns" }
+daer-ebpf = { path = "crates/daer-ebpf" }
+daer-geodata = { path = "crates/daer-geodata" }
+daer-outbound = { path = "crates/daer-outbound" }
+daer-routing = { path = "crates/daer-routing" }
+daer-sniff = { path = "crates/daer-sniff" }
+
+aes = "0.8"
+aes-gcm = "0.10"
+anyhow = "1.0"
+bytes = "1"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+hmac = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
+zeroize = "1.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+arc-swap = "1.9"
+aya = "0.14"
+clap = { version = "4.5", features = ["derive"] }
+fastrand = "2.3"
+getrandom = "0.3"
+ml-kem = "0.2.3"
+rand_core = "0.6.4"
+glob = "0.3"
+ipnet = "2.11"
+libc = "0.2"
+# Pinned by path so both projects can move together; `pins/netune.toml` records the
+# exact revision and `make pins` fails when the checkout drifts. The `version`
+# requirement is what makes the switch to a registry/tag dependency a one-liner.
+netune = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.4", default-features = false }
+netune-trace = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.4" }
+aho-corasick = "1.1"
+regex = "1.11"
+schemars = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = "0.6"
+sha2 = "0.10"
+thiserror = "2.0"
+toml = "1.1"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "time",
+    "signal",
+    "sync",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

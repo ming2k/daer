@@ -1,0 +1,31 @@
+[package]
+name = "daer-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Control plane and transparent proxy data path for daer"
+
+[dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
+daer-common.workspace = true
+daer-config.workspace = true
+daer-dns.workspace = true
+daer-ebpf.workspace = true
+aya.workspace = true
+daer-outbound.workspace = true
+daer-routing.workspace = true
+daer-sniff.workspace = true
+libc.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+
+[[test]]
+name = "transparent"
+
+[lints]
+workspace = true

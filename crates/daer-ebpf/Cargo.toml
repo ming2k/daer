@@ -1,0 +1,28 @@
+[package]
+name = "daer-ebpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "eBPF object loading and map ABI for daer"
+
+[dependencies]
+daer-common.workspace = true
+ipnet.workspace = true
+aya = { workspace = true, optional = true }
+
+[dev-dependencies]
+libc.workspace = true
+aya-obj = "0.3"
+
+[features]
+default = ["loader"]
+loader = ["dep:aya"]
+
+[[test]]
+name = "kernel"
+
+[lints]
+workspace = true

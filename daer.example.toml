@@ -1,0 +1,141 @@
+#:schema ./daer.schema.json
+# daer — reference configuration
+#
+# Print it with `daer config example`; check it with `daer config validate`.
+# Every table is optional: an empty file is a valid configuration, and the
+# defaults below are the ones daer actually uses.
+#
+# Unknown keys are errors, not warnings: a typo must fail loudly.
+
+# Schema version. daer refuses a version it does not understand.
+schema = 1
+
+# Extra files, relative to this one. Tables merge key by key, arrays are
+# concatenated, and a key set twice is an error.
+#include = ["conf.d/*.toml"]
+
+[global]
+# Transparent-proxy port. This is not an HTTP/SOCKS port: the eBPF program
+# redirects intercepted traffic here.
+tproxy-port = 12345
+# Refuse traffic that did not come through the eBPF program.
+tproxy-port-protect = true
+# Socket mark for daer-originated traffic. Omit to let daer pick an internal
+# mark that prevents UDP self-capture.
+#so-mark = 0
+# tracing filter directive: "info", "debug", or "daer=debug,netune=trace".
+log-level = "info"
+
+# Interfaces to proxy. "auto" detects the default route's interface.
+#lan-interface = ["docker0"]
+wan-interface = ["auto"]
+
+# How long to wait for a sniffable byte sequence before falling back to IP.
+sniffing-timeout = "30ms"
+auto-sniff-punt = true
+
+allow-insecure = false
+disable-waiting-network = false
+
+
+[global.tls]
+# TLS fingerprint preset owned by netune: "netune-default", "chrome-current",
+# "firefox-current", "safari-current", "codex-reqwest", "codex-network-proxy".
+# Unknown names fail
+# at load time instead of silently falling back to the default identity.
+#profile = "chrome-current"
+# Split the ClientHello across TCP segments to defeat naive SNI filtering.
+fragment = false
+fragment-length = "50-100"
+fragment-interval = "10-20"
+
+# Health-check defaults; each [[group]] may override any of these.
+[global.health-check]
+# URL first, then optional direct IPs so the probe does not depend on DNS.
+tcp-url = ["http://cp.cloudflare.com", "1.1.1.1", "2606:4700:4700::1111"]
+tcp-method = "HEAD"
+udp-dns = ["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]
+interval = "30s"
+# Shifts the switching threshold of moving averages; may be negative.
+tolerance = "0s"
+
+# Subscriptions are merged into the node pool. Either write bare URLs
+# (`subscription = ["https://…"]`) or these tables, not both.
+#[[subscription]]
+#tag = "my_sub"
+#url = "https://www.example.com/subscription/link"
+## Cache the last successful fetch next to the configuration.
+#persist = false
+
+# Nodes, also merged into the pool.
+#
+# A chain (`a -> b`) is NOT supported by this build: it is rejected at validation
+# rather than silently truncated to its first hop. Listing one here is an error.
+#[[node]]
+#tag = "edge"
+#url = "vless://…"
+#
+#[[node]]
+#url = "socks5://127.0.0.1:1080"
+
+# A group selects nodes from the pool and picks one per connection.
+[[group]]
+name = "proxy"
+# "random", "fixed(0)", "min", "min-moving-avg", "min-avg10", …
+policy = "min-moving-avg"
+# Filters are OR-ed; each is a conjunction. An annotation is carried into the
+# selected node's properties.
+#filters = [
+#    "subtag(my_sub) && !name(keyword: 'ExpireAt:')",
+#    { match = "name(node1)", annotate = { add_latency = "-500ms" } },
+#]
+#
+#[group.health-check]
+#tcp-url = ["http://test.steampowered.com"]
+
+[dns]
+# "4", "6", or 0 for no preference.
+ipversion-prefer = 0
+# Every upstream is `tag:protocol://host:port`, and the tag is what `[dns.request]` rules
+# name. The protocol is required: "UDP unless it fails" is a policy, not a default.
+#
+# Protocols: udp, tcp, tls (DoT), https (DoH), or a `+` chain tried in order.
+# A name instead of an address is rejected for now — bootstrapping an upstream is a
+# resolver problem of its own — so the address is written out.
+upstream = ["alidns:udp://223.5.5.5:53", "googledns:tcp://8.8.8.8:53"]
+# An IP, not an address: the port is always 53. `--listen ip:port` overrides it.
+#bind = "0.0.0.0"
+optimistic-cache = true
+optimistic-cache-ttl = 60
+optimistic-stale-reply-ttl = 30
+max-cache-size = 65536
+
+# Per-domain TTL overrides, in seconds.
+[dns.fixed-domain-ttl]
+#".example.com" = 60
+
+[dns.request]
+rules = []
+# Where a request that matches no rule goes.
+fallback = "googledns"
+
+[dns.response]
+rules = []
+fallback = "accept"
+
+[routing]
+# Rules are evaluated top to bottom; the first match wins.
+rules = [
+    # Network managers should reach the network directly, otherwise binding to
+    # the WAN interface produces a false-negative connectivity check.
+    "pname(NetworkManager) -> direct",
+    # Keep broadcast and multicast traffic away from the proxy.
+    "dip(224.0.0.0/3, 'ff00::/8') -> direct",
+    "dip(geoip:private) -> direct",
+    # HTTP/3 usually costs more CPU and memory than it is worth.
+    "l4proto(udp) && dport(443) -> block",
+    "dip(geoip:cn) -> direct",
+    "domain(geosite:cn) -> direct",
+]
+# Where everything else goes.
+fallback = "proxy"
