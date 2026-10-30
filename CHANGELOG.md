@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AnyTLS Outbound Protocol Engine & Multiplexed Session Substrate**:
+  - Full support for the modern AnyTLS protocol (`type = "anytls"` in `[[node]]` and `anytls://` link parsing).
+  - First-class multi-stream session multiplexing (`AnyTlsSession`), amortizing TLS handshakes across concurrent transparent proxy flows.
+  - Native binary frame codec (`Waste`, `Syn`, `Push`, `Fin`, `Settings`, `Alert`, `UpdatePaddingScheme`, `SynAck`, `HeartRequest`, `HeartResponse`).
+  - Robust client authentication flight with SHA-256 password hashing and obfuscation padding.
+  - Full TCP and UDP datagram support via UDP-over-TCP (UoT) tunneling (`sp.v2.udp-over-tcp.arpa:53`).
+  - Automatic session pooling, keep-alive heartbeat maintenance, and zero-allocation stream relaying.
+- **Hysteria 2 Outbound Protocol Engine over QUIC**:
+  - Full support for the Hysteria 2 protocol (`type = "hysteria2"` in `[[node]]` and `hysteria2://` / `hy2://` URI links).
+  - Native QUIC client integration with `SO_MARK` pre-bind enforcement (`[INV-MARK-01]`) preventing routing loops.
+  - HTTP/3 authentication flight (`POST https://hysteria/auth`) with random padding and status `233` verification.
+  - Bidirectional TCP tunneling with QUIC varint framing (`0x401` request frame, server response parsing).
+  - RFC 9221 QUIC datagrams for native low-latency UDP packet relay.
+  - Brutal congestion control downlink advertisement (`Hysteria-CC-RX`) and bandwidth hints (`up-mbps`, `down-mbps`).
+
+
 ## [0.0.2] - 2026-10-30
 
 ### Added
@@ -24,10 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Graceful handling of unimplemented protocols from subscriptions (e.g. Hysteria2) as warnings rather than aborting startup.
 - **Systemd service unit (`install/daer.service`)**:
   - Out-of-the-box system service definition with `Type=simple` and `ExecStartPre=/usr/bin/daer config validate -c /etc/daer/config.toml`.
-  - Zero-downtime reload via `ExecReload=/bin/kill -HUP $MAINPID`.
-  - Least-privilege sandboxing: drops root privileges and bounds capabilities to `CAP_BPF` and `CAP_NET_ADMIN` via `AmbientCapabilities` and `CapabilityBoundingSet`.
-  - Hardened isolation flags: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, and address family restriction.
-  - High-concurrency limits (`LimitNOFILE=1048576`, `LimitNPROC=4096`) and OOM killer protection (`OOMScoreAdjust=-100`).
+  - Zero-downtime reload via `ExecReload=/usr/bin/kill -HUP $MAINPID`.
+  - Least-privilege sandboxing: drops root privileges and bounds capabilities to `CAP_BPF`, `CAP_NET_ADMIN`, and `CAP_NET_BIND_SERVICE` via `AmbientCapabilities` and `CapabilityBoundingSet`.
+  - Hardened isolation flags: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `ProtectControlGroups=true`, `ProtectKernelTunables=true`, `LockPersonality=true`, `RestrictRealtime=true`, `PrivateTmp=true`, `ConfigurationDirectory=daer`, and `ReadWritePaths=/etc/daer` allowing subscription persistence in `persist.d/`.
+  - High-concurrency limits (`LimitNOFILE=1048576`, `LimitNPROC=4096`, `LimitMEMLOCK=infinity`) and OOM killer protection (`OOMScoreAdjust=-100`).
 - **Standardized installation target**:
   - `cargo xtask install` installs the `daer` executable (`PREFIX/bin`), eBPF datapath object (`PREFIX/lib/daer`), and systemd unit (`PREFIX/lib/systemd/system`).
 - **Resilient eBPF object path resolution**:

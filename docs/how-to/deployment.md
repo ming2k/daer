@@ -161,13 +161,14 @@ User=root
 # Resource limits
 LimitNPROC=4096
 LimitNOFILE=1048576
+LimitMEMLOCK=infinity
 OOMScoreAdjust=-100
 
 # Validate configuration before starting. A broken configuration exits with non-zero
 # and prevents starting or restarting with an invalid state.
 ExecStartPre=/usr/bin/daer config validate -c /etc/daer/config.toml
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/usr/bin/kill -HUP $MAINPID
 
 # Restart policy
 Restart=on-failure
@@ -177,15 +178,23 @@ RestartSec=5s
 TimeoutStartSec=120
 TimeoutStopSec=30
 
-# The two capabilities the datapath needs; everything else is dropped.
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN
+# The capabilities the datapath and privileged listeners (e.g. port 53) need.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictRealtime=true
 PrivateTmp=true
 # The listener and the device pair need the network, so `PrivateNetwork` is off.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Configuration directory and write access for subscription persistence (persist.d)
+ConfigurationDirectory=daer
+ReadWritePaths=/etc/daer
 
 [Install]
 WantedBy=multi-user.target
@@ -266,7 +275,7 @@ Be aware before trusting it with traffic:
 * A REALITY node has **no datagram transport**, so a UDP flow routed to such a group is refused
   rather than silently sent direct. Silence there would be a leak: the client would believe UDP
   was tunnelled when it was not.
-* **vmess, plain vless, anytls, hysteria2, tuic** are not implemented; a link naming one is
+* **vmess, plain vless, tuic** are not implemented; a link naming one is
   listed but not selectable, and is never silently downgraded to `direct`.
 * The **event ring** (per-flow trace, `bpf_trace_printk`) is not consumed yet: there is no
   per-flow trace beyond the `debug` logs.

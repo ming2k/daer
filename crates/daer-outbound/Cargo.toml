@@ -10,6 +10,7 @@ description = "Outbound dialers, groups and health checks for daer"
 autotests = false
 
 [dependencies]
+bytes.workspace = true
 daer-common.workspace = true
 libc.workspace = true
 aes-gcm.workspace = true
@@ -29,6 +30,14 @@ netune.workspace = true
 netune-trace.workspace = true
 regex.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-platform-verifier = "0.6"
+socket2.workspace = true
 ml-kem.workspace = true
 rand_core.workspace = true
 
@@ -39,6 +48,12 @@ name = "shadowsocks_interop"
 
 [[test]]
 name = "trojan_interop"
+
+[[test]]
+name = "anytls_interop"
+
+[[test]]
+name = "hysteria2_interop"
 
 [[test]]
 name = "reality_live"

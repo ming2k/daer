@@ -25,11 +25,12 @@ pub mod validate;
 pub use error::ParseError;
 pub use expr::{Function, Param, ParamValue, RoutingRule};
 pub use model::{
-    Config, DirectEndpoint, DirectNode, Dns, DnsRouting, FakeIpConfig, Filter, FunctionOrString,
-    Global, Group, HealthCheck, HealthCheckOverride, HttpEndpoint, HttpNode, Node, NodeEndpoint,
-    RealityConfig, Routing, SCHEMA_VERSION, ShadowsocksEndpoint, ShadowsocksNode, Socks5Endpoint,
-    Socks5Node, StructuredNode, Subscription, Tls, TrojanEndpoint, TrojanNode, VlessEndpoint,
-    VlessNode, parse_filter_expr, parse_rule_expr, parse_value_expr, render_functions,
+    AnyTlsEndpoint, AnyTlsNode, Config, DirectEndpoint, DirectNode, Dns, DnsRouting, FakeIpConfig,
+    Filter, FunctionOrString, Global, Group, HealthCheck, HealthCheckOverride, HttpEndpoint,
+    HttpNode, Hysteria2Endpoint, Hysteria2Node, Node, NodeEndpoint, RealityConfig, Routing,
+    SCHEMA_VERSION, ShadowsocksEndpoint, ShadowsocksNode, Socks5Endpoint, Socks5Node,
+    StructuredNode, Subscription, Tls, TrojanEndpoint, TrojanNode, VlessEndpoint, VlessNode,
+    parse_filter_expr, parse_rule_expr, parse_value_expr, render_functions,
 };
 pub use scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration, parse_integer};
 pub use toml_config::Loaded;

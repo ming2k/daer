@@ -26,6 +26,7 @@
 //! listing them as "next up".
 
 mod alive;
+pub mod anytls;
 mod check;
 mod dialer;
 mod direct;
@@ -33,6 +34,7 @@ mod error;
 mod filter;
 pub mod fragment;
 mod group;
+pub mod hysteria2;
 mod latency;
 mod node_dialer;
 mod property;
@@ -42,12 +44,14 @@ pub mod subscription;
 pub mod trojan;
 
 pub use alive::{AliveDialerSet, DialerId, NotifyOutcome};
+pub use anytls::AnyTlsConnector;
 pub use check::{CheckError, CheckUrl, HttpChecker, HttpMethod, TcpChecker, UdpDnsChecker};
 pub use dialer::Dialer;
 pub use direct::DirectDialer;
 pub use error::OutboundError;
 pub use filter::{Annotation, FilterError, FilterSet};
 pub use group::DialerGroup;
+pub use hysteria2::Hysteria2Connector;
 pub use latency::{LatenciesN, MovingAverage};
 pub use node_dialer::{DialerOptions, NodeDialer};
 pub use property::{GroupPolicy, Property, Protocol, Security, parse_group_policy};

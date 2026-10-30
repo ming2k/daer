@@ -676,6 +676,111 @@
         {
           "type": "object",
           "properties": {
+            "allow-insecure": {
+              "type": "boolean"
+            },
+            "idle-sessions": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "password": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "sni": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "any-tls"
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port",
+            "password"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow-insecure": {
+              "type": "boolean"
+            },
+            "down-mbps": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "obfs": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "server": {
+              "type": "string"
+            },
+            "sni": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "hysteria2"
+            },
+            "up-mbps": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port",
+            "password"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "flow": {
               "type": [
                 "string",

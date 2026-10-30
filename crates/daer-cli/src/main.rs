@@ -120,7 +120,7 @@ enum RouteCommand {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
-    /// Convert an outbound URI link (vless://, ss://, trojan://, socks5://, http://, direct://)
+    /// Convert an outbound URI link (vless://, hysteria2://, anytls://, ss://, trojan://, socks5://, http://, direct://)
     /// into a structured [[node]] TOML table.
     Convert {
         /// Outbound URI link to convert. If omitted, reads lines from standard input.
@@ -1423,6 +1423,9 @@ fallback = "proxy"
         let ss_link =
             "ss://YWVzLTEyOC1ncm06bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
         assert!(convert_node(Some(ss_link)).is_ok());
+
+        let anytls_link = "anytls://secret@anytls.example.com:443?sni=sni.example.com#anytls-node";
+        assert!(convert_node(Some(anytls_link)).is_ok());
     }
 
     #[test]
@@ -1435,6 +1438,7 @@ fallback = "proxy"
             "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f#US%20VIP%2001".to_owned(),
             "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkjp1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.titech.ac.jp&pbk=VAqawSsDR9SnBoN8ucLfUXIZO3Ugkd27HN7TOqh1AXo&sid=f0#Japan%20VIP%2001".to_owned(),
             "hysteria2://df4af3d0-030e-4062-baa6-eb9dd45298ef@151.242.183.252:20443?sni=apple.com#HK%2001".to_owned(),
+            "tuic://uuid:password@1.2.3.4:443#unsupported-node".to_owned(),
         ]);
 
         let sub_url = "https://example.com/api/subscribe?token=test";
@@ -1462,7 +1466,7 @@ fallback = "direct"
         let config = dir.write("config.toml", config_toml.as_bytes());
 
         let resolved = block_on(load_resolved(&config)).expect("resolves subscription");
-        assert_eq!(resolved.config.node.len(), 3);
+        assert_eq!(resolved.config.node.len(), 4);
 
         // Verify group mentions node
         let jp_node = resolved
@@ -1477,12 +1481,19 @@ fallback = "direct"
             .iter()
             .find(|n| n.label().contains("US"))
             .expect("us node");
+        let hk_node = resolved
+            .config
+            .node
+            .iter()
+            .find(|n| n.label().contains("HK 01"))
+            .expect("hk node");
         let jp_group = &resolved.config.group[0];
 
         assert!(daer_control::group_mentions_node(jp_group, jp_node));
         assert!(!daer_control::group_mentions_node(jp_group, us_node));
+        assert!(!daer_control::group_mentions_node(jp_group, hk_node));
 
-        // Validate config should succeed (unsupported hysteria2 from subscription produces a warning, not failure)
+        // Validate config should succeed (unsupported tuic from subscription produces a warning, not failure)
         let report = block_on(validate_config(&config)).expect("validates");
         assert!(
             report

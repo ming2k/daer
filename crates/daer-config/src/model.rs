@@ -525,6 +525,8 @@ pub enum NodeEndpoint {
     #[serde(alias = "ss")]
     Shadowsocks(ShadowsocksNode),
     Trojan(TrojanNode),
+    AnyTls(AnyTlsNode),
+    Hysteria2(Hysteria2Node),
     Vless(VlessNode),
     #[serde(skip_deserializing)]
     Unsupported {
@@ -539,6 +541,8 @@ pub type Socks5Endpoint = Socks5Node;
 pub type HttpEndpoint = HttpNode;
 pub type ShadowsocksEndpoint = ShadowsocksNode;
 pub type TrojanEndpoint = TrojanNode;
+pub type AnyTlsEndpoint = AnyTlsNode;
+pub type Hysteria2Endpoint = Hysteria2Node;
 pub type VlessEndpoint = VlessNode;
 
 impl NodeEndpoint {
@@ -586,6 +590,30 @@ impl NodeEndpoint {
                 }
                 if node.password.is_empty() {
                     return Err("trojan: 'password' must not be empty".to_owned());
+                }
+                Ok(())
+            }
+            Self::AnyTls(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("anytls: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("anytls: 'port' must not be 0".to_owned());
+                }
+                if node.password.is_empty() {
+                    return Err("anytls: 'password' must not be empty".to_owned());
+                }
+                Ok(())
+            }
+            Self::Hysteria2(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("hysteria2: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("hysteria2: 'port' must not be 0".to_owned());
+                }
+                if node.password.is_empty() {
+                    return Err("hysteria2: 'password' must not be empty".to_owned());
                 }
                 Ok(())
             }
@@ -640,6 +668,8 @@ impl NodeEndpoint {
             Self::Http(n) => n.tag.as_deref(),
             Self::Shadowsocks(n) => n.tag.as_deref(),
             Self::Trojan(n) => n.tag.as_deref(),
+            Self::AnyTls(n) => n.tag.as_deref(),
+            Self::Hysteria2(n) => n.tag.as_deref(),
             Self::Vless(n) => n.tag.as_deref(),
             Self::Unsupported { .. } => None,
         }
@@ -654,6 +684,8 @@ impl NodeEndpoint {
             Self::Http(n) => format!("{}:{}", n.server, n.port),
             Self::Shadowsocks(n) => format!("{}:{}", n.server, n.port),
             Self::Trojan(n) => format!("{}:{}", n.server, n.port),
+            Self::AnyTls(n) => format!("{}:{}", n.server, n.port),
+            Self::Hysteria2(n) => format!("{}:{}", n.server, n.port),
             Self::Vless(n) => format!("{}:{}", n.server, n.port),
             Self::Unsupported { link, .. } => link.clone(),
         }
@@ -668,6 +700,8 @@ impl NodeEndpoint {
             Self::Http(n) => n.to_link(),
             Self::Shadowsocks(n) => n.to_link(),
             Self::Trojan(n) => n.to_link(),
+            Self::AnyTls(n) => n.to_link(),
+            Self::Hysteria2(n) => n.to_link(),
             Self::Vless(n) => n.to_link(),
             Self::Unsupported { link, .. } => link.clone(),
         }
@@ -814,6 +848,123 @@ impl TrojanNode {
         format!(
             "trojan://{}@{server}:{}{query_str}",
             self.password, self.port
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AnyTlsNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+    #[serde(
+        default = "default_idle_sessions",
+        skip_serializing_if = "is_default_idle_sessions"
+    )]
+    pub idle_sessions: usize,
+}
+
+fn default_idle_sessions() -> usize {
+    1
+}
+
+fn is_default_idle_sessions(v: &usize) -> bool {
+    *v == 1
+}
+
+impl AnyTlsNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let mut query = Vec::new();
+        if let Some(sni) = &self.sni
+            && !sni.is_empty()
+        {
+            query.push(format!("sni={}", percent_encode(sni)));
+        }
+        if self.allow_insecure {
+            query.push("allowInsecure=1".to_owned());
+        }
+        if self.idle_sessions > 1 {
+            query.push(format!("idle_sessions={}", self.idle_sessions));
+        }
+        let query_str = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        format!(
+            "anytls://{}@{server}:{}{query_str}",
+            percent_encode(&self.password),
+            self.port
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Hysteria2Node {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub up_mbps: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub down_mbps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<String>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+impl Hysteria2Node {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        let server = format_host(&self.server);
+        let mut query = Vec::new();
+        if let Some(sni) = &self.sni
+            && !sni.is_empty()
+        {
+            query.push(format!("sni={}", percent_encode(sni)));
+        }
+        if self.allow_insecure {
+            query.push("insecure=1".to_owned());
+        }
+        if self.up_mbps > 0 {
+            query.push(format!("upmbps={}", self.up_mbps));
+        }
+        if self.down_mbps > 0 {
+            query.push(format!("downmbps={}", self.down_mbps));
+        }
+        if let Some(obfs) = &self.obfs {
+            query.push(format!("obfs={}", percent_encode(obfs)));
+        }
+        let query_str = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        format!(
+            "hysteria2://{}@{server}:{}{query_str}",
+            percent_encode(&self.password),
+            self.port
         )
     }
 }
@@ -1165,6 +1316,105 @@ impl StructuredNode {
                     allow_insecure,
                 }))
             }
+            "anytls" => {
+                let (authority, query) = match before_fragment.split_once('?') {
+                    Some((auth, q)) => (auth, q),
+                    None => (before_fragment, ""),
+                };
+                let (password, hostport) = authority
+                    .rsplit_once('@')
+                    .ok_or_else(|| "anytls link has no 'password@server:port'".to_owned())?;
+                let (server, port) = parse_host_port(hostport)?;
+
+                let mut sni = None;
+                let mut allow_insecure = false;
+                let mut idle_sessions = 1;
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    let (k, v) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    match k {
+                        "sni" | "peer" if !v.is_empty() => {
+                            sni = Some(percent_decode(v));
+                        }
+                        "allowInsecure" | "allow_insecure" | "insecure" => {
+                            allow_insecure = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "idle_sessions" | "min_idle_sessions" => {
+                            if let Ok(n) = v.parse::<usize>() {
+                                idle_sessions = n.max(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Self::AnyTls(AnyTlsNode {
+                    tag,
+                    server,
+                    port,
+                    password: percent_decode(password),
+                    sni,
+                    allow_insecure,
+                    idle_sessions,
+                }))
+            }
+            "hysteria2" | "hy2" => {
+                let (authority, query) = match before_fragment.split_once('?') {
+                    Some((auth, q)) => (auth, q),
+                    None => (before_fragment, ""),
+                };
+                let (password, hostport) = authority
+                    .rsplit_once('@')
+                    .ok_or_else(|| "hysteria2 link has no 'password@server:port'".to_owned())?;
+                let (server, port) = parse_host_port(hostport)?;
+
+                let mut sni = None;
+                let mut allow_insecure = false;
+                let mut up_mbps = 0;
+                let mut down_mbps = 0;
+                let mut obfs = None;
+
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    let (k, v) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    match k {
+                        "sni" | "peer" if !v.is_empty() => {
+                            sni = Some(percent_decode(v));
+                        }
+                        "insecure" | "allowInsecure" | "allow_insecure" => {
+                            allow_insecure = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                        "upmbps" | "up_mbps" => {
+                            if let Ok(n) = v.parse::<u64>() {
+                                up_mbps = n;
+                            }
+                        }
+                        "downmbps" | "down_mbps" => {
+                            if let Ok(n) = v.parse::<u64>() {
+                                down_mbps = n;
+                            }
+                        }
+                        "obfs" | "obfs-password" if !v.is_empty() => {
+                            obfs = Some(percent_decode(v));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Self::Hysteria2(Hysteria2Node {
+                    tag,
+                    server,
+                    port,
+                    password: percent_decode(password),
+                    sni,
+                    allow_insecure,
+                    up_mbps,
+                    down_mbps,
+                    obfs,
+                }))
+            }
             "vless" => {
                 let (user_part, rest) = before_fragment
                     .split_once('@')
@@ -1245,7 +1495,7 @@ impl<'de> Deserialize<'de> for Node {
                 }
                 if !table.contains_key("type") {
                     return Err(D::Error::custom(
-                        "missing 'type' in [[node]] table (expected e.g. type = \"vless\", \"shadowsocks\", \"trojan\", \"socks5\", \"http\", \"direct\")",
+                        "missing 'type' in [[node]] table (expected e.g. type = \"vless\", \"anytls\", \"shadowsocks\", \"trojan\", \"socks5\", \"http\", \"direct\")",
                     ));
                 }
 
@@ -1645,6 +1895,38 @@ mod tests {
         let trojan_link = "trojan://password@node.example.com:443?sni=sni.example.com#my-trojan";
         let structured = StructuredNode::from_link(trojan_link).expect("converts trojan link");
         assert_eq!(structured.tag(), Some("my-trojan"));
+
+        let anytls_link = "anytls://secret-pass@anytls.example.com:443?sni=sni.example.com&allowInsecure=1&idle_sessions=3#my-anytls";
+        let structured = StructuredNode::from_link(anytls_link).expect("converts anytls link");
+        match structured {
+            StructuredNode::AnyTls(anytls) => {
+                assert_eq!(anytls.tag.as_deref(), Some("my-anytls"));
+                assert_eq!(anytls.server, "anytls.example.com");
+                assert_eq!(anytls.port, 443);
+                assert_eq!(anytls.password, "secret-pass");
+                assert_eq!(anytls.sni.as_deref(), Some("sni.example.com"));
+                assert!(anytls.allow_insecure);
+                assert_eq!(anytls.idle_sessions, 3);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let hy2_link = "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com&insecure=1&upmbps=50&downmbps=100&obfs=salamander#my-hy2";
+        let structured = StructuredNode::from_link(hy2_link).expect("converts hysteria2 link");
+        match structured {
+            StructuredNode::Hysteria2(hy2) => {
+                assert_eq!(hy2.tag.as_deref(), Some("my-hy2"));
+                assert_eq!(hy2.server, "hy2.example.com");
+                assert_eq!(hy2.port, 443);
+                assert_eq!(hy2.password, "secret-hy2");
+                assert_eq!(hy2.sni.as_deref(), Some("sni.example.com"));
+                assert!(hy2.allow_insecure);
+                assert_eq!(hy2.up_mbps, 50);
+                assert_eq!(hy2.down_mbps, 100);
+                assert_eq!(hy2.obfs.as_deref(), Some("salamander"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

@@ -27,7 +27,9 @@ use netune::{
 };
 use netune_trace::Recorder;
 
+use crate::anytls::AnyTlsConnector;
 use crate::error::OutboundError;
+use crate::hysteria2::Hysteria2Connector;
 use crate::property::Protocol;
 use crate::reality::connector::RealityConnector;
 use crate::shadowsocks::ShadowSocksConnector;
@@ -114,6 +116,8 @@ pub enum NodeDialer {
     Proxy(ProxyTransport),
     ShadowSocks(ShadowSocksTransport),
     Trojan(TrojanTransport),
+    AnyTls(AnyTlsTransport),
+    Hysteria2(Hysteria2Transport),
     Reality(RealityTransport),
 }
 
@@ -124,6 +128,8 @@ impl fmt::Debug for NodeDialer {
             Self::Proxy(dialer) => f.debug_tuple("Proxy").field(dialer).finish(),
             Self::ShadowSocks(dialer) => f.debug_tuple("ShadowSocks").field(dialer).finish(),
             Self::Trojan(dialer) => f.debug_tuple("Trojan").field(dialer).finish(),
+            Self::AnyTls(dialer) => f.debug_tuple("AnyTls").field(dialer).finish(),
+            Self::Hysteria2(dialer) => f.debug_tuple("Hysteria2").field(dialer).finish(),
             Self::Reality(dialer) => f.debug_tuple("Reality").field(dialer).finish(),
         }
     }
@@ -180,6 +186,34 @@ impl NodeDialer {
                     options,
                 )?;
                 Ok(Self::Trojan(TrojanTransport { connector }))
+            }
+            daer_config::NodeEndpoint::AnyTls(n) => {
+                let connector = AnyTlsConnector::new(
+                    &n.server,
+                    n.port,
+                    &n.password,
+                    n.sni.as_deref(),
+                    n.allow_insecure,
+                    n.idle_sessions,
+                    options,
+                )?;
+                Ok(Self::AnyTls(AnyTlsTransport { connector }))
+            }
+            daer_config::NodeEndpoint::Hysteria2(n) => {
+                let connector = Hysteria2Connector::new(
+                    crate::hysteria2::connector::Hysteria2Params {
+                        server: &n.server,
+                        port: n.port,
+                        password: &n.password,
+                        sni: n.sni.as_deref(),
+                        allow_insecure: n.allow_insecure,
+                        up_mbps: n.up_mbps,
+                        down_mbps: n.down_mbps,
+                        obfs: n.obfs.as_deref(),
+                    },
+                    options,
+                )?;
+                Ok(Self::Hysteria2(Hysteria2Transport { connector }))
             }
             daer_config::NodeEndpoint::Vless(n) => {
                 let reality = n.reality.as_ref().ok_or_else(|| {
@@ -247,6 +281,14 @@ impl NodeDialer {
             let connector = TrojanConnector::from_link(link, options)?;
             return Ok(Self::Trojan(TrojanTransport { connector }));
         }
+        if scheme.eq_ignore_ascii_case("anytls") {
+            let connector = AnyTlsConnector::from_link(link, options)?;
+            return Ok(Self::AnyTls(AnyTlsTransport { connector }));
+        }
+        if scheme.eq_ignore_ascii_case("hysteria2") || scheme.eq_ignore_ascii_case("hy2") {
+            let connector = Hysteria2Connector::from_link(link, options)?;
+            return Ok(Self::Hysteria2(Hysteria2Transport { connector }));
+        }
         // `vless://` is REALITY-only in this build. A plain `security=tls` vless link is
         // refused by `RealityConnector::from_link` with that reason rather than being sent
         // somewhere it would not work.
@@ -291,6 +333,8 @@ impl NodeDialer {
             Self::Proxy(dialer) => dialer.connect(authority).await,
             Self::ShadowSocks(dialer) => dialer.connect(authority).await,
             Self::Trojan(dialer) => dialer.connect(authority).await,
+            Self::AnyTls(dialer) => dialer.connect(authority).await,
+            Self::Hysteria2(dialer) => dialer.connect(authority).await,
             Self::Reality(dialer) => dialer.connect(authority).await,
         }
     }
@@ -301,6 +345,8 @@ impl NodeDialer {
             Self::Proxy(dialer) => dialer.protocol(),
             Self::ShadowSocks(_) => Protocol::ShadowSocks,
             Self::Trojan(_) => Protocol::Trojan,
+            Self::AnyTls(_) => Protocol::AnyTls,
+            Self::Hysteria2(_) => Protocol::Hysteria2,
             Self::Reality(_) => Protocol::Reality,
         }
     }
@@ -346,8 +392,62 @@ impl NodeDialer {
             Self::Proxy(dialer) => dialer.datagram_connector(),
             Self::Reality(dialer) => Some(dialer.datagram_connector()),
             Self::Trojan(dialer) => Some(dialer.datagram_connector()),
+            Self::AnyTls(dialer) => Some(dialer.datagram_connector()),
+            Self::Hysteria2(dialer) => Some(dialer.datagram_connector()),
             Self::ShadowSocks(dialer) => Some(dialer.datagram_connector()),
         }
+    }
+}
+
+/// A Hysteria 2 node.
+pub struct Hysteria2Transport {
+    connector: Hysteria2Connector,
+}
+
+impl fmt::Debug for Hysteria2Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hysteria2Transport")
+            .field("server", &self.connector.server())
+            .field("server_name", &self.connector.server_name())
+            .finish()
+    }
+}
+
+impl Hysteria2Transport {
+    pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
+        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
+        self.connector.connect(authority, &recorder).await
+    }
+
+    #[must_use]
+    pub fn datagram_connector(&self) -> Arc<dyn DatagramConnector> {
+        self.connector.datagram_connector()
+    }
+}
+
+/// An AnyTLS node.
+pub struct AnyTlsTransport {
+    connector: AnyTlsConnector,
+}
+
+impl fmt::Debug for AnyTlsTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnyTlsTransport")
+            .field("server", &self.connector.server())
+            .field("server_name", &self.connector.server_name())
+            .finish()
+    }
+}
+
+impl AnyTlsTransport {
+    pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
+        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
+        self.connector.connect(authority, &recorder).await
+    }
+
+    #[must_use]
+    pub fn datagram_connector(&self) -> Arc<dyn DatagramConnector> {
+        self.connector.datagram_connector()
     }
 }
 

@@ -16,6 +16,10 @@ pub enum Protocol {
     ShadowSocks,
     /// Trojan: a password-authenticated session inside TLS to the node.
     Trojan,
+    /// AnyTLS: multiplexed session with traffic obfuscation inside TLS.
+    AnyTls,
+    /// Hysteria 2: proxy over QUIC with HTTP/3 authentication and UDP datagrams.
+    Hysteria2,
     /// REALITY: `vless` authenticated by a ClientHello session-id tag, with the presented
     /// certificate belonging to an impersonated site rather than to the node.
     Reality,
@@ -32,6 +36,8 @@ impl Protocol {
             "socks5" | "socks" => Self::Socks5,
             "ss" | "shadowsocks" => Self::ShadowSocks,
             "trojan" | "trojan-go" => Self::Trojan,
+            "anytls" => Self::AnyTls,
+            "hysteria2" | "hy2" => Self::Hysteria2,
             "vless" => Self::Reality,
             other => Self::Other(other.to_owned()),
         }
@@ -45,6 +51,8 @@ impl Protocol {
             Self::Socks5 => "socks5",
             Self::ShadowSocks => "ss",
             Self::Trojan => "trojan",
+            Self::AnyTls => "anytls",
+            Self::Hysteria2 => "hysteria2",
             Self::Reality => "vless",
             Self::Other(other) => other,
         }
@@ -211,6 +219,24 @@ impl Property {
                     allow_insecure_requested: n.allow_insecure,
                 },
             ),
+            daer_config::NodeEndpoint::AnyTls(n) => (
+                Protocol::AnyTls,
+                format!("{}:{}", n.server, n.port),
+                true,
+                Security::Tls {
+                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.allow_insecure,
+                },
+            ),
+            daer_config::NodeEndpoint::Hysteria2(n) => (
+                Protocol::Hysteria2,
+                format!("{}:{}", n.server, n.port),
+                true,
+                Security::Tls {
+                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.allow_insecure,
+                },
+            ),
             daer_config::NodeEndpoint::Vless(n) => (
                 Protocol::Reality,
                 format!("{}:{}", n.server, n.port),
@@ -265,7 +291,10 @@ impl Property {
                 None => (Protocol::Other(link.to_owned()), String::new()),
             }
         };
-        let udp = matches!(protocol, Protocol::Direct | Protocol::Socks5);
+        let udp = matches!(
+            protocol,
+            Protocol::Direct | Protocol::Socks5 | Protocol::AnyTls | Protocol::Hysteria2
+        );
         let security = security_of(&protocol, link, &address);
         Self {
             name: name.into(),
@@ -326,6 +355,50 @@ fn security_of(protocol: &Protocol, link: &str, address: &str) -> Security {
                 allow_insecure_requested: false,
             },
         },
+        Protocol::AnyTls => {
+            let sni = link
+                .split_once('?')
+                .and_then(|(_, q)| {
+                    q.split('&').find_map(|pair| {
+                        let (k, v) = pair.split_once('=')?;
+                        if k == "sni" || k == "peer" {
+                            Some(v.to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| address.split(':').next().unwrap_or_default().to_owned());
+            Security::Tls {
+                server_name: sni,
+                allow_insecure_requested: link.contains("allowInsecure=1")
+                    || link.contains("allow_insecure=1")
+                    || link.contains("insecure=1")
+                    || link.contains("insecure=true"),
+            }
+        }
+        Protocol::Hysteria2 => {
+            let sni = link
+                .split_once('?')
+                .and_then(|(_, q)| {
+                    q.split('&').find_map(|pair| {
+                        let (k, v) = pair.split_once('=')?;
+                        if k == "sni" || k == "peer" {
+                            Some(v.to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| address.split(':').next().unwrap_or_default().to_owned());
+            Security::Tls {
+                server_name: sni,
+                allow_insecure_requested: link.contains("insecure=1")
+                    || link.contains("insecure=true")
+                    || link.contains("allowInsecure=1")
+                    || link.contains("allow_insecure=1"),
+            }
+        }
         // An unknown scheme is not evidence of plaintext. `vmess://` and
         // `vless://` carry their own cryptography; reporting them as plaintext
         // would be a false alarm that trains an operator to ignore the report.
