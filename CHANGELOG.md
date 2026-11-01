@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-11-01
+
+### Added
+
+- **Datapath State Ownership & Lifecycle Management ([ADR-0013](docs/adr/0013-datapath-state-ownership.md), `[INV-DATAPATH-01]`)**:
+  - The transparent proxy datapath owns all box-global routing prerequisites upon attach and tears them down on drop.
+  - Automatic `fwmark` policy routing rules and `local default` routes across routing table 2023 for IPv4 and IPv6.
+  - Automatic per-interface sysctl configuration for `rp_filter` (loose mode `2`) and IP forwarding (`forwarding = 1`), with clean restoration.
+  - Link-layer hook autodetection: inspects interface `ARPHRD` link kind to attach `_l2` TC filters for Ethernet and `_l3` filters for point-to-point / tunnel interfaces, preventing packet truncation.
+  - Registered UDP transparent ingress listener in `listen_socket_map` (key `1`), enabling transparent UDP packet reception and forwarding.
+- **Kernel Observed Facts & Routing Telemetry ([ADR-0013](docs/adr/0013-datapath-state-ownership.md), `[INV-KERNEL-FACTS-01]`)**:
+  - Read observed facts from `routing_handoff_map` (`mac`, `dscp`, `pname`, `pid`) into userspace `KernelObserver`.
+  - Honest fact matching: `mac(...)`, `dscp(...)`, and `pname(...)` rules match only when observed; unknown process name (`pid = 0`) is reported as unknown rather than empty string.
+- **netune 0.0.5 Upgrade**:
+  - Pinned `netune` and `netune-trace` to `v0.0.5`.
+  - Integrated `DialObserverSink` with `TraceSink` for streaming transport trace export during outbound dials.
+
 ## [0.0.3] - 2026-10-30
 
 ### Added
