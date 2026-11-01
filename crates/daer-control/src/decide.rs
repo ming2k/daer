@@ -38,6 +38,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+
+/// `IPPROTO_TCP`, the datapath's `l4proto` for a stream flow.
+const IPPROTO_TCP: u8 = 6;
+/// `IPPROTO_UDP`, the datapath's `l4proto` for a datagram flow.
+const IPPROTO_UDP: u8 = 17;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -225,6 +230,18 @@ pub struct RouterOptions {
     pub fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
     /// Observational DNS Snooper for Real-IP mode (ADR-0011).
     pub dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
+    /// The datapath's per-flow facts, when a datapath is attached.
+    ///
+    /// `None` is the honest state for `--no-datapath`, the diagnostics, and every test: the
+    /// router then matches on addresses and the sniffed name only, and a rule needing a MAC,
+    /// a DSCP, or a process name does not match by accident.
+    pub kernel_observer: Option<Arc<dyn KernelObserver>>,
+    /// Where a dial's measurement goes.
+    ///
+    /// `None` records only the transport's own ring, which nothing reads. The daemon installs
+    /// [`daer_outbound::LogObserver`] so a dial's span reaches the journal; a diagnostic or a
+    /// test leaves it unset.
+    pub dial_observer: daer_outbound::ObserverSlot,
 }
 
 impl RouterOptions {
@@ -240,6 +257,8 @@ impl RouterOptions {
             so_mark: None,
             fake_ip: None,
             dns_snooper: None,
+            kernel_observer: None,
+            dial_observer: None,
         }
     }
 
@@ -254,6 +273,20 @@ impl RouterOptions {
     #[must_use]
     pub fn with_dns_snooper(mut self, dns_snooper: Option<Arc<daer_dns::DnsSnooper>>) -> Self {
         self.dns_snooper = dns_snooper;
+        self
+    }
+
+    /// Supplies the datapath's per-flow facts.
+    #[must_use]
+    pub fn with_kernel_observer(mut self, observer: Option<Arc<dyn KernelObserver>>) -> Self {
+        self.kernel_observer = observer;
+        self
+    }
+
+    /// Supplies the destination for dial measurements.
+    #[must_use]
+    pub fn with_dial_observer(mut self, observer: daer_outbound::ObserverSlot) -> Self {
+        self.dial_observer = observer;
         self
     }
 
@@ -307,6 +340,10 @@ pub struct Router {
     groups: std::sync::RwLock<HashMap<String, GroupRoute>>,
     fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
     dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
+    /// The datapath's per-flow facts, when one is attached.
+    kernel_observer: Option<Arc<dyn KernelObserver>>,
+    /// Where a dial's measurement goes.
+    dial_observer: daer_outbound::ObserverSlot,
 }
 
 impl Router {
@@ -437,6 +474,8 @@ impl Router {
             groups: std::sync::RwLock::new(groups),
             fake_ip,
             dns_snooper,
+            kernel_observer: options.kernel_observer.clone(),
+            dial_observer: options.dial_observer.clone(),
         })
     }
 
@@ -504,20 +543,7 @@ impl Router {
     /// caller in every one of those cases.
     pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, IngressError> {
         // 1. Check if destination IP maps to a domain via Fake-IP or DNS Snooping.
-        let known_domain = if let Some(fake_ip) = &self.fake_ip {
-            if let std::net::IpAddr::V4(v4) = flow.destination.ip() {
-                fake_ip.reverse_lookup(v4)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-        .or_else(|| {
-            self.dns_snooper
-                .as_ref()
-                .and_then(|snooper| snooper.lookup(flow.destination.ip()))
-        });
+        let known_domain = self.known_domain(flow.destination);
 
         if let Some(domain) = known_domain {
             tracing::debug!(
@@ -526,7 +552,7 @@ impl Router {
                 domain = %domain,
                 "flow resolved via dns mapping"
             );
-            let verdict = self.verdict_with_domain(flow.source, flow.destination, Some(&domain));
+            let verdict = self.verdict_for_flow(flow.source, flow.destination, Some(&domain));
             return self.dial_with_authority(flow, verdict, Some(&domain)).await;
         }
 
@@ -552,11 +578,11 @@ impl Router {
             // The name is borrowed from `outcome`, which lives to the end of this block;
             // the verdict is computed inside it so no borrow outlives the outcome.
             let name = outcome.name();
-            let verdict = self.verdict_with_domain(flow.source, flow.destination, name);
+            let verdict = self.verdict_for_flow(flow.source, flow.destination, name);
             return self.dial_with_authority(flow, verdict, name).await;
         }
 
-        let verdict = self.verdict(flow);
+        let verdict = self.verdict_for_flow(flow.source, flow.destination, None);
         self.dial_with_authority(flow, verdict, None).await
     }
 
@@ -625,7 +651,16 @@ impl Router {
         authority: &str,
     ) -> Result<daer_outbound::Established, IngressError> {
         let node = self.select_node(destination, group)?;
-        node.connect(authority)
+        // The dial is wrapped so its span reaches the observer when one is installed. A group
+        // whose dials are never measured is a group whose slowness has no explanation in any
+        // log: the transport's recorder is filled by netune and then dropped.
+        let observed = daer_outbound::ObservedDialer::new(
+            Arc::clone(&node),
+            self.dial_observer.clone(),
+            group,
+        );
+        observed
+            .connect(authority)
             .await
             .map_err(|error| IngressError::Dial {
                 destination,
@@ -669,7 +704,65 @@ impl Router {
     /// Takes [`FlowFacts`] and an optional sniffed domain name (e.g. from QUIC).
     #[must_use]
     pub fn verdict_for_datagram(&self, facts: FlowFacts, domain: Option<&str>) -> Verdict {
-        self.verdict_with_protocol(facts.source, facts.destination, domain, L4ProtoMask::UDP)
+        self.verdict_with_kernel(
+            facts.source,
+            facts.destination,
+            domain,
+            L4ProtoMask::UDP,
+            self.observe(facts.source, facts.destination, IPPROTO_UDP),
+        )
+    }
+
+    /// The authority a datagram flow should be dialed to.
+    ///
+    /// # Why the datagram half needs this and TCP could do without it
+    ///
+    /// TCP's [`Router::resolve`] walks the same three sources of a name — Fake-IP, the DNS
+    /// snooper, then a QUIC/TLS sniff — and passes the winner to
+    /// [`Router::dial_with_authority`]. The datagram relay used to skip all of it and dial
+    /// `original_destination`, which is correct only when the destination is a real
+    /// address. With Fake-IP enabled the destination is a synthetic `198.18.0.0/15`
+    /// address, so dialing it sends the flow to a host that does not exist; with DNS
+    /// snooping the name is known and dialing the IP silently discards it, which breaks
+    /// every `domain(...)` rule for UDP and makes the flow's own SNI/Host irrelevant to
+    /// where it goes.
+    ///
+    /// The `direct` outbound keeps dialing the literal address: a direct flow is a flow
+    /// whose destination is authoritative, and turning a known domain into a direct dial
+    /// by name would re-resolve through a resolver the user did not ask for.
+    #[must_use]
+    pub fn dial_target(&self, facts: FlowFacts, domain: Option<&str>) -> String {
+        let verdict = self.verdict_for_datagram(facts, domain);
+        if &*verdict.outbound.name == "direct" {
+            return facts.destination.to_string();
+        }
+        match domain {
+            Some(name) => format!("{name}:{}", facts.destination.port()),
+            None => facts.destination.to_string(),
+        }
+    }
+
+    /// The name a datagram flow's destination is known by, if any.
+    ///
+    /// Fake-IP first, then the DNS snooper: the same order [`Router::resolve`] uses for
+    /// TCP, kept in one place so the two halves of the data path cannot disagree about
+    /// which source of truth wins.
+    #[must_use]
+    pub fn known_domain(&self, destination: SocketAddr) -> Option<String> {
+        let from_fake_ip = self.fake_ip.as_ref().and_then(|fake_ip| {
+            if let std::net::IpAddr::V4(v4) = destination.ip() {
+                fake_ip.reverse_lookup(v4)
+            } else {
+                None
+            }
+        });
+        from_fake_ip
+            .or_else(|| {
+                self.dns_snooper
+                    .as_ref()
+                    .and_then(|snooper| snooper.lookup(destination.ip()))
+            })
+            .map(|domain| domain.to_string())
     }
 
     /// Opens the datagram leg for a decided flow.
@@ -720,14 +813,6 @@ impl Router {
             destination: facts.destination,
             source: OutboundError::NoDatagramSupport(group_name.to_string()),
         })
-    }
-
-    /// The routing verdict for a flow, without dialing.
-    ///
-    /// Falls back to the configuration's fallback outbound when no rule matches.
-    #[must_use]
-    pub fn verdict(&self, flow: &Accepted) -> Verdict {
-        self.verdict_for(flow.source, flow.destination)
     }
 
     /// What a group would select right now, for diagnostics.
@@ -786,6 +871,19 @@ impl Router {
     }
 
     /// Explains the decision for a flow, with a sniffed domain.
+    ///
+    /// # What this cannot see, and why that is correct
+    ///
+    /// The flow path uses [`Self::verdict_for_flow`], which asks the datapath for the source
+    /// MAC, DSCP, and process name it observed. `explain` has no flow and therefore no map key,
+    /// so it evaluates with [`KernelFacts::default`]: a `mac(...)`, `dscp(...)`, or `pname(...)`
+    /// rule does **not** match here.
+    ///
+    /// That asymmetry is the honest answer rather than a bug: "what would the rules say about a
+    /// hypothetical flow from A to B" and "what did the kernel see for this flow" are different
+    /// questions, and inventing a MAC for the first would make the diagnostic claim a fact it
+    /// does not have. The rule that a fact nobody observed cannot match is what
+    /// `[INV-KERNEL-FACTS-01]` states.
     #[must_use]
     pub fn explain_with_domain(
         &self,
@@ -841,7 +939,13 @@ impl Router {
         destination: SocketAddr,
         domain: Option<&str>,
     ) -> Trace {
-        let facts = facts_with_domain(source, destination, domain, L4ProtoMask::TCP);
+        let facts = facts_with_kernel(
+            source,
+            destination,
+            domain,
+            L4ProtoMask::TCP,
+            KernelFacts::default(),
+        );
         let mut trace = daer_routing::explain(&self.matches, &facts);
         trace.outbound.get_or_insert_with(|| self.fallback.clone());
         trace
@@ -872,6 +976,36 @@ impl Router {
         self.verdict_with_protocol(source, destination, domain, L4ProtoMask::TCP)
     }
 
+    /// The routing verdict for a TCP flow, asking the datapath what it observed.
+    ///
+    /// This is the form the flow path uses. [`Self::verdict_with_domain`] stays for the
+    /// diagnostic entry points, which have no socket and therefore no map key: a rule needing
+    /// a MAC or a process name correctly fails to match there, because `daer route explain`
+    /// cannot claim to know what the kernel saw for a flow that does not exist.
+    #[must_use]
+    pub fn verdict_for_flow(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        domain: Option<&str>,
+    ) -> Verdict {
+        self.verdict_with_kernel(
+            source,
+            destination,
+            domain,
+            L4ProtoMask::TCP,
+            self.observe(source, destination, IPPROTO_TCP),
+        )
+    }
+
+    /// What the datapath observed for a flow, or the honest default.
+    fn observe(&self, source: SocketAddr, destination: SocketAddr, l4proto: u8) -> KernelFacts {
+        self.kernel_observer
+            .as_ref()
+            .and_then(|observer| observer.observe(source, destination, l4proto))
+            .unwrap_or_default()
+    }
+
     /// The routing verdict for one L4 protocol, with a sniffed domain.
     ///
     /// The protocol is a parameter rather than a constant because `l4proto(tcp)` and
@@ -885,7 +1019,33 @@ impl Router {
         domain: Option<&str>,
         l4proto: L4ProtoMask,
     ) -> Verdict {
-        let facts = facts_with_domain(source, destination, domain, l4proto);
+        self.verdict_with_kernel(source, destination, domain, l4proto, KernelFacts::default())
+    }
+
+    /// The routing verdict, with the facts only the datapath could observe.
+    ///
+    /// # Why the extra argument exists
+    ///
+    /// A redirected flow reaches userspace through an accepted socket, which carries the
+    /// client address and the original destination and nothing else. The source **MAC**, the
+    /// **DSCP**, and the **process name** are gone by then. The kernel writes them into
+    /// `routing_handoff_map` before it defers the flow (ADR-0011), so a caller that has the
+    /// datapath can pass them here; a caller that does not passes the default and gets
+    /// address-and-domain matching, which is what it can prove.
+    ///
+    /// Leaving them out is not a cosmetic loss: a `mac(...)`, `dscp(...)`, or `pname(...)`
+    /// rule compiled into the userspace half matched nothing, so a configuration that read as
+    /// "this app goes direct" silently proxied it instead.
+    #[must_use]
+    pub fn verdict_with_kernel(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        domain: Option<&str>,
+        l4proto: L4ProtoMask,
+        kernel: KernelFacts,
+    ) -> Verdict {
+        let facts = facts_with_kernel(source, destination, domain, l4proto, kernel);
         first_hit(&self.matches, &facts).map_or_else(
             || Verdict {
                 outbound: self.fallback.clone(),
@@ -984,21 +1144,145 @@ impl GroupRoute {
     }
 }
 
-/// Facts for a flow.
+/// What the datapath observed about a flow and userspace cannot.
 ///
-/// Process name, DSCP and source MAC are not known at the ingress: they come from the
-/// kernel's connection state and are supplied as unknown, so a rule that needs them cannot
-/// match by accident. The domain is supplied when the caller sniffed one — an absent
-/// domain is the honest default, because a guessed one would route traffic through the
-/// wrong outbound.
+/// # Why this is a distinct type rather than three more arguments
 ///
-/// Split from `facts` so the two callers — the hot path, which may have sniffed, and the
-/// diagnostic entry points, which have not — share one construction and cannot drift.
-fn facts_with_domain<'a>(
+/// The three fields travel together, come from the same map entry, and are absent for the
+/// same reason (no datapath, or the kernel decided the flow itself). Bundling them makes
+/// "unknown" one value — [`KernelFacts::default`] — instead of three independent zeroes that
+/// a caller could set inconsistently.
+///
+/// The default is the honest answer for a flow whose handoff entry was never written: a rule
+/// that needs one of these facts must not match by accident.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KernelFacts {
+    /// The client's source MAC, when the datapath saw the packet.
+    pub mac: MacAddr,
+    /// The packet's DSCP.
+    pub dscp: u8,
+    /// The process that opened the flow, when the cgroup hooks are attached.
+    pub process_name: ProcessName,
+}
+
+impl KernelFacts {
+    /// Builds the facts from a `routing_handoff_map` entry.
+    ///
+    /// A `pid` of `0` means the cgroup hooks were not attached (see ADR-0011's kernel
+    /// policy), and the C leaves `pname` empty in that case; the process name is then
+    /// reported as unknown rather than as the empty string a rule could match.
+    #[must_use]
+    pub fn from_handoff(result: &daer_ebpf::abi::RoutingResult) -> Self {
+        let process_name = if result.pid == 0 {
+            ProcessName::from_bytes_truncated(b"")
+        } else {
+            ProcessName::from_bytes_truncated(&result.pname)
+        };
+        Self {
+            mac: MacAddr(result.mac),
+            dscp: result.dscp,
+            process_name,
+        }
+    }
+}
+
+/// What a flow's kernel-side facts come from.
+///
+/// # Why a trait, and why on the router
+///
+/// `routing_handoff_map` is a BPF map: reading it needs `&mut Ebpf`, which the accept loop
+/// cannot hold (it serves many flows concurrently and the map handle is not `Sync`). The
+/// datapath handle therefore owns the map and exposes this narrow trait, and the router
+/// holds an `Arc<dyn KernelObserver>`. A router built without a datapath — the diagnostics,
+/// the tests, `--no-datapath` — has no observer and gets [`KernelFacts::default`], which is
+/// exactly the behaviour it had before the map was read at all.
+///
+/// Implementations must be cheap and non-blocking: this runs once per flow, before the
+/// routing decision.
+pub trait KernelObserver: Send + Sync + std::fmt::Debug {
+    /// The facts the datapath recorded for this flow, or `None` when it recorded none.
+    fn observe(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        l4proto: u8,
+    ) -> Option<KernelFacts>;
+}
+
+/// A [`KernelObserver`] over the datapath's handoff map.
+///
+/// The map is behind a `Mutex` because `aya`'s map lookup needs `&mut`. The lock is held for
+/// one `bpf_map_lookup_elem` and never across an `await`, so a flow pays a uncontended mutex
+/// plus one syscall — the same order as the `peek` the sniffer already does.
+#[derive(Debug)]
+pub struct HandoffObserver {
+    ebpf: std::sync::Mutex<Option<aya::Ebpf>>,
+}
+
+impl HandoffObserver {
+    /// Takes ownership of the loaded object.
+    ///
+    /// The object is *moved* here rather than borrowed: it is what keeps the programs
+    /// attached, so its owner is the datapath handle, and the observer is the one part of
+    /// that handle the flow path needs.
+    #[must_use]
+    pub fn new(ebpf: aya::Ebpf) -> Self {
+        Self {
+            ebpf: std::sync::Mutex::new(Some(ebpf)),
+        }
+    }
+
+    /// Runs `f` with the object, for the code that republishes the policy on reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the object has already been taken, which would be a shutdown
+    /// race rather than a data-path condition.
+    pub fn with_ebpf<T>(&self, f: impl FnOnce(&mut aya::Ebpf) -> T) -> Result<T, String> {
+        let mut guard = self.ebpf.lock().unwrap_or_else(|e| e.into_inner());
+        let ebpf = guard
+            .as_mut()
+            .ok_or_else(|| "the datapath object is no longer owned".to_owned())?;
+        Ok(f(ebpf))
+    }
+
+    /// Detaches the object, returning it to the caller.
+    pub fn take(&self) -> Option<aya::Ebpf> {
+        self.ebpf.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl KernelObserver for HandoffObserver {
+    fn observe(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        l4proto: u8,
+    ) -> Option<KernelFacts> {
+        let mut guard = self.ebpf.lock().unwrap_or_else(|e| e.into_inner());
+        let ebpf = guard.as_mut()?;
+        let key = daer_ebpf::abi::TuplesKey::of(source, destination, l4proto);
+        let entry = daer_ebpf::Handoff::new(ebpf).lookup(key)?;
+        Some(KernelFacts::from_handoff(&entry.result))
+    }
+}
+
+/// Facts for a flow, with whatever the datapath observed.
+///
+/// The domain is supplied when the caller sniffed one — an absent domain is the honest
+/// default, because a guessed one would route traffic through the wrong outbound. The
+/// kernel-supplied fields come from [`KernelFacts`], which is the default (all unknown) for
+/// a flow the kernel never handed off.
+///
+/// One construction for both callers — the hot path, which may have sniffed and may have a
+/// handoff entry, and the diagnostic entry points, which have neither — so the two cannot
+/// drift.
+fn facts_with_kernel<'a>(
     source: SocketAddr,
     destination: SocketAddr,
     domain: Option<&'a str>,
     l4proto: L4ProtoMask,
+    kernel: KernelFacts,
 ) -> MatchFacts<'a> {
     MatchFacts {
         source_addr: source.ip(),
@@ -1007,9 +1291,9 @@ fn facts_with_domain<'a>(
         dest_port: destination.port(),
         l4proto,
         domain,
-        process_name: ProcessName::from_bytes_truncated(b""),
-        dscp: 0,
-        mac: MacAddr([0; 6]),
+        process_name: kernel.process_name,
+        dscp: kernel.dscp,
+        mac: kernel.mac,
     }
 }
 
@@ -1371,7 +1655,13 @@ fallback = "direct"
     #[test]
     fn facts_carry_the_tuple_and_leave_the_unknowns_unknown() {
         let (source, destination) = flow(443);
-        let facts = facts_with_domain(source, destination, None, L4ProtoMask::TCP);
+        let facts = facts_with_kernel(
+            source,
+            destination,
+            None,
+            L4ProtoMask::TCP,
+            KernelFacts::default(),
+        );
         assert_eq!(facts.source_port, 41_234);
         assert_eq!(facts.dest_port, 443);
         assert_eq!(facts.l4proto, L4ProtoMask::TCP);
@@ -1380,5 +1670,131 @@ fallback = "direct"
         assert!(facts.process_name.is_unspecified());
         assert_eq!(facts.dscp, 0);
         assert_eq!(facts.mac, MacAddr([0; 6]));
+    }
+
+    /// An observer that reports fixed facts, standing in for the datapath's map.
+    #[derive(Debug)]
+    struct FixedObserver(KernelFacts);
+
+    impl KernelObserver for FixedObserver {
+        fn observe(
+            &self,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+            _l4proto: u8,
+        ) -> Option<KernelFacts> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn a_mac_rule_matches_only_when_the_datapath_supplied_the_mac() {
+        // The falsifier for the silently-inert rule class. `mac(...)` was compiled into the
+        // userspace half of a partitioned policy, and `MatchFacts` was built with `[0; 6]`, so
+        // the rule could never fire: a configuration that read "this device goes direct"
+        // proxied it instead, with no warning and no log line.
+        let source = r#"
+[[group]]
+name = "proxy"
+policy = "fixed(0)"
+
+[routing]
+rules = ["mac(00:11:22:33:44:55) -> block"]
+fallback = "proxy"
+"#;
+        let (from, to) = flow(443);
+
+        // Without an observer: the rule cannot fire, and the fallback applies.
+        let blind = router(source);
+        assert_eq!(
+            &*blind.verdict_for_flow(from, to, None).outbound.name,
+            "proxy"
+        );
+
+        // With the datapath's facts: the rule fires.
+        let mut name = [0u8; daer_routing::TASK_COMM_LEN];
+        name[..4].copy_from_slice(b"curl");
+        let observer = Arc::new(FixedObserver(KernelFacts {
+            mac: MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            dscp: 0,
+            process_name: daer_routing::ProcessName::from_bytes_truncated(&name),
+        }));
+        let config = daer_config::toml_config::load_str(source).expect("config loads");
+        let seeing = Router::new(
+            &config,
+            GenerationId::new(7),
+            &RouterOptions::default().with_kernel_observer(Some(observer)),
+        )
+        .expect("router builds");
+        assert_eq!(
+            &*seeing.verdict_for_flow(from, to, None).outbound.name,
+            "block"
+        );
+    }
+
+    #[test]
+    fn a_pname_rule_matches_only_when_the_datapath_supplied_the_process() {
+        let source = r#"
+[[group]]
+name = "proxy"
+policy = "fixed(0)"
+
+[routing]
+rules = ["pname(curl) -> block"]
+fallback = "proxy"
+"#;
+        let (from, to) = flow(443);
+        let mut name = [0u8; daer_routing::TASK_COMM_LEN];
+        name[..4].copy_from_slice(b"curl");
+
+        let observer = Arc::new(FixedObserver(KernelFacts {
+            mac: MacAddr([0; 6]),
+            dscp: 0,
+            process_name: daer_routing::ProcessName::from_bytes_truncated(&name),
+        }));
+        let config = daer_config::toml_config::load_str(source).expect("config loads");
+        let router = Router::new(
+            &config,
+            GenerationId::new(7),
+            &RouterOptions::default().with_kernel_observer(Some(observer)),
+        )
+        .expect("router builds");
+        assert_eq!(
+            &*router.verdict_for_flow(from, to, None).outbound.name,
+            "block"
+        );
+
+        // A different process name must not match, which is what proves the rule is reading
+        // the fact rather than the presence of an observer.
+        let other = Arc::new(FixedObserver(KernelFacts::default()));
+        let config = daer_config::toml_config::load_str(source).expect("config loads");
+        let router = Router::new(
+            &config,
+            GenerationId::new(7),
+            &RouterOptions::default().with_kernel_observer(Some(other)),
+        )
+        .expect("router builds");
+        assert_eq!(
+            &*router.verdict_for_flow(from, to, None).outbound.name,
+            "proxy"
+        );
+    }
+
+    #[test]
+    fn a_pid_of_zero_reports_the_process_name_as_unknown() {
+        // `pid == 0` means the cgroup hooks are not attached, and the C leaves `pname` empty.
+        // Treating the empty array as a name would let `pname()` match an empty string.
+        let result = daer_ebpf::abi::RoutingResult {
+            pid: 0,
+            pname: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+            mac: [1, 2, 3, 4, 5, 6],
+            dscp: 46,
+            ..daer_ebpf::abi::RoutingResult::default()
+        };
+        let facts = KernelFacts::from_handoff(&result);
+        assert!(facts.process_name.is_unspecified());
+        // The MAC and DSCP are still real: they come from the packet, not from the hooks.
+        assert_eq!(facts.mac, MacAddr([1, 2, 3, 4, 5, 6]));
+        assert_eq!(facts.dscp, 46);
     }
 }

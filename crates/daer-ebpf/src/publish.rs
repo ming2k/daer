@@ -275,8 +275,7 @@ pub fn publish_outbound_connectivity(
 /// Returns the OS error when the map is missing or is not a `SOCKMAP`.
 pub fn publish_listeners(
     ebpf: &mut Ebpf,
-    tcp4: std::os::fd::RawFd,
-    tcp6: std::os::fd::RawFd,
+    listeners: crate::listeners::Listeners,
 ) -> std::io::Result<()> {
     use aya::maps::SockMap;
 
@@ -294,17 +293,16 @@ pub fn publish_listeners(
             crate::names::map::LISTEN_SOCKET
         ))
     })?;
-    // The keys are the C's own: 0 is tcp4, 1 is udp, 2 is tcp6. UDP has no listener yet —
-    // datagram relay is a known gap — so its slot stays empty rather than pointing at a TCP
-    // socket that would corrupt the flow.
+    // The keys are the C's own: 0 is tcp4, 1 is udp, 2 is tcp6. All three are written:
+    // leaving the UDP slot empty was how every datagram on the eBPF path disappeared, since
+    // `assign_listener(skb, IPPROTO_UDP)` looks up key 1 and returns -1 when it is absent.
     // `SockMap::set` wants references: the fd is borrowed for the duration of the call and
     // the kernel takes its own reference, so the fd stays owned by the caller.
-    map.set(0, &tcp4, 0).map_err(|error| {
-        std::io::Error::other(format!("cannot publish the tcp4 listener: {error}"))
-    })?;
-    map.set(2, &tcp6, 0).map_err(|error| {
-        std::io::Error::other(format!("cannot publish the tcp6 listener: {error}"))
-    })?;
+    for (key, fd, family) in listeners.entries() {
+        map.set(key, &fd, 0).map_err(|error| {
+            std::io::Error::other(format!("cannot publish the {family} listener: {error}"))
+        })?;
+    }
     Ok(())
 }
 

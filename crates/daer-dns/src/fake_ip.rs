@@ -17,8 +17,128 @@ pub struct FakeIpPool {
     enabled: bool,
     net: Ipv4Net,
     pool_size: usize,
-    exclude: Vec<String>,
+    /// The compiled exclusion list.
+    ///
+    /// Compiled rather than compared as strings: ADR-0012 documents
+    /// `exclude = ["geosite:cn", "domain(suffix: local)"]`, and the previous
+    /// `ends_with` comparison would have looked for a domain literally ending in
+    /// `.geosite:cn` — matching nothing, so the exclusion the operator wrote was silently
+    /// inert and every Chinese domain got a synthetic address.
+    exclude: Exclusions,
     state: Mutex<PoolState>,
+}
+
+/// A compiled `dns.fake-ip.exclude` list.
+///
+/// Three pattern forms, because that is what an operator writes:
+///
+/// * `example.com` — a suffix (the bare name and its subdomains), the common case;
+/// * `full:example.com` / `suffix:example.com` / `keyword:ads` / `regex:^ads\.` — the same
+///   keys a routing rule uses;
+/// * `geosite:cn` — a category from `geosite.dat`, resolved before this type is built.
+#[derive(Debug, Default)]
+struct Exclusions {
+    /// Plain suffixes and `suffix:` patterns.
+    suffixes: daer_routing::domain::DomainIndex,
+    /// `full:` patterns.
+    exact: daer_routing::domain::DomainIndex,
+    /// `keyword:` patterns.
+    keywords: daer_routing::domain::DomainIndex,
+    /// `regex:` patterns.
+    regexes: daer_routing::domain::DomainIndex,
+}
+
+impl Exclusions {
+    /// Compiles the configured patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the pattern whose key is not one of the four accepted
+    /// spellings. A silently ignored pattern would disable an exclusion the operator
+    /// believes is active.
+    fn compile(patterns: &[String]) -> Result<Self, String> {
+        let mut suffixes = Vec::new();
+        let mut exact = Vec::new();
+        let mut keywords = Vec::new();
+        let mut regexes = Vec::new();
+        for pattern in patterns {
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // `geosite:` cannot be resolved here: this type has no dat reader. The loader
+            // expands it before building the pool, so reaching this arm means the expansion
+            // did not happen, and guessing would be worse than refusing.
+            if trimmed.contains(':') {
+                let (key, value) = trimmed.split_once(':').expect("contains a colon");
+                let key = key.trim();
+                let value = value.trim();
+                match key {
+                    "full" => exact.push(value),
+                    "suffix" => suffixes.push(value),
+                    "keyword" => keywords.push(value),
+                    "regex" => regexes.push(value),
+                    "geosite" | "geoip" | "ext" => {
+                        return Err(format!(
+                            "dns.fake-ip.exclude: {trimmed:?} is a category, not a domain \
+                             pattern; expand it before building the pool"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "dns.fake-ip.exclude: {other:?} is not a domain matcher key \
+                             (expected full, suffix, keyword, or regex)"
+                        ));
+                    }
+                }
+            } else {
+                suffixes.push(trimmed);
+            }
+        }
+        let mut warnings = Vec::new();
+        let exclusions = Self {
+            suffixes: daer_routing::domain::DomainIndex::new(
+                daer_routing::domain::DomainKey::Suffix,
+                &suffixes,
+                &mut warnings,
+            ),
+            exact: daer_routing::domain::DomainIndex::new(
+                daer_routing::domain::DomainKey::Full,
+                &exact,
+                &mut warnings,
+            ),
+            keywords: daer_routing::domain::DomainIndex::new(
+                daer_routing::domain::DomainKey::Keyword,
+                &keywords,
+                &mut warnings,
+            ),
+            regexes: daer_routing::domain::DomainIndex::new(
+                daer_routing::domain::DomainKey::Regex,
+                &regexes,
+                &mut warnings,
+            ),
+        };
+        for warning in warnings {
+            tracing::warn!(%warning, "dns.fake-ip.exclude");
+        }
+        Ok(exclusions)
+    }
+
+    /// True when `domain` matches any pattern.
+    fn matches(&self, domain: &str) -> bool {
+        self.suffixes.matches(domain)
+            || self.exact.matches(domain)
+            || self.keywords.matches(domain)
+            || self.regexes.matches(domain)
+    }
+
+    /// True when no pattern was configured.
+    fn is_empty(&self) -> bool {
+        self.suffixes.is_empty()
+            && self.exact.is_empty()
+            && self.keywords.is_empty()
+            && self.regexes.is_empty()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -42,7 +162,7 @@ impl FakeIpPool {
             enabled: config.enabled,
             net,
             pool_size: config.pool_size.max(1),
-            exclude: config.exclude.clone(),
+            exclude: Exclusions::compile(&config.exclude)?,
             state: Mutex::new(PoolState::default()),
         })
     }
@@ -65,10 +185,10 @@ impl FakeIpPool {
         self.pool_size
     }
 
-    /// The exclusion list.
+    /// Whether the exclusion list is empty.
     #[must_use]
-    pub fn exclude(&self) -> &[String] {
-        &self.exclude
+    pub fn has_exclusions(&self) -> bool {
+        !self.exclude.is_empty()
     }
 
     /// Whether an address falls within the configured Fake-IP subnet.
@@ -84,19 +204,17 @@ impl FakeIpPool {
     }
 
     /// Whether a domain is excluded from Fake-IP synthesis.
+    ///
+    /// The pattern syntax is the one ADR-0012 documents (`suffix:`/`full:`/`keyword:`/
+    /// `regex:`, and a bare name as a suffix), evaluated by the same `DomainIndex` the
+    /// routing matcher uses, so an exclusion cannot mean something different from an
+    /// identical routing rule.
     #[must_use]
     pub fn is_excluded(&self, domain: &str) -> bool {
-        let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
-        for pattern in &self.exclude {
-            let pat = pattern.trim_end_matches('.').to_ascii_lowercase();
-            if pat.is_empty() {
-                continue;
-            }
-            if normalized == pat || normalized.ends_with(&format!(".{pat}")) {
-                return true;
-            }
+        if self.exclude.is_empty() {
+            return false;
         }
-        false
+        self.exclude.matches(domain.trim_end_matches('.'))
     }
 
     /// Allocates or returns the synthetic IP associated with `domain`.
@@ -227,7 +345,7 @@ mod tests {
 
         assert!(pool.is_enabled());
         assert_eq!(pool.pool_size(), 100);
-        assert_eq!(pool.exclude().len(), 2);
+        assert!(pool.has_exclusions());
 
         // Exclusion check
         assert!(pool.is_excluded("gateway.local"));
@@ -255,6 +373,71 @@ mod tests {
         assert!(!disabled_pool.is_enabled());
         assert!(!disabled_pool.contains_ip(IpAddr::V4(ip1)));
         assert_eq!(disabled_pool.reverse_lookup(ip1), None);
+    }
+
+    #[test]
+    fn the_exclusion_list_understands_the_documented_pattern_syntax() {
+        // ADR-0012 documents `exclude = ["geosite:cn", "domain(suffix: local)"]`. The old
+        // matcher compared strings with `ends_with`, so `suffix:local` only matched a domain
+        // literally ending in `.suffix:local` — the exclusion the operator wrote was inert
+        // and every excluded name got a synthetic address. This is the falsifier: each form
+        // the ADR names must match the names it is supposed to.
+        let config = FakeIpConfig {
+            enabled: true,
+            inet: "198.18.0.0/15".to_owned(),
+            pool_size: 100,
+            exclude: vec![
+                "suffix:local".to_owned(),
+                "corp.internal".to_owned(),
+                "full:only.example".to_owned(),
+                "keyword:ads".to_owned(),
+                "regex:^track[0-9]+\\.".to_owned(),
+            ],
+        };
+        let pool = FakeIpPool::from_config(&config).expect("pool builds");
+
+        for excluded in [
+            "gateway.local",
+            "srv.corp.internal",
+            "only.example",
+            "ads.example.net",
+            "track7.example.org",
+        ] {
+            assert!(pool.is_excluded(excluded), "{excluded} must be excluded");
+        }
+        for included in ["example.com", "notonly.example", "example.org"] {
+            assert!(
+                !pool.is_excluded(included),
+                "{included} must not be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_category_is_refused_rather_than_ignored() {
+        // `geosite:cn` needs a dat reader, which this type does not have. Accepting the
+        // pattern and matching nothing would silently disable an exclusion; refusing it
+        // makes the loader expand it first, and makes a missed expansion visible.
+        let config = FakeIpConfig {
+            enabled: true,
+            inet: "198.18.0.0/15".to_owned(),
+            pool_size: 100,
+            exclude: vec!["geosite:cn".to_owned()],
+        };
+        let error = FakeIpPool::from_config(&config).expect_err("must refuse");
+        assert!(error.contains("geosite"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_matcher_key_is_refused_by_name() {
+        let config = FakeIpConfig {
+            enabled: true,
+            inet: "198.18.0.0/15".to_owned(),
+            pool_size: 100,
+            exclude: vec!["sufix:local".to_owned()],
+        };
+        let error = FakeIpPool::from_config(&config).expect_err("must refuse");
+        assert!(error.contains("sufix"), "{error}");
     }
 
     #[test]

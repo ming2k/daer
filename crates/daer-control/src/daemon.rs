@@ -184,6 +184,37 @@ impl Daemon {
         self.datagram_stats.as_ref().map(Arc::clone)
     }
 
+    /// The three fds the datapath may assign a redirected flow to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the missing half when the UDP relay could not bind. The
+    /// datapath must not be attached in that state: a redirected datagram with no listener
+    /// in `listen_socket_map[1]` is shot after the datapath has already taken it off the
+    /// direct path, which looks exactly like a network outage.
+    pub fn listeners(&self) -> Result<daer_ebpf::Listeners, String> {
+        let Some(datagrams) = self.datagrams.as_ref() else {
+            return Err(
+                "the UDP relay is not bound, so the datapath has no datagram listener to \
+                 assign a redirected datagram to; refusing to attach rather than dropping \
+                 every UDP flow (see the WARN about the datagram socket)"
+                    .to_owned(),
+            );
+        };
+        let Some(udp) = datagrams.raw_fd() else {
+            return Err(
+                "the datagram ingress cannot expose a socket fd, so the datapath cannot \
+                 assign redirected datagrams to it"
+                    .to_owned(),
+            );
+        };
+        Ok(daer_ebpf::Listeners {
+            tcp4: self.listener.raw_fd_v4(),
+            udp,
+            tcp6: self.listener.raw_fd_v6(),
+        })
+    }
+
     /// The health-check settings of the current generation.
     ///
     /// The whole table rather than just the interval: a probe's URL, HTTP method and UDP DNS
@@ -223,7 +254,9 @@ impl Daemon {
         // receiver and stop when the sender fires.
         let service = crate::datagram::DatagramService {
             ingress: Arc::clone(ingress),
-            router: self.generations.current().router_arc(),
+            router: Arc::new(DatagramRouterForGeneration {
+                generations: Arc::clone(&self.generations),
+            }),
             options: crate::datagram::RelayOptions::default(),
             stats: self.datagram_stats.as_ref().map_or_else(
                 || Arc::new(crate::datagram::DatagramStats::default()),
@@ -328,6 +361,73 @@ impl crate::serve::Decide for RouterForGeneration {
         Box::pin(async move {
             let router = generation.router();
             crate::serve::Decide::decide(router, flow).await
+        })
+    }
+}
+
+/// A [`DatagramRouter`](crate::datagram::DatagramRouter) that reads the *current*
+/// generation per session.
+///
+/// The datagram half had no equivalent of [`RouterForGeneration`]: it captured one
+/// `Arc<Router>` when the relay started, so a `SIGHUP` reload changed nothing for UDP. New
+/// datagram flows kept being routed by the rules the process booted with, silently and
+/// indefinitely, while TCP followed the new file.
+struct DatagramRouterForGeneration {
+    generations: Arc<Generations>,
+}
+
+impl std::fmt::Debug for DatagramRouterForGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DatagramRouterForGeneration(..)")
+    }
+}
+
+impl crate::datagram::DatagramRouter for DatagramRouterForGeneration {
+    fn known_domain(&self, destination: SocketAddr) -> Option<String> {
+        self.generations
+            .current()
+            .router()
+            .known_domain(destination)
+    }
+
+    fn verdict_for_datagram(
+        &self,
+        facts: crate::inbound::FlowFacts,
+        domain: Option<&str>,
+    ) -> crate::decide::Verdict {
+        self.generations
+            .current()
+            .router()
+            .verdict_for_datagram(facts, domain)
+    }
+
+    fn dial_target(&self, facts: crate::inbound::FlowFacts, domain: Option<&str>) -> String {
+        self.generations
+            .current()
+            .router()
+            .dial_target(facts, domain)
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        facts: crate::inbound::FlowFacts,
+        verdict: &'a crate::decide::Verdict,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Arc<dyn daer_outbound::DatagramConnector>,
+                        crate::error::IngressError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        // The generation is pinned into an `Arc` before the future is created: it is what
+        // keeps this session's rules alive even if a reload swaps the generation mid-dial.
+        let generation = self.generations.current();
+        Box::pin(async move {
+            crate::decide::Router::open_datagram(generation.router(), facts, verdict).await
         })
     }
 }

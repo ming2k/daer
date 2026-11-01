@@ -9,6 +9,9 @@
 pub mod abi;
 pub mod elf;
 pub mod epoch;
+#[cfg(feature = "loader")]
+pub mod handoff;
+pub mod listeners;
 pub mod names;
 
 #[cfg(feature = "loader")]
@@ -21,6 +24,9 @@ pub use elf::{ElfError, normalize_section_names};
 pub use epoch::{
     Entry, MapWriter, PublishError, Published, Slot, Stamp, active_slot, publish, rollback,
 };
+#[cfg(feature = "loader")]
+pub use handoff::Handoff;
+pub use listeners::Listeners;
 
 #[cfg(feature = "loader")]
 pub use loader::{LoadError, attach_tc, load, load_path, set_device_ifindex};

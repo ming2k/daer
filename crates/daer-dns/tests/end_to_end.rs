@@ -300,3 +300,125 @@ fallback = "origin"
     assert_eq!(reply.response_code(), ResponseCode::SERVFAIL);
     assert_eq!(resolver.stats().snapshot().upstream_errors, 1);
 }
+
+/// Builds a resolver with Fake-IP on, served on a fresh UDP port.
+async fn fake_ip_server(origin: SocketAddr) -> (SocketAddr, Arc<Resolver>) {
+    let config = daer_config::toml_config::load_str(&format!(
+        r#"
+[dns]
+upstream = ["origin:tcp://{origin}"]
+
+[dns.fake-ip]
+enabled = true
+inet = "198.18.0.0/15"
+pool-size = 256
+exclude = ["suffix:local.example"]
+
+[dns.request]
+fallback = "origin"
+"#
+    ))
+    .expect("config loads");
+    let resolver = Arc::new(Resolver::from_config(&config).expect("resolver builds"));
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("binds");
+    let address = socket.local_addr().expect("addr");
+    let served = Arc::clone(&resolver);
+    tokio::spawn(async move {
+        let _ = serve_udp_on(socket, served, std::future::pending()).await;
+    });
+    (address, resolver)
+}
+
+fn typed_query(id: u16, name: &str, rtype: RecordType) -> Message {
+    Message {
+        id,
+        flags: Flags(0x0100),
+        questions: vec![Question::internet(Name::parse(name).expect("name"), rtype)],
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn fake_ip_synthesises_an_a_record_without_asking_the_upstream() {
+    let (origin_address, origin_calls) = origin().await;
+    let (address, resolver) = fake_ip_server(origin_address).await;
+
+    let reply = ask(address, &typed_query(30, "site.example.com", RecordType::A))
+        .await
+        .expect("a reply");
+    let answer = reply.answers.first().expect("an answer");
+    assert_eq!(answer.rtype, RecordType::A);
+    assert_eq!(
+        origin_calls.load(Ordering::Relaxed),
+        0,
+        "a synthetic answer must not reach the upstream"
+    );
+    let octets: [u8; 4] = answer.rdata.as_slice().try_into().expect("four octets");
+    let synthetic = std::net::Ipv4Addr::from(octets);
+    assert!(
+        resolver
+            .fake_ip()
+            .contains_ip(std::net::IpAddr::V4(synthetic)),
+        "{synthetic} must be inside the configured pool"
+    );
+    // The reverse mapping is what the transparent data path uses to recover the name.
+    let domain = resolver
+        .fake_ip()
+        .reverse_lookup(synthetic)
+        .expect("reverse lookup");
+    assert_eq!(&*domain, "site.example.com");
+}
+
+#[tokio::test]
+async fn fake_ip_suppresses_aaaa_so_a_dual_stack_client_cannot_bypass_the_pool() {
+    // The pool is IPv4-only. Forwarding `AAAA` to the upstream hands a dual-stack client the
+    // real IPv6 address, which it prefers: the flow then never touches the synthetic
+    // address and the whole Fake-IP path is bypassed while the configuration says it is
+    // active. An empty NOERROR is what makes the client fall back to `A`.
+    let (origin_address, origin_calls) = origin().await;
+    let (address, _resolver) = fake_ip_server(origin_address).await;
+
+    let reply = ask(
+        address,
+        &typed_query(31, "site.example.com", RecordType::AAAA),
+    )
+    .await
+    .expect("a reply");
+    assert_eq!(reply.response_code(), ResponseCode::NOERROR);
+    assert!(
+        reply.answers.is_empty(),
+        "AAAA must be answered with no records, got {:?}",
+        reply.answers
+    );
+    assert_eq!(
+        origin_calls.load(Ordering::Relaxed),
+        0,
+        "the suppressed AAAA must not reach the upstream either"
+    );
+}
+
+#[tokio::test]
+async fn an_excluded_name_keeps_its_real_address() {
+    // `exclude = ["suffix:local.example"]`: a name the operator excluded must be resolved
+    // normally, or the box cannot reach its own services through the pool.
+    let (origin_address, origin_calls) = origin().await;
+    let (address, _resolver) = fake_ip_server(origin_address).await;
+
+    let reply = ask(
+        address,
+        &typed_query(32, "printer.local.example", RecordType::A),
+    )
+    .await
+    .expect("a reply");
+    assert_eq!(
+        origin_calls.load(Ordering::Relaxed),
+        1,
+        "an excluded name must reach the upstream"
+    );
+    let answer = reply.answers.first().expect("the real answer");
+    assert_eq!(answer.rdata, vec![93, 184, 216, 34]);
+}

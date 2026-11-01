@@ -99,46 +99,99 @@ than one that refuses to start.
 `SIGHUP` reloads; `SIGTERM`/`SIGINT` stop accepting and give live flows 10s to finish. A
 reload that fails to build publishes nothing, so a typo cannot stop a working proxy.
 
+## The DNS server, and when it starts
+
+`daer run` builds the resolver, its Fake-IP pool, and its DNS snooper **always**, because they
+are the contract between the DNS half and the data path: the resolver writes a name-to-address
+mapping and the router reads it back.
+
+It *listens* only when the configuration asks for it:
+
+| Configuration | DNS listener |
+| --- | --- |
+| `dns.bind` set | started on that address (port 53) |
+| `[dns.fake-ip] enabled = true` | started on `dns.bind`, default `0.0.0.0:53` |
+| neither | **not** started; the daemon logs at `INFO` that it is not the box's resolver |
+
+Binding `0.0.0.0:53` unconditionally would be a regression, not a convenience: a box already
+running `systemd-resolved` would see `daer run` fail with `EADDRINUSE`, and a box that does not
+want daer as its resolver would have one installed anyway. Fake-IP counts as a request because
+the feature is inert without a resolver handing out the synthetic addresses.
+
 ## The socket mark
 
-The datapath redirects by port. Without a mark, daer's *own* outbound connection to the
-origin matches the same rule and is redirected back into daer's listener: the flow appears to
-hang with no error in any log. Setting a mark and excluding it in the redirect rule is what
-separates "flows from clients" from "flows from daer".
+The datapath recognises daer's own traffic by `skb->mark`, not by port. Without a consistent
+mark, daer's *outbound* connection to an origin is caught by its own datapath and redirected
+back into its own listener: the flow appears to hang with no error in any log. The
+end-to-end test measured **17,134** accepted flows for a single client request before the mark
+was threaded through.
 
 ```toml
 [global]
 so-mark = 0x0dae
 ```
 
-```sh
-nft add rule ip daer prerouting meta mark 0x0dae return
+`daer run` applies that value in three places and logs it once:
+
+```text
+INFO listening for redirected flows port=12345 so_mark=Some(3566) generation=gen1
 ```
+
+* the generation's dialers (`SocketConfig::mark`, applied **before** `connect(2)`);
+* `PARAM.dae_socket_mark`, which the datapath compares against `skb->mark`;
+* the redirect exclusion, which is the datapath's own check — there is no firewall rule to
+  write for it.
 
 The mark is *not* applied by default: `SO_MARK` needs `CAP_NET_ADMIN`, so a default would make
 every unprivileged run fail to dial. Set it in production.
 
-## The redirect rules
+## The redirect and the policy routing
 
-The datapath handles redirected traffic; something has to redirect it. With nftables, for
-traffic arriving on `eth0` and destined for the internet:
+`daer run` installs everything the redirect needs. There is no firewall rule to write and no
+`ip rule` to add by hand: the datapath redirects with `bpf_redirect` into the `daer0`/`daer0peer`
+pair, and `daer` owns the state that makes that work.
 
-```sh
-nft add table ip daer
-nft add chain ip daer prerouting '{ type filter hook prerouting priority mangle; }'
-nft add rule ip daer prerouting meta mark 0x0dae return
-nft add rule ip daer prerouting iif eth0 ip daddr @local_nets return
-nft add rule ip daer prerouting iif eth0 tcp tproxy to :12345
-```
+What it sets up, in order, before the first flow is served:
 
-Two things are easy to get wrong:
+| State | Why |
+| --- | --- |
+| `daer0` / `daer0peer` veth pair, both up | the redirect target, and the path the listener is reachable through |
+| `ip rule add fwmark 0x8000000/0x8000000 table 2023` (v4 and v6) | a redirected packet carries a **non-local** destination; the rule is what sends it to a `local` route instead of the forward path |
+| `ip route add local default dev lo table 2023` (v4 and v6) | the destination of that route |
+| `net.ipv4.conf.daer0peer.rp_filter = 0` | reverse-path filtering would drop a packet with a non-local source before `bpf_sk_assign` could deliver it |
+| `net.ipv4.conf.daer0peer.forwarding = 1`, `net.ipv4.conf.all.forwarding = 1` | the gateway role |
+| TC classifiers on every `lan`/`wan` interface | see below |
+| `listen_socket_map` entries `0` (tcp4), `1` (**udp**), `2` (tcp6) | `assign_listener` looks the socket up by key; an empty slot is a flow the datapath has already taken off the direct path and then drops |
 
-* **the mark exclusion must come first**, or daer proxies itself;
-* **local addresses must be excluded**, or the box cannot reach its own services — the
-  proxied destination would be the box itself.
+All of it is removed again when the daemon exits: the rules and routes are owned by a guard
+that deletes them on drop, and the sysctls are restored to whatever they were.
 
-`ip rule`/`ip route` for the transparent port are not needed with `tproxy`: unlike
-`REDIRECT`, the destination is preserved and daer reads it from the socket.
+### Which TC program goes on which interface
+
+Every hook has an `_l2` and an `_l3` variant, and exactly **one** is attached per interface:
+
+| Interface `type` (ARPHRD) | Program variant | Why |
+| --- | --- | --- |
+| `1` (Ethernet: `eth0`, `wlan0`, `enp*`) | `_l2` | a 14-byte Ethernet header precedes the IP header |
+| `0xFFFE`/`512`/`768`/… (TUN, WireGuard, PPP, `netkit`) | `_l3` | the packet starts at the IP header |
+
+Attaching both is not belt-and-braces: the wrong variant reads the first bytes of the IP header
+as a MAC address (or skips 14 bytes into the IP header) and misclassifies every packet on that
+interface. `daer run` reads `/sys/class/net/<if>/type` and refuses an interface whose type has
+no parser, rather than guessing.
+
+`lan` and `wan` are not the same attachment:
+
+* `lan` interfaces get `lan_ingress` and `lan_egress`;
+* `wan` interfaces get `wan_ingress` and `wan_egress`.
+
+## What `--no-datapath` means
+
+`--no-datapath` serves the accept/relay path **without attaching anything**. Nothing is
+redirected into the transparent port, so no traffic is proxied: it exists to exercise the
+control plane in a container without `CAP_BPF`/`CAP_NET_ADMIN`, and `daer run` says so at
+`WARN`. It is not a way to run a proxy with a firewall rule instead — the firewall `tproxy`
+path and the eBPF path are alternatives, and this build implements the eBPF one.
 
 ## systemd
 
@@ -262,43 +315,33 @@ systemctl reload daer
 
 Be aware before trusting it with traffic:
 
-* **UDP** flows are relayed: the daemon owns a transparent datagram socket, drives one session
-  per peer, remembers where each reply goes, and its counters are readable
-  (`Daemon::datagram_stats`). What is **not** proven end to end is the `tproxy` *redirect* of a
-  datagram, and the reason is the test topology rather than the code: `TPROXY` matches on the
-  ingress interface, so proving it needs the origin in a second network namespace, which a
-  development sandbox cannot create. Three single-namespace topologies were tried and each
-  failed for a fixture reason — the redirect also caught the origin's reply; a veth peer's
-  traffic is routed internally so `iif` is `lo` (a `counter` rule saw zero packets); and policy
-  routing alone does not create an `iif`. `crates/daer-control/tests/transparent.rs` states this
-  and skips with the reason. On a two-namespace box, run it there.
-* A REALITY node has **no datagram transport**, so a UDP flow routed to such a group is refused
-  rather than silently sent direct. Silence there would be a leak: the client would believe UDP
-  was tunnelled when it was not.
-* **vmess, plain vless, tuic** are not implemented; a link naming one is
-  listed but not selectable, and is never silently downgraded to `direct`.
-* The **event ring** (per-flow trace, `bpf_trace_printk`) is not consumed yet: there is no
-  per-flow trace beyond the `debug` logs.
-* **`domain(...)` rules keep flows on the userspace path.** The kernel cannot evaluate a domain
-  predicate without `domain_routing_map`, an IP-keyed bitmap the control plane has to maintain
-  from DNS answers; this build does not maintain it. Every flow is then handed to userspace,
-  which is correct but costs a relay hop. The daemon says which tier it is in at startup —
-  see [ADR-0005](adr/0005-kernel-policy-encoding.md).
-
-## The socket mark, and the loop it prevents
-
-`SO_MARK` is not optional in a working deployment, and the value must be the same in three
-places: the daemon's own dials, the datapath's `PARAM.dae_socket_mark`, and the redirect rule's
-exclusion. `daer run` decides it once, applies it to all three, and logs it:
-
-```text
-INFO listening for redirected flows port=12345 so_mark=Some(3566) generation=gen1 …
-```
-
-With `--no-datapath` the mark is `None` on purpose: `SO_MARK` needs `CAP_NET_ADMIN`, so an
-unprivileged run must dial without one.
-
-The failure this prevents is not theoretical. Without a consistent mark the daemon's own
-connection to an origin matches the same `tproxy` rule as a client's and is redirected back into
-the listener: the end-to-end test observed **17,134** accepted flows for a single client request
-before the mark was threaded through, and the flow simply hung.
+* **vmess, plain vless, tuic** are not implemented; a link naming one is listed but not
+  selectable, and is never silently downgraded to `direct`.
+* A REALITY node has **no datagram transport**, so a UDP flow routed to such a group is
+  refused rather than silently sent direct. Silence there would be a leak: the client would
+  believe UDP was tunnelled when it was not.
+* The **event ring** (per-flow trace) is not consumed yet: there is no per-flow trace beyond
+  the `debug` logs.
+* **`domain(...)` rules keep flows on the userspace path.** The kernel cannot evaluate a
+  domain predicate without `domain_routing_map`, an IP-keyed bitmap the control plane would
+  have to maintain from DNS answers; this build does not maintain it. Every flow is then
+  handed to userspace, which is correct but costs a relay hop. The daemon says which tier it
+  is in at startup — see [ADR-0005](../adr/0005-kernel-policy-encoding.md). The facts the kernel
+  did observe (source MAC, DSCP, process name) **are** read back from
+  `routing_handoff_map`, so `mac(...)`, `dscp(...)`, and `pname(...)` rules do match on that
+  path.
+* **IPv6 UDP is not proxied on the eBPF path.** The datapath's `assign_listener` uses one
+  family-independent key for datagrams (`key = &one_key`) while TCP picks a key by family, so
+  `listen_socket_map` has a single datagram slot and it holds the IPv4 socket. A v6 datagram
+  redirected by the kernel is assigned to a socket that cannot receive it. IPv4 UDP and all TCP
+  are unaffected; the daemon says so at `WARN` when it attaches. The fix belongs in the C
+  datapath (a fourth key, or `bpf_sk_lookup_udp`), not in userspace, and guessing a second slot
+  would silently mismatch the object.
+* The **`tproxy` redirect of a datagram is not proven end to end**, and the reason is the test
+  topology rather than the code: `TPROXY` matches on the ingress interface, so proving it needs
+  the origin in a second network namespace, which a development sandbox cannot create. Three
+  single-namespace topologies were tried and each failed for a fixture reason. On a
+  two-namespace box, run `crates/daer-control/tests/transparent.rs` there; it states the
+  limitation and skips with the reason. What *is* proven in one namespace: the reply leaves
+  from the original destination (not from the transparent port), one client port talking to
+  two destinations gets two sessions, and the reply-socket cache evicts instead of leaking fds.

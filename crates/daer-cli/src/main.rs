@@ -1027,13 +1027,35 @@ fallback = "proxy"
 
     #[test]
     fn rejects_missing_geodata() {
+        // The asset search is confined to the temp directory. Left unconfined it falls back
+        // to `/usr/share/daer`, where a packaged installation keeps the real `geoip.dat`, so
+        // this test would report "found" on any machine with daer installed and only fail on
+        // a clean checkout — which is the opposite of what it claims to prove.
         let dir = TempDir::new("missing");
         let config = dir.write(
             "config.toml",
             b"[routing]\nrules = [\"dip(geoip:cn) -> direct\"]\nfallback = \"direct\"\n",
         );
-        let error = block_on(validate_config(&config)).expect_err("must fail");
+        // `block_on` inside the closure, not outside: the closure returns an *unpolled*
+        // future, so confining the environment around it alone would remove the variable
+        // before the search ran — which is exactly how this test failed silently once.
+        let error = confined(|| block_on(validate_config(&config))).expect_err("must fail");
         assert!(format!("{error:#}").contains("geoip.dat"), "{error:#}");
+    }
+
+    /// Runs `f` with the geodata search confined to the configuration's own directory.
+    ///
+    /// The environment is process-global and the tests run in parallel, so the variable is
+    /// only set for the duration of `f` and the lock serialises the tests that use it.
+    fn confined<T>(f: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above serialises every use of this variable in the test binary.
+        unsafe { std::env::set_var("DAER_ASSETS_CONFINED", "1") };
+        let out = f();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("DAER_ASSETS_CONFINED") };
+        out
     }
 
     #[test]

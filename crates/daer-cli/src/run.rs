@@ -91,10 +91,23 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     } else {
         Some(loaded.global.so_mark.unwrap_or(DEFAULT_SOCKET_MARK))
     };
-    let options_router =
-        RouterOptions::with_assets_beside(&options.config).with_socket_mark(so_mark);
+
+    // The DNS half is built first, and its Fake-IP pool and snooper are handed to every
+    // generation. Without this the pool existed and nothing wrote to it: the resolver's
+    // synthetic addresses were unknown to the router, so Fake-IP could never work through
+    // the daemon. One pool for the process also survives a reload, which is what a client's
+    // open connections to a synthetic address require.
+    let (dns, fake_ip, snooper) = start_dns(&loaded, &options).await?;
+    let base_options = RouterOptions::with_assets_beside(&options.config)
+        .with_socket_mark(so_mark)
+        .with_fake_ip(fake_ip)
+        .with_dns_snooper(Some(snooper))
+        // A dial's span reaches the journal. Without this the transport's recorder is filled
+        // by netune and dropped, so "why is this node slow" has no answer in any log — which is
+        // exactly the state the daemon was in before the observer existed.
+        .with_dial_observer(Some(std::sync::Arc::new(daer_outbound::LogObserver)));
     let daemon =
-        Daemon::bind(&loaded, &options_router).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Daemon::bind(&loaded, &base_options).map_err(|error| anyhow::anyhow!("{error}"))?;
     tracing::info!(
         port = daemon.port,
         so_mark = ?so_mark,
@@ -102,7 +115,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         "listening for redirected flows"
     );
 
-    let mut ebpf = if options.no_datapath {
+    let ebpf: Option<daer_control::datapath::Attached> = if options.no_datapath {
         tracing::warn!(
             "serving without the kernel datapath (--no-datapath): nothing is redirected \
              into the transparent port, so no traffic is actually proxied"
@@ -112,6 +125,40 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         Some(attach(&daemon, &options, &lan, &wan, so_mark).await?)
     };
 
+    // The observer only exists once the datapath is attached, so the generation that will
+    // serve has to be rebuilt with it. This is not cosmetic: without the observer the router
+    // matches on addresses and the sniffed name only, so every `mac(...)`, `dscp(...)`, and
+    // `pname(...)` rule is compiled, accepted, and inert.
+    let options_router = match ebpf.as_ref() {
+        Some(attached) => {
+            let with_observer = base_options
+                .clone()
+                .with_kernel_observer(Some(attached.observer()));
+            // A rebuild, not a mutation: a generation is immutable once published, and the
+            // reload path is the only thing that replaces one. A failure here leaves the
+            // address-only generation serving, which is correct but degraded, so it is a
+            // warning rather than a refusal.
+            match daemon.reload(&loaded, &with_observer) {
+                Ok(()) => {
+                    tracing::info!(
+                        generation = %daemon.generation().describe(),
+                        "generation rebuilt with the datapath's flow facts (mac/dscp/pname)"
+                    );
+                    with_observer
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not rebuild the generation with the datapath's flow facts; \
+                         mac/dscp/pname rules will not match"
+                    );
+                    base_options
+                }
+            }
+        }
+        None => base_options,
+    };
+
     if options.dry_run {
         tracing::info!("--dry-run: datapath attached, exiting without serving");
         return Ok(());
@@ -119,11 +166,155 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
 
     // ADR-0006: health scheduling is part of the daemon, not an optional extra. Without it a
     // latency policy's alive set stays empty and every flow to such a group is refused.
-    let (health_stop, _health) = start_health(&daemon);
+    let mut health = start_health(&daemon);
 
-    let result = serve_until_signal(&daemon, &options, &options_router, ebpf.as_mut()).await;
-    let _ = health_stop.send(true);
+    let result = serve_until_signal(
+        &daemon,
+        &options,
+        &options_router,
+        ebpf.as_ref(),
+        &mut health,
+    )
+    .await;
+    health.stop();
+    if let Some(dns) = dns {
+        dns.stop().await;
+    }
     result
+}
+
+/// Prepares the DNS half and starts a server **only when the configuration asks for one**.
+///
+/// # Why the daemon has a DNS half at all
+///
+/// A transparent proxy that does not answer DNS cannot route by name for a client that
+/// resolves through it, and — more concretely — Fake-IP has nowhere to allocate an address.
+/// The resolver already existed as its own subcommand, but `daer run` never started it, so
+/// the daemon's `FakeIpPool` and `DnsSnooper` were empty structs nothing wrote to: every
+/// synthetic destination was unknown, and `domain(...)` rules could only fire from a
+/// sniffed SNI.
+///
+/// # Why the server is conditional
+///
+/// Binding `0.0.0.0:53` unconditionally is not a convenience, it is a regression: a box
+/// already running `systemd-resolved` (or any resolver on port 53) would see `daer run` fail
+/// with `EADDRINUSE`, and a box that does not want daer to be its resolver would have one
+/// installed anyway. The listener is started when the operator said so — `dns.bind` is set,
+/// or Fake-IP is enabled, which has no meaning without a resolver to hand out the synthetic
+/// addresses. Otherwise the daemon still builds the pool and the snooper (so a later reload
+/// that turns Fake-IP on needs no second path) and says at `INFO` that it is not serving.
+///
+/// # Why the state is returned rather than owned here
+///
+/// The pool and the snooper are the *contract* between the two halves: DNS writes a
+/// name-to-address mapping, the data path reads it back. They are owned by the process (this
+/// function hands them to `RouterOptions`, which every generation clones) so a `SIGHUP`
+/// reload keeps the mappings a client's open connections depend on.
+///
+/// # Errors
+///
+/// Returns the resolver build error or, when the server was asked for, the bind error. Both
+/// are load-time failures: a daemon that cannot answer the queries it was configured to serve
+/// is a configuration the operator has to fix, not one to serve around.
+async fn start_dns(
+    config: &daer_config::Config,
+    options: &RunOptions,
+) -> anyhow::Result<(
+    Option<DnsHandle>,
+    Option<std::sync::Arc<daer_dns::FakeIpPool>>,
+    std::sync::Arc<daer_dns::DnsSnooper>,
+)> {
+    // The pool is built from the configuration even when Fake-IP is disabled: the type
+    // reports `is_enabled()`, and building it unconditionally means a reload that turns
+    // Fake-IP on does not need a second constructor path.
+    let fake_ip = std::sync::Arc::new(
+        daer_dns::FakeIpPool::from_config(&config.dns.fake_ip)
+            .map_err(|error| anyhow::anyhow!("dns.fake-ip: {error}"))?,
+    );
+    let snooper = std::sync::Arc::new(daer_dns::DnsSnooper::default());
+
+    // Fake-IP without a resolver is inert: nothing allocates a synthetic address, so the pool
+    // would never be consulted. Treating it as a request for the server is what makes the
+    // feature usable without a second configuration key.
+    let wants_server = config.dns.bind.is_some() || config.dns.fake_ip.enabled;
+    let transports = crate::dns::transports(config)?;
+    let resolver = std::sync::Arc::new(
+        daer_dns::Resolver::with_state(
+            config,
+            transports,
+            std::sync::Arc::clone(&fake_ip),
+            std::sync::Arc::clone(&snooper),
+        )
+        .map_err(|error| anyhow::anyhow!("cannot build the dns resolver: {error}"))?,
+    );
+
+    if !wants_server {
+        tracing::info!(
+            "dns server not started: `dns.bind` is unset and fake-ip is disabled, so this \
+             daemon is not the box's resolver (set `dns.bind` to serve, or enable `[dns.fake-ip]`)"
+        );
+        return Ok((None, Some(fake_ip), snooper));
+    }
+
+    let plan = crate::dns::Plan::resolve(config, None, false, false).map_err(anyhow::Error::msg)?;
+    let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut udp_shutdown = shutdown.subscribe();
+    let mut tcp_shutdown = shutdown.subscribe();
+    let udp = plan.udp.then(|| {
+        let resolver = std::sync::Arc::clone(&resolver);
+        let address = plan.address;
+        tokio::spawn(async move {
+            daer_dns::serve_udp(resolver, address, async move {
+                let _ = udp_shutdown.recv().await;
+            })
+            .await
+        })
+    });
+    let tcp = plan.tcp.then(|| {
+        let resolver = std::sync::Arc::clone(&resolver);
+        let address = plan.address;
+        tokio::spawn(async move {
+            daer_dns::serve_tcp(resolver, address, async move {
+                let _ = tcp_shutdown.recv().await;
+            })
+            .await
+        })
+    });
+    tracing::info!(
+        plan = %plan.describe(),
+        fake_ip = fake_ip.is_enabled(),
+        "dns server started: name-based routing and fake-ip are live"
+    );
+    let _ = options;
+    Ok((
+        Some(DnsHandle { shutdown, udp, tcp }),
+        Some(fake_ip),
+        snooper,
+    ))
+}
+
+/// The running DNS server, stopped on shutdown.
+///
+/// Holds the broadcast sender rather than the tasks' join handles: dropping the sender makes
+/// every receiver's `recv` return, which is how the two servers stop together.
+struct DnsHandle {
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    udp: Option<tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>>,
+    tcp: Option<tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>>,
+}
+
+impl DnsHandle {
+    /// Signals both servers and waits for them.
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        for handle in [self.udp, self.tcp].into_iter().flatten() {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "dns server stopped with an error"),
+                Err(error) => tracing::warn!(%error, "dns server task did not finish"),
+            }
+        }
+    }
 }
 
 /// Prepares the device pair and attaches the datapath.
@@ -133,7 +324,7 @@ async fn attach(
     lan: &[String],
     wan: &[String],
     so_mark: Option<u32>,
-) -> anyhow::Result<aya::Ebpf> {
+) -> anyhow::Result<daer_control::datapath::Attached> {
     let object_path = resolve_object_path(&options.object);
     if !object_path.exists() {
         return Err(anyhow::anyhow!(
@@ -169,15 +360,18 @@ async fn attach(
         socket_mark: so_mark.unwrap_or(0),
     };
 
+    // The listeners come from the daemon rather than being assembled here: the UDP fd is
+    // part of the same contract, and a datapath attached without it drops every datagram
+    // it redirects.
+    let listeners = daemon
+        .listeners()
+        .map_err(|reason| anyhow::anyhow!("cannot attach the datapath: {reason}"))?;
     let ebpf = datapath::attach(
         &object_path,
         &param,
         lan,
         wan,
-        daer_control::datapath::Listeners {
-            tcp4: daemon.listener.raw_fd_v4(),
-            tcp6: daemon.listener.raw_fd_v6(),
-        },
+        listeners,
         &daemon.generation().router().kernel_policy(),
     )
     .map_err(|error| anyhow::anyhow!("cannot attach the datapath: {error}"))?;
@@ -190,23 +384,46 @@ async fn attach(
         object = %object_path.display(),
         "datapath attached: redirected flows will be proxied"
     );
+    // The C's `assign_listener` has one family-independent slot for datagrams, so a redirected
+    // IPv6 datagram is assigned to the IPv4 socket and dropped. Saying so at startup is the
+    // difference between "v6 UDP does not work" and "the network is broken".
+    tracing::warn!(
+        "IPv6 UDP is not proxied on the eBPF path: the datapath has one datagram listener slot \
+         and it holds the IPv4 socket. IPv4 UDP, and all TCP, are unaffected"
+    );
     Ok(ebpf)
 }
 
 fn resolve_object_path(path: &Path) -> PathBuf {
+    resolve_object_path_in(path, INSTALLED_OBJECT_PATHS)
+}
+
+/// Where a packaged installation puts the datapath object.
+const INSTALLED_OBJECT_PATHS: [&str; 3] = [
+    "/usr/lib/daer/datapath.o",
+    "/usr/local/lib/daer/datapath.o",
+    "/usr/share/daer/datapath.o",
+];
+
+/// [`resolve_object_path`] with the search path injected.
+///
+/// Split out because the public form reads the host's `/usr/lib`, which makes a test of
+/// "no candidate exists" pass or fail depending on what the machine has installed. That is
+/// the definition of a test that cannot be trusted: it was green on a clean checkout and red
+/// on any box with a packaged daer.
+fn resolve_object_path_in(
+    path: &Path,
+    candidates: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> PathBuf {
     if path.exists() {
         return path.to_path_buf();
     }
     // If the path was the default relative path and does not exist in the working directory,
     // look in standard system-wide installation locations before failing.
-    for candidate in [
-        "/usr/lib/daer/datapath.o",
-        "/usr/local/lib/daer/datapath.o",
-        "/usr/share/daer/datapath.o",
-    ] {
-        let p = Path::new(candidate);
-        if p.exists() {
-            return p.to_path_buf();
+    for candidate in candidates {
+        let candidate = candidate.as_ref();
+        if candidate.exists() {
+            return candidate.to_path_buf();
         }
     }
     path.to_path_buf()
@@ -223,7 +440,8 @@ async fn serve_until_signal(
     daemon: &Daemon,
     options: &RunOptions,
     router_options: &RouterOptions,
-    mut ebpf: Option<&mut aya::Ebpf>,
+    ebpf: Option<&daer_control::datapath::Attached>,
+    health: &mut HealthScheduler,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut hangup = {
@@ -265,7 +483,7 @@ async fn serve_until_signal(
                 return Ok(());
             }
             _ = hangup.recv() => {
-                reload(daemon, options, router_options, ebpf.as_deref_mut());
+                reload(daemon, options, router_options, ebpf, health);
             }
         }
         #[cfg(not(unix))]
@@ -340,40 +558,80 @@ async fn wait_for_interfaces(
 
 /// Starts health scheduling against the generation that is serving right now.
 ///
-/// Returns the shutdown sender and the handle. The handle is deliberately kept: dropping it
-/// would abort the task, which is the failure mode this whole function exists to prevent
-/// (ADR-0006 — the scheduler existed and was never spawned).
+/// Returns a [`HealthScheduler`] whose [`HealthScheduler::restart`] re-spawns the probes
+/// against a new generation. That is the ADR-0006 invariant: the scheduler holds the router
+/// it probes, so a reload must hand it the new one rather than leave it measuring a
+/// generation nothing routes to. The old code started the scheduler once at startup and
+/// never restarted it, so after the first `SIGHUP` the new generation's groups received no
+/// probes at all and a latency policy silently stopped selecting.
+fn start_health(daemon: &Daemon) -> HealthScheduler {
+    let mut scheduler = HealthScheduler::default();
+    scheduler.restart(daemon);
+    scheduler
+}
+
+/// The live health-probe task, replaceable on reload.
 ///
-/// A group whose policy needs measurement but whose nodes have no literal address (a name, not
-/// an `ip:port`) is reported: probing it would be a second, silent DNS decision, and the flow
-/// path resolves the name again anyway.
-fn start_health(
-    daemon: &Daemon,
-) -> (
-    tokio::sync::watch::Sender<bool>,
-    Option<tokio::task::JoinHandle<()>>,
-) {
-    let (stop, watch) = tokio::sync::watch::channel(false);
-    let generation = daemon.generation();
-    let interval = daemon.health_interval();
-    // The whole `[global.health-check]` table, so the probe's URL, method and DNS endpoints are
-    // the configured ones rather than a built-in default (ADR-0006).
-    let handle = daer_control::spawn_health_scheduler(
-        generation.router_arc(),
-        &daemon.health_check(),
-        watch,
-    );
-    match &handle {
-        Some(_) => tracing::info!(
-            interval_ms = interval.as_std().map(|i| i.as_millis()).unwrap_or(0),
-            "health scheduling started: node selection can measure latency"
-        ),
-        None => tracing::debug!(
-            "health scheduling not started (the interval is zero or no node has a literal \
-             address to probe)"
-        ),
+/// # Why the handle is held
+///
+/// Dropping a `JoinHandle` detaches the task rather than aborting it, so the old code leaked
+/// a scheduler per reload. Stopping it explicitly is what keeps exactly one scheduler
+/// running, and it is why this type owns the shutdown sender.
+#[derive(Debug, Default)]
+struct HealthScheduler {
+    current: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+}
+
+impl HealthScheduler {
+    /// Stops whatever is running and starts probes for `daemon`'s current generation.
+    fn restart(&mut self, daemon: &Daemon) {
+        self.stop();
+        let generation = daemon.generation();
+        let interval = daemon.health_interval();
+        let (stop, watch) = tokio::sync::watch::channel(false);
+        // The whole `[global.health-check]` table, so the probe's URL, method and DNS
+        // endpoints are the configured ones rather than a built-in default (ADR-0006).
+        let handle = daer_control::spawn_health_scheduler(
+            generation.router_arc(),
+            &daemon.health_check(),
+            watch,
+        );
+        match handle {
+            Some(handle) => {
+                tracing::info!(
+                    interval_ms = interval.as_std().map(|i| i.as_millis()).unwrap_or(0),
+                    generation = %generation.describe(),
+                    "health scheduling started: node selection can measure latency"
+                );
+                self.current = Some((stop, handle));
+            }
+            None => {
+                tracing::debug!(
+                    "health scheduling not started (the interval is zero or no node has a \
+                     literal address to probe)"
+                );
+            }
+        }
     }
-    (stop, handle)
+
+    /// Stops the running scheduler, waiting for its task to finish.
+    ///
+    /// Waiting matters: a probe in flight holds sockets to nodes, and leaving it running
+    /// while a new scheduler starts would double the probe load for a moment. The wait is
+    /// bounded by the task observing its watch channel.
+    fn stop(&mut self) {
+        let Some((stop, handle)) = self.current.take() else {
+            return;
+        };
+        let _ = stop.send(true);
+        // `abort` rather than awaiting the handle: this runs inside a synchronous reload
+        // path, and the scheduler's own loop exits on the watch channel. Aborting only
+        // matters for a probe already in flight, which is exactly what should be cut short.
+        handle.abort();
+    }
 }
 
 /// Re-reads the configuration and publishes it, reporting what happened.
@@ -381,7 +639,8 @@ fn reload(
     daemon: &Daemon,
     options: &RunOptions,
     router_options: &RouterOptions,
-    mut ebpf: Option<&mut aya::Ebpf>,
+    ebpf: Option<&daer_control::datapath::Attached>,
+    health: &mut HealthScheduler,
 ) {
     let started = std::time::Instant::now();
     let loaded = match super::block_on(daer_control::load_resolved(&options.config)) {
@@ -397,17 +656,25 @@ fn reload(
         Ok(()) => {
             let generation = daemon.generation();
             let router = generation.router();
-            if let Some(ebpf) = ebpf.as_mut() {
+            if let Some(attached) = ebpf.as_ref() {
                 let gen_id = u16::try_from(generation.id().get()).unwrap_or(u16::MAX);
-                if let Err(error) =
-                    datapath::republish_policy(ebpf, gen_id, &router.kernel_policy())
-                {
-                    tracing::error!(
+                // The publish runs inside the observer's own lock: `AyaWriter` needs
+                // `&mut Ebpf`, which only the owner of the object can hand out.
+                let published = attached.with_ebpf(|object| {
+                    datapath::republish_policy(object, gen_id, &router.kernel_policy())
+                });
+                match published {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::error!(
                         %error,
                         "republishing kernel policy failed; kernel will use previous slot"
-                    );
+                    ),
+                    Err(reason) => tracing::error!(%reason, "cannot reach the datapath object"),
                 }
             }
+            // The scheduler holds the router it probes, so it has to be handed the new
+            // generation; leaving it running would measure a policy nothing routes to.
+            health.restart(daemon);
             tracing::info!(
                 generation = %generation.describe(),
                 elapsed_ms = started.elapsed().as_millis(),
@@ -448,7 +715,26 @@ mod tests {
 
     #[test]
     fn resolve_object_path_preserves_non_existing_when_no_candidates() {
+        // An empty candidate list, not the host's `/usr/lib`: the assertion is about the
+        // fallback, and a machine with a packaged daer must not change the answer.
         let non_existing = Path::new("/non/existing/datapath.o");
-        assert_eq!(resolve_object_path(non_existing), non_existing);
+        assert_eq!(
+            resolve_object_path_in(non_existing, std::iter::empty::<&Path>()),
+            non_existing
+        );
+    }
+
+    #[test]
+    fn resolve_object_path_finds_the_first_existing_candidate() {
+        let directory = std::env::temp_dir().join(format!("daer-object-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let present = directory.join("datapath.o");
+        std::fs::write(&present, b"x").expect("writes");
+        let absent = directory.join("missing.o");
+        assert_eq!(
+            resolve_object_path_in(Path::new("/non/existing/datapath.o"), [&absent, &present]),
+            present
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

@@ -165,6 +165,30 @@ pub fn build_resolver(config: &Config) -> anyhow::Result<Arc<Resolver>> {
     Ok(Arc::new(resolver))
 }
 
+/// Builds every transport a configuration declares, keyed by tag.
+///
+/// Split out of [`Resolver::from_config`] so a caller that wants to share the resolver's
+/// Fake-IP pool and snooper (the combined daemon) can build the transports itself and hand
+/// both to [`Resolver::with_state`]. The parse and build are the same two steps
+/// `from_config` performs, so the two paths cannot disagree about which specs are valid.
+///
+/// # Errors
+///
+/// Returns a message naming the upstream entry whose transport could not be built. Every
+/// declared upstream must build: a resolver that accepted a tag it cannot serve would answer
+/// "no such upstream" for queries the operator believes are routed.
+pub fn transports(config: &Config) -> anyhow::Result<Vec<(String, Arc<dyn Upstream>)>> {
+    let mut transports: Vec<(String, Arc<dyn Upstream>)> = Vec::new();
+    for entry in &config.dns.upstream {
+        let spec = UpstreamSpec::parse(entry).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let transport = spec
+            .build()
+            .map_err(|error| anyhow::anyhow!("dns.upstream {entry:?}: {error}"))?;
+        transports.push((spec.tag, transport));
+    }
+    Ok(transports)
+}
+
 /// Builds the transport a spec names.
 ///
 /// `check` calls this, so a spec that reports usable is one that builds. Kept as a function

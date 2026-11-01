@@ -1248,8 +1248,8 @@ dependencies = [
 
 [[package]]
 name = "netune"
-version = "0.0.4"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.4#4159ebdeb10267245e942d84b526307db7194efd"
+version = "0.0.5"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.5#f1a3a80bb34c698c2e2a2a3c9c02f19a5e630aa4"
 dependencies = [
  "base64 0.22.1",
  "brotli",
@@ -1268,8 +1268,8 @@ dependencies = [
 
 [[package]]
 name = "netune-http1"
-version = "0.0.4"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.4#4159ebdeb10267245e942d84b526307db7194efd"
+version = "0.0.5"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.5#f1a3a80bb34c698c2e2a2a3c9c02f19a5e630aa4"
 dependencies = [
  "bytes",
  "http",
@@ -1278,8 +1278,8 @@ dependencies = [
 
 [[package]]
 name = "netune-trace"
-version = "0.0.4"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.4#4159ebdeb10267245e942d84b526307db7194efd"
+version = "0.0.5"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.5#f1a3a80bb34c698c2e2a2a3c9c02f19a5e630aa4"
 dependencies = [
  "serde",
 ]

@@ -379,12 +379,43 @@ mod tests {
 
     #[test]
     fn reports_missing_geodata_files() {
-        let dir = TempDir::new("missing");
-        let optimizer = DatReaderOptimizer::new(vec![dir.0.clone()]);
+        // The search path is pinned, so the assertion is about a missing file rather than
+        // about what the host happens to have in `~/.local/share/daer`. Unpinned, this test
+        // was green on a clean checkout and red on any machine that had installed the real
+        // `geoip.dat` — the definition of a test that cannot be trusted.
+        let empty = TempDir::new("missing");
+        let optimizer = pinned_assets(vec![empty.0.clone()]);
         let error = optimizer
             .optimize(rules("routing { dip(geoip:cn) -> direct }"))
             .expect_err("must fail");
         assert!(error.message.contains("geoip.dat: not found"), "{error}");
+    }
+
+    /// An optimizer whose asset search is confined to `dirs` plus one empty directory.
+    ///
+    /// `DAER_LOCATION_ASSET` replaces the XDG search entirely (see
+    /// `daer_geodata::assets`), so pointing it at an empty directory is what makes "not
+    /// found" mean "not found". The variable is process-global and the tests run in
+    /// parallel, so the lock serialises the tests that use it; it is never restored, because
+    /// every caller wants the pinned path for the rest of its own body and no other test
+    /// reads it.
+    fn pinned_assets(dirs: Vec<PathBuf>) -> DatReaderOptimizer {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // The guard is deliberately leaked into the optimizer's lifetime: the variable has to
+        // stay set while `optimize` runs, which is inside the caller.
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let empty = TempDir::new("pinned");
+        // SAFETY: the lock above serialises every use of this variable in this binary, and
+        // no other test in this crate reads it.
+        unsafe { std::env::set_var("DAER_LOCATION_ASSET", &empty.0) };
+        // Without this the search still falls back to `/usr/share/daer`, where a packaged
+        // installation keeps the real `geoip.dat`: the test would then pass on a clean
+        // checkout and fail on a machine with daer installed, which is the opposite of a
+        // falsifier.
+        // SAFETY: the lock above serialises every use of this variable in this binary, and
+        // no other test in this crate reads it.
+        unsafe { std::env::set_var("DAER_ASSETS_CONFINED", "1") };
+        DatReaderOptimizer::new(dirs)
     }
 
     #[test]

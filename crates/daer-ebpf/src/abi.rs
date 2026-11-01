@@ -380,6 +380,96 @@ const _: () = assert!(std::mem::size_of::<PortRange>() == 4);
 const _: () = assert!(MATCH_SET_SIZE == 24);
 const _: () = assert!(LPM_KEY_SIZE == 20);
 
+/// The kernel's routing decision for one flow, as `routing_handoff_map` carries it.
+///
+/// ```c
+/// struct routing_result {
+///     __u32 mark;
+///     __u8 must;
+///     __u8 mac[6];
+///     __u8 outbound;
+///     __u8 pname[TASK_COMM_LEN];
+///     __u32 pid;
+///     __u8 dscp;
+///     __u8 routing_epoch_slot;
+///     __u16 datapath_generation;
+/// };
+/// struct routing_handoff_entry {
+///     __u64 last_seen_ns;
+///     struct routing_result result;
+/// };
+/// ```
+///
+/// # Why userspace reads this
+///
+/// The datapath observes three things userspace cannot recover from the accepted socket: the
+/// client's **source MAC**, the packet's **DSCP**, and — through the cgroup hooks — the
+/// **process name** and pid that opened the flow. When the kernel defers a flow to the
+/// control plane (any configuration with a `domain(...)` rule, see ADR-0011), it publishes
+/// this entry first. A userspace evaluation that did not read it had those three fields
+/// zeroed, so every `mac(...)`, `dscp(...)`, and `pname(...)` rule after the partition
+/// boundary silently matched nothing — the rule was accepted, lowered, and inert.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoutingResult {
+    /// `mark` the rule attached to the outbound.
+    pub mark: u32,
+    /// Whether the outbound is `must`.
+    pub must: u8,
+    /// The client's source MAC, as the packet carried it.
+    pub mac: [u8; 6],
+    /// The selected outbound id.
+    pub outbound: u8,
+    /// `TASK_COMM_LEN` bytes, NUL-padded.
+    pub pname: [u8; TASK_COMM_LEN],
+    /// The pid that opened the flow, or `0` when the cgroup hooks are not attached.
+    pub pid: u32,
+    /// The packet's DSCP.
+    pub dscp: u8,
+    /// The routing epoch slot, encoded so `0` means unknown (see `tproxy.c`).
+    pub routing_epoch_slot: u8,
+    /// Which datapath generation wrote this entry.
+    pub datapath_generation: u16,
+}
+
+/// `TASK_COMM_LEN`, the size of the kernel's `pname` field.
+pub const TASK_COMM_LEN: usize = 16;
+
+/// One `routing_handoff_map` value.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoutingHandoff {
+    /// `bpf_ktime_get_ns()` at the write, used to expire a stale entry.
+    pub last_seen_ns: u64,
+    /// The decision the kernel reached.
+    pub result: RoutingResult,
+}
+
+// Verified against the C with `cc -c` and `offsetof`: `mark` is 4 bytes at 0, `must` at 4,
+// `mac` at 5, `outbound` at 11, `pname` at 12, `pid` at 28, `dscp` at 32, the slot at 33,
+// and the generation at 34, giving 36 with 4-byte alignment. The handoff entry pads the
+// result to offset 8, so the whole value is 48.
+const _: () = assert!(std::mem::size_of::<RoutingResult>() == 36);
+const _: () = assert!(std::mem::align_of::<RoutingResult>() == 4);
+const _: () = assert!(std::mem::size_of::<RoutingHandoff>() == 48);
+const _: () = assert!(std::mem::align_of::<RoutingHandoff>() == 8);
+
+impl RoutingHandoff {
+    /// Decodes a map value, or `None` when the width is not this struct's.
+    ///
+    /// A wrong width is not a panic: it means the object and this crate disagree, which the
+    /// caller reports once at startup rather than aborting a flow.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != std::mem::size_of::<Self>() {
+            return None;
+        }
+        // SAFETY: the length is exactly `size_of::<Self>()` and every field is an integer or
+        // a byte array, so any bit pattern is a valid value.
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

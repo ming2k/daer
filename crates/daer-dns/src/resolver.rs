@@ -292,6 +292,35 @@ impl Resolver {
         config: &Config,
         transports: impl IntoIterator<Item = (String, Arc<dyn Upstream>)>,
     ) -> Result<Self, ResolverError> {
+        let fake_ip = Arc::new(
+            crate::fake_ip::FakeIpPool::from_config(&config.dns.fake_ip)
+                .map_err(ResolverError::Upstream)?,
+        );
+        let snooper = Arc::new(crate::fake_ip::DnsSnooper::default());
+        Self::with_state(config, transports, fake_ip, snooper)
+    }
+
+    /// Builds a resolver over an existing Fake-IP pool and snooper.
+    ///
+    /// # Why the state is injectable
+    ///
+    /// The two halves of `daer run` need the *same* pool and the *same* snooper: the DNS
+    /// server allocates a synthetic address for a name, and the transparent data path has to
+    /// turn that address back into the name. A resolver that owned a private pool would make
+    /// Fake-IP unusable through the daemon — every synthetic destination would be unknown to
+    /// the router, which is exactly the state the daemon shipped in. The pool also has to
+    /// survive a `SIGHUP` reload, so it is owned by the process rather than by a generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolverError`] when a declared tag has no transport, when the request or
+    /// response routing does not compile, or when the cache configuration is invalid.
+    pub fn with_state(
+        config: &Config,
+        transports: impl IntoIterator<Item = (String, Arc<dyn Upstream>)>,
+        fake_ip: Arc<crate::fake_ip::FakeIpPool>,
+        snooper: Arc<crate::fake_ip::DnsSnooper>,
+    ) -> Result<Self, ResolverError> {
         let request = RequestRouter::compile(config)?;
         let response = ResponseRouter::compile(config)?;
         let cache_config = CacheConfig::from_config(config).map_err(ResolverError::Cache)?;
@@ -314,12 +343,6 @@ impl Resolver {
 
         let ipversion_prefer = IpVersionPreference::parse(config.dns.ipversion_prefer)
             .map_err(ResolverError::Upstream)?;
-
-        let fake_ip = Arc::new(
-            crate::fake_ip::FakeIpPool::from_config(&config.dns.fake_ip)
-                .map_err(ResolverError::Upstream)?,
-        );
-        let snooper = Arc::new(crate::fake_ip::DnsSnooper::default());
 
         Ok(Self {
             request,
@@ -410,22 +433,39 @@ impl Resolver {
             Decision::Upstream(tag) => tag,
         };
 
-        if self.fake_ip.is_enabled()
-            && !query.questions.is_empty()
-            && query.questions[0].qtype == RecordType::A
-        {
+        if self.fake_ip.is_enabled() && !query.questions.is_empty() {
+            let qtype = query.questions[0].qtype;
             let qname = query.questions[0].name.to_string();
             if !self.fake_ip.is_excluded(&qname) {
-                let fake_addr = self.fake_ip.allocate(&qname);
-                let mut reply = Message::reply_to(query, ResponseCode::NOERROR);
-                reply.answers.push(crate::wire::Record {
-                    name: query.questions[0].name.clone(),
-                    rtype: RecordType::A,
-                    class: query.questions[0].qclass,
-                    ttl: 60,
-                    rdata: fake_addr.octets().to_vec(),
-                });
-                return Ok(Resolution::Answer(reply));
+                match qtype {
+                    RecordType::A => {
+                        let fake_addr = self.fake_ip.allocate(&qname);
+                        let mut reply = Message::reply_to(query, ResponseCode::NOERROR);
+                        reply.answers.push(crate::wire::Record {
+                            name: query.questions[0].name.clone(),
+                            rtype: RecordType::A,
+                            class: query.questions[0].qclass,
+                            ttl: 60,
+                            rdata: fake_addr.octets().to_vec(),
+                        });
+                        return Ok(Resolution::Answer(reply));
+                    }
+                    RecordType::AAAA => {
+                        // An empty NOERROR for `AAAA`, not a pass-through.
+                        //
+                        // The pool is IPv4-only, so a synthesised address only exists in
+                        // `A`. Forwarding `AAAA` to the upstream would hand a dual-stack
+                        // client the *real* IPv6 address, and the client would prefer it:
+                        // the flow then leaves over IPv6, never touches the synthetic
+                        // address, and the whole Fake-IP path is bypassed — while the
+                        // configuration says it is in effect. Answering "no AAAA" is the
+                        // standard way to make a client fall back to `A`, and it is what
+                        // `ipversion-prefer = 4` would do if it could reach this query.
+                        let reply = Message::reply_to(query, ResponseCode::NOERROR);
+                        return Ok(Resolution::Answer(reply));
+                    }
+                    _ => {}
+                }
             }
         }
 

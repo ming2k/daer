@@ -36,6 +36,37 @@ use tokio::net::UdpSocket;
 use crate::error::IngressError;
 use crate::inbound::is_self_connect;
 
+/// Which address family a datagram flow uses, and whether the datapath can deliver it.
+///
+/// Exists so "IPv6 UDP is not proxied on the eBPF path" is a value the daemon reports rather
+/// than a sentence in a document: the C's `assign_listener` has one family-independent slot for
+/// datagrams (`key = &one_key`), so only the IPv4 socket can receive a redirected datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramFamily {
+    /// Delivered: `listen_socket_map[1]` holds the wildcard IPv4 socket.
+    Ipv4,
+    /// **Not** delivered on the eBPF path: there is no slot for a v6 datagram socket.
+    Ipv6,
+}
+
+impl DatagramFamily {
+    /// The family of an address.
+    #[must_use]
+    pub const fn of(address: SocketAddr) -> Self {
+        if address.is_ipv6() {
+            Self::Ipv6
+        } else {
+            Self::Ipv4
+        }
+    }
+
+    /// True when the datapath can assign a redirected datagram of this family.
+    #[must_use]
+    pub const fn is_deliverable(self) -> bool {
+        matches!(self, Self::Ipv4)
+    }
+}
+
 /// One received datagram: who sent it, where it was going, and its payload length.
 ///
 /// The payload is left in the caller's buffer; this type is the addressing answer, which
@@ -65,12 +96,30 @@ pub trait DatagramIngress: Send + Sync + std::fmt::Debug {
         Box<dyn std::future::Future<Output = Result<Datagram, IngressError>> + Send + 'a>,
     >;
 
-    /// Sends one reply datagram to `peer`.
-    fn send_to<'a>(
+    /// Sends one reply datagram to `peer`, **from** `source`.
+    ///
+    /// `source` is the original destination the client sent to. A UDP client validates the
+    /// source address of a reply against the destination it wrote to (or its socket is
+    /// `connect(2)`-ed, in which case the kernel drops anything else and answers with
+    /// `ICMP port unreachable`). Replying from the wildcard listener's own address and the
+    /// transparent port instead — which is what `send_to(payload, peer)` on the listener
+    /// socket does — makes every UDP client discard the answer. That is the difference
+    /// between a working DNS/QUIC relay and one that looks like it silently drops traffic.
+    fn send_from<'a>(
         &'a self,
         payload: &'a [u8],
+        source: SocketAddr,
         peer: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>>;
+
+    /// The socket fd the datapath may assign a redirected datagram to, when there is one.
+    ///
+    /// `None` for an ingress that is not backed by a real socket: a test double has no fd to
+    /// publish, and reporting a wrong one would put a foreign socket in
+    /// `listen_socket_map[1]`.
+    fn raw_fd(&self) -> Option<RawFd> {
+        None
+    }
 }
 
 impl DatagramIngress for TransparentDatagramListener {
@@ -83,12 +132,21 @@ impl DatagramIngress for TransparentDatagramListener {
         Box::pin(TransparentDatagramListener::recv(self, buffer))
     }
 
-    fn send_to<'a>(
+    fn send_from<'a>(
         &'a self,
         payload: &'a [u8],
+        source: SocketAddr,
         peer: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(TransparentDatagramListener::send_to(self, payload, peer))
+        // The future is already complete: see `TransparentDatagramListener::try_send_from`
+        // for why a UDP reply has no backpressure to await.
+        Box::pin(std::future::ready(
+            TransparentDatagramListener::try_send_from(self, payload, source, peer),
+        ))
+    }
+
+    fn raw_fd(&self) -> Option<RawFd> {
+        Some(TransparentDatagramListener::raw_fd(self))
     }
 }
 
@@ -102,6 +160,88 @@ pub struct TransparentDatagramListener {
     v4: UdpSocket,
     v6: UdpSocket,
     port: u16,
+    /// One transparent socket per original destination, for the reply direction.
+    ///
+    /// Keyed by the destination a client sent to, because that is the source address its
+    /// reply must carry. See [`Self::send_from`].
+    ///
+    /// # Why this is bounded
+    ///
+    /// A destination socket holds an fd, and the set of destinations is unbounded: a client
+    /// that walks a /16 of QUIC servers, or an attacker that sends to one datagram per
+    /// address, would otherwise exhaust the process's fd limit. The cache is therefore a
+    /// **bounded LRU** ([`REPLY_SOCKET_CACHE`]), evicting the least recently used destination.
+    /// An evicted destination is re-bound on its next reply, which costs one `socket(2)` —
+    /// far cheaper than an `EMFILE` that stops every flow.
+    sources: std::sync::Mutex<ReplySockets>,
+}
+
+/// How many reply sockets one ingress keeps.
+///
+/// Sized for a DNS or QUIC workload (tens of upstreams) with room for a browsing client
+/// fanning out to hundreds of destinations, while staying far below a default 1024 fd limit.
+pub const REPLY_SOCKET_CACHE: usize = 512;
+
+/// The bounded reply-socket cache, with LRU order kept explicitly.
+///
+/// `HashMap` alone has no order, and a timestamp per entry would need a second scan to find
+/// the eviction victim; a `VecDeque` of keys is what makes eviction O(1) and the ordering
+/// exact. The map is the source of truth for liveness, the deque for recency — an entry is
+/// removed from both together, which is the invariant [`ReplySockets::get_or_insert`]
+/// maintains.
+#[derive(Debug, Default)]
+struct ReplySockets {
+    sockets: std::collections::HashMap<SocketAddr, UdpSocket>,
+    /// Most-recently-used last.
+    order: std::collections::VecDeque<SocketAddr>,
+}
+
+impl ReplySockets {
+    /// Returns the socket for `source`, binding it when absent and evicting when full.
+    fn get_or_insert(&mut self, source: SocketAddr) -> io::Result<&UdpSocket> {
+        self.get_or_insert_with(source, bind_source)
+    }
+
+    /// [`Self::get_or_insert`] with the socket builder injected.
+    ///
+    /// Split so the eviction bookkeeping — the part that prevents an fd leak — is testable
+    /// without `CAP_NET_ADMIN`: `bind_source` sets `IP_TRANSPARENT`, which an unprivileged
+    /// test cannot do, but the LRU does not care how a socket was made.
+    fn get_or_insert_with(
+        &mut self,
+        source: SocketAddr,
+        bind: impl FnOnce(Domain, SocketAddr) -> io::Result<UdpSocket>,
+    ) -> io::Result<&UdpSocket> {
+        if self.sockets.contains_key(&source) {
+            // Touch: move to the back so it is the last candidate for eviction.
+            self.order.retain(|key| *key != source);
+            self.order.push_back(source);
+        } else {
+            if self.order.len() >= REPLY_SOCKET_CACHE {
+                // Evict the least recently used. `pop_front` and the map removal are the same
+                // entry, so the two containers cannot disagree.
+                if let Some(victim) = self.order.pop_front() {
+                    self.sockets.remove(&victim);
+                }
+            }
+            let family = if source.is_ipv6() {
+                Domain::IPV6
+            } else {
+                Domain::IPV4
+            };
+            self.sockets.insert(source, bind(family, source)?);
+            self.order.push_back(source);
+        }
+        self.sockets
+            .get(&source)
+            .ok_or_else(|| io::Error::other("reply socket vanished after insert"))
+    }
+
+    /// How many sockets are cached, for a test that asserts the bound.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.sockets.len()
+    }
 }
 
 impl TransparentDatagramListener {
@@ -115,13 +255,51 @@ impl TransparentDatagramListener {
         let v4 = bind_family(Domain::IPV4, IpAddr::V4(listen_ip), port)?;
         let port = v4.local_addr().map_err(IngressError::Socket)?.port();
         let v6 = bind_family(Domain::IPV6, IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
-        Ok(Self { v4, v6, port })
+        Ok(Self {
+            v4,
+            v6,
+            port,
+            sources: std::sync::Mutex::new(ReplySockets::default()),
+        })
     }
 
     /// The port both families are bound to.
     #[must_use]
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The IPv4 socket's fd, for `listen_socket_map` key `1`.
+    ///
+    /// # The IPv6 limitation this encodes
+    ///
+    /// The C's `assign_listener` picks the key by family for TCP (`0` v4, `2` v6) but uses the
+    /// single family-independent key `1` for every datagram:
+    ///
+    /// ```c
+    /// const __u32 *key = &one_key;
+    /// if (l4proto == IPPROTO_TCP)
+    ///     key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
+    /// ```
+    ///
+    /// There is therefore **one** datagram slot, and it can hold one socket. A v6 datagram
+    /// redirected by the eBPF path is assigned to this v4 socket, which cannot receive it.
+    ///
+    /// The fix belongs in the datapath (a fourth key for `udp6`, or `bpf_sk_lookup_udp`), not
+    /// here: guessing a second slot would silently mismatch the object this crate does not own.
+    /// Until then the daemon reports it — see [`DatagramFamily::Ipv6`] and the startup warning
+    /// in `daer run` — rather than letting v6 UDP look like a network outage.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.v4.as_raw_fd()
+    }
+
+    /// The IPv6 socket's fd, which the datapath has **no slot** for today.
+    ///
+    /// Returned so the limitation is visible in one place and a future object that gains a
+    /// `udp6` key only has to change `Listeners` and this accessor. Nothing publishes it: an
+    /// unused fd in a `SOCKMAP` slot the C never looks up would be a lie about what works.
+    pub fn raw_fd_v6(&self) -> std::os::fd::RawFd {
+        self.v6.as_raw_fd()
     }
 
     /// Receives one datagram into `buffer`, reporting its source and original
@@ -166,19 +344,37 @@ impl TransparentDatagramListener {
         }
     }
 
-    /// Sends one reply datagram back to `peer`.
+    /// Sends one reply datagram to `peer` **from** the original destination `source`.
     ///
-    /// The family is chosen from the peer's address rather than from the socket that
-    /// received the datagram, because the two listeners are separate sockets and a v4
-    /// socket cannot send to a v6 peer.
+    /// # Why this cannot use the listener socket
+    ///
+    /// The listener is bound to the wildcard address and the transparent port. Sending from
+    /// it puts `source_ip = <box address>` and `source_port = <tproxy port>` on the wire, so
+    /// the client sees a reply from an address it never sent to. A `connect(2)`-ed client
+    /// socket has that packet rejected by its own kernel (`ICMP port unreachable`), and an
+    /// unconnected one drops it in the application. Every datagram relay therefore needs a
+    /// socket that owns the original destination: `IP_TRANSPARENT` is what allows binding a
+    /// non-local address.
+    ///
+    /// # Why this is not `async`
+    ///
+    /// A UDP `sendto(2)` on a non-blocking socket either queues the datagram or fails; it
+    /// never waits for the peer. Wrapping it in a future would suggest a backpressure that
+    /// does not exist, and holding the source-socket lock across a real `.await` would
+    /// serialise every reply behind the slowest one.
     ///
     /// # Errors
     ///
-    /// Returns the OS error from the send; a reply that cannot be delivered ends that
-    /// peer's session, never the relay.
-    pub async fn send_to(&self, payload: &[u8], peer: SocketAddr) -> io::Result<usize> {
-        let socket = if peer.is_ipv6() { &self.v6 } else { &self.v4 };
-        socket.send_to(payload, peer).await
+    /// Returns the OS error from creating, binding or sending. A reply that cannot be
+    /// delivered ends that peer's session, never the relay.
+    pub fn try_send_from(
+        &self,
+        payload: &[u8],
+        source: SocketAddr,
+        peer: SocketAddr,
+    ) -> io::Result<usize> {
+        let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+        sources.get_or_insert(source)?.try_send_to(payload, peer)
     }
 
     /// Turns a decoded datagram into a [`Datagram`], applying the self-connect rule.
@@ -326,6 +522,29 @@ fn bind_family(domain: Domain, ip: IpAddr, port: u16) -> Result<UdpSocket, Ingre
     UdpSocket::from_std(socket.into()).map_err(IngressError::Socket)
 }
 
+/// Binds a transparent datagram socket that **owns** `source` as its local address.
+///
+/// This is the reply half of the relay: the socket's local address becomes the packet's
+/// source address, so a client sees the reply coming from the destination it sent to
+/// rather than from the transparent port. `IP_TRANSPARENT` is what allows binding an
+/// address that is not local to the box.
+///
+/// # Why `reuse_address` and not `reuse_port`
+///
+/// Two destinations can share a port (`1.1.1.1:53` and `8.8.8.8:53` are distinct
+/// `(address, port)` pairs, so `SO_REUSEADDR` is what makes a second bind of the same
+/// *port* on a different address legal). `SO_REUSEPORT` would additionally allow two
+/// sockets on the *same* address and port, which is never what the reply path wants.
+fn bind_source(domain: Domain, source: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let fd = socket.as_raw_fd();
+    set_transparent(fd, domain)?;
+    socket.bind(&source.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
 /// Enables `IP_TRANSPARENT` (`IPV6_TRANSPARENT`) so the socket may own a redirected
 /// destination.
 fn set_transparent(fd: RawFd, domain: Domain) -> io::Result<()> {
@@ -388,6 +607,68 @@ fn unmap(address: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_reply_socket_cache_evicts_instead_of_growing_without_bound() {
+        // The falsifier for an fd leak. The first version of `send_from` kept one socket per
+        // original destination in a plain `HashMap` and never removed one, so a client walking
+        // a range of destinations would exhaust the process's fd limit and take every flow
+        // down with `EMFILE`. The bound is what makes the cache a cache.
+        //
+        // `bind_source` sets `IP_TRANSPARENT`, which needs `CAP_NET_ADMIN`; the eviction
+        // bookkeeping is what this asserts, so the socket builder is a plain loopback bind.
+        let plain = |domain: Domain, address: SocketAddr| -> io::Result<UdpSocket> {
+            let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&address.into())?;
+            UdpSocket::from_std(socket.into())
+        };
+        let mut cache = ReplySockets::default();
+        for port in 0..(REPLY_SOCKET_CACHE + 8) {
+            let source: SocketAddr = format!("127.0.0.1:{}", 20_000 + port)
+                .parse()
+                .expect("addr");
+            cache
+                .get_or_insert_with(source, plain)
+                .expect("loopback binds");
+        }
+        assert_eq!(
+            cache.len(),
+            REPLY_SOCKET_CACHE,
+            "the cache must stay at its bound, not grow with the destinations seen"
+        );
+        assert_eq!(
+            cache.order.len(),
+            cache.len(),
+            "the recency queue and the map must never disagree"
+        );
+
+        // A source that is still cached is reused rather than re-bound, and becomes the most
+        // recently used, so the next eviction takes a different entry.
+        let recent: SocketAddr = format!("127.0.0.1:{}", 20_000 + REPLY_SOCKET_CACHE - 1)
+            .parse()
+            .expect("addr");
+        cache.get_or_insert_with(recent, plain).expect("cached");
+        assert_eq!(*cache.order.back().expect("non-empty"), recent);
+    }
+
+    #[test]
+    fn only_ipv4_datagrams_are_deliverable_on_the_ebpf_path() {
+        // The falsifier for "v6 UDP silently does not work". The C's `assign_listener` uses one
+        // family-independent key for datagrams, so the map holds the v4 socket only; a v6
+        // datagram assigned to it cannot be received. Asserting the split here is what keeps
+        // the daemon's warning honest instead of a claim in a document.
+        assert!(DatagramFamily::Ipv4.is_deliverable());
+        assert!(!DatagramFamily::Ipv6.is_deliverable());
+        assert_eq!(
+            DatagramFamily::of("192.0.2.1:53".parse().expect("addr")),
+            DatagramFamily::Ipv4
+        );
+        assert_eq!(
+            DatagramFamily::of("[2001:db8::1]:53".parse().expect("addr")),
+            DatagramFamily::Ipv6
+        );
+    }
 
     #[test]
     fn the_control_buffer_covers_the_largest_address() {

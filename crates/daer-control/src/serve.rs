@@ -479,12 +479,16 @@ mod tests {
             })
         }
 
-        fn send_to<'a>(
+        fn send_from<'a>(
             &'a self,
             payload: &'a [u8],
+            _source: std::net::SocketAddr,
             peer: std::net::SocketAddr,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>
         {
+            // A loopback socket cannot own a non-local source address; the source-address
+            // assertion lives in `datagram`'s `LoopbackIngress` test, which records the
+            // pair instead of relying on the wire.
             Box::pin(async move { self.socket.send_to(payload, peer).await })
         }
     }

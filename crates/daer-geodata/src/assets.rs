@@ -20,6 +20,7 @@ use crate::error::GeoDataError;
 
 const ASSET_DIR_NAMES: [&str; 1] = ["daer"];
 const LOCATION_ENV: &str = "DAER_LOCATION_ASSET";
+const CONFINE_ENV: &str = "DAER_ASSETS_CONFINED";
 
 #[derive(Debug, Clone, Default)]
 pub struct LocationFinder {
@@ -62,23 +63,40 @@ impl LocationFinder {
     fn search_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         let location = env::var_os(LOCATION_ENV).filter(|value| !value.is_empty());
+        // A caller that set `DAER_ASSETS_CONFINED` has said the search path is exactly what
+        // it named. A packaged installation relies on the system directories, and a test
+        // asserting "this file is missing" must not see them: without this flag such a test
+        // passes on a clean checkout and fails on a machine with daer installed, which is the
+        // opposite of a falsifier.
+        let confined = confined();
 
         if let Some(location) = location {
             dirs.push(PathBuf::from(location));
             dirs.extend(self.extern_dirs.iter().cloned());
-            for base in ["/usr/local/share", "/usr/share"] {
-                for name in ASSET_DIR_NAMES {
-                    dirs.push(PathBuf::from(base).join(name));
+            if !confined {
+                for base in ["/usr/local/share", "/usr/share"] {
+                    for name in ASSET_DIR_NAMES {
+                        dirs.push(PathBuf::from(base).join(name));
+                    }
                 }
             }
-            dirs.extend(self.extern_dirs.iter().cloned());
         } else {
             dirs.extend(self.extern_dirs.iter().cloned());
-            dirs.extend(xdg_asset_dirs());
+            if !confined {
+                dirs.extend(xdg_asset_dirs());
+            }
         }
 
         dirs
     }
+}
+
+/// True when the asset search must not fall back to the system directories.
+///
+/// Set by a caller (a test, or a deployment that wants to prove it is not silently using a
+/// distro copy) that needs the search path to be exactly what it named.
+fn confined() -> bool {
+    env::var_os(CONFINE_ENV).is_some_and(|value| !value.is_empty())
 }
 
 fn xdg_asset_dirs() -> Vec<PathBuf> {

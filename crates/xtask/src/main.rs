@@ -50,9 +50,13 @@ fn build_ebpf() {
     let datapath_src = env::var("DAER_DATAPATH_SRC")
         .map(PathBuf::from)
         .unwrap_or_else(|_| root.join("ebpf/kern"));
+    // The vendored BTF trees live beside the C source, not in a sibling `ebpf/headers`
+    // directory: `ebpf/kern/headers/vmlinux.h` is what `#include "vmlinux.h"` resolves
+    // against once the build directory symlinks `headers`. The default used to point at
+    // the nonexistent sibling, so a clean checkout failed before clang ran.
     let headers = env::var("DAER_BPF_HEADERS")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| root.join("ebpf/headers"));
+        .unwrap_or_else(|_| datapath_src.join("headers"));
     let max_match_set_len = env::var("MAX_MATCH_SET_LEN").unwrap_or_else(|_| "1024".to_string());
     let clang = env::var("CLANG").unwrap_or_else(|_| "clang".to_string());
     let bpf_arch = detect_bpf_arch();

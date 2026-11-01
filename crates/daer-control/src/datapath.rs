@@ -16,8 +16,34 @@
 //! whichever interface the packet is about to leave through, so the pair is how "this flow
 //! is ours" is expressed. Creating it lazily keeps `daer run` from needing an external
 //! setup script, and reusing an existing pair keeps a restart from breaking live flows.
+//!
+//! # Why the policy routing is installed here too
+//!
+//! `daer0peer` delivers a redirected packet into the local stack with a **non-local**
+//! destination address and `fwmark = TPROXY_MARK`. The kernel only hands such a packet to
+//! the `bpf_sk_assign`-ed socket when a rule sends it to a `local` route, so the datapath is
+//! incomplete without:
+//!
+//! ```text
+//! ip rule  add fwmark 0x8000000/0x8000000 table 2023
+//! ip route add local default dev lo table 2023
+//! ```
+//!
+//! and the same pair for IPv6. This used to be documentation-only, which made an attached
+//! datapath silently fail to deliver: the redirect happened, the packet reached
+//! `daer0peer`, and the stack routed it onward as a *forwarded* packet instead of a local
+//! one. [`RouteTable`] owns that state and removes it on drop.
+//!
+//! # Why the link layer type decides the program
+//!
+//! The datapath has two variants of every hook: an `_l2` one that starts parsing after the
+//! Ethernet header, and an `_l3` one that starts at the IP header. Attaching both to one
+//! interface is not "belt and braces": the wrong variant reads the first bytes of the IP
+//! header as a MAC address (or vice versa) and misclassifies every packet. [`LinkKind`] is
+//! read from `/sys/class/net/<if>/type` and picks exactly one.
 
 use std::process::Command;
+use std::sync::Arc;
 
 use daer_ebpf::loader;
 
@@ -25,6 +51,75 @@ use daer_ebpf::loader;
 pub const DEVICE: &str = "daer0";
 /// Its peer, which the transparent listener is reachable through.
 pub const PEER: &str = "daer0peer";
+
+/// The `fwmark` the datapath stamps on a redirected packet, and the routing table that
+/// sends it to `local`. Both are part of the kernel contract: `tproxy.c` sets
+/// `skb->mark = TPROXY_MARK` and documents this exact rule/route pair.
+pub const TPROXY_ROUTE_TABLE: u32 = 2023;
+
+/// The ARPHRD type of an interface, which decides how many link-layer bytes precede the
+/// IP header.
+///
+/// Only two answers matter to the datapath: a device that carries an Ethernet header
+/// (`_l2`), and one that does not (`_l3` — TUN, WireGuard, PPP, and the `netkit`/`veth`
+/// ends whose traffic is already L3). Anything else is refused rather than guessed: a
+/// wrong guess misparses every packet on that interface, which is silent and total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// `ARPHRD_ETHER` (1): a 14-byte Ethernet header precedes the IP header.
+    Ethernet,
+    /// `ARPHRD_NONE` (0xFFFE), `ARPHRD_TUNNEL`, `ARPHRD_PPP`, ...: the packet starts at IP.
+    RawIp,
+}
+
+impl LinkKind {
+    /// Reads the link kind of `interface` from `/sys/class/net`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatapathError::Device`] when the interface does not exist or reports a
+    /// hardware type the datapath has no parser for.
+    pub fn of(interface: &str) -> Result<Self, DatapathError> {
+        let path = format!("/sys/class/net/{interface}/type");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| DatapathError::Device(format!("cannot read {path}: {error}")))?;
+        let raw: u32 = text.trim().parse().map_err(|_| {
+            DatapathError::Device(format!("{path} is not an ARPHRD type: {}", text.trim()))
+        })?;
+        Self::from_arphrd(interface, raw)
+    }
+
+    /// Maps an `ARPHRD_*` value, naming the interface when it is unsupported.
+    ///
+    /// Split from [`Self::of`] so the mapping is testable without a real device of every
+    /// kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatapathError::Device`] for a hardware type with no `_l2`/`_l3` variant.
+    pub fn from_arphrd(interface: &str, arphrd: u32) -> Result<Self, DatapathError> {
+        match arphrd {
+            // ARPHRD_ETHER
+            1 => Ok(Self::Ethernet),
+            // ARPHRD_NONE (0xFFFE), ARPHRD_PPP (512), ARPHRD_TUNNEL (768),
+            // ARPHRD_TUNNEL6 (769), ARPHRD_SIT (776), ARPHRD_IPGRE (778),
+            // ARPHRD_RAWIP (519), ARPHRD_WIREGUARD (65534 == 0xFFFE is NONE).
+            512 | 519 | 768 | 769 | 776 | 778 | 65_534 => Ok(Self::RawIp),
+            other => Err(DatapathError::Device(format!(
+                "{interface} has ARPHRD type {other}, which has no datapath parser; \
+                 exclude it with `lan`/`wan` or use an Ethernet or L3 interface"
+            ))),
+        }
+    }
+
+    /// The `_l2` program when this is an Ethernet device, `_l3` otherwise.
+    const fn pick(self, l2: &'static str, l3: &'static str) -> &'static str {
+        match self {
+            Self::Ethernet => l2,
+            Self::RawIp => l3,
+        }
+    }
+}
 
 /// What went wrong while wiring the datapath.
 #[derive(Debug)]
@@ -58,6 +153,161 @@ impl std::fmt::Display for DatapathError {
 }
 
 impl std::error::Error for DatapathError {}
+
+/// The policy-routing state the datapath needs, installed once and removed on drop.
+///
+/// Two families, each with one rule and one route. The guard is deliberately not
+/// `Clone`: the rules are box-global state, and two owners would remove them while the
+/// other was still redirecting.
+///
+/// # Why removal is best effort
+///
+/// `Drop` cannot report, and a failure to remove is not worth aborting a shutdown for: a
+/// stale `local default` rule is harmless when no datapath is attached (nothing sets the
+/// mark), and the next `daer run` re-installs it idempotently.
+#[derive(Debug)]
+pub struct RouteTable {
+    /// The families actually installed, so a partial failure removes only what it added.
+    installed: Vec<Family>,
+}
+
+/// One address family's rule and route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    /// The `ip` family selector, `-4` or `-6`.
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::V4 => "-4",
+            Self::V6 => "-6",
+        }
+    }
+}
+
+/// The `fwmark` selector the datapath's redirected packets carry.
+const MARK_SPEC: &str = "0x8000000/0x8000000";
+/// The routing table number, as `ip` spells it.
+const TABLE_SPEC: &str = "2023";
+
+impl Family {
+    /// The full argument vector for `ip <flag> rule add ...`.
+    const fn rule(self) -> [&'static str; 7] {
+        [
+            self.flag(),
+            "rule",
+            "add",
+            "fwmark",
+            MARK_SPEC,
+            "table",
+            TABLE_SPEC,
+        ]
+    }
+
+    /// The full argument vector for `ip <flag> route add local default dev lo table 2023`.
+    ///
+    /// `dev lo` is required: the kernel rejects a `local` route with no output device, and
+    /// `lo` is correct because a `local` route terminates in the host stack.
+    const fn route(self) -> [&'static str; 8] {
+        [
+            self.flag(),
+            "route",
+            "add",
+            "local",
+            "default",
+            "dev",
+            "lo",
+            "table",
+        ]
+    }
+
+    /// The same vector with the table number appended, since [`Self::route`] ends on the
+    /// `table` keyword for readability at the call site.
+    fn route_with_table(self) -> Vec<&'static str> {
+        let mut route = self.route().to_vec();
+        route.push(TABLE_SPEC);
+        route
+    }
+
+    /// The deletion form of [`Self::rule`].
+    const fn rule_del(self) -> [&'static str; 7] {
+        [
+            self.flag(),
+            "rule",
+            "del",
+            "fwmark",
+            MARK_SPEC,
+            "table",
+            TABLE_SPEC,
+        ]
+    }
+
+    /// The deletion form of [`Self::route`].
+    fn route_del(self) -> Vec<&'static str> {
+        let mut route = self.route().to_vec();
+        route[2] = "del";
+        route.push(TABLE_SPEC);
+        route
+    }
+}
+
+impl RouteTable {
+    /// Installs `fwmark -> table 2023 -> local default` for IPv4 and IPv6.
+    ///
+    /// Idempotent: whatever a previous run left behind is deleted first, so a restart after
+    /// a crash does not fail on "File exists".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatapathError::Command`] naming the failing `ip` invocation. A family that
+    /// fails removes the families that already succeeded before returning.
+    pub fn install() -> Result<Self, DatapathError> {
+        let mut installed = Vec::with_capacity(2);
+        for family in [Family::V4, Family::V6] {
+            if let Err(error) = install_family(family) {
+                // Roll back what was installed: a half-configured table would send one
+                // family's redirected traffic into the forward path.
+                let guard = Self { installed };
+                drop(guard);
+                return Err(error);
+            }
+            installed.push(family);
+        }
+        Ok(Self { installed })
+    }
+
+    fn remove(&self) -> Result<(), DatapathError> {
+        for family in &self.installed {
+            // A missing rule or route is the state being asked for, so a failure here is
+            // not an error worth surfacing.
+            let _ = run(&family.rule_del());
+            let _ = run(&family.route_del());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RouteTable {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            tracing::debug!(%error, "could not remove the datapath policy routing");
+        }
+    }
+}
+
+/// Installs one family's rule and route, replacing whatever was there.
+fn install_family(family: Family) -> Result<(), DatapathError> {
+    // Delete first so both commands are idempotent: `ip rule add` tolerates a duplicate
+    // (it creates a second identical rule), while `ip route add` fails with EEXIST.
+    let _ = run(&family.rule_del());
+    let _ = run(&family.route_del());
+    run(&family.rule())?;
+    run(&family.route_with_table())?;
+    Ok(())
+}
 
 fn run(line: &[&str]) -> Result<String, DatapathError> {
     let Some((program, arguments)) = line.split_first() else {
@@ -152,7 +402,7 @@ pub fn ifindex(interface: &str) -> Result<u32, DatapathError> {
 /// Loads the object, attaches every program, and returns the handle.
 ///
 /// The handle must be kept alive for the lifetime of the daemon: dropping it detaches the
-/// programs, and the box silently stops proxying.
+/// programs and removes the policy routing, and the box silently stops proxying.
 ///
 /// # Errors
 ///
@@ -165,120 +415,188 @@ pub fn attach(
     wan: &[String],
     listeners: Listeners,
     policy: &daer_routing::Policy,
-) -> Result<aya::Ebpf, DatapathError> {
+) -> Result<Attached, DatapathError> {
     use aya::programs::tc::TcAttachType;
     use daer_ebpf::loader::attach_tc;
     use daer_ebpf::names::program;
 
     let mut ebpf = loader::load_path(object, param).map_err(DatapathError::Object)?;
 
-    // LAN side: traffic *from* the local network being proxied. Both the L2 and the L3
-    // program are attached because the datapath picks between them per packet; attaching
-    // one would leave the other half of the traffic on the direct path.
-    for interface in lan {
-        let _ = attach_tc(
+    // Resolved before anything is attached: a device with no parser must stop the run
+    // rather than leave half the interfaces hooked and the rest silently direct.
+    let lan_kinds = kinds(lan)?;
+    let wan_kinds = kinds(wan)?;
+
+    for (interface, kind) in &lan_kinds {
+        // LAN ingress: traffic *from* the local network being proxied. LAN egress: the
+        // reply direction of a proxied flow, and the box's own traffic on a LAN-facing
+        // device.
+        attach_tc(
             &mut ebpf,
-            program::LAN_INGRESS_L2,
+            kind.pick(program::LAN_INGRESS_L2, program::LAN_INGRESS_L3),
             interface,
             TcAttachType::Ingress,
         )
         .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
+        attach_tc(
             &mut ebpf,
-            program::LAN_INGRESS_L3,
-            interface,
-            TcAttachType::Ingress,
-        )
-        .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
-            &mut ebpf,
-            program::LAN_EGRESS_L2,
-            interface,
-            TcAttachType::Egress,
-        )
-        .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
-            &mut ebpf,
-            program::LAN_EGRESS_L3,
+            kind.pick(program::LAN_EGRESS_L2, program::LAN_EGRESS_L3),
             interface,
             TcAttachType::Egress,
         )
         .map_err(DatapathError::Object)?;
     }
 
-    // WAN side: the box's own traffic, and the return path of a proxied flow.
-    for interface in wan {
-        let _ = attach_tc(
+    for (interface, kind) in &wan_kinds {
+        // WAN ingress and egress: the box's own traffic and the return path of a proxied
+        // flow. These two hooks are what make `daer` a gateway for the host itself.
+        attach_tc(
             &mut ebpf,
-            program::WAN_INGRESS_L2,
+            kind.pick(program::WAN_INGRESS_L2, program::WAN_INGRESS_L3),
             interface,
             TcAttachType::Ingress,
         )
         .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
+        attach_tc(
             &mut ebpf,
-            program::WAN_INGRESS_L3,
-            interface,
-            TcAttachType::Ingress,
-        )
-        .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
-            &mut ebpf,
-            program::WAN_EGRESS_L2,
+            kind.pick(program::WAN_EGRESS_L2, program::WAN_EGRESS_L3),
             interface,
             TcAttachType::Egress,
-        )
-        .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
-            &mut ebpf,
-            program::WAN_EGRESS_L3,
-            interface,
-            TcAttachType::Egress,
-        )
-        .map_err(DatapathError::Object)?;
-        // The pair programs handle traffic between our two devices: this is what makes a
-        // redirected flow reach the listener instead of looping.
-        let _ = attach_tc(
-            &mut ebpf,
-            program::WAN_LAN_INGRESS_L2,
-            interface,
-            TcAttachType::Ingress,
-        )
-        .map_err(DatapathError::Object)?;
-        let _ = attach_tc(
-            &mut ebpf,
-            program::WAN_LAN_INGRESS_L3,
-            interface,
-            TcAttachType::Ingress,
         )
         .map_err(DatapathError::Object)?;
     }
 
-    // The local device pair.
+    // The local device pair. `daer0peer` is where a redirected packet is assigned to the
+    // transparent listener; `daer0` is the return path of the listener's replies.
     for (interface, direction, name) in [
         (DEVICE, TcAttachType::Ingress, program::DEVICE_INGRESS),
         (PEER, TcAttachType::Ingress, program::PEER_INGRESS),
     ] {
-        let _ = attach_tc(&mut ebpf, name, interface, direction).map_err(DatapathError::Object)?;
+        attach_tc(&mut ebpf, name, interface, direction).map_err(DatapathError::Object)?;
     }
+
+    // A redirected packet arrives on `daer0peer` with a non-local source *and*
+    // destination, so reverse-path filtering would drop it before `bpf_sk_assign` could
+    // matter. Both sysctls and the `fwmark` table are box-global state owned by the
+    // returned guard.
+    let sysctls = Sysctl::apply()?;
+    let routes = RouteTable::install()?;
 
     republish_policy(&mut ebpf, param.datapath_generation, policy)?;
     // Without this the datapath decides "proxy" and then has nowhere to send the packet:
     // `assign_listener` looks the socket up in `listen_socket_map` and returns -1 when it is
     // empty, so the flow dies with no diagnostic on either side.
-    daer_ebpf::publish_listeners(&mut ebpf, listeners.tcp4, listeners.tcp6)
+    daer_ebpf::publish_listeners(&mut ebpf, listeners)
         .map_err(|error| DatapathError::Device(format!("cannot publish the listeners: {error}")))?;
-    Ok(ebpf)
+    Ok(Attached {
+        ebpf: std::sync::Arc::new(crate::decide::HandoffObserver::new(ebpf)),
+        _routes: routes,
+        _sysctls: sysctls,
+    })
+}
+
+/// Everything an attached datapath holds open.
+///
+/// One value rather than three returns, because the three must have the same lifetime: a
+/// dropped [`RouteTable`] with a live eBPF program leaves the kernel redirecting packets
+/// into a table that no longer sends them local.
+#[derive(Debug)]
+pub struct Attached {
+    /// The loaded object and the flow-fact observer over it.
+    ///
+    /// One field rather than two because they are the same resource: the observer reads
+    /// `routing_handoff_map` out of this object, and republishing the policy on reload writes
+    /// into it.
+    ebpf: Arc<crate::decide::HandoffObserver>,
+    /// The `fwmark` policy routing.
+    _routes: RouteTable,
+    /// The per-interface sysctls.
+    _sysctls: Sysctl,
+}
+
+impl Attached {
+    /// The observer the router should be built with.
+    ///
+    /// Returned as a trait object so `RouterOptions` does not have to name the eBPF type: the
+    /// router only ever needs [`crate::decide::KernelObserver`].
+    pub fn observer(&self) -> Arc<dyn crate::decide::KernelObserver> {
+        Arc::clone(&self.ebpf) as Arc<dyn crate::decide::KernelObserver>
+    }
+
+    /// Runs `f` with the loaded object, for republishing a policy on reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the object is no longer owned, which would be a shutdown race.
+    pub fn with_ebpf<T>(&self, f: impl FnOnce(&mut aya::Ebpf) -> T) -> Result<T, String> {
+        self.ebpf.with_ebpf(f)
+    }
+}
+
+/// Resolves `(interface, link kind)` pairs, failing on the first unknown device.
+fn kinds(interfaces: &[String]) -> Result<Vec<(&str, LinkKind)>, DatapathError> {
+    interfaces
+        .iter()
+        .map(|interface| Ok((interface.as_str(), LinkKind::of(interface)?)))
+        .collect()
+}
+
+/// The per-interface sysctls the datapath needs, restored on drop.
+#[derive(Debug, Default)]
+struct Sysctl {
+    /// `(path, previous contents)` for every value written.
+    written: Vec<(String, Option<String>)>,
+}
+
+impl Sysctl {
+    /// Disables reverse-path filtering on the peer and enables forwarding.
+    ///
+    /// `net.ipv4.conf.daer0peer.rp_filter = 0` is what lets a packet with a non-local
+    /// source address be delivered locally; without it the redirect is dropped by the
+    /// stack with an `rp_filter` counter and no other trace.
+    fn apply() -> Result<Self, DatapathError> {
+        let mut guard = Self::default();
+        for (path, value) in [
+            ("net/ipv4/conf/daer0peer/rp_filter", "0"),
+            ("net/ipv4/conf/daer0peer/forwarding", "1"),
+            ("net/ipv4/conf/all/forwarding", "1"),
+        ] {
+            guard.write(path, value)?;
+        }
+        Ok(guard)
+    }
+
+    fn write(&mut self, path: &str, value: &str) -> Result<(), DatapathError> {
+        let full = format!("/proc/sys/{path}");
+        let previous = std::fs::read_to_string(&full).ok();
+        if previous.as_deref().map(str::trim) == Some(value) {
+            // Already correct: record nothing, so drop does not restore a value it did
+            // not change.
+            return Ok(());
+        }
+        std::fs::write(&full, value).map_err(|error| {
+            DatapathError::Device(format!("cannot write {full} = {value}: {error}"))
+        })?;
+        self.written.push((full, previous));
+        Ok(())
+    }
+}
+
+impl Drop for Sysctl {
+    fn drop(&mut self) {
+        for (path, previous) in self.written.drain(..).rev() {
+            if let Some(value) = previous {
+                let _ = std::fs::write(&path, value.trim());
+            }
+        }
+    }
 }
 
 /// The listener file descriptors the datapath hands redirected flows to.
-#[derive(Debug, Clone, Copy)]
-pub struct Listeners {
-    /// IPv4 listener, key `0` in the datapath's `SOCKMAP`.
-    pub tcp4: std::os::fd::RawFd,
-    /// IPv6 listener, key `2`.
-    pub tcp6: std::os::fd::RawFd,
-}
+///
+/// Re-exported from `daer-ebpf` rather than declared here: the keys are ABI, and a second
+/// definition is a second thing that can drift.
+pub use daer_ebpf::Listeners;
 
 /// Publishes the epoch and rule count the datapath reads.
 ///

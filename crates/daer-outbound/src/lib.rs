@@ -37,6 +37,7 @@ mod group;
 pub mod hysteria2;
 mod latency;
 mod node_dialer;
+mod observe;
 mod property;
 mod reality;
 pub mod shadowsocks;
@@ -86,7 +87,10 @@ pub use netune::{
     DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, Preset, SocketConfig,
     UdpConnector,
 };
-pub use netune_trace::Recorder;
+pub use netune_trace::{Recorder, TraceSink};
+pub use observe::{
+    DialId, DialObserver, DialObserverSink, LogObserver, ObservedDialer, ObserverSlot,
+};
 
 pub use daer_common::SelectionPolicy;
 pub use daer_config::TimeSpan;
