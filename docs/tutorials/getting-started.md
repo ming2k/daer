@@ -61,8 +61,8 @@ policy = "min-moving-avg"
 
 [routing]
 rules = [
-    "dip(geoip:private) -> direct",
-    "domain(geosite:cn) -> direct"
+    "provider(private) -> direct",
+    "provider(cn) -> direct"
 ]
 fallback = "proxy"
 ```
@@ -70,7 +70,7 @@ fallback = "proxy"
 Validate your configuration syntax before starting:
 
 ```bash
-daer config validate -c config.toml
+daer check -c config.toml
 ```
 
 ---

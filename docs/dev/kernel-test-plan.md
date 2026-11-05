@@ -94,17 +94,17 @@ policy = "min-moving-avg"
 # so this pair is what decides the tier. Both are correct, and the startup log says
 # which one you got.
 rules = [
-  "dip(geoip:private) -> direct",
+  "provider(private) -> direct",
 ]
 fallback = "proxy"
 ```
 
-Check it compiles before starting — `route explain` uses the same generation the data path
+Check it compiles before starting — `daer explain` uses the same generation the data path
 does:
 
 ```sh
-./target/release/daer config validate -c /tmp/daer-test.toml
-./target/release/daer route explain 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why \
+./target/release/daer check -c /tmp/daer-test.toml
+./target/release/daer explain 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why \
     -c /tmp/daer-test.toml
 ```
 
@@ -147,7 +147,7 @@ configuration with `domain(...)` rules gets today. The reason string names the r
 is visible: either drop the domain predicate (if the address is enough) or accept the slower
 tier.
 
-`daer route explain <src> <dst>` answers the same question offline, from the *same* generation
+`daer explain <src> <dst>` answers the same question offline, from the *same* generation
 the daemon serves — the two share one loader (ADR-0006), so they cannot disagree about the node
 pool or the rules.
 
@@ -201,7 +201,7 @@ DEBUG daer_control::decide: flow decided generation=gen1 source=10.0.0.2:51234 \
 ```
 
 `outbound=direct` where you expected `proxy` means the rule matched something you did not
-intend — `route explain --why` with the same source/destination answers which predicate did.
+intend — `daer explain --why` with the same source/destination answers which predicate did.
 
 ## Step 6 — does a reload keep connections alive?
 
@@ -225,7 +225,7 @@ Any of these, whichever is the first thing that does not match:
 | step 1 fails | the whole `kernel-check.sh` output + `/tmp/daer-kernel-load.log` |
 | step 3 exits | `/tmp/daer-run.log` |
 | step 5 times out | `/tmp/daer-run.log` with `log-level = "debug"`, plus `nft list ruleset` |
-| step 5 reaches the wrong egress IP | `route explain --why` for the same flow, plus the log |
+| step 5 reaches the wrong egress IP | `daer explain --why` for the same flow, plus the log |
 
 ## What is expected to be broken already
 

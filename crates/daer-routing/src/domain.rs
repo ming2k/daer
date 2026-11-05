@@ -56,6 +56,7 @@ pub enum DomainKey {
     Suffix,
     Keyword,
     Regex,
+    Composite,
 }
 
 impl DomainKey {
@@ -65,6 +66,7 @@ impl DomainKey {
             Self::Suffix => "suffix",
             Self::Keyword => "keyword",
             Self::Regex => "regex",
+            Self::Composite => "composite",
         }
     }
 
@@ -79,6 +81,7 @@ impl DomainKey {
             "suffix" => Ok(Self::Suffix),
             "keyword" => Ok(Self::Keyword),
             "regex" => Ok(Self::Regex),
+            "composite" => Ok(Self::Composite),
             other => Err(RoutingError::new(format!(
                 "addDomain: unsupported key: {other}"
             ))),
@@ -87,8 +90,8 @@ impl DomainKey {
 }
 
 /// Whether a suffix pattern also matches the bare name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SuffixScope {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SuffixScope {
     /// `example.com`: matches `example.com` and `a.example.com`.
     SelfAndSubdomains,
     /// `.example.com`: matches only `a.example.com`.
@@ -97,7 +100,7 @@ enum SuffixScope {
 
 impl SuffixScope {
     /// The wider of two scopes. A key declared both ways matches both ways.
-    fn widen(self, other: Self) -> Self {
+    pub fn widen(self, other: Self) -> Self {
         if self == Self::SelfAndSubdomains || other == Self::SelfAndSubdomains {
             Self::SelfAndSubdomains
         } else {
@@ -178,6 +181,9 @@ impl DomainIndex {
                             index.patterns.push(boxed);
                         }
                         DomainKey::Regex => unreachable!("regex is handled in its own arm"),
+                        DomainKey::Composite => {
+                            unreachable!("composite is handled via from_composite")
+                        }
                     }
                 }
                 DomainKey::Regex => match regex::Regex::new(pattern) {
@@ -191,6 +197,9 @@ impl DomainIndex {
                         ));
                     }
                 },
+                DomainKey::Composite => {
+                    unreachable!("composite is handled via from_composite")
+                }
             }
         }
 
@@ -211,6 +220,52 @@ impl DomainIndex {
             }
         }
 
+        index
+    }
+
+    /// Builds a composite domain index holding full, suffix, keyword, and regex patterns
+    /// directly from pre-compiled collections (e.g. from a DRB).
+    pub fn from_composite(
+        exact: &[String],
+        suffix: &[(String, SuffixScope)],
+        keyword: &[String],
+        regex: &[String],
+    ) -> Self {
+        let mut index = Self {
+            key: DomainKey::Composite,
+            ..Self::default()
+        };
+        for pat in exact {
+            let lowered = pat.to_ascii_lowercase();
+            index.exact.insert(lowered.into_boxed_str());
+            index.patterns.push(pat.clone().into_boxed_str());
+        }
+        for (pat, scope) in suffix {
+            let lowered = pat.to_ascii_lowercase();
+            index
+                .suffix
+                .entry(lowered.clone().into_boxed_str())
+                .and_modify(|existing| *existing = existing.widen(*scope))
+                .or_insert(*scope);
+            index.patterns.push(lowered.into_boxed_str());
+        }
+        if !keyword.is_empty() {
+            let lowered_kw: Vec<String> = keyword.iter().map(|k| k.to_ascii_lowercase()).collect();
+            if let Ok(ac) = AhoCorasick::new(lowered_kw.iter().map(String::as_str)) {
+                index.keyword = Some(ac);
+            }
+            for kw in keyword {
+                index.patterns.push(kw.clone().into_boxed_str());
+            }
+        }
+        if !regex.is_empty() {
+            if let Ok(set) = RegexSet::new(regex.iter().map(String::as_str)) {
+                index.regex = Some(set);
+            }
+            for r in regex {
+                index.patterns.push(r.clone().into_boxed_str());
+            }
+        }
         index
     }
 
@@ -259,6 +314,25 @@ impl DomainIndex {
                 .regex
                 .as_ref()
                 .is_some_and(|set| set.is_match(normalized)),
+            DomainKey::Composite => {
+                if !self.exact.is_empty() && self.exact.contains(normalized) {
+                    return true;
+                }
+                if !self.suffix.is_empty() && self.matches_suffix(normalized) {
+                    return true;
+                }
+                if let Some(ac) = &self.keyword
+                    && ac.is_match(normalized)
+                {
+                    return true;
+                }
+                if let Some(set) = &self.regex
+                    && set.is_match(normalized)
+                {
+                    return true;
+                }
+                false
+            }
         }
     }
 

@@ -96,7 +96,7 @@ forwarded nothing (or the wrong thing).
    `KernelObserver` returns `KernelFacts` (MAC, DSCP, process name) for a flow;
    `HandoffObserver` implements it over `routing_handoff_map`. The router consults it on the
    flow path and falls back to `KernelFacts::default()` when there is no datapath — which is
-   the honest answer for `--no-datapath`, for `daer route explain`, and for every test. A rule
+   the honest answer for `--no-datapath`, for `daer explain`, and for every test. A rule
    that needs a fact nobody observed must not match by accident.
 
 6. **`pid == 0` means the process name is unknown, not empty.** The cgroup hooks populate
@@ -113,7 +113,7 @@ forwarded nothing (or the wrong thing).
 
   **Observable consequence**: a datapath run starts on `gen2`, not `gen1`, because the first
   compile is the address-only generation and the rebuild replaces it. The log says so
-  (`generation rebuilt with the datapath's flow facts`), and `daer route explain` builds its own
+  (`generation rebuilt with the datapath's flow facts`), and `daer explain` builds its own
   generation anyway, so no diagnostic depends on the number. With `--no-datapath` the daemon
   stays on `gen1`, which is what a reader comparing two logs should expect.
 - The datapath's box-global state is process-global. Two `daer` instances on one box would
@@ -123,7 +123,7 @@ forwarded nothing (or the wrong thing).
   `&mut` and the observer needs the same object. The lock is held for one map operation and
   never across an `await`.
 - A `mac(...)`/`pname(...)`/`dscp(...)` rule now matches on the flow path and still does not
-  match in `daer route explain`, which has no flow and therefore no map key. That asymmetry is
+  match in `daer explain`, which has no flow and therefore no map key. That asymmetry is
   intentional and is the difference between "what the kernel saw for this flow" and "what the
   rules say about a hypothetical one".
 

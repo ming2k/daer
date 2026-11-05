@@ -11,6 +11,7 @@ members = [
     "crates/daer-outbound",
     "crates/daer-routing",
     "crates/daer-sniff",
+    "crates/geodrb",
     "crates/xtask",
 ]
 
@@ -94,3 +95,35 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# `dev` and `test` carry full debuginfo by default, and for this workspace that is the
+# dominant cost of the build rather than a nicety:
+#
+# * a single test binary links to 77–110 MB, of which `size` attributes ~14 MB to text;
+# * there are 23 test targets, and every one of them links the **whole** dependency graph
+#   again — 759 executables and ~53 GB of `target/debug/deps` was measured on a warm tree;
+# * cargo runs them in parallel, so a change to one library re-links most of the workspace at
+#   once. A no-op `cargo test --no-run --workspace` takes 169 ms; the same command after
+#   touching one file's library took 666 s, all of it linking.
+#
+# `line-tables-only` keeps the thing debuginfo is actually used for here — a panic message
+# and a backtrace that name the source line — and drops the type and variable metadata that
+# accounts for most of the bytes. Dependencies get no debuginfo at all: when a test fails, the
+# frame that matters is in this workspace, and `[profile.dev.package."*"]` is the lever that
+# keeps a rebuild of our own code from re-encoding every third-party crate.
+#
+# `split-debuginfo` writes the debug sections beside the binary instead of into it, which is
+# what keeps the linker from rewriting a 100 MB file on every rebuild of an unrelated crate.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test.package."*"]
+debug = false

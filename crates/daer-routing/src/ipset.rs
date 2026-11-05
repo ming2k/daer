@@ -143,6 +143,30 @@ impl IpIndex {
         self.len == 0
     }
 
+    /// Compiles directly from pre-merged intervals and prefixes (e.g. from a DRB).
+    #[must_use]
+    pub fn from_merged(v4: Vec<(u32, u32)>, v6: Vec<(u128, u128)>, prefixes: Vec<IpNet>) -> Self {
+        let total = v4.len() + v6.len();
+        Self {
+            v4,
+            v6,
+            len: prefixes.len().max(total),
+            prefixes,
+        }
+    }
+
+    /// Slices the sorted, merged IPv4 intervals.
+    #[must_use]
+    pub fn v4_intervals(&self) -> &[(u32, u32)] {
+        &self.v4
+    }
+
+    /// Slices the sorted, merged IPv6 intervals.
+    #[must_use]
+    pub fn v6_intervals(&self) -> &[(u128, u128)] {
+        &self.v6
+    }
+
     /// How many intervals the set compiles to. Exposed for tests that assert the
     /// merge actually merges; not part of the matching contract.
     #[must_use]

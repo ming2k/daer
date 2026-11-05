@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 
 use daer_config::toml_config::{self, Loaded};
 
+use crate::rule_provider::{
+    RuleProviderResolution, resolve_rule_providers, resolve_rule_providers_with,
+};
 use crate::subscription::{Resolution, resolve_subscriptions, resolve_subscriptions_with};
 
 /// A configuration with every subscription resolved, plus what to tell the operator.
@@ -35,6 +38,8 @@ pub struct Resolved {
     pub warnings: Vec<String>,
     /// What the subscriptions produced, for a caller that wants to report it.
     pub subscriptions: Resolution,
+    /// What the rule providers produced (ADR-0014).
+    pub rule_providers: RuleProviderResolution,
 }
 
 impl Resolved {
@@ -94,12 +99,28 @@ pub async fn load_resolved(path: &Path) -> anyhow::Result<Resolved> {
         }
     }
 
+    let rule_providers = resolve_rule_providers(&config, &directory).await;
+    if !rule_providers.providers.is_empty() {
+        if rule_providers.all_usable() {
+            warnings.push(format!("rule providers: {}", rule_providers.describe()));
+        } else {
+            let failed = rule_providers.failed().len();
+            let total = rule_providers.providers.len();
+            anyhow::bail!(
+                "{failed} of {total} rule provider(s) could not be loaded and no cache was \
+                 available: {}",
+                rule_providers.describe()
+            );
+        }
+    }
+
     warn_about_empty_groups(&config, &mut warnings);
     Ok(Resolved {
         config,
         files,
         warnings,
         subscriptions,
+        rule_providers,
     })
 }
 
@@ -168,12 +189,24 @@ pub async fn load_resolved_with(
         );
     }
 
+    let rule_providers = resolve_rule_providers_with(&config, &directory, timeout).await;
+    if !rule_providers.providers.is_empty() && !rule_providers.all_usable() {
+        let failed = rule_providers.failed().len();
+        let total = rule_providers.providers.len();
+        anyhow::bail!(
+            "{failed} of {total} rule provider(s) could not be loaded and no cache was \
+             available: {}",
+            rule_providers.describe()
+        );
+    }
+
     warn_about_empty_groups(&config, &mut warnings);
     Ok(Resolved {
         config,
         files,
         warnings,
         subscriptions,
+        rule_providers,
     })
 }
 

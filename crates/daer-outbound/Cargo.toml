@@ -59,6 +59,9 @@ name = "hysteria2_interop"
 name = "reality_live"
 
 [[test]]
+name = "reality_interop"
+
+[[test]]
 name = "client_hello_probe"
 
 

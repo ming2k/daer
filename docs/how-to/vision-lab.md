@@ -119,9 +119,31 @@ Xtls Unpadding new block, content 56 padding 0   command 1
 
 | Test | Answers |
 | --- | --- |
+| `tests/reality_interop.rs` | **CI's gate**: start a local reference `xray` inbound and carry bytes both ways through REALITY + Vision. Skips with a reason without `xray`. Carries the negative controls (a wrong `pbk`, a non-REALITY server) |
 | `tests/vision_lab.rs` | is the Vision frame right, with REALITY out of the path? |
-| `tests/reality_live.rs` | does a real node authenticate us and carry bytes, end to end? |
+| `tests/reality_live.rs` | does a *third-party* node authenticate us and carry bytes, end to end? Needs `DAER_REALITY_LINK`; not a CI gate, because a public node is someone else's uptime and someone else's config |
 | `tests/reality_tag_audit.rs` | are the ClientHello offsets and groups still as REALITY needs? |
 | `tests/client_hello_probe.rs` | is our ClientHello valid TLS at all? (any TLS 1.3 server) |
 
 Run the ignored ones with `-- --include-ignored`.
+
+## The interop test starts its own server
+
+`tests/reality_interop.rs` is the one to run before touching the REALITY or Vision paths, and
+the one CI relies on. It needs no configuration and no credential:
+
+```sh
+cargo test -p daer-outbound --test reality_interop -- --nocapture
+XRAY_BIN=../Xray-core/xray cargo test -p daer-outbound --test reality_interop
+```
+
+It generates a key pair with `xray x25519`, starts an inbound on a free port, and asserts that
+a request comes back as a bare `HTTP/1.` response — then asserts the *two* negations that make
+that assertion mean something: a wrong `pbk` must be refused rather than forwarded, and a
+server that speaks no REALITY must not be accepted. Without those, a client that accepted any
+TLS server would pass.
+
+`DAER_REALITY_DEST` overrides the impersonated site (default `www.microsoft.com:443`). It must
+be a **real** site on 443: REALITY mimics the target's handshake record lengths, so a small
+certificate makes the *server* fail its own padding check with `payload[0]: 8, padding: -4`,
+which reads like a client bug and is not one.

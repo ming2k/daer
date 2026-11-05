@@ -86,6 +86,12 @@
         "rules": []
       }
     },
+    "rule-provider": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RuleProvider"
+      }
+    },
     "schema": {
       "description": "Schema version. Bumped when a change cannot be expressed as a default.",
       "type": "integer",
@@ -830,6 +836,20 @@
       ],
       "unevaluatedProperties": false
     },
+    "ProviderFormat": {
+      "type": "string",
+      "enum": [
+        "drb",
+        "text"
+      ]
+    },
+    "ProviderType": {
+      "type": "string",
+      "enum": [
+        "file",
+        "http"
+      ]
+    },
     "RealityConfig": {
       "type": "object",
       "properties": {
@@ -880,6 +900,45 @@
         }
       },
       "additionalProperties": false
+    },
+    "RuleProvider": {
+      "description": "One `[[rule-provider]]` entry.",
+      "type": "object",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/ProviderFormat",
+          "default": "drb"
+        },
+        "interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tag": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/ProviderType",
+          "default": "file"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tag"
+      ]
     },
     "Subscription": {
       "description": "`subscription = [\"url\"]` or `[[subscription]] tag/url/persist`.",

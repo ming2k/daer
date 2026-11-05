@@ -92,6 +92,7 @@ pub mod inbound;
 pub mod ingress_udp;
 pub mod load;
 pub mod relay;
+pub mod rule_provider;
 pub mod serve;
 pub mod sniff;
 pub mod subscription;
@@ -118,6 +119,10 @@ pub use load::{
     Resolved, group_mentions_node, load_resolved, load_resolved_with, warn_about_empty_groups,
 };
 pub use relay::{Relayed, splice};
+pub use rule_provider::{
+    ResolvedRuleProvider, RuleProviderResolution, resolve_rule_providers,
+    resolve_rule_providers_with,
+};
 pub use serve::{
     Decide, Ingress, Metrics, ServeStats, ShutdownReason, Stopped, is_resource_exhausted,
     serve as serve_ingress, serve_with_datagrams,

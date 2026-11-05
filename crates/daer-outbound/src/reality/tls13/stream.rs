@@ -917,6 +917,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Connection<S> {
                                     match self.layer.unframe(&header, &body) {
                                         Ok((ContentType::ApplicationData, payload)) => {
                                             self.reading = fresh;
+                                            if payload.is_empty() {
+                                                // A zero-length `application_data` record is legal in
+                                                // TLS 1.3 and a REALITY node writes one immediately
+                                                // after the handshake (Xray's buffered writer flushes
+                                                // an empty record before the VLESS reply).
+                                                //
+                                                // Returning `Ready(Ok(()))` here with nothing written
+                                                // would be read as **EOF** by every caller: `AsyncRead`
+                                                // has no other way to say "zero bytes so far". The
+                                                // tunnel then dies before the reply is written off the
+                                                // peer's buffer — which is exactly what the first live
+                                                // interop run showed: a completed REALITY authentication,
+                                                // a `200 OK` on the server's side of the log, and an
+                                                // immediate EOF at the client.
+                                                //
+                                                // The record is not data, so the loop pulls the next
+                                                // one. Termination is the peer's: each iteration has
+                                                // consumed a record from the socket, and a dry socket
+                                                // returns `Pending`.
+                                                continue;
+                                            }
                                             self.layer.pending.extend_from_slice(&payload);
                                             let take =
                                                 self.layer.pending.len().min(buf.remaining());
@@ -1229,5 +1250,92 @@ mod tests {
         message.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
         message.extend_from_slice(body);
         message
+    }
+
+    /// A connection whose read key matches the returned peer's write key.
+    ///
+    /// The connection's socket is a duplex whose other half is returned as the feeder, so a
+    /// test can write exactly the records it wants the connection to see.
+    fn paired_connection() -> (
+        Tls13Connection<tokio::io::DuplexStream>,
+        RecordLayer,
+        tokio::io::DuplexStream,
+    ) {
+        let key = [0x5au8; 32];
+        let iv = [0x3cu8; 12];
+        let (feeder, remote) = tokio::io::duplex(64 * 1024);
+        let mut connection = Tls13Connection {
+            io: remote,
+            layer: RecordLayer::new(),
+            reading: Reading::Header {
+                filled: 0,
+                bytes: [0u8; RecordHeader::LEN],
+            },
+            awaiting_write: Vec::new(),
+            written: 0,
+        };
+        connection.layer.read_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("read key"));
+        let mut peer = RecordLayer::new();
+        peer.write_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("write key"));
+        (connection, peer, feeder)
+    }
+
+    #[tokio::test]
+    async fn a_zero_length_application_record_is_not_end_of_stream() {
+        // The bug this test exists for: a REALITY node flushes an empty
+        // `application_data` record right after the handshake. Returning
+        // `Ready(Ok(()))` for it with nothing written is what `AsyncRead` reports as
+        // **EOF**, so the tunnel died before the reply the node had already buffered
+        // ever arrived — a completed REALITY authentication, a `200 OK` in the node's
+        // own log, and zero bytes at the caller.
+        let (mut connection, mut peer, mut feeder) = paired_connection();
+        let mut wire = peer
+            .frame(ContentType::ApplicationData, &[])
+            .expect("empty record frames");
+        wire.extend_from_slice(
+            &peer
+                .frame(ContentType::ApplicationData, b"HTTP/1.1 200 OK\r\n")
+                .expect("payload frames"),
+        );
+        tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut feeder, &wire)
+                .await
+                .expect("feed");
+            // `feeder` drops here, closing the socket: the read loop must still hand back
+            // the payload before it sees the EOF.
+        });
+
+        let mut got = Vec::new();
+        let read = tokio::io::AsyncReadExt::read_to_end(&mut connection, &mut got)
+            .await
+            .expect("read must not fail");
+        assert_eq!(
+            got, b"HTTP/1.1 200 OK\r\n",
+            "the empty record must be skipped, and the data after it must arrive"
+        );
+        assert_eq!(read, got.len());
+    }
+
+    #[tokio::test]
+    async fn an_empty_record_and_then_nothing_is_still_end_of_stream() {
+        // The negative control for the test above: skipping an empty record must not turn
+        // into "wait forever" or "invent data". A peer that sends only the empty record and
+        // then closes is a real EOF, and the read has to say so.
+        let (mut connection, mut peer, mut feeder) = paired_connection();
+        let wire = peer
+            .frame(ContentType::ApplicationData, &[])
+            .expect("empty record frames");
+        tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut feeder, &wire)
+                .await
+                .expect("feed");
+        });
+
+        let mut got = Vec::new();
+        let read = tokio::io::AsyncReadExt::read_to_end(&mut connection, &mut got)
+            .await
+            .expect("read must not fail");
+        assert_eq!(read, 0, "an empty record carries no data");
+        assert!(got.is_empty(), "no bytes may be invented");
     }
 }

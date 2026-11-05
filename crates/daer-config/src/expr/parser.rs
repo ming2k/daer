@@ -233,8 +233,8 @@ mod tests {
 
     #[test]
     fn parses_keyed_parameters_and_outbound_calls() {
-        let parsed = rule("domain(geosite:cn) -> proxy(mark: 0x10)");
-        assert_eq!(parsed.and_functions[0].params[0].key, "geosite");
+        let parsed = rule("domain(provider:cn) -> proxy(mark: 0x10)");
+        assert_eq!(parsed.and_functions[0].params[0].key, "provider");
         assert_eq!(parsed.outbound.params[0].key, "mark");
         assert_eq!(parsed.outbound.params[0].value.to_string(), "0x10");
     }

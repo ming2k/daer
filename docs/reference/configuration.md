@@ -112,15 +112,19 @@ Direct outbound connection without proxying.
 
 ### Converting Existing Links
 
-The legacy `url` string field in `[[node]]` has been retired in favor of strict, type-safe structured tables. To convert an existing URI link (e.g. from a sharing panel) into a structured table, use the `daer node convert` CLI command:
+The legacy `url` string field in `[[node]]` has been retired in favor of strict, type-safe structured tables.
 
-```bash
-daer node convert "vless://uuid@server:port?encryption=none&security=reality&sni=example.com&pbk=...#my-node"
+`daer` parses URI links at runtime, so a link from a sharing panel does not need hand-converting:
+declare it as a `[[subscription]]` and the node pool is filled on load and on every reload.
+
+```toml
+[[subscription]]
+tag = "panel"
+url = "https://example.com/api/subscribe?token=..."
 ```
 
-This outputs a validated `[[node]]` TOML block ready to paste into your configuration.
-
-Remote subscription endpoints declaring lists of URI links continue to be supported natively via `[[subscription]]`.
+An inline `[[node]]` is still written as a structured table, and `daer check` names any field
+it cannot honour.
 
 ---
 
@@ -136,7 +140,22 @@ Groups nodes together for policy-based selection and health checking.
 
 ---
 
-## 5. `[routing]` Table
+## 5. `[[rule-provider]]` Tables (ADR-0014)
+
+Declares pre-compiled DRB (`.drb`) or human-readable text rule sets from local files or remote HTTP subscriptions.
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `tag` | string | Required | Unique identifier for referencing in routing rules via `provider(tag)`. |
+| `type` | string | `"file"` | Provider type: `"file"` or `"http"`. |
+| `url` | string | Optional | Remote download URL (required when `type = "http"`). |
+| `path` | string | Optional | Local file path (required when `type = "file"`). |
+| `format` | string | `"drb"` | Artifact format: `"drb"` (binary zero-copy) or `"text"` (plain text). |
+| `interval` | string | Optional | Auto-update interval for HTTP providers (e.g. `"24h"`, `"12h"`). |
+
+---
+
+## 6. `[routing]` Table
 
 Defines flow matching rules and default verdicts.
 
@@ -147,17 +166,20 @@ Defines flow matching rules and default verdicts.
 
 ### Rule Predicates
 
-- `dip(cidr)` / `dip(geoip:tag)` — Match destination IP.
-- `sip(cidr)` / `sip(geoip:tag)` — Match source IP.
+- `dip(cidr)` — Match destination IP.
+- `sip(cidr)` — Match source IP.
 - `dport(port_range)` — Match destination port.
 - `sport(port_range)` — Match source port.
-- `domain(domain_str)` / `domain(geosite:tag)` — Match sniffed domain.
+- `domain(suffix|full|keyword|regex: pattern)` — Match the sniffed domain by kind.
+- `provider(tag)` / `rule-set(tag)` — Match IP intervals or domains from a declared `[[rule-provider]]`.
+- `dip(provider:tag)` / `ip(provider:tag)` — Match only IP intervals from a declared rule provider.
+- `domain(provider:tag)` — Match only domains from a declared rule provider.
 - `l4proto(tcp|udp)` — Match Layer 4 transport protocol.
 - `pname(process_name)` — Match client process name.
 
 ---
 
-## 6. `[dns]` Table
+## 7. `[dns]` Table
 
 Configures the built-in DNS server, caching, and upstream transports.
 

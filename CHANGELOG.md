@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **REALITY sessions died immediately after authenticating** (`daer-outbound`). A REALITY node
+  flushes a legal zero-length `application_data` record right after the handshake;
+  `Tls13Connection::poll_read` answered it with `Ready(Ok(()))` and nothing written, which is
+  `AsyncRead`'s encoding for end-of-stream. Every proxied connection through every REALITY node
+  returned zero bytes while the node's own log showed the request served. The record is now
+  skipped and the loop pulls the next one; termination remains the peer's.
+- **`daer node convert` produced output that could not be loaded** (`daer-config`). Two defects,
+  both invisible in the printed text and fatal when pasted back: a nested table rendered as
+  `[reality]` instead of `[node.reality]`, and `tag` was emitted twice (once from `Node`, once
+  from its flattened endpoint), which TOML rejects as a duplicate key. The command now
+  serializes a one-element document so `toml` owns the table headers, and validates the node
+  before printing it, so a mistyped cipher reports
+  `unknown method 'aes-128-grm'` instead of emitting a block that fails later.
+
+### Added
+
+- **`daer-outbound/tests/reality_interop.rs`** — REALITY + Vision carried end to end against a
+  local reference `xray` inbound that the test starts itself. This is the CI gate the path was
+  missing: the pre-existing `reality_live.rs` is `#[ignore]` and needs a credentialed public
+  node, so nothing in CI exercised the code that the defect above broke. Two negative controls
+  make the positive assertion falsifiable: a wrong `pbk` must be refused rather than forwarded
+  to the impersonated site, and a server that speaks no REALITY must not be accepted. Skips
+  with a stated reason when no `xray` binary is present.
+
+### Changed
+
+- **Build profiles trimmed for a workspace with 23 test targets** (`Cargo.toml`). `dev` and
+  `test` now use `debug = "line-tables-only"` with `split-debuginfo = "unpacked"`, and
+  dependencies carry no debuginfo. Measured effect: a test binary went from 77–192 MB to
+  15–25 MB, `target/debug/deps` from 62 GB to 9.3 GB, and rebuilding after touching one library
+  from 666 s to 2 s. `file:line` in a panic message and in `RUST_BACKTRACE=1` frames is
+  preserved, which is what the debuginfo was being used for.
+- **`cargo xtask ci` bounds its parallelism** to `nproc/2` (`DAER_CI_JOBS` overrides). Cargo's
+  default starts all 23 test linkers at once, and the wall-clock cost was dominated by their
+  contention rather than their work. The suite now runs in 37 s.
+
 ## [0.0.4] - 2026-11-01
 
 ### Added

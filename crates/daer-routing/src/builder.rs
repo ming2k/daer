@@ -13,6 +13,7 @@ use daer_config::{Function, Param, RoutingRule};
 use ipnet::IpNet;
 
 use crate::domain::{DomainIndex, DomainKey};
+use crate::drb::{DrbSet, RuleProviderPool};
 use crate::error::RoutingError;
 use crate::ipset::IpIndex;
 use crate::matcher::{MatchSet, MatchValue};
@@ -95,6 +96,36 @@ pub trait MatchSink {
         target: &MatchTarget,
     ) -> Result<(), RoutingError>;
 
+    fn add_provider(
+        &mut self,
+        negated: bool,
+        set: &DrbSet,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        let _ = (negated, set, target);
+        Ok(())
+    }
+
+    fn add_ip_index(
+        &mut self,
+        negated: bool,
+        index: IpIndex,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        let _ = (negated, index, target);
+        Ok(())
+    }
+
+    fn add_domain_index(
+        &mut self,
+        negated: bool,
+        index: DomainIndex,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        let _ = (negated, index, target);
+        Ok(())
+    }
+
     /// Records a non-fatal diagnostic, such as a truncated process name.
     fn warn(&mut self, _message: String) {}
 }
@@ -102,11 +133,22 @@ pub trait MatchSink {
 #[derive(Debug)]
 pub struct RulesBuilder<'a, S: MatchSink> {
     sink: &'a mut S,
+    providers: Option<&'a RuleProviderPool>,
 }
 
 impl<'a, S: MatchSink> RulesBuilder<'a, S> {
     pub fn new(sink: &'a mut S) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            providers: None,
+        }
+    }
+
+    pub fn with_providers(sink: &'a mut S, providers: &'a RuleProviderPool) -> Self {
+        Self {
+            sink,
+            providers: Some(providers),
+        }
     }
 
     pub fn sink(&self) -> &S {
@@ -140,7 +182,7 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                     };
 
                     self.dispatch(function, key, &values, &target)
-                        .map_err(|err| err.context(format!("failed to parse '{function}'")))?;
+                        .map_err(|err| err.context(format!("in '{function}'")))?;
                 }
             }
         }
@@ -157,14 +199,65 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
         let negated = function.negated;
 
         match function.name.as_str() {
+            "provider" => {
+                require_bare(function, key)?;
+                for (index, tag) in values.iter().enumerate() {
+                    let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
+                        RoutingError::new(format!("unknown rule provider: {tag}"))
+                    })?;
+                    let t = if index + 1 == values.len() {
+                        target.clone()
+                    } else {
+                        MatchTarget::logical_or(target.mark(), target.must())
+                    };
+                    self.sink.add_provider(negated, set, &t)?;
+                }
+                Ok(())
+            }
             "domain" => {
-                let key = DomainKey::parse(key)?;
-                self.sink.add_domain(negated, key, values, target)
+                if key == "provider" {
+                    for (index, tag) in values.iter().enumerate() {
+                        let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
+                            RoutingError::new(format!("unknown rule provider: {tag}"))
+                        })?;
+                        let t = if index + 1 == values.len() {
+                            target.clone()
+                        } else {
+                            MatchTarget::logical_or(target.mark(), target.must())
+                        };
+                        if let Some(dom) = set.to_domain_index() {
+                            self.sink.add_domain_index(negated, dom, &t)?;
+                        }
+                    }
+                    Ok(())
+                } else if is_retired_dat_key(key) {
+                    Err(retired_dat_key("domain", key))
+                } else {
+                    let key = DomainKey::parse(key)?;
+                    self.sink.add_domain(negated, key, values, target)
+                }
             }
             "ip" => {
-                require_bare(function, key)?;
-                let prefixes = parse_prefixes(values)?;
-                self.sink.add_ip(negated, &prefixes, target)
+                if key == "provider" {
+                    for (index, tag) in values.iter().enumerate() {
+                        let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
+                            RoutingError::new(format!("unknown rule provider: {tag}"))
+                        })?;
+                        let t = if index + 1 == values.len() {
+                            target.clone()
+                        } else {
+                            MatchTarget::logical_or(target.mark(), target.must())
+                        };
+                        if let Some(ip) = set.to_ip_index() {
+                            self.sink.add_ip_index(negated, ip, &t)?;
+                        }
+                    }
+                    Ok(())
+                } else {
+                    require_bare(function, key)?;
+                    let prefixes = parse_prefixes(values)?;
+                    self.sink.add_ip(negated, &prefixes, target)
+                }
             }
             "sip" => {
                 require_bare(function, key)?;
@@ -220,10 +313,38 @@ fn require_bare(function: &Function, key: &str) -> Result<(), RoutingError> {
         return Ok(());
     }
     let name = &function.name;
+    if is_retired_dat_key(key) {
+        return Err(retired_dat_key(name, key));
+    }
     Err(RoutingError::new(format!(
         "{name}: unsupported parameter key {key:?}; {name} takes bare values only and accepts \
          no named parameter, so write {name}(<value>)"
     )))
+}
+
+/// True for the keys that used to reach a Protobuf `.dat` file.
+fn is_retired_dat_key(key: &str) -> bool {
+    matches!(key, "geosite" | "geoip" | "ext")
+}
+
+/// The error for `geosite:` / `geoip:` / `ext:`.
+///
+/// These named a Protobuf `.dat` file. Both the file and the reader are gone (ADR-0014,
+/// ADR-0015), so the honest answer is to name the replacement rather than say "unsupported key":
+/// an operator migrating a working configuration needs to know where the category went, and the
+/// data is still available — as a compiled `.drb` from `geodrb`.
+fn retired_dat_key(function: &str, key: &str) -> RoutingError {
+    RoutingError::new(format!(
+        "{function}({key}: ...): the `{key}:` key names a Protobuf .dat file, which this build \
+         no longer reads (ADR-0014). Declare the category as a `[[rule-provider]]` and write \
+         `provider(<tag>)`, or `{function}(provider: <tag>)` to use only that provider's \
+         {}. See `geodrb`: https://github.com/daeuniverse/geodrb",
+        if function == "domain" {
+            "domains"
+        } else {
+            "addresses"
+        }
+    ))
 }
 
 fn group_params_by_key(params: &[Param]) -> Vec<(&str, Vec<&str>)> {
@@ -369,6 +490,39 @@ impl MatchSink for RecordingSink {
         Ok(())
     }
 
+    fn add_provider(
+        &mut self,
+        negated: bool,
+        set: &DrbSet,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        let sets = set.to_match_sets(target, negated);
+        for s in sets {
+            self.matches.push(s);
+        }
+        Ok(())
+    }
+
+    fn add_ip_index(
+        &mut self,
+        negated: bool,
+        index: IpIndex,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        self.push(MatchValue::IpSet(index), target, negated);
+        Ok(())
+    }
+
+    fn add_domain_index(
+        &mut self,
+        negated: bool,
+        index: DomainIndex,
+        target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        self.push(MatchValue::Domain(index), target, negated);
+        Ok(())
+    }
+
     fn warn(&mut self, message: String) {
         self.warnings.push(message);
     }
@@ -498,6 +652,19 @@ impl MatchSink for ValidationSink {
         Ok(())
     }
 
+    fn add_provider(
+        &mut self,
+        _negated: bool,
+        set: &DrbSet,
+        _target: &MatchTarget,
+    ) -> Result<(), RoutingError> {
+        if set.is_empty() {
+            self.warnings
+                .push(format!("rule provider '{}' is empty", set.name));
+        }
+        Ok(())
+    }
+
     fn warn(&mut self, message: String) {
         self.warnings.push(message);
     }
@@ -519,6 +686,40 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| daer_config::parse_rule_expr(line).expect("parses"))
             .collect()
+    }
+
+    /// The retired `.dat` keys must name their replacement, not say "unsupported key".
+    ///
+    /// A migrating operator has a configuration that worked, and the only useful answer says
+    /// where the category went. "unsupported key: geosite" is indistinguishable from a typo and
+    /// leaves them to guess.
+    #[test]
+    fn retired_dat_keys_name_the_replacement() {
+        for (rule, function, data) in [
+            ("domain(geosite:cn) -> direct", "domain", "domains"),
+            ("dip(geoip:cn) -> direct", "ip", "addresses"),
+            ("sip(geoip:private) -> direct", "sip", "addresses"),
+        ] {
+            // The alias optimizer runs first in the real pipeline (`dip` -> `ip`), so the
+            // fixture has to reflect what lowering actually sees.
+            let rules = AliasOptimizer.optimize(rules(rule)).expect("optimizes");
+            let error = RulesBuilder::new(&mut RecordingSink::default())
+                .apply(&rules)
+                .expect_err("a .dat key must not lower");
+            let message = error.to_string();
+            assert!(message.contains("ADR-0014"), "{rule}: {message}");
+            assert!(message.contains("[[rule-provider]]"), "{rule}: {message}");
+            assert!(message.contains(data), "{rule}: {message}");
+            assert!(
+                !message.contains("unsupported parameter key"),
+                "{rule} fell back to the generic message: {message}"
+            );
+            // The context names the function, so a rule with several predicates is identifiable.
+            assert!(
+                message.contains(&format!("in '{function}(")),
+                "{rule}: the error must name the function: {message}"
+            );
+        }
     }
 
     #[test]
@@ -570,7 +771,7 @@ mod tests {
         let error = RulesBuilder::new(&mut sink)
             .apply(&rules)
             .expect_err("must fail");
-        assert!(error.message.starts_with("failed to parse 'ip("), "{error}");
+        assert!(error.message.starts_with("in 'ip("), "{error}");
     }
 
     #[test]

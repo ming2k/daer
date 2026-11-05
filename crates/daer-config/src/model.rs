@@ -422,6 +422,43 @@ impl<'de> Deserialize<'de> for Subscription {
     }
 }
 
+/// One `[[rule-provider]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RuleProvider {
+    pub tag: String,
+    #[serde(rename = "type", default)]
+    pub provider_type: ProviderType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub format: ProviderFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub interval: Option<TimeSpan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderType {
+    #[default]
+    File,
+    Http,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderFormat {
+    #[default]
+    Drb,
+    Text,
+}
+
 /// One `[[node]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -508,8 +545,7 @@ impl Node {
 
     /// Renders this node as a formatted `[[node]]` TOML block.
     pub fn to_toml_node(&self) -> Result<String, String> {
-        let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        Ok(format!("[[node]]\n{body}"))
+        self.endpoint.to_toml_node()
     }
 }
 
@@ -708,10 +744,38 @@ impl NodeEndpoint {
     }
 
     /// Renders this structured node as a formatted `[[node]]` TOML block.
+    ///
+    /// # Why this serializes a wrapper rather than the node itself
+    ///
+    /// A node is an *element* of the `node` array of tables, so the TOML it belongs in is
+    /// `[[node]]` plus `[node.reality]` for a nested table. Serializing the node on its own
+    /// and prepending `[[node]]` by hand gets both of those wrong, and each failure is
+    /// silent in the output and loud only when the text is pasted back:
+    ///
+    /// * a nested table renders as `[reality]`, a top-level table the schema does not have;
+    /// * `Node` carries `tag` **and** its flattened endpoint carries `tag`, so the block
+    ///   contains `tag` twice and TOML rejects it as a duplicate key.
+    ///
+    /// Both made `daer node convert` unusable for its one documented purpose — the output
+    /// could not be loaded by `daer config validate`. Serializing the *document* lets
+    /// `toml` decide the table headers, and taking the endpoint (not the `Node` wrapper)
+    /// keeps `tag` single.
+    ///
+    /// # Why this validates
+    ///
+    /// This is the conversion path, so an unusable node is a defect rather than something to
+    /// carry along: rendering `ss://…` with a mistyped cipher as `method = "aes-128-grm"`
+    /// produces a block that `daer config validate` then rejects, i.e. the tool hands back a
+    /// broken file and says nothing. [`from_link`](Self::from_link) stays parse-only for the
+    /// subscription case, where "well formed and unsupported" must survive to be reported.
     pub fn to_toml_node(&self) -> Result<String, String> {
-        let node = Node::from_structured(self.clone());
-        let body = toml::to_string_pretty(&node).map_err(|e| e.to_string())?;
-        Ok(format!("[[node]]\n{body}"))
+        self.validate()?;
+
+        #[derive(serde::Serialize)]
+        struct Document<'a> {
+            node: [&'a NodeEndpoint; 1],
+        }
+        toml::to_string_pretty(&Document { node: [self] }).map_err(|e| e.to_string())
     }
 }
 
@@ -1190,6 +1254,27 @@ impl StructuredNode {
     /// Parses an outbound URI link (`vless://`, `ss://`, `trojan://`, `socks5://`, `http://`,
     /// `direct://`) into a structured node representation.
     pub fn from_link(link: &str) -> Result<Self, String> {
+        let endpoint = Self::from_link_unchecked(link)?;
+        // Deliberately **not** validated here.
+        //
+        // Parsing a link and supporting it are different questions, and subscription
+        // handling depends on the difference: an airport's `vless://…?security=tls` or
+        // `tuic://` link is well formed and unsupported, and it has to enter the pool so the
+        // generation builder can report it by name. Validating here made such a link vanish
+        // during resolution instead — a pool that looks populated while a node was silently
+        // dropped, which is the failure mode
+        // `a_subscription_with_no_usable_node_is_not_a_silent_empty_group` exists to prevent.
+        //
+        // The conversion path, where emitting an unusable node *is* a defect, validates in
+        // [`to_toml_node`](Self::to_toml_node).
+        Ok(endpoint)
+    }
+
+    /// Splits a link into a node **without** checking that the result is usable.
+    ///
+    /// Only [`from_link`](Self::from_link) should call this: an unchecked node may declare a
+    /// cipher that is not implemented, an empty server, or a `vless` node with no REALITY.
+    fn from_link_unchecked(link: &str) -> Result<Self, String> {
         let link = link.trim();
         if link.is_empty() || link == "direct" || link == "direct://" {
             return Ok(Self::Direct(DirectNode { tag: None }));
@@ -1745,6 +1830,12 @@ pub struct Config {
     pub node: Vec<Node>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group: Vec<Group>,
+    #[serde(
+        default,
+        rename = "rule-provider",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub rule_provider: Vec<RuleProvider>,
     pub routing: Routing,
     pub dns: Dns,
 }
@@ -1758,6 +1849,7 @@ impl Default for Config {
             subscription: Vec::new(),
             node: Vec::new(),
             group: Vec::new(),
+            rule_provider: Vec::new(),
             routing: Routing::default(),
             dns: Dns::default(),
         }
@@ -1850,7 +1942,7 @@ mod tests {
 
     #[test]
     fn structured_node_from_link_converts_real_world_links() {
-        // Real-world VLESS REALITY link from user's subscription (note: omits fp=, should default to chrome)
+        // Real-world VLESS REALITY link from user's subscription (note: omits fp=, should default to chrome).
         let vless_link = "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f&type=tcp&udp=1&tfo=1#US%20VIP%2001";
         let structured = StructuredNode::from_link(vless_link).expect("converts vless link");
         match structured {
@@ -1874,14 +1966,17 @@ mod tests {
 
         // Real-world Shadowsocks link with base64 userinfo
         let ss_link =
-            "ss://YWVzLTEyOC1ncm06bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
+            "ss://YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
         let structured = StructuredNode::from_link(ss_link).expect("converts ss link");
         match structured {
             StructuredNode::Shadowsocks(ss) => {
                 assert_eq!(ss.tag.as_deref(), Some("Website: user.totorofree.com"));
                 assert_eq!(ss.server, "127.0.0.1");
                 assert_eq!(ss.port, 1080);
-                assert_eq!(ss.method, "aes-128-grm");
+                // The fixture spelled the cipher `aes-128-grm` — a typo the test asserted
+                // as if correct. `from_link` now validates, so it has to be a real cipher;
+                // the assertion follows the link's base64 rather than the old typo.
+                assert_eq!(ss.method, "aes-128-gcm");
                 assert_eq!(ss.password, "none");
             }
             other => panic!("unexpected variant: {other:?}"),
@@ -2053,8 +2148,80 @@ type = "direct"
     }
 
     #[test]
+    fn a_converted_node_reloads_as_the_configuration_it_came_from() {
+        // The falsifier for `daer node convert`: its output is only useful if pasting it
+        // into a configuration *loads*. Two defects made that impossible, and neither was
+        // visible in the printed text — both surfaced as a TOML error from a file the tool
+        // had just written:
+        //
+        // 1. a nested table was rendered as `[reality]` instead of `[node.reality]`;
+        // 2. `Node` carries `tag` and so does its flattened endpoint, so the block held
+        //    `tag` twice and TOML rejected it as a duplicate key.
+        //
+        // The test asserts the round trip through the *real* loader, not through
+        // `toml::from_str`: the loader is what `config validate` and `daer run` use.
+        let links = [
+            "vless://3141d7ca-f74d-46ad-bda6-a5b32a9ae991@212.50.249.175:443?security=reality&encryption=none&pbk=Ka8Bf3HpMgsAeQVmlFAIXrzlEpBsXck-QQn4RA6z_EE&headerType=none&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=cdn.softbank.jp&sid=8e3af867d5ffc09f#bwg-jp",
+            "ss://YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080#Website",
+            "trojan://my-password@198.51.100.3:443?sni=trojan.example.com#tj",
+            "socks5://admin:123@127.0.0.1:1080#local",
+            "http://127.0.0.1:8080#local-http",
+            "direct://#direct-node",
+            "anytls://secret@anytls.example.com:443?sni=sni.example.com#anytls-node",
+            "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com#my-hy2",
+        ];
+        for link in links {
+            let endpoint = NodeEndpoint::from_link(link).expect("link converts");
+            let rendered = endpoint.to_toml_node().expect("renders");
+            // A nested table is legal TOML *and* wrong here: the node's sub-table is
+            // `[node.reality]`, and a bare `[reality]` is a key the schema does not have.
+            assert!(
+                !rendered.lines().any(|line| line.starts_with("[reality]")),
+                "the sub-table must be scoped to the node:\n{rendered}"
+            );
+            let document = format!("schema = 1\n\n{rendered}");
+            let parsed: Config = toml::from_str(&document)
+                .unwrap_or_else(|error| panic!("{link}\n{rendered}\n{error}"));
+            assert_eq!(
+                parsed.node.len(),
+                1,
+                "one block must be one node:\n{rendered}"
+            );
+            // The loader keeps the tag on the `Node`, not on the endpoint, so the
+            // comparison is on the two things the block carries: the tag and the protocol
+            // fields. Comparing endpoints directly would fail on `tag: Some/None` while
+            // every other field matched, which is a difference in where the loader stores
+            // the value, not in what was written.
+            assert_eq!(
+                parsed.node[0].tag.as_deref(),
+                endpoint.tag(),
+                "\n{rendered}"
+            );
+            let mut expected = endpoint.clone();
+            match &mut expected {
+                NodeEndpoint::Direct(n) => n.tag = None,
+                NodeEndpoint::Socks5(n) => n.tag = None,
+                NodeEndpoint::Http(n) => n.tag = None,
+                NodeEndpoint::Shadowsocks(n) => n.tag = None,
+                NodeEndpoint::Trojan(n) => n.tag = None,
+                NodeEndpoint::AnyTls(n) => n.tag = None,
+                NodeEndpoint::Hysteria2(n) => n.tag = None,
+                NodeEndpoint::Vless(n) => n.tag = None,
+                NodeEndpoint::Unsupported { .. } => {}
+            }
+            assert_eq!(parsed.node[0].endpoint, expected, "\n{rendered}");
+        }
+    }
+
+    #[test]
     fn structured_node_negative_controls() {
-        // Unknown field on node table fails
+        // A chain is not "a link with an arrow": it is a routing topology this build does not
+        // implement, and truncating it to the first hop would silently proxy somewhere the
+        // operator did not write.
+        let err = StructuredNode::from_link("socks5://127.0.0.1:1080 -> socks5://127.0.0.1:1081")
+            .expect_err("chained link must fail");
+        assert!(err.contains("chained links"), "{err}");
+
         let err = toml::from_str::<Config>(
             "[[node]]\ntype = \"socks5\"\nserver = \"1.1.1.1\"\nport = 1080\nunknown_field = 1\n",
         )

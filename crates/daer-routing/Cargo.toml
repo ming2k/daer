@@ -12,7 +12,6 @@ description = "Routing rule lowering, matching and policy identity for daer"
 daer-common.workspace = true
 daer-config.workspace = true
 daer-ebpf.workspace = true
-daer-geodata.workspace = true
 aho-corasick.workspace = true
 ipnet.workspace = true
 regex.workspace = true

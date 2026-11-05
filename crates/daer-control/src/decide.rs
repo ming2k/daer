@@ -55,9 +55,9 @@ use daer_outbound::{
 };
 
 use daer_routing::{
-    AliasOptimizer, DatReaderOptimizer, DeduplicateParamsOptimizer, MatchFacts, MatchSet,
-    MergeAndSortOptimizer, NormalizedProgram, Outbound, RecordingSink, RoutingError, RulesBuilder,
-    Trace, first_hit, is_builtin_outbound, parse_outbound,
+    AliasOptimizer, DeduplicateParamsOptimizer, MatchFacts, MatchSet, MergeAndSortOptimizer,
+    NormalizedProgram, Outbound, RecordingSink, RoutingError, RulesBuilder, Trace, first_hit,
+    is_builtin_outbound, parse_outbound,
 };
 use daer_routing::{L4ProtoMask, ProcessName};
 
@@ -204,12 +204,6 @@ impl fmt::Display for Explanation {
 /// What the router needs besides the configuration.
 #[derive(Debug, Clone, Default)]
 pub struct RouterOptions {
-    /// Where to look for `geoip.dat` / `geosite.dat`.
-    ///
-    /// The configuration's own directory comes first, because that is where an
-    /// operator keeps its assets; the standard system directories are appended by
-    /// [`RouterOptions::with_assets_beside`].
-    pub geodata_dirs: Vec<std::path::PathBuf>,
     /// The socket mark to put on daer's own outbound sockets, overriding `global.so-mark`.
     ///
     /// # Why an override exists at all
@@ -242,24 +236,43 @@ pub struct RouterOptions {
     /// [`daer_outbound::LogObserver`] so a dial's span reaches the journal; a diagnostic or a
     /// test leaves it unset.
     pub dial_observer: daer_outbound::ObserverSlot,
+    /// Pre-loaded rule provider pool (ADR-0014).
+    pub rule_providers: Option<Arc<daer_routing::RuleProviderPool>>,
 }
 
 impl RouterOptions {
-    /// Looks for geodata beside `config` first, then in the standard directories.
+    /// The defaults: no override, no datapath facts, no dial observer.
+    ///
+    /// A caller that has a configuration *file* uses [`Self::for_config`] instead, because the
+    /// rules of a file are resolved relative to that file's directory.
     #[must_use]
-    pub fn with_assets_beside(config: impl AsRef<std::path::Path>) -> Self {
-        let mut geodata_dirs = Vec::new();
-        if let Some(directory) = config.as_ref().parent() {
-            geodata_dirs.push(directory.to_path_buf());
-        }
-        Self {
-            geodata_dirs,
-            so_mark: None,
-            fake_ip: None,
-            dns_snooper: None,
-            kernel_observer: None,
-            dial_observer: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The defaults, with the configuration's own directory recorded.
+    ///
+    /// `config` is accepted rather than ignored: a caller reading a file passes its path so a
+    /// relative `[[rule-provider]] path` resolves beside it, and the signature is the place
+    /// that requirement is visible.
+    #[must_use]
+    pub fn for_config(config: impl AsRef<std::path::Path>) -> Self {
+        let config = config.as_ref();
+        debug_assert!(
+            config.parent().is_some(),
+            "a configuration path always has a parent"
+        );
+        Self::default()
+    }
+
+    /// Supplies the preloaded rule provider pool.
+    #[must_use]
+    pub fn with_rule_providers(
+        mut self,
+        providers: Option<Arc<daer_routing::RuleProviderPool>>,
+    ) -> Self {
+        self.rule_providers = providers;
+        self
     }
 
     /// Overrides the synthetic Fake-IP pool.
@@ -360,16 +373,14 @@ impl Router {
         generation: GenerationId,
         options: &RouterOptions,
     ) -> Result<Self, RoutingError> {
-        // The dat reader is part of the pipeline, not an extra: `geoip:`/`geosite:`
-        // appear in real rules, and omitting it would make those rules fail to
-        // compile at run time while `daer config validate` accepted them.
-        let dat_reader = DatReaderOptimizer::new(options.geodata_dirs.clone());
+        // `geoip:` / `geosite:` are gone with the Protobuf reader (ADR-0014/ADR-0015): a rule
+        // names a `provider(...)`, and the provider is a compiled `.drb` set. There is no
+        // optimizer here that could resurrect the retired format.
         let program = NormalizedProgram::new(
             &config.routing.rules,
             config.routing.fallback.clone(),
             &[
                 &AliasOptimizer,
-                &dat_reader,
                 &MergeAndSortOptimizer,
                 &DeduplicateParamsOptimizer,
             ],
@@ -419,7 +430,10 @@ impl Router {
         let mut sink = RecordingSink::default();
         let mut fallback = None;
         {
-            let mut builder = RulesBuilder::new(&mut sink);
+            let mut builder = match &options.rule_providers {
+                Some(providers) => RulesBuilder::with_providers(&mut sink, providers),
+                None => RulesBuilder::new(&mut sink),
+            };
             program.lower(&mut builder, |value| {
                 let outbound = fallback_outbound(value)?;
                 check_target(&outbound.name, &known)?;

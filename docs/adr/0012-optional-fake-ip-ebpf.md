@@ -59,11 +59,18 @@ enabled = false
 inet = "198.18.0.0/15"           # Reserved benchmark range (RFC 2544 / RFC 3596)
 pool-size = 65535                 # Bound memory allocation
 exclude = [
-    "geosite:cn",
-    "domain(suffix: local)",
-    "domain(suffix: lan)",
+    "suffix: cn-example",           # see the note below
+    "suffix: local",
+    "suffix: lan",
 ]
 ```
+
+> **`geosite:` / `geoip:` in `exclude` is refused, not ignored.** This record was written when
+> a category reference could be expanded by the loader. [ADR-0014](0014-drb-rule-binary-and-providers.md)
+> replaced `.dat` with compiled `.drb` providers and [ADR-0015](0015-cli-is-four-verbs.md)
+> removed the reader from the daemon, so `exclude` now accepts domain patterns only
+> (`suffix:`, `full:`, `keyword:`, `regex:`, or a bare suffix) and `daer check` names any
+> category it cannot honour. The isolation guarantee below is unchanged.
 
 - **Invariant `[INV-FAKEIP-01]` (Isolation Guarantee)**:
   When `enabled = false`, the Fake-IP subsystem is inert. The ingress datapath performs zero reverse lookups, treats `198.18.0.0/15` as standard unmapped IP addresses, and produces no DNS responses from synthetic pools.

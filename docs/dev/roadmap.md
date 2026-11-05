@@ -9,11 +9,11 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 | Area | State |
 | --- | --- |
-| Protocol: REALITY (tag, TLS 1.3 client, certificate check, `X25519MLKEM768`) | ✅ live-verified |
-| Protocol: XTLS Vision (`flow=xtls-rprx-vision`) | ✅ live-verified (uplink and downlink) |
+| Protocol: REALITY (tag, TLS 1.3 client, certificate check, `X25519MLKEM768`) | ✅ verified end to end against a local reference `xray` inbound, in CI (`tests/reality_interop.rs`) |
+| Protocol: XTLS Vision (`flow=xtls-rprx-vision`) | ✅ verified end to end (uplink and downlink) against a local reference `xray` inbound, in CI |
 | Configuration (TOML schema, expression language, loader, validation) | ✅ |
-| Configuration tooling (`fmt`, `example`, JSON Schema, drift check) | ✅ |
-| Decision tooling (`daer route explain`, `--why`, `--domain`, `daer route nodes`, node security identity) | ✅ |
+| Configuration tooling (JSON Schema + drift check; `fmt`/`example` removed by ADR-0015) | ✅ |
+| Decision tooling (`daer explain --why --domain`, `daer check --nodes`, node security identity) | ✅ |
 | Routing semantics (lowering, matching, policy identity, geodata) | ✅ reference implementation |
 | Routing matcher performance | ✅ indexed, allocation-free: `suffix` is a label walk over a hash set, `keyword` Aho–Corasick, `regex` a `RegexSet`, `full` a hash set, `dip`/`sip` merged intervals + binary search. Measured on `geosite:cn` (110,249 domains): 368 µs → **89 ns** on a miss, 28.9 µs → **82 ns** on a hit. `tests/hot_path.rs` asserts the cost does not scale with set size and that a decision allocates nothing |
 | Subscriptions (fetch, base64 / SIP008 / plain decoding, `persist` cache) | ✅ `daer-outbound::subscription` + `daer-control::subscription`; resolved before a generation is built, so `Router::new` stays a pure function of its configuration |
@@ -27,7 +27,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
 | Health checks: the configured `tcp-url`, `tcp-method` and `udp-dns` are what probes use | ✅ |
 | Outbound: Vision (`xtls-rprx-vision`) | ⬜ refused at load with the reason. The TLS record layer now exists, so the blocking condition moved from "ADR-0002 forbids it" to "the splice logic is not written" |
-| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Not yet interop-tested against a live node** — that is the remaining evidence |
+| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
 | Datagrams: netune transport + SOCKS5 UDP associate (netune side) | ✅ |
 | Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; not yet wired to a daemon entry point |
 | Health checks: probes + scheduler (`UdpDnsChecker`, `Scheduler`) | ✅ probe instrument follows the node's claims; results record into the live generation |
@@ -38,7 +38,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | DNS: upstream syntax + DNS over TCP | ✅ |
 | DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` is a plain `UdpSocket`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. **No netune change was needed** — the earlier entries in [`netune-requests.md`](netune-requests.md) that blamed netune for these were wrong and are corrected there |
 | DNS: UDP and TCP server sockets | ✅ |
-| DNS: `daer dns serve` / `daer dns check` | ✅ |
+| DNS: served by `daer run`, upstream usability gated by `daer check` (ADR-0015) | ✅ |
 | DNS: bootstrap resolver | ⬜ |
 | Sniffing (TLS SNI incl. split records, HTTP `Host`, absolute-form target) | ✅ |
 | Sniffing: connection-side loop, `dial-mode = domain` wired into routing | ✅ |
@@ -154,11 +154,12 @@ large for the client's EDNS size sets `TC` instead of being silently shortened, 
 connection carries a bounded number of length-prefixed queries. `asis` is expressed as
 silence on both, because the decision means "let the client's own resolver answer".
 
-Done as well: the runnable service. `daer dns serve` binds UDP and/or TCP, installs
-`SIGINT`/`SIGTERM` handlers and stops after letting in-flight queries finish; `daer dns
-check` reports which upstreams this build can use and exits non-zero when one cannot, so it
-is usable as a CI gate. `tests/end_to_end.rs` drives a real UDP client through the real
-server to a real DNS-over-TCP origin.
+Done as well: the runnable service. `daer run` starts the resolver itself — UDP and TCP on
+`dns.bind` — and installs `SIGINT`/`SIGTERM` handlers that stop it after letting in-flight
+queries finish. There is no standalone DNS subcommand: `daer check` reports which upstreams
+this build can use and exits non-zero when one cannot, so it is usable as a CI gate.
+`tests/end_to_end.rs` drives a real UDP client through the real server to a real DNS-over-TCP
+origin.
 
 Remaining: the bootstrap resolver, and name resolution for an upstream address (an entry
 must currently be `ip:port`). Every transport — `udp`, `tcp`, `tls`, `https` — is
@@ -246,7 +247,7 @@ so a forwarded flow cannot produce the signature. Without that check the earlier
 invisible — a request for `example.com` came back with a real HTTP reply from Apple's CDN, and
 a test that only asserted "a reply arrived" passed on it.
 
-**Vision is done and live-verified**, after three more defects that only a local
+**Vision is done and verified end to end**, after three more defects that only a local
 `xray run` could show (see [`docs/how-to/vision-lab.md`](../how-to/vision-lab.md) for the harness):
 
 6. The VLESS request header wrote the port **twice** — once from `PortThenAddress` and once
@@ -260,6 +261,20 @@ a test that only asserted "a reply arrived" passed on it.
 Worth recording what the *absence* of this cost: before the lab existed, the working frame
 and the broken one differed only in a command byte and a two-byte offset, both of which a
 remote node answers with "reset".
+
+**A fourth defect reached `main`, and the reason it did is worth stating.** After the three
+above, a REALITY session authenticated correctly and then read **zero bytes**: the node
+flushed a legal zero-length `application_data` record right after the handshake, and
+`Tls13Connection::poll_read` answered it with `Ready(Ok(()))` and nothing written — which is
+`AsyncRead`'s encoding for end-of-stream. Every proxied connection through every REALITY node
+was dead while the roadmap said "live-verified".
+
+The harness in `docs/how-to/vision-lab.md` existed and would have caught it. What did not
+exist was a *reason to run it*: `tests/reality_live.rs` is `#[ignore]` and needs a credentialed
+public node, so nothing in CI exercised the path, and a `✅` in this table recorded a manual
+result whose relevance nobody had to re-establish. `tests/reality_interop.rs` closes that:
+it starts the reference server itself, so REALITY + Vision is a fixture that CI runs on every
+commit, and a skip is stated rather than silently absent.
 
 Remaining, in subscription-usage order: vmess → plain vless → anytls → hysteria2 → tuic.
 vmess, plain vless and anytls are connectors over a raw stream, so they compose with

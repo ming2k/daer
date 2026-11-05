@@ -169,7 +169,7 @@ policy and every existing invariant are untouched.
 - **A REALITY node is not "TLS to the node" in the diagnostic sense.** Its
   `Security` identity must say REALITY, not `tls sni=…`: the certificate presented is
   not evidence of identity, and reporting it as such would make
-  `daer route nodes` claim a guarantee the session does not provide.
+  `daer check --nodes` claim a guarantee the session does not provide.
 
 ## Links
 

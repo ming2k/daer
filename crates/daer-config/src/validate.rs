@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::model::{Config, FunctionOrString, SCHEMA_VERSION};
+use crate::model::{Config, FunctionOrString, ProviderType, SCHEMA_VERSION};
 
 /// A semantic error, attributed to the field that caused it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +84,7 @@ pub fn normalize(config: &mut Config) -> Result<Vec<String>, ConfigError> {
     check_groups(config)?;
     check_dns(config)?;
     check_endpoints(config)?;
+    check_rule_providers(config)?;
     Ok(warnings)
 }
 
@@ -255,6 +256,67 @@ fn check_endpoints(config: &Config) -> Result<(), ConfigError> {
         node.endpoint
             .validate()
             .map_err(|e| ConfigError::new("node", e))?;
+    }
+    Ok(())
+}
+
+fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
+    let mut tags = BTreeSet::new();
+    for provider in &config.rule_provider {
+        let tag = provider.tag.trim();
+        if tag.is_empty() {
+            return Err(ConfigError::new(
+                "rule-provider.tag",
+                "rule provider tag must not be empty",
+            ));
+        }
+        if !tags.insert(tag) {
+            return Err(ConfigError::new(
+                "rule-provider.tag",
+                format!("duplicate rule provider tag {:?}", provider.tag),
+            ));
+        }
+        match provider.provider_type {
+            ProviderType::File => {
+                let Some(path) = &provider.path else {
+                    return Err(ConfigError::new(
+                        "rule-provider.path",
+                        format!("file provider {:?} must specify 'path'", provider.tag),
+                    ));
+                };
+                if path.trim().is_empty() {
+                    return Err(ConfigError::new(
+                        "rule-provider.path",
+                        format!("empty path for file provider {:?}", provider.tag),
+                    ));
+                }
+            }
+            ProviderType::Http => {
+                let Some(url) = &provider.url else {
+                    return Err(ConfigError::new(
+                        "rule-provider.url",
+                        format!("http provider {:?} must specify 'url'", provider.tag),
+                    ));
+                };
+                if url.trim().is_empty() {
+                    return Err(ConfigError::new(
+                        "rule-provider.url",
+                        format!("empty URL for http provider {:?}", provider.tag),
+                    ));
+                }
+            }
+        }
+        if let Some(interval) = provider.interval
+            && interval.as_nanos() <= 0
+        {
+            return Err(ConfigError::new(
+                "rule-provider.interval",
+                format!(
+                    "interval must be positive (got \"{}\") for rule provider {:?}",
+                    interval, provider.tag
+                ),
+            ));
+        }
     }
     Ok(())
 }

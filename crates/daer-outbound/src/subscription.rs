@@ -118,8 +118,32 @@ pub async fn fetch(url: &str, timeout: Duration) -> Result<Decoded, Subscription
     decode(&body)
 }
 
-/// Fetches the raw body.
+/// The outcome of an HTTP fetch that supports ETag conditional requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// Server returned HTTP 304 Not Modified.
+    NotModified,
+    /// Server returned new body, with optional ETag header.
+    Updated {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
+}
+
+/// Fetches the raw body unconditionally.
 pub async fn fetch_body(url: &str, timeout: Duration) -> Result<Vec<u8>, SubscriptionError> {
+    match fetch_body_conditional(url, None, timeout).await? {
+        FetchOutcome::Updated { bytes, .. } => Ok(bytes),
+        FetchOutcome::NotModified => Ok(Vec::new()),
+    }
+}
+
+/// Fetches the body with support for `If-None-Match` (ETag) conditional requests.
+pub async fn fetch_body_conditional(
+    url: &str,
+    etag: Option<&str>,
+    timeout: Duration,
+) -> Result<FetchOutcome, SubscriptionError> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| SubscriptionError::Fetch("no scheme in the subscription URL".to_owned()))?;
@@ -169,15 +193,30 @@ pub async fn fetch_body(url: &str, timeout: Duration) -> Result<Vec<u8>, Subscri
         }
     };
 
-    let head = RequestHead::new(netune::Method::GET, path);
+    let mut head = RequestHead::new(netune::Method::GET, path);
+    if let Some(etag_val) = etag {
+        head = head.with_header("if-none-match", etag_val);
+    }
+
     let response = tokio::time::timeout(timeout, client.request(&target, head, None))
         .await
         .map_err(|_| SubscriptionError::Fetch("the fetch timed out".to_owned()))?
         .map_err(|error| SubscriptionError::Fetch(error.to_string()))?;
 
+    if response.head.status.as_u16() == 304 {
+        return Ok(FetchOutcome::NotModified);
+    }
+
     if !response.head.status.is_success() {
         return Err(SubscriptionError::Status(response.head.status.as_u16()));
     }
+
+    let resp_etag = response
+        .head
+        .headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     // Reject on the declared length before reading, when the server told us.
     if let netune::BodyKind::Length(length) = response.head.body
@@ -195,7 +234,10 @@ pub async fn fetch_body(url: &str, timeout: Duration) -> Result<Vec<u8>, Subscri
     if bytes.len() > MAX_BODY {
         return Err(SubscriptionError::TooLarge { limit: MAX_BODY });
     }
-    Ok(bytes.to_vec())
+    Ok(FetchOutcome::Updated {
+        bytes: bytes.to_vec(),
+        etag: resp_etag,
+    })
 }
 
 /// Decodes a subscription body into node links.

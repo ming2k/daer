@@ -10,7 +10,7 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 | `CAP_BPF`, `CAP_NET_ADMIN` | load and attach the datapath; `IP_TRANSPARENT` on the listener |
 | `ip` | creates the `daer0`/`daer0peer` pair |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
-| `geoip.dat` / `geosite.dat` | only when a rule says `geoip:` / `geosite:` |
+| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from disk, an `http` one is cached under `~/.cache/daer/rules` |
 
 ## Build
 
@@ -61,18 +61,20 @@ name = "proxy"
 policy = "min-moving-avg"
 
 [routing]
-rules = ["dip(geoip:private) -> direct", "domain(geosite:cn) -> direct"]
+rules = ["provider(private) -> direct", "provider(cn) -> direct"]
 fallback = "proxy"
 ```
 
 Check it before starting:
 
 ```sh
-daer config validate -c /etc/daer/config.toml
-daer route explain 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why -c /etc/daer/config.toml
+daer check -c /etc/daer/config.toml
+daer route 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why -c /etc/daer/config.toml
+# or simply:
+daer route example.com --why -c /etc/daer/config.toml
 ```
 
-`route explain --why` prints the verdict a running daer would act on, including
+`daer route --why` prints the verdict a running daer would act on, including
 "undeliverable, group X has no selectable node" — which is the failure that otherwise looks
 like a network problem.
 
@@ -219,7 +221,7 @@ OOMScoreAdjust=-100
 
 # Validate configuration before starting. A broken configuration exits with non-zero
 # and prevents starting or restarting with an invalid state.
-ExecStartPre=/usr/bin/daer config validate -c /etc/daer/config.toml
+ExecStartPre=/usr/bin/daer check -c /etc/daer/config.toml
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
 ExecReload=/usr/bin/kill -HUP $MAINPID
 
@@ -298,7 +300,7 @@ Userspace tests cannot catch any of those, which is why this script exists.
 journalctl -u daer -b | grep 'datapath attached'
 
 # 2. is the policy what you think?
-daer route explain 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why -c /etc/daer/config.toml
+daer route example.com --why -c /etc/daer/config.toml
 
 # 3. does a flow actually get proxied?
 curl -sS -o /dev/null -w '%{http_code}\n' --interface eth0 https://example.com

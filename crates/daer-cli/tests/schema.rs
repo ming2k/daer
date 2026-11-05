@@ -6,7 +6,7 @@
 //! A failure means a field was added, removed, or changed in `daer-config`
 //! without updating the published schema. Regenerate it with:
 //!
-//!     cargo run -p daer-cli -- config schema > daer.schema.json
+//!     cargo run -p daer-cli -- schema > daer.schema.json
 
 #[test]
 fn schema_is_up_to_date() {
@@ -22,7 +22,7 @@ fn schema_is_up_to_date() {
     if on_disk.trim() != generated.trim() {
         panic!(
             "\n[DRIFT DETECTED] daer.schema.json is out of date!\n\
-             Run `cargo run -p daer-cli -- config schema > daer.schema.json` to update it.\n"
+             Run `cargo run -p daer-cli -- schema > daer.schema.json` to update it.\n"
         );
     }
 }

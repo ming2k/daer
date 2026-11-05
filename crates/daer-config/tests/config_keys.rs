@@ -27,6 +27,7 @@ const CONFIG_STRUCTS: &[&str] = &[
     "Filter",
     "Node",
     "Subscription",
+    "RuleProvider",
     "Config",
 ];
 
@@ -159,7 +160,7 @@ fn every_configuration_key_has_a_consumer() {
     }
 
     assert_eq!(
-        total, 63,
-        "expected exactly 63 configuration fields to be verified"
+        total, 70,
+        "expected exactly 70 configuration fields to be verified"
     );
 }

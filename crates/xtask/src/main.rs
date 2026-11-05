@@ -153,9 +153,9 @@ fn run_command(cmd: &str, args: &[&str]) -> ExitStatus {
 fn generate_schema(write: bool) {
     let root = workspace_root();
     let output = Command::new("cargo")
-        .args(["run", "-q", "-p", "daer-cli", "--", "config", "schema"])
+        .args(["run", "-q", "-p", "daer-cli", "--", "schema"])
         .output()
-        .expect("failed to run daer-cli config schema");
+        .expect("failed to run daer-cli schema");
 
     if !output.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
@@ -174,6 +174,7 @@ fn generate_schema(write: bool) {
 
 fn run_ci() {
     println!("=== Running CI Suite ===");
+    let jobs = format!("-j{}", ci_jobs());
     run_command("cargo", &["fmt", "--all", "--", "--check"]);
     run_command(
         "cargo",
@@ -182,13 +183,40 @@ fn run_ci() {
             "--workspace",
             "--all-targets",
             "--locked",
+            &jobs,
             "--",
             "-D",
             "warnings",
         ],
     );
-    run_command("cargo", &["test", "--workspace", "--locked"]);
+    run_command("cargo", &["test", "--workspace", "--locked", &jobs]);
     println!("\n✅ All checks and tests passed cleanly!");
+}
+
+/// How many codegen units to run in parallel during CI.
+///
+/// Cargo's default is one job per core, and this workspace has 23 test targets that each link
+/// the entire dependency graph. On a 16-core box that is 23 concurrent `rust-lld` processes,
+/// and the wall-clock cost is dominated by their *contention* rather than their work: measured
+/// on the dev machine, an uncontended no-op `cargo test --no-run --workspace` takes 169 ms
+/// while the same command after touching one library took 666 s, every one of those seconds
+/// inside the linker.
+///
+/// Half the cores is the point where the linkers stop competing for the same page cache and
+/// the same disk queue while still using the machine. `DAER_CI_JOBS` overrides it for a
+/// machine where that trade is different — a CI runner with a fast NVMe wants more, a laptop
+/// on a battery wants fewer.
+fn ci_jobs() -> usize {
+    if let Some(jobs) = std::env::var("DAER_CI_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+    {
+        return jobs;
+    }
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).max(1))
+        .unwrap_or(1)
 }
 
 fn run_install(args: &[String]) {

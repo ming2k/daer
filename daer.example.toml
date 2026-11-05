@@ -1,7 +1,7 @@
 #:schema ./daer.schema.json
 # daer — reference configuration
 #
-# Print it with `daer config example`; check it with `daer config validate`.
+# Check it with `daer check -c <this file>`; the schema is `daer schema`.
 # Every table is optional: an empty file is a valid configuration, and the
 # defaults below are the ones daer actually uses.
 #
@@ -70,9 +70,9 @@ tolerance = "0s"
 # Nodes, also merged into the pool.
 #
 # Nodes in configuration must be declared as structured tables (with explicit
-# type checking and editor schema validation). To convert an existing URI link
-# (vless://, ss://, trojan://, etc.) to a structured table, run:
-#     daer node convert "<URI>"
+# type checking and editor schema validation). A URI link (vless://, ss://,
+# trojan://, …) does not need hand-converting: declare it as a `[[subscription]]`
+# and the pool is filled on load and on every reload.
 #
 # A chain (`a -> b`) is NOT supported by this build: it is rejected at validation
 # rather than silently truncated to its first hop. Listing one here is an error.
@@ -152,6 +152,39 @@ fallback = "googledns"
 rules = []
 fallback = "accept"
 
+# Rule Providers (ADR-0014). A provider is a compiled `.drb` set or a plain-text rule file,
+# local or remote. This is how `geoip:` / `geosite:` are expressed now: the `.dat` format is
+# retired, and `geodrb` converts an existing file once.
+#
+# Published sets: https://github.com/daeuniverse/geodrb
+#   geodrb convert geosite.dat --code cn -o geosite-cn.drb
+#   geodrb convert geoip.dat  --code cn -o geoip-cn.drb --type geoip
+#
+# These URLs resolve once that repository has published its first build. Until then (or with
+# no network at all) `daer check` names every provider it could not load and the cache path it
+# looked in, rather than starting with an empty rule — that is the intended behaviour, not a
+# failure of the example. Point `path` at a local `.drb` to work offline.
+[[rule-provider]]
+tag = "private"
+type = "http"
+url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geoip-private.drb"
+format = "drb"
+interval = "24h"
+
+[[rule-provider]]
+tag = "cn"
+type = "http"
+url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geosite-cn.drb"
+format = "drb"
+interval = "24h"
+
+[[rule-provider]]
+tag = "cn-ip"
+type = "http"
+url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geoip-cn.drb"
+format = "drb"
+interval = "24h"
+
 [routing]
 # Rules are evaluated top to bottom; the first match wins.
 rules = [
@@ -160,11 +193,11 @@ rules = [
     "pname(NetworkManager) -> direct",
     # Keep broadcast and multicast traffic away from the proxy.
     "dip(224.0.0.0/3, 'ff00::/8') -> direct",
-    "dip(geoip:private) -> direct",
+    "provider(private) -> direct",
     # HTTP/3 usually costs more CPU and memory than it is worth.
     "l4proto(udp) && dport(443) -> block",
-    "dip(geoip:cn) -> direct",
-    "domain(geosite:cn) -> direct",
+    # Domestic destinations: domains and addresses from the same provider tags.
+    "provider(cn, cn-ip) -> direct",
 ]
 # Where everything else goes.
 fallback = "proxy"

@@ -38,7 +38,13 @@ impl RulesOptimizer for AliasOptimizer {
                 match function.name.as_str() {
                     "dport" => function.name = "port".to_owned(),
                     "dip" => function.name = "ip".to_owned(),
+                    "rule-set" | "ruleset" => function.name = "provider".to_owned(),
                     _ => {}
+                }
+                for param in &mut function.params {
+                    if param.key == "rule-set" || param.key == "ruleset" {
+                        param.key = "provider".to_owned();
+                    }
                 }
                 if function.name == "domain" {
                     for param in &mut function.params {

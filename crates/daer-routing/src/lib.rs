@@ -20,7 +20,7 @@
 //! agreement, or `tests/kernel_policy.rs` fails.
 
 mod builder;
-mod dat_reader;
+pub mod drb;
 mod error;
 mod identity;
 mod ipset;
@@ -35,8 +35,8 @@ pub mod explain;
 pub mod kernel;
 
 pub use builder::{MatchSink, RecordingSink, RulesBuilder, ValidationSink};
-pub use dat_reader::DatReaderOptimizer;
-pub use domain::{DomainIndex, DomainKey};
+pub use domain::{DomainIndex, DomainKey, SuffixScope};
+pub use drb::{DRB_MAGIC, DRB_VERSION, DrbError, DrbSet, DrbSummary, RuleProviderPool};
 pub use error::RoutingError;
 pub use explain::{PredicateTrace, RuleTrace, Trace, explain};
 pub use identity::{PolicyEpoch, PolicyIdentity, hash_normalized_program};

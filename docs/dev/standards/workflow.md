@@ -19,11 +19,32 @@ Before any change is merged or released, it must clear the five verification gat
 │    Zero clippy warnings, zero dead code or type ambiguities │
 ├─────────────────────────────────────────────────────────────┤
 │ 3. Automated Test & Invariants Gate:                        │
-│    `cargo test --workspace --locked`                        │
+│    `cargo xtask ci`  (fmt, clippy, test -j<nproc/2>)        │
 │    All unit, integration, and falsifiable tests pass,       │
 │    including schema integrity and unconsumed keys gates     │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### What the test gate needs on the machine
+
+Two suites are *fixtures* rather than dependencies: they start what they need and **skip with a
+stated reason** when it is absent (ADR-0007 — a skip that says why is a fact).
+
+| Fixture | Suite | Without it |
+| :--- | :--- | :--- |
+| `xray` on `PATH` or `$XRAY_BIN` | `daer-outbound/tests/reality_interop.rs` | REALITY + Vision interop is skipped, which is the only end-to-end coverage of that path |
+| `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the kernel datapath tests are skipped; CI runs them under `unshare -Urn` via `scripts/kernel-check.sh` |
+
+A release should not be cut from a run where the interop suite skipped: the `✅` in
+`docs/dev/roadmap.md` for REALITY means "CI exercised it", and a skip is the absence of that.
+
+### Why `-j<nproc/2>`
+
+Every test target links the whole dependency graph, and on a many-core machine cargo starts all
+of them at once. Measured on a 16-core box: an uncontended `cargo test --no-run --workspace`
+takes 169 ms, while the same command after touching one library took 666 s — every second of it
+inside 23 concurrent `rust-lld` processes competing for the same page cache and disk queue.
+`DAER_CI_JOBS` overrides the default.
 
 ---
 

@@ -2,32 +2,50 @@
 
 //! The `daer` command line.
 //!
-//! Two kinds of subcommand live here and they have different shapes:
+//! # The surface is focused runtime & diagnostics
 //!
-//! * **inspection** — `config`, `route`: load, compile, answer, exit. No runtime, no
-//!   signals, no side effects.
-//! * **service** — `dns serve`: binds sockets, installs signal handlers and runs until told
-//!   to stop. It is the only path that needs an async runtime, so only it constructs one.
+//! `daer` is a **runtime and network diagnostic suite**. It consumes a configuration; it does not manufacture one.
+//!
+//! ```text
+//!   daer run                      the daemon: eBPF datapath + ingress + relay + DNS
+//!   daer check                    does this configuration run, and what would it do
+//!   daer route <TARGET>           which rule and outbound decide this flow or target
+//!   daer probe <SUBCOMMAND>       active probe for node reachability, handshake, and health
+//!   daer schema                   the JSON Schema, for an editor
+//!   daer version                  build information
+//! ```
+//!
+//! Everything that used to sit beside those verbs was a *build-time producer* wearing a
+//! runtime's clothes, and each one was removed rather than documented:
+//!
+//! | removed | why it is not the daemon's job |
+//! | --- | --- |
+//! | `config validate` | merged into `daer check`: one command answers "will this run". |
+//! | `config fmt`, `config example` | a configuration is hand-written TOML; a formatter and a sample belong in an editor and in the docs. |
+//! | `explain` | replaced by `daer route <TARGET>`: natural routing lookup mental model. |
+//! | `node convert` | [ADR-0014] put subscription parsing in the runtime, so a URI no longer needs hand-converting. A text transformer is a third-party tool. |
+//! | `rule compile` / `inspect` / `convert` | the rule compiler is a **producer**. It lives in `geodrb`, so the daemon links no `daer-geodata` and can never be the thing that speaks Protobuf. |
+//! | `dns serve` / `dns check` | the resolver is part of `daer run` (Fake-IP has no meaning without it) and upstream usability is part of `daer check`. A standalone DNS server is a different product. |
+//!
+//! [ADR-0014]: https://github.com/daeuniverse/daer/blob/main/docs/adr/0014-drb-rule-binary-and-providers.md
 
 mod dns;
+mod probe;
 mod run;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use daer_config::{Config, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_NAMES, FunctionOrString};
 use daer_outbound::{FilterSet, parse_group_policy};
 use daer_routing::{
-    AliasOptimizer, DatReaderOptimizer, DeduplicateParamsOptimizer, MergeAndSortOptimizer,
-    NormalizedProgram, Outbound, RoutingError, RulesBuilder, ValidationSink, is_builtin_outbound,
-    parse_outbound,
+    AliasOptimizer, DeduplicateParamsOptimizer, MergeAndSortOptimizer, NormalizedProgram, Outbound,
+    RoutingError, RulesBuilder, ValidationSink, is_builtin_outbound, parse_outbound,
 };
-
-/// The reference configuration, also printed by `daer config example`.
-const EXAMPLE_TOML: &str = include_str!("../../../daer.example.toml");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,28 +61,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Work with a configuration file.
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    /// Convert or inspect outbound nodes.
-    Node {
-        #[command(subcommand)]
-        command: NodeCommand,
-    },
-    /// Explain what daer would do with a flow, without running it.
-    Route {
-        #[command(subcommand)]
-        command: RouteCommand,
-    },
-    /// Run or inspect the DNS resolver.
-    Dns {
-        #[command(subcommand)]
-        command: dns::Command,
-    },
     /// Run the transparent proxy.
     Run {
+        /// Configuration file. Defaults to `/etc/daer/config.toml`.
         #[arg(short, long, value_name = "PATH")]
         config: Option<PathBuf>,
         /// The compiled datapath object.
@@ -80,82 +79,134 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Print build information.
-    Version,
-}
-
-#[derive(Debug, Subcommand)]
-enum RouteCommand {
-    /// Print the routing decision for a source/destination pair.
+    /// Check that a configuration would run, and print what it would do.
     ///
-    /// The same decision the data path makes, from the same compiled generation:
-    /// the answer here is the answer a running daer would act on.
-    Explain {
-        /// Client address (`ip:port`).
-        source: SocketAddr,
-        /// Destination address (`ip:port`).
-        destination: SocketAddr,
+    /// Resolves subscriptions and rule providers, compiles every rule, builds every group,
+    /// binds nothing. Exits non-zero on anything `daer run` would refuse, which makes it the
+    /// one command a deployment gate needs.
+    Check {
+        /// Configuration file. Defaults to `/etc/daer/config.toml`.
         #[arg(short, long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Print every node in every group, with its protocol and security identity.
+        #[arg(long)]
+        nodes: bool,
+    },
+    /// Route a flow, IP, or domain through the routing engine without running the daemon.
+    ///
+    /// Evaluates the identical decision the data path makes, from the same compiled generation.
+    Route {
+        /// Target to route: domain, IP, or IP:port (e.g. `bilibili.com`, `1.1.1.1`), or source address when 2 arguments are provided.
+        target: String,
+        /// Optional destination address (`ip:port` or `ip`) when target is used as source.
+        destination: Option<String>,
+        /// Optional client source address (`ip:port`). Defaults to `127.0.0.1:12345`.
+        #[arg(long, value_name = "IP:PORT")]
+        source: Option<SocketAddr>,
+        /// Configuration file. Defaults to `/etc/daer/config.toml`.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// The sniffed domain, as a `domain(...)` rule would see it (auto-inferred if target is a domain).
+        #[arg(long, value_name = "NAME")]
+        domain: Option<String>,
         /// Show every rule and every predicate, not just the winner.
         #[arg(long)]
         why: bool,
-        /// The sniffed domain, as a `domain(...)` rule would see it.
-        ///
-        /// Without this a `domain(...)` rule is unverifiable from the command line,
-        /// which makes the most common kind of rule the one kind a diagnostic cannot
-        /// check. A name here is what sniffing would have supplied.
-        #[arg(long, value_name = "NAME")]
-        domain: Option<String>,
     },
-    /// List every node in every group, with its protocol and security identity.
-    ///
-    /// Answers "which nodes exist, and how is each session protected" without opening a
-    /// connection or printing a secret.
-    Nodes {
-        #[arg(short, long, value_name = "PATH")]
-        config: Option<PathBuf>,
+    /// Probe network reachability, protocol handshake, or end-to-end connectivity.
+    Probe {
+        #[command(subcommand)]
+        command: ProbeCommand,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum NodeCommand {
-    /// Convert an outbound URI link (vless://, hysteria2://, anytls://, ss://, trojan://, socks5://, http://, direct://)
-    /// into a structured [[node]] TOML table.
-    Convert {
-        /// Outbound URI link to convert. If omitted, reads lines from standard input.
-        link: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigCommand {
-    /// Load the configuration and dry-run routing, groups and outbounds.
-    Validate {
-        /// Entry configuration file.
-        #[arg(short, long, value_name = "PATH")]
-        config: Option<PathBuf>,
-    },
-    /// Print the configuration in canonical TOML.
-    Fmt {
-        #[arg(short, long, value_name = "PATH")]
-        config: Option<PathBuf>,
-    },
-    /// Print a commented reference configuration.
-    Example,
     /// Print the JSON Schema of a configuration file.
     ///
-    /// Point an editor at it (`#:schema ./daer.schema.json`) or validate a file in
-    /// CI without building daer.
+    /// Point an editor at it (`#:schema ./daer.schema.json`) or validate a file in CI without
+    /// building daer. The reference configuration lives in the docs.
     Schema,
+    /// Print build information.
+    Version,
+    /// Removed; replaced by `daer route`.
+    #[command(hide = true)]
+    Explain {
+        #[command(subcommand)]
+        command: Removed,
+    },
+    /// Removed in ADR-0015; the error names the replacement.
+    #[command(hide = true)]
+    Config {
+        #[command(subcommand)]
+        command: Removed,
+    },
+    /// Removed in ADR-0015; the error names the replacement.
+    #[command(hide = true)]
+    Node {
+        #[command(subcommand)]
+        command: Removed,
+    },
+    /// Removed in ADR-0015; the error names the replacement.
+    #[command(hide = true)]
+    Dns {
+        #[command(subcommand)]
+        command: Removed,
+    },
+    /// Removed in ADR-0015; the error names the replacement.
+    #[command(hide = true)]
+    Rule {
+        #[command(subcommand)]
+        command: Removed,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProbeCommand {
+    /// Probe an outbound node's reachability, TLS/protocol handshake, and health.
+    Node {
+        /// Name or label of the node declared in configuration.
+        node: String,
+        /// Configuration file. Defaults to `/etc/daer/config.toml`.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Probe timeout in seconds.
+        #[arg(short, long, default_value = "5")]
+        timeout: u64,
+        /// Target URL for end-to-end test.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// Probe an HTTP/HTTPS endpoint.
+    Url {
+        /// Target URL to probe.
+        #[arg(default_value = "http://cp.cloudflare.com/generate_204")]
+        url: String,
+        /// Configuration file. Defaults to `/etc/daer/config.toml`.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Probe timeout in seconds.
+        #[arg(short, long, default_value = "5")]
+        timeout: u64,
+        /// Node to probe through.
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
+    },
+}
+
+/// A subcommand placeholder that exists only to carry the migration message.
+///
+/// Accepting the flag and refusing with a reason is the difference between a script that tells
+/// its operator what to change and one that prints `unknown subcommand` and stops. The verb is
+/// `hide`n, so `--help` still shows four.
+#[derive(Debug, Subcommand)]
+enum Removed {
+    /// The consumed arguments are irrelevant: the verb itself is the error.
+    #[command(external_subcommand)]
+    Any(#[allow(dead_code)] Vec<String>),
 }
 
 /// Runs `future` on a runtime built for the duration of the call.
 ///
-/// Only the subcommands that do I/O (`dns serve`, `config validate`, `route
-/// nodes`) pay for a runtime. The purely computational ones (`fmt`, `schema`,
-/// `example`, `route explain` on an inline configuration) stay synchronous, which
-/// keeps them fast enough to run in a loop and impossible to leave a thread behind.
+/// Only the subcommands that do I/O (`check`, `explain`) pay for a runtime. The purely
+/// computational ones (`schema`, `version`) stay synchronous, which keeps them fast enough to
+/// run in a loop and impossible to leave a thread behind.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -218,40 +269,6 @@ fn init_logging(level: &str) {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Config { command } => match command {
-            ConfigCommand::Validate { config } => resolve_config(config).and_then(|path| {
-                // Only subcommands that fetch (validate, route) need a runtime; the
-                // rest stay synchronous and side-effect free.
-                block_on(async move { validate(&path).await })
-            }),
-            ConfigCommand::Fmt { config } => resolve_config(config).and_then(|path| fmt(&path)),
-            ConfigCommand::Example => {
-                print!("{EXAMPLE_TOML}");
-                Ok(())
-            }
-            ConfigCommand::Schema => {
-                println!("{}", daer_config::schema::json_schema());
-                Ok(())
-            }
-        },
-        Command::Node { command } => match command {
-            NodeCommand::Convert { link } => convert_node(link.as_deref()),
-        },
-        Command::Route { command } => match command {
-            RouteCommand::Explain {
-                source,
-                destination,
-                config,
-                why,
-                domain,
-            } => resolve_config(config).and_then(|path| {
-                block_on(async move {
-                    explain_route(&path, source, destination, why, domain.as_deref()).await
-                })
-            }),
-            RouteCommand::Nodes { config } => resolve_config(config)
-                .and_then(|path| block_on(async move { list_nodes(&path).await })),
-        },
         Command::Run {
             config,
             object,
@@ -270,25 +287,66 @@ fn main() -> ExitCode {
                 .await
             })
         }),
-        Command::Dns { command } => match command {
-            dns::Command::Serve {
+        Command::Check { config, nodes } => resolve_config(config)
+            .and_then(|path| block_on(async move { check(&path, nodes).await })),
+        Command::Route {
+            target,
+            destination,
+            source,
+            config,
+            domain,
+            why,
+        } => resolve_config(config).and_then(|path| {
+            let flow = parse_route_target(&target, destination.as_deref(), source, domain)?;
+            block_on(async move {
+                explain_route(
+                    &path,
+                    flow.source,
+                    flow.destination,
+                    why,
+                    flow.domain.as_deref(),
+                )
+                .await
+            })
+        }),
+        Command::Probe { command } => match command {
+            ProbeCommand::Node {
+                node,
                 config,
-                listen,
-                udp_only,
-                tcp_only,
+                timeout,
+                url,
             } => resolve_config(config).and_then(|path| {
-                // The only subcommand that runs a service, so the only one that builds a
-                // runtime. Inspection commands stay synchronous and side-effect free.
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .context("cannot start the async runtime")?;
-                runtime.block_on(serve_dns(&path, listen, udp_only, tcp_only))
+                block_on(async move {
+                    probe::probe_node(probe::ProbeNodeOptions {
+                        node,
+                        config: path,
+                        timeout: std::time::Duration::from_secs(timeout),
+                        url,
+                    })
+                    .await
+                })
             }),
-            dns::Command::Check { config } => {
-                resolve_config(config).and_then(|path| check_dns(&path))
-            }
+            ProbeCommand::Url {
+                url,
+                config,
+                timeout,
+                node,
+            } => resolve_config(config).and_then(|path| {
+                block_on(async move {
+                    probe::probe_url(probe::ProbeUrlOptions {
+                        url,
+                        config: path,
+                        timeout: std::time::Duration::from_secs(timeout),
+                        node,
+                    })
+                    .await
+                })
+            }),
         },
+        Command::Schema => {
+            println!("{}", daer_config::schema::json_schema());
+            Ok(())
+        }
         Command::Version => {
             println!(
                 "{} {} ({}, {})",
@@ -299,6 +357,29 @@ fn main() -> ExitCode {
             );
             Ok(())
         }
+        Command::Explain { .. } => Err(removed_verb(
+            "explain",
+            "`daer route <TARGET>` resolves routing decisions (e.g. `daer route bilibili.com` or `daer route 1.1.1.1`)",
+        )),
+        Command::Config { .. } => Err(removed_verb(
+            "config",
+            "`daer check` answers \"will this run\"; the sample and the schema are `daer schema` \
+             and the repository's daer.example.toml",
+        )),
+        Command::Node { .. } => Err(removed_verb(
+            "node",
+            "declare a `[[subscription]]` (daer parses links at runtime) or use an external \
+             subscription converter",
+        )),
+        Command::Dns { .. } => Err(removed_verb(
+            "dns",
+            "`daer run` serves DNS when `dns.bind` or `[dns.fake-ip]` asks for it, and \
+             `daer check` reports every unusable upstream",
+        )),
+        Command::Rule { .. } => Err(removed_verb(
+            "rule",
+            "the DRB producer is `geodrb`: `geodrb compile`, `geodrb convert`, `geodrb inspect`",
+        )),
     };
 
     match result {
@@ -310,116 +391,36 @@ fn main() -> ExitCode {
     }
 }
 
-/// Runs the DNS server until a signal arrives.
-async fn serve_dns(
-    path: &Path,
-    listen: Option<SocketAddr>,
-    udp_only: bool,
-    tcp_only: bool,
-) -> anyhow::Result<()> {
-    let config = dns::load(path)?;
-    let plan =
-        dns::Plan::resolve(&config, listen, udp_only, tcp_only).map_err(anyhow::Error::msg)?;
-    let resolver = dns::build_resolver(&config)?;
-
-    println!("daer dns: serving {}", plan.describe());
-
-    {
-        // One shutdown signal for both sockets, so they stop together. `watch` rather than a
-        // oneshot because both servers need it and neither should own it.
-        let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
-        let mut udp_shutdown = shutdown.subscribe();
-        let mut tcp_shutdown = shutdown.subscribe();
-
-        let udp = plan.udp.then(|| {
-            let resolver = std::sync::Arc::clone(&resolver);
-            let address = plan.address;
-            tokio::spawn(async move {
-                daer_dns::serve_udp(resolver, address, async move {
-                    let _ = udp_shutdown.recv().await;
-                })
-                .await
-            })
-        });
-        let tcp = plan.tcp.then(|| {
-            let resolver = std::sync::Arc::clone(&resolver);
-            let address = plan.address;
-            tokio::spawn(async move {
-                daer_dns::serve_tcp(resolver, address, async move {
-                    let _ = tcp_shutdown.recv().await;
-                })
-                .await
-            })
-        });
-
-        wait_for_signal().await;
-        eprintln!("daer dns: shutting down");
-        let _ = shutdown.send(());
-
-        for handle in [udp, tcp].into_iter().flatten() {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("daer dns: {error}"),
-                Err(error) => eprintln!("daer dns: server task failed: {error}"),
-            }
-        }
-        Ok(())
-    }
+/// The error for a verb that ADR-0015 removed.
+///
+/// A rename that says nothing is indistinguishable from a typo, and the operator's next move —
+/// diffing `--help` against an old script — is exactly the work a good error removes.
+fn removed_verb(verb: &str, replacement: &str) -> anyhow::Error {
+    anyhow::anyhow!("`daer {verb}` was removed: {replacement}")
 }
 
-/// Resolves when the process is asked to stop.
-async fn wait_for_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(error) => {
-                eprintln!("daer dns: cannot install SIGTERM handler: {error}");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
+/// Answers "will this configuration run, and what would it do".
+///
+/// One command, one exit status. It performs every step `daer run` performs before it binds a
+/// socket — resolve subscriptions and rule providers, compile and lower every rule, build
+/// every group, check every node this build can speak — so a configuration that passes here
+/// is one the daemon can serve. `--nodes` additionally prints the resolved node pool, which is
+/// what `daer route nodes` used to be.
+async fn check(path: &Path, nodes: bool) -> anyhow::Result<()> {
+    let report = validate_config(path).await?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
 
-/// Reports which upstreams this build can use.
-fn check_dns(path: &Path) -> anyhow::Result<()> {
-    let config = dns::load(path)?;
-    // Compile the resolver as well: `check` must fail for anything `serve` would refuse, or
-    // it is a check that cannot be trusted.
-    let _ = dns::build_resolver(&config)?;
+    if nodes {
+        list_nodes(path).await?;
+    }
 
-    let reports = dns::check_upstreams(&config).map_err(anyhow::Error::msg)?;
-    if reports.is_empty() {
-        println!("{}: no dns.upstream entries declared", path.display());
-        return Ok(());
-    }
-    let unusable = reports
-        .iter()
-        .filter(|report| report.unavailable.is_some())
-        .count();
-    for report in &reports {
-        println!("{}", report.line());
-    }
-    if unusable > 0 {
-        anyhow::bail!(
-            "{unusable} of {} upstream(s) cannot be used by this build",
-            reports.len()
-        );
-    }
     println!(
-        "{}: {} upstream(s), all usable",
+        "{}: ok, {} routing rule(s), {} file(s)",
         path.display(),
-        reports.len()
+        report.rules,
+        report.files
     );
     Ok(())
 }
@@ -448,6 +449,7 @@ struct LoadedConfig {
     config: Config,
     files: Vec<PathBuf>,
     warnings: Vec<String>,
+    rule_providers: Option<Arc<daer_routing::RuleProviderPool>>,
 }
 
 fn load_config(path: &Path) -> anyhow::Result<LoadedConfig> {
@@ -460,64 +462,81 @@ fn load_config(path: &Path) -> anyhow::Result<LoadedConfig> {
         config: loaded.config,
         files: loaded.files,
         warnings: loaded.warnings,
+        rule_providers: None,
     })
 }
 
-async fn validate(path: &Path) -> anyhow::Result<()> {
-    let report = validate_config(path).await?;
-    for warning in &report.warnings {
-        eprintln!("warning: {warning}");
+struct RouteFlow {
+    source: SocketAddr,
+    destination: SocketAddr,
+    domain: Option<String>,
+}
+
+fn parse_route_target(
+    target: &str,
+    second_arg: Option<&str>,
+    explicit_source: Option<SocketAddr>,
+    explicit_domain: Option<String>,
+) -> anyhow::Result<RouteFlow> {
+    let default_source: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let source = explicit_source.unwrap_or(default_source);
+
+    if let Some(dest_str) = second_arg {
+        let src: SocketAddr = if let Ok(addr) = target.parse::<SocketAddr>() {
+            addr
+        } else if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+            SocketAddr::new(ip, 12345)
+        } else {
+            anyhow::bail!("invalid source address '{target}': expected ip or ip:port");
+        };
+
+        let dst: SocketAddr = if let Ok(addr) = dest_str.parse::<SocketAddr>() {
+            addr
+        } else if let Ok(ip) = dest_str.parse::<std::net::IpAddr>() {
+            SocketAddr::new(ip, 443)
+        } else {
+            anyhow::bail!("invalid destination address '{dest_str}': expected ip or ip:port");
+        };
+
+        return Ok(RouteFlow {
+            source: src,
+            destination: dst,
+            domain: explicit_domain,
+        });
     }
-    println!(
-        "{}: ok, {} routing rule(s), {} file(s)",
-        path.display(),
-        report.rules,
-        report.files
-    );
-    Ok(())
-}
 
-fn fmt(path: &Path) -> anyhow::Result<()> {
-    let loaded = load_config(path)?;
-    print!("{}", daer_config::toml_config::to_string(&loaded.config));
-    Ok(())
-}
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(RouteFlow {
+            source,
+            destination: addr,
+            domain: explicit_domain,
+        });
+    }
 
-fn convert_node(link: Option<&str>) -> anyhow::Result<()> {
-    if let Some(link) = link {
-        let structured =
-            daer_config::StructuredNode::from_link(link).map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!(
-            "{}",
-            structured
-                .to_toml_node()
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        );
+    if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+        return Ok(RouteFlow {
+            source,
+            destination: SocketAddr::new(ip, 443),
+            domain: explicit_domain,
+        });
+    }
+
+    let (host, port) = if let Some((h, p)) = target.rsplit_once(':') {
+        if let Ok(port_num) = p.parse::<u16>() {
+            (h, port_num)
+        } else {
+            (target, 443)
+        }
     } else {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut count = 0;
-        for line in stdin.lock().lines() {
-            let line = line?;
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
-            }
-            let structured = daer_config::StructuredNode::from_link(line)
-                .map_err(|e| anyhow::anyhow!("{line:?}: {e}"))?;
-            println!(
-                "{}",
-                structured
-                    .to_toml_node()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-            );
-            count += 1;
-        }
-        if count == 0 {
-            anyhow::bail!("no links provided via stdin");
-        }
-    }
-    Ok(())
+        (target, 443)
+    };
+
+    let domain = explicit_domain.unwrap_or_else(|| host.to_string());
+    Ok(RouteFlow {
+        source,
+        destination: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
+        domain: Some(domain),
+    })
 }
 
 /// Prints the routing decision for one flow and whether it is actionable.
@@ -585,13 +604,15 @@ async fn load_resolved(path: &Path) -> anyhow::Result<LoadedConfig> {
         config: resolved.config,
         files: resolved.files,
         warnings: resolved.warnings,
+        rule_providers: Some(resolved.rule_providers.pool),
     })
 }
 
 /// Lists every node with its protocol and security identity.
 async fn list_nodes(path: &Path) -> anyhow::Result<()> {
     let loaded = load_resolved(path).await?;
-    let options = daer_control::RouterOptions::with_assets_beside(path);
+    let options = daer_control::RouterOptions::for_config(path)
+        .with_rule_providers(loaded.rule_providers.clone());
     let generations = daer_control::Generations::new(&loaded.config, &options)
         .with_context(|| path.display().to_string())?;
     let router = generations.current();
@@ -647,7 +668,8 @@ async fn explain(
     let source: SocketAddr = source.parse().context("invalid source address")?;
     let destination: SocketAddr = destination.parse().context("invalid destination address")?;
     let loaded = load_resolved(path).await?;
-    let options = daer_control::RouterOptions::with_assets_beside(path);
+    let options = daer_control::RouterOptions::for_config(path)
+        .with_rule_providers(loaded.rule_providers.clone());
     let generations = daer_control::Generations::new(&loaded.config, &options)
         .with_context(|| path.display().to_string())?;
     Ok(generations
@@ -677,14 +699,26 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let dat_reader = DatReaderOptimizer::new(vec![config_dir.clone()]);
+
+    let provider_res = daer_control::resolve_rule_providers(&loaded.config, &config_dir).await;
+    if !provider_res.providers.is_empty() {
+        if provider_res.all_usable() {
+            warnings.push(format!("rule providers: {}", provider_res.describe()));
+        } else {
+            anyhow::bail!(
+                "{} of {} rule provider(s) could not be loaded and no cache was available: {}",
+                provider_res.failed().len(),
+                provider_res.providers.len(),
+                provider_res.describe()
+            );
+        }
+    }
 
     let program = NormalizedProgram::new(
         &loaded.config.routing.rules,
         loaded.config.routing.fallback.clone(),
         &[
             &AliasOptimizer,
-            &dat_reader,
             &MergeAndSortOptimizer,
             &DeduplicateParamsOptimizer,
         ],
@@ -693,7 +727,7 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
 
     let mut sink = ValidationSink::default();
     {
-        let mut builder = RulesBuilder::new(&mut sink);
+        let mut builder = RulesBuilder::with_providers(&mut sink, &provider_res.pool);
         program
             .lower(&mut builder, |fallback| {
                 let outbound = fallback_outbound(fallback)?;
@@ -765,28 +799,48 @@ fn fallback_outbound(fallback: &FunctionOrString) -> Result<Outbound, RoutingErr
     parse_outbound(&function)
 }
 
-/// Fails on anything the run path would refuse, so `validate` is a real gate.
+/// Fails on anything the run path would refuse, so `daer check` is a real gate.
 ///
-/// Checks that were missing, each of which produced a green light for a
-/// configuration that cannot run:
+/// Checks that were missing, each of which produced a green light for a configuration that
+/// cannot run:
 ///
-/// * `dns.bind` was never parsed here, so `bind = "0.0.0.0:53"` passed `validate`
-///   and then failed every `dns serve`;
-/// * a node whose protocol this build cannot speak was skipped silently at
-///   generation build time, so a configuration made only of `vmess://` nodes
-///   validated clean and then had no selectable node at all.
+/// * `dns.bind` was never parsed here, so `bind = "0.0.0.0:53"` passed the gate and then
+///   failed to bind;
+/// * a node whose protocol this build cannot speak was skipped silently at generation build
+///   time, so a configuration made only of `vmess://` nodes validated clean and then had no
+///   selectable node at all;
+/// * an upstream this build cannot build was reported nowhere, so the first query got
+///   "no such upstream" for a tag the operator believed was routed.
 ///
-/// Subscriptions are *resolved*, not assumed: `validate` fetches them, so a
-/// subscription that is unreachable and uncached is an error here rather than an
-/// empty group at run time.
+/// Subscriptions are *resolved*, not assumed: the gate fetches them, so a subscription that is
+/// unreachable and uncached is an error here rather than an empty group at run time.
 ///
-/// A validator that passes a configuration the daemon cannot serve is worse than no
-/// validator: it is trusted.
+/// A validator that passes a configuration the daemon cannot serve is worse than no validator:
+/// it is trusted.
 fn validate_runtime(config: &Config, warnings: &mut Vec<String>) -> anyhow::Result<()> {
-    // The DNS plan is what `dns serve` binds; validating it here is the only way
-    // `validate` and `serve` cannot disagree.
-    crate::dns::Plan::resolve(config, None, false, false)
-        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    // The DNS plan is what `daer run` binds; validating it here is the only way `check` and
+    // the daemon cannot disagree.
+    crate::dns::Plan::resolve(config).map_err(|message| anyhow::anyhow!("{message}"))?;
+
+    // Every declared upstream must be one this build can speak. `daer check` is a load-time
+    // gate, so an unusable upstream is an error here rather than a silent "no such upstream"
+    // answer to the first query after `daer run` has already started.
+    let reports = crate::dns::check_upstreams(config).map_err(anyhow::Error::msg)?;
+    let unusable_upstreams: Vec<String> = reports
+        .iter()
+        .filter_map(|report| report.unavailable.as_ref().map(|_| report.line()))
+        .collect();
+    if !unusable_upstreams.is_empty() {
+        anyhow::bail!(
+            "{} of {} dns upstream(s) cannot be used by this build:\n  {}",
+            unusable_upstreams.len(),
+            reports.len(),
+            unusable_upstreams.join("\n  ")
+        );
+    }
+    if !reports.is_empty() {
+        warnings.push(format!("dns upstreams: {} usable", reports.len()));
+    }
 
     // Every node must be either usable or named as unusable: a node that is
     // silently unselectable makes a group look populated while every flow to it
@@ -857,6 +911,13 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// The reference configuration, asserted by a test rather than printed by a command.
+    ///
+    /// It is documentation: an operator copies it, an editor validates against it. Bundling it
+    /// into the release binary was a `config example` subcommand's reason to exist, and it was
+    /// the wrong reason — the file lives in the repository and in the docs.
+    const EXAMPLE_TOML: &str = include_str!("../../../daer.example.toml");
+
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -894,51 +955,59 @@ mod tests {
         }
     }
 
-    fn varint(mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value == 0 {
-                out.push(byte);
-                return out;
-            }
-            out.push(byte | 0x80);
+    /// Rewrites the example's three HTTP providers into local file providers backed by
+    /// fixtures, so the shipped *rules* and schema are validated without a network.
+    ///
+    /// A test that reached `cdn.jsdelivr.net` would fail on a runner without egress and pass
+    /// on one with it, which is a gate whose result depends on the machine. The provider
+    /// declarations themselves are covered by `rule_provider_integration_with_routing_and_explain`
+    /// and by `daer_control::rule_provider`'s own tests.
+    fn example_with_local_providers(dir: &TempDir) -> PathBuf {
+        let private = dir.0.join("geoip-private.drb");
+        let cn = dir.0.join("geosite-cn.drb");
+        let cn_ip = dir.0.join("geoip-cn.drb");
+        for (path, rules) in [
+            (&private, "ip: 10.0.0.0/8\nip: 192.168.0.0/16\n"),
+            (&cn, "suffix: example.cn\n"),
+            (&cn_ip, "ip: 1.2.3.0/24\n"),
+        ] {
+            let set = daer_routing::DrbSet::from_text(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("fixture"),
+                rules,
+            )
+            .expect("fixture compiles");
+            std::fs::write(path, set.encode()).expect("fixture writes");
         }
-    }
 
-    fn length_delimited(number: u8, payload: &[u8]) -> Vec<u8> {
-        let mut out = varint(u64::from((number << 3) | 2));
-        out.extend_from_slice(&varint(payload.len() as u64));
-        out.extend_from_slice(payload);
-        out
-    }
-
-    fn geoip_dat(code: &str, prefix: u8, ip: &[u8]) -> Vec<u8> {
-        let mut cidr = length_delimited(1, ip);
-        cidr.extend_from_slice(&varint(0x10));
-        cidr.extend_from_slice(&varint(u64::from(prefix)));
-        let mut entry = length_delimited(1, code.as_bytes());
-        entry.extend_from_slice(&length_delimited(2, &cidr));
-        length_delimited(1, &entry)
-    }
-
-    fn geosite_dat(code: &str, value: &str) -> Vec<u8> {
-        let mut domain = vec![0x08, 0x03];
-        domain.extend_from_slice(&length_delimited(2, value.as_bytes()));
-        let mut entry = length_delimited(1, code.as_bytes());
-        entry.extend_from_slice(&length_delimited(2, &domain));
-        length_delimited(1, &entry)
+        let mut text = EXAMPLE_TOML.to_owned();
+        for (tag, path) in [("private", &private), ("cn", &cn), ("cn-ip", &cn_ip)] {
+            let marker = format!("[[rule-provider]]\ntag = \"{tag}\"\ntype = \"http\"");
+            let replacement = format!(
+                "[[rule-provider]]\ntag = \"{tag}\"\ntype = \"file\"\npath = \"{}\"",
+                path.display()
+            );
+            assert!(
+                text.contains(&marker),
+                "the shipped example must still declare provider {tag:?} as HTTP: {text}"
+            );
+            text = text.replace(&marker, &replacement);
+            // The block's `url` and `interval` lines are meaningless for a `file` provider:
+            // comment them out rather than delete them, so the example still reads as the
+            // declaration it started as.
+            text = text.replace(
+                &format!("\ntype = \"file\"\npath = \"{}\"\nurl = ", path.display()),
+                &format!("\ntype = \"file\"\npath = \"{}\"\n#url = ", path.display()),
+            );
+        }
+        dir.write("config.toml", text.as_bytes())
     }
 
     #[test]
     fn the_reference_example_validates() {
         let dir = TempDir::new("example");
-        let mut geoip = geoip_dat("cn", 24, &[1, 2, 3, 0]);
-        geoip.extend(geoip_dat("private", 8, &[10, 0, 0, 0]));
-        dir.write("geoip.dat", &geoip);
-        dir.write("geosite.dat", &geosite_dat("cn", "example.cn"));
-        let config = dir.write("config.toml", EXAMPLE_TOML.as_bytes());
+        let config = example_with_local_providers(&dir);
 
         let report = block_on(validate_config(&config)).expect("the shipped example validates");
         assert!(report.rules > 0);
@@ -946,7 +1015,7 @@ mod tests {
 
         // ADR-0006/ADR-0007: a configuration whose group can select no node must *say so*, and
         // the shipped example is exactly that shape — its nodes are commented out on purpose, so
-        // `route explain` reports an empty group instead of pretending. What this asserts is the
+        // `daer explain` reports an empty group instead of pretending. What this asserts is the
         // diagnostic, not a silent success: the failure mode being guarded against is a default
         // policy that selects nothing **without** anyone noticing.
         let resolution = block_on(load_resolved(&config)).expect("resolves");
@@ -964,11 +1033,12 @@ mod tests {
         // which is the part that regressed (`min-moving-avg` selected nothing until a probe ran).
         let text = format!(
             "{}\n[[node]]\ntag = \"example\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
-            EXAMPLE_TOML
+            std::fs::read_to_string(&config).expect("reads the rewritten example")
         );
         let config_with_node = dir.write("with-node.toml", text.as_bytes());
         let resolved = block_on(load_resolved(&config_with_node)).expect("resolves");
-        let options = daer_control::RouterOptions::with_assets_beside(&config_with_node);
+        let options = daer_control::RouterOptions::for_config(&config_with_node)
+            .with_rule_providers(resolved.rule_providers.clone());
         let generations =
             daer_control::Generations::new(&resolved.config, &options).expect("builds");
         let node = generations
@@ -977,30 +1047,6 @@ mod tests {
             .node_identity("proxy")
             .expect("the example's default policy must select a node once one exists");
         assert_eq!(node.group, "proxy");
-    }
-
-    #[test]
-    fn validates_a_toml_config_with_geodata() {
-        let dir = TempDir::new("ok");
-        let mut geoip = geoip_dat("cn", 24, &[1, 2, 3, 0]);
-        geoip.extend(geoip_dat("private", 8, &[10, 0, 0, 0]));
-        dir.write("geoip.dat", &geoip);
-        dir.write("geosite.dat", &geosite_dat("cn", "example.cn"));
-        let config = dir.write(
-            "config.toml",
-            br#"[[group]]
-name = "proxy"
-policy = "min-moving-avg"
-
-[routing]
-rules = ["dip(geoip:cn) -> direct", "domain(geosite:cn) -> proxy"]
-fallback = "proxy"
-"#,
-        );
-
-        let report = block_on(validate_config(&config)).expect("validates");
-        assert_eq!(report.rules, 2);
-        assert_eq!(report.files, 1);
     }
 
     #[test]
@@ -1026,42 +1072,34 @@ fallback = "proxy"
     }
 
     #[test]
-    fn rejects_missing_geodata() {
-        // The asset search is confined to the temp directory. Left unconfined it falls back
-        // to `/usr/share/daer`, where a packaged installation keeps the real `geoip.dat`, so
-        // this test would report "found" on any machine with daer installed and only fail on
-        // a clean checkout — which is the opposite of what it claims to prove.
-        let dir = TempDir::new("missing");
+    fn rejects_a_missing_rule_provider_file() {
+        // A `file` provider that does not exist must fail the gate by name. The retired
+        // replacement for this test was `rejects_missing_geodata`, which asserted the same
+        // property for the `.dat` search path ADR-0014 removed.
+        let dir = TempDir::new("missing-provider");
         let config = dir.write(
             "config.toml",
-            b"[routing]\nrules = [\"dip(geoip:cn) -> direct\"]\nfallback = \"direct\"\n",
-        );
-        // `block_on` inside the closure, not outside: the closure returns an *unpolled*
-        // future, so confining the environment around it alone would remove the variable
-        // before the search ran — which is exactly how this test failed silently once.
-        let error = confined(|| block_on(validate_config(&config))).expect_err("must fail");
-        assert!(format!("{error:#}").contains("geoip.dat"), "{error:#}");
-    }
+            br#"[[rule-provider]]
+tag = "gone"
+type = "file"
+path = "does-not-exist.drb"
+format = "drb"
 
-    /// Runs `f` with the geodata search confined to the configuration's own directory.
-    ///
-    /// The environment is process-global and the tests run in parallel, so the variable is
-    /// only set for the duration of `f` and the lock serialises the tests that use it.
-    fn confined<T>(f: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the lock above serialises every use of this variable in the test binary.
-        unsafe { std::env::set_var("DAER_ASSETS_CONFINED", "1") };
-        let out = f();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("DAER_ASSETS_CONFINED") };
-        out
+[routing]
+rules = ["provider(gone) -> direct"]
+fallback = "direct"
+"#,
+        );
+        let error = block_on(validate_config(&config)).expect_err("must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("gone"), "{message}");
+        assert!(message.contains("does-not-exist"), "{message}");
     }
 
     #[test]
     fn rejects_a_dns_bind_that_is_an_address_not_an_ip() {
-        // The example configuration shipped `0.0.0.0:53` for a while, and `validate`
-        // passed it while `dns serve` refused it. The gate is now the same code.
+        // The example configuration shipped `0.0.0.0:53` for a while: the gate passed it
+        // while the bind refused it, because the two used different code. They are now one.
         let dir = TempDir::new("badbind");
         let config = dir.write("config.toml", b"[dns]\nbind = \"0.0.0.0:53\"\n");
         let error = block_on(validate_config(&config)).expect_err("must fail");
@@ -1090,13 +1128,6 @@ fallback = "g"
         let error = block_on(validate_config(&config)).expect_err("must fail");
         let message = format!("{error:#}");
         assert!(message.contains("vmess"), "{message}");
-    }
-
-    #[test]
-    fn rejects_a_chained_link_rather_than_truncating_it() {
-        let err = convert_node(Some("socks5://127.0.0.1:1080 -> socks5://127.0.0.1:1081"))
-            .expect_err("chained link must fail");
-        assert!(format!("{err:#}").contains("chained links"), "{err:#}");
     }
 
     #[test]
@@ -1291,7 +1322,7 @@ policy = "fixed(0)"
         );
 
         let loaded = load_config(&config).expect("loads");
-        let options = daer_control::RouterOptions::with_assets_beside(&config);
+        let options = daer_control::RouterOptions::for_config(&config);
         let generations = daer_control::Generations::new(&loaded.config, &options).expect("builds");
         let nodes = generations.current().router().nodes();
         assert_eq!(nodes.len(), 3, "{nodes:#?}");
@@ -1407,7 +1438,7 @@ fallback = "proxy"
 
         let loaded = load_config(&config).expect("loads");
         assert_eq!(loaded.config.node.len(), 2);
-        let options = daer_control::RouterOptions::with_assets_beside(&config);
+        let options = daer_control::RouterOptions::for_config(&config);
         let generations = daer_control::Generations::new(&loaded.config, &options).expect("builds");
         let nodes = generations.current().router().nodes();
         assert_eq!(nodes.len(), 2);
@@ -1435,19 +1466,6 @@ fallback = "proxy"
         .expect("explains");
         let selected = explanation.selected.expect("node selected");
         assert_eq!(selected.node, "hk-vless");
-    }
-
-    #[test]
-    fn convert_node_command_converts_uri_to_structured_toml() {
-        let vless_link = "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f#US%20VIP%2001";
-        assert!(convert_node(Some(vless_link)).is_ok());
-
-        let ss_link =
-            "ss://YWVzLTEyOC1ncm06bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
-        assert!(convert_node(Some(ss_link)).is_ok());
-
-        let anytls_link = "anytls://secret@anytls.example.com:443?sni=sni.example.com#anytls-node";
-        assert!(convert_node(Some(anytls_link)).is_ok());
     }
 
     #[test]
@@ -1525,7 +1543,7 @@ fallback = "direct"
         );
 
         // Generates router and selects Japan node
-        let options = daer_control::RouterOptions::with_assets_beside(&config);
+        let options = daer_control::RouterOptions::for_config(&config);
         let generations =
             daer_control::Generations::new(&resolved.config, &options).expect("builds router");
         let selected_node = generations
@@ -1577,6 +1595,63 @@ fallback = "direct"
     }
 
     #[test]
+    fn removed_verbs_name_their_replacement() {
+        // ADR-0015: a stale script must be told what to change. `unknown subcommand` is
+        // indistinguishable from a typo, and the operator's next move would be diffing
+        // `--help` against the script.
+        for (verb, expected) in [
+            ("config", "daer check"),
+            ("explain", "daer route"),
+            ("node", "[[subscription]]"),
+            ("dns", "daer run"),
+            ("rule", "geodrb"),
+        ] {
+            let error = block_on(async { cli_error(verb).await });
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(verb) && message.contains(expected),
+                "`daer {verb}` must name {expected:?}: {message}"
+            );
+        }
+    }
+
+    /// Drives the real parser so the assertion is about the shipped surface, not a copy.
+    ///
+    /// A hand-built `Command` would pass even if `main` stopped routing the verb, which is the
+    /// only thing this test exists to check.
+    async fn cli_error(verb: &str) -> anyhow::Error {
+        let cli = Cli::try_parse_from(["daer", verb, "whatever"]).expect("the verb still parses");
+        let result: anyhow::Result<()> = match cli.command {
+            Command::Config { .. } => Err(removed_verb(
+                "config",
+                "`daer check` answers \"will this run\"; the sample and the schema are \
+                 `daer schema` and the repository's daer.example.toml",
+            )),
+            Command::Explain { .. } => Err(removed_verb(
+                "explain",
+                "`daer route <TARGET>` resolves routing decisions (e.g. `daer route bilibili.com` or `daer route 1.1.1.1`)",
+            )),
+            Command::Node { .. } => Err(removed_verb(
+                "node",
+                "declare a `[[subscription]]` (daer parses links at runtime) or use an external \
+                 subscription converter",
+            )),
+            Command::Dns { .. } => Err(removed_verb(
+                "dns",
+                "`daer run` serves DNS when `dns.bind` or `[dns.fake-ip]` asks for it, and \
+                 `daer check` reports every unusable upstream",
+            )),
+            Command::Rule { .. } => Err(removed_verb(
+                "rule",
+                "the DRB producer is `geodrb`: `geodrb compile`, `geodrb convert`, \
+                 `geodrb inspect`",
+            )),
+            other => panic!("{other:?} is not a removed verb"),
+        };
+        result.expect_err("a removed verb must not succeed")
+    }
+
+    #[test]
     fn accepts_builtin_outbounds() {
         let dir = TempDir::new("builtin");
         let config = dir.write(
@@ -1584,5 +1659,94 @@ fallback = "direct"
             b"[routing]\nrules = [\"dport(443) -> block\"]\nfallback = \"direct\"\n",
         );
         block_on(validate_config(&config)).expect("validates");
+    }
+
+    #[test]
+    fn rule_provider_integration_with_routing_and_explain() {
+        let dir = TempDir::new("rule-provider-routing");
+        let _rules_file = dir.write("direct.rules", b"ip: 192.168.100.0/24\nsuffix: corp.lan\n");
+        let config = dir.write(
+            "config.toml",
+            br#"
+schema = 1
+
+[[rule-provider]]
+tag = "internal-corp"
+type = "file"
+path = "direct.rules"
+format = "text"
+
+[routing]
+rules = ["provider(internal-corp) -> direct"]
+fallback = "block"
+"#,
+        );
+
+        let report = block_on(validate_config(&config)).expect("validates");
+        assert_eq!(report.rules, 1);
+
+        // 1. IP match: 192.168.100.42 -> direct
+        let exp = block_on(explain(&config, "10.0.0.1:1234", "192.168.100.42:80", None))
+            .expect("explains ip");
+        assert_eq!(&*exp.outbound.name, "direct");
+
+        // 2. Domain match: portal.corp.lan -> direct
+        let exp = block_on(explain(
+            &config,
+            "10.0.0.1:1234",
+            "1.1.1.1:80",
+            Some("portal.corp.lan"),
+        ))
+        .expect("explains domain");
+        assert_eq!(&*exp.outbound.name, "direct");
+
+        // 3. Fallback: other.com -> block
+        let err = block_on(explain_route(
+            &config,
+            "10.0.0.1:1234".parse().unwrap(),
+            "1.1.1.1:80".parse().unwrap(),
+            false,
+            Some("other.com"),
+        ))
+        .expect_err("must report blocked flow");
+        assert!(err.to_string().contains("blocked"));
+    }
+
+    #[test]
+    fn parse_route_target_supports_single_domain() {
+        let flow = parse_route_target("bilibili.com", None, None, None).expect("parses domain");
+        assert_eq!(flow.source.to_string(), "127.0.0.1:12345");
+        assert_eq!(flow.destination.port(), 443);
+        assert_eq!(flow.domain.as_deref(), Some("bilibili.com"));
+
+        let flow_port =
+            parse_route_target("bilibili.com:8443", None, None, None).expect("parses domain:port");
+        assert_eq!(flow_port.destination.port(), 8443);
+        assert_eq!(flow_port.domain.as_deref(), Some("bilibili.com"));
+    }
+
+    #[test]
+    fn parse_route_target_supports_single_ip() {
+        let flow = parse_route_target("1.1.1.1", None, None, None).expect("parses ip");
+        assert_eq!(flow.destination.to_string(), "1.1.1.1:443");
+        assert_eq!(flow.domain, None);
+
+        let flow_port = parse_route_target("1.1.1.1:80", None, None, None).expect("parses ip:port");
+        assert_eq!(flow_port.destination.to_string(), "1.1.1.1:80");
+        assert_eq!(flow_port.domain, None);
+    }
+
+    #[test]
+    fn parse_route_target_supports_classic_four_tuple() {
+        let flow = parse_route_target(
+            "192.168.1.10:41234",
+            Some("93.184.216.34:443"),
+            None,
+            Some("example.com".to_string()),
+        )
+        .expect("parses 4-tuple");
+        assert_eq!(flow.source.to_string(), "192.168.1.10:41234");
+        assert_eq!(flow.destination.to_string(), "93.184.216.34:443");
+        assert_eq!(flow.domain.as_deref(), Some("example.com"));
     }
 }

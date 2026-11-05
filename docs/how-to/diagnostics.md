@@ -70,7 +70,12 @@ session: it is worth reporting separately downstream.
 ### Reproduce it offline
 
 ```sh
-daer route explain 192.168.1.10:41234 93.184.216.34:443 -c config.toml
+# Natural target routing lookup (domain or IP):
+daer route bilibili.com -c config.toml
+daer route 93.184.216.34:443 -c config.toml
+
+# Or classic 4-tuple:
+daer route 192.168.1.10:41234 93.184.216.34:443 -c config.toml
 ```
 
 ```
@@ -90,12 +95,12 @@ The `decided by` line is the **normalized** rule, not the file's spelling: the
 optimizer rewrites `dport` to `port`, sorts parameters and merges adjacent rules.
 Showing the raw input would risk displaying a rule the engine never evaluated.
 
-A `domain(...)` rule cannot fire without a name, and the data path gets that name
-from sniffing. `--domain <name>` supplies the same fact from the command line, which
-is the only way to verify a domain rule without a live flow:
+A `domain(...)` rule cannot fire without a name. In `daer route`, passing a domain directly
+(e.g. `daer route www.bilibili.com`) auto-supplies the domain, or `--domain <name>` can be passed
+explicitly:
 
 ```
-daer route explain 10.0.0.2:40000 93.184.216.34:443 -c config.toml --domain www.bilibili.com
+daer route 10.0.0.2:40000 93.184.216.34:443 -c config.toml --domain www.bilibili.com
 ```
 
 From code, the same answer is available as data:
@@ -109,7 +114,7 @@ assert_eq!(explanation.outbound.name, "proxy");
 ### "Why did the rule I wrote never fire?"
 
 ```sh
-daer route explain 192.168.1.10:41234 93.184.216.34:443 --why -c config.toml
+daer route 192.168.1.10:41234 93.184.216.34:443 --why -c config.toml
 ```
 
 ```
@@ -163,7 +168,7 @@ proxy") into a regression test.
 `rule 0` is the first rule in the configuration, not the first internal match set.
 One rule lowers to several match sets (one per predicate), so an internal index
 would be a number no operator can map back to their file. The ordinal is
-`NormalizedProgram::rules[n]`, and `route explain` prints that rule's text so the
+`NormalizedProgram::rules[n]`, and `daer route` prints that rule's text so the
 number never has to be looked up by hand.
 
 ### Facts the ingress does not have
@@ -204,11 +209,11 @@ them apart.
 
 The configuration layer reports before anything runs:
 
-* `daer config validate` — loads the tree (including `include`), applies defaults,
+* `daer check` — loads the tree (including `include`), applies defaults,
   compiles every rule, resolves every outbound name, and dry-runs groups and
   filters. Errors carry `line:column` and a caret, including inside a rule
   expression.
-* `daer config schema` — the JSON Schema, so an editor flags a typo before the
+* `daer schema` — the JSON Schema, so an editor flags a typo before the
   validator ever runs. Automated test `schema_is_up_to_date` fails if the checked-in schema drifts
   from the model.
 
@@ -385,33 +390,28 @@ Two details that look like bugs and are correctness:
 
 ## 5h. "Is the resolver running correctly?"
 
-Two commands and one log line answer it without a packet capture:
+One command answers it without a packet capture:
 
 ```sh
-daer dns check -c config.toml
+daer check -c config.toml
 ```
+
+`daer check` compiles the full resolver, parses `dns.bind`, and reports every declared
+upstream this build cannot speak:
 
 ```
 plain [tcp] ok
 remote [udp] unusable: no transport for upstream "remote"
-1 of 2 upstream(s) cannot be used by this build
+1 of 2 dns upstream(s) cannot be used by this build:
+  remote [udp] unusable: no transport for upstream "remote"
 ```
 
-`check` exits non-zero for any unusable upstream, so it works as a gate. It compiles the
-full resolver before reporting, so it cannot pass a configuration `serve` would refuse.
+It exits non-zero in that case, so it works as a gate. `daer run` starts the resolver when
+`dns.bind` or `[dns.fake-ip]` asks for one, and logs `dns server started` with the address.
 
-```sh
-daer dns serve -c config.toml
-```
-
-```
-daer dns: serving 0.0.0.0:53 on udp+tcp
-```
-
-`dns.bind` is an **IP**, not an address: the port is always 53. `--listen` takes a full
-`ip:port` and overrides it. A port inside `dns.bind` is rejected with the field name rather
-than silently interpreted, because "bind 127.0.0.1:5353" and "bind 127.0.0.1" differ by
-something the operator cannot see in the file.
+`dns.bind` is an **IP**, not an address: the port is always 53. A port inside `dns.bind` is
+rejected with the field name rather than silently interpreted, because "bind 127.0.0.1:5353"
+and "bind 127.0.0.1" differ by something the operator cannot see in the file.
 
 ## 5i. "The shadowsocks node does not work"
 
@@ -453,7 +453,7 @@ Three things that are protocol-level rather than configuration-level:
 ## 5k. "Which nodes exist, and how is each session protected?"
 
 ```sh
-daer route nodes -c config.toml
+daer check --nodes -c config.toml
 ```
 
 ```
@@ -471,7 +471,7 @@ The security identity is derived **structurally** — from the scheme, the ciphe
 convention: a diagnostic that printed a credential would turn a bug report into a credential
 leak, so `Property::security` cannot reach one.
 
-`route explain` carries the same identity for the node a rule selected, so one command answers
+`daer route` carries the same identity for the node a rule selected, so one command answers
 "which rule, which outbound, which node, and how is it protected":
 
 ```
@@ -521,7 +521,7 @@ routes nothing.
 | `serve` | one broken flow never ends the loop; resource exhaustion backs off; a flow is owned by the supervisor, so the loop ending does not end it |
 | `supervise` | `drain` returns exactly when the last flow ends, from any number of concurrent waiters |
 | `generation` | a reload that fails publishes nothing; the message says whether anything is still serving, and only claims so when it is true; a flow keeps the generation it arrived under |
-| `daer route explain` | the printed decision is produced by the same compiled generation the data path uses, and its exit status distinguishes "served" from "dropped" |
+| `daer route` | the printed decision is produced by the same compiled generation the data path uses, and its exit status distinguishes "served" from "dropped" |
 | `daer-routing::explain` | `decided_by`/`outbound` always equal `first_hit`'s; predicates are grouped as the configuration nests them |
 | `daer-dns::wire` | every prefix of a message fails cleanly; compression pointers may only point backwards, with a hop budget |
 | `daer-dns::routing` | an undeclared upstream, an unsupported predicate or a missing fallback fails at load, not per query |

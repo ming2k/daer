@@ -1,109 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The `dns` subcommand: run the resolver, or inspect what it would do.
+//! The resolver's configuration surface, shared by `daer run` and `daer check`.
 //!
-//! # Why `serve` lives here and not behind the data path
+//! # Why there is no `daer dns serve`
 //!
-//! The resolver is a complete subsystem — sockets, routing, cache, upstreams — and it is
-//! useful on its own: a box can be a DNS server before it is a transparent proxy. Exposing
-//! it as its own subcommand means the DNS layer can be exercised end to end while the
-//! kernel side is still being written, and it gives the eventual combined daemon one code
-//! path instead of two.
+//! The resolver is not a product of its own: Fake-IP has no meaning without the datapath that
+//! reads the synthetic addresses back, and `domain(...)` rules have no name without the
+//! resolver. A box that wants a DNS server has one; a box that wants `daer` gets the resolver
+//! as part of `daer run`.
 //!
-//! # Shutdown
-//!
-//! `SIGINT`/`SIGTERM` stop accepting and let `serve` return; in-flight queries finish or hit
-//! their own timeout. Nothing is killed mid-exchange, because a truncated DNS reply is
-//! indistinguishable from a wrong one at the client.
+//! What *is* worth exposing is the question "would these upstreams work", because that answer
+//! is a load-time gate rather than a runtime service. It lives here and is called from
+//! `daer check`, so a configuration that names an upstream this build cannot speak fails the
+//! check instead of failing the first query.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
-use clap::Subcommand;
 use daer_config::Config;
+use daer_dns::Upstream;
 use daer_dns::transport::UpstreamSpec;
-use daer_dns::{Resolver, Upstream, UpstreamError};
 
-/// A single DNS query endpoint.
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Run the DNS server.
-    Serve {
-        #[arg(short, long, value_name = "PATH")]
-        config: Option<PathBuf>,
-        /// Address to listen on. Overrides `dns.bind`.
-        #[arg(long, value_name = "IP:PORT")]
-        listen: Option<SocketAddr>,
-        /// Serve UDP only.
-        #[arg(long, conflicts_with = "tcp_only")]
-        udp_only: bool,
-        /// Serve TCP only.
-        #[arg(long, conflicts_with = "udp_only")]
-        tcp_only: bool,
-    },
-    /// Report which upstreams this build can actually use.
-    Check {
-        #[arg(short, long, value_name = "PATH")]
-        config: Option<PathBuf>,
-    },
-}
-
-/// What to bind, and on which transports.
+/// What `daer run` binds for DNS.
+///
+/// `dns.bind` is a bare IP (`0.0.0.0`, `[::]`), not an address: the port is always 53, which
+/// is the only port a client will ask without being told. A value that is not an IP is an
+/// error rather than a guess, because binding somewhere the operator did not write is a
+/// silent outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plan {
     pub address: SocketAddr,
-    pub udp: bool,
-    pub tcp: bool,
 }
 
 impl Plan {
-    /// Resolves the plan from a configuration and the command-line overrides.
-    ///
-    /// `dns.bind` is a bare IP (`0.0.0.0`, `[::]`), not an address: the port is always 53,
-    /// which is the only port a client will ask without being told. A bare port in `--listen`
-    /// is therefore an error rather than a guess about which address was meant.
-    ///
     /// # Errors
     ///
-    /// Returns a message when `dns.bind` is not an IP, or when both `--udp-only` and
-    /// `--tcp-only` are given (clap catches the second; this keeps the invariant local).
-    pub fn resolve(
-        config: &Config,
-        listen: Option<SocketAddr>,
-        udp_only: bool,
-        tcp_only: bool,
-    ) -> Result<Self, String> {
-        let address = match listen {
-            Some(address) => address,
-            None => {
-                let ip = match &config.dns.bind {
-                    Some(bind) => bind
-                        .parse::<IpAddr>()
-                        .map_err(|_| format!("dns.bind: {bind:?} is not an IP address"))?,
-                    None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                };
-                SocketAddr::new(ip, 53)
-            }
+    /// Returns a message when `dns.bind` is not an IP.
+    pub fn resolve(config: &Config) -> Result<Self, String> {
+        let ip = match &config.dns.bind {
+            Some(bind) => bind
+                .parse::<IpAddr>()
+                .map_err(|_| format!("dns.bind: {bind:?} is not an IP address"))?,
+            None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         };
         Ok(Self {
-            address,
-            udp: !tcp_only,
-            tcp: !udp_only,
+            address: SocketAddr::new(ip, 53),
         })
     }
 
     /// A one-line description, for the startup log.
     #[must_use]
     pub fn describe(&self) -> String {
-        let transports = match (self.udp, self.tcp) {
-            (true, true) => "udp+tcp",
-            (true, false) => "udp",
-            (false, true) => "tcp",
-            (false, false) => "none",
-        };
-        format!("{} on {transports}", self.address)
+        format!("{} on udp+tcp", self.address)
     }
 }
 
@@ -143,9 +91,9 @@ pub fn check_upstreams(config: &Config) -> Result<Vec<UpstreamReport>, String> {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("+");
-        // One predicate, two callers: a spec `serve` cannot build is a spec `check` reports.
-        // Both go through `UpstreamSpec::build`, so they cannot disagree.
-        let unavailable = transport_for(&spec).err().map(|error| error.to_string());
+        // One predicate, two callers: a spec the daemon cannot build is a spec `daer check`
+        // reports. Both go through `UpstreamSpec::build`, so they cannot disagree.
+        let unavailable = spec.build().err().map(|error| error.to_string());
         reports.push(UpstreamReport {
             tag: spec.tag,
             protocols,
@@ -155,22 +103,12 @@ pub fn check_upstreams(config: &Config) -> Result<Vec<UpstreamReport>, String> {
     Ok(reports)
 }
 
-/// Builds the resolver a server uses.
-///
-/// # Errors
-///
-/// Returns the resolver's own error, which names the part that failed.
-pub fn build_resolver(config: &Config) -> anyhow::Result<Arc<Resolver>> {
-    let resolver = Resolver::from_config(config).context("cannot build the dns resolver")?;
-    Ok(Arc::new(resolver))
-}
-
 /// Builds every transport a configuration declares, keyed by tag.
 ///
 /// Split out of [`Resolver::from_config`] so a caller that wants to share the resolver's
-/// Fake-IP pool and snooper (the combined daemon) can build the transports itself and hand
-/// both to [`Resolver::with_state`]. The parse and build are the same two steps
-/// `from_config` performs, so the two paths cannot disagree about which specs are valid.
+/// Fake-IP pool and snooper (the daemon) can build the transports itself and hand both to
+/// [`Resolver::with_state`]. The parse and build are the same two steps `from_config`
+/// performs, so the two paths cannot disagree about which specs are valid.
 ///
 /// # Errors
 ///
@@ -189,32 +127,6 @@ pub fn transports(config: &Config) -> anyhow::Result<Vec<(String, Arc<dyn Upstre
     Ok(transports)
 }
 
-/// Builds the transport a spec names.
-///
-/// `check` calls this, so a spec that reports usable is one that builds. Kept as a function
-/// rather than duplicated so the two can never disagree.
-///
-/// # Errors
-///
-/// Returns the build error, which names the protocol that could not be built.
-pub fn transport_for(spec: &UpstreamSpec) -> Result<Arc<dyn Upstream>, UpstreamError> {
-    spec.build()
-}
-
-/// Reads a configuration, mapping the error for a daemon that must not start on a bad file.
-///
-/// # Errors
-///
-/// Returns the loader error with the path attached.
-pub fn load(path: &Path) -> anyhow::Result<Config> {
-    let loaded = daer_config::toml_config::load(path)
-        .with_context(|| format!("failed to load {}", path.display()))?;
-    for warning in &loaded.warnings {
-        tracing::warn!(%warning, "configuration warning");
-    }
-    Ok(loaded.config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,45 +136,23 @@ mod tests {
     }
 
     #[test]
-    fn the_default_plan_is_port_53_on_both_transports() {
-        let plan = Plan::resolve(&config(""), None, false, false).expect("resolves");
+    fn the_default_plan_is_port_53_on_every_address() {
+        let plan = Plan::resolve(&config("")).expect("resolves");
         assert_eq!(plan.address.port(), 53);
         assert!(plan.address.ip().is_unspecified());
-        assert!(plan.udp && plan.tcp);
         assert_eq!(plan.describe(), "0.0.0.0:53 on udp+tcp");
     }
 
     #[test]
     fn dns_bind_sets_the_address_and_the_port_stays_53() {
-        let plan = Plan::resolve(&config("[dns]\nbind = \"127.0.0.1\"\n"), None, false, false)
-            .expect("resolves");
+        let plan = Plan::resolve(&config("[dns]\nbind = \"127.0.0.1\"\n")).expect("resolves");
         assert_eq!(plan.address.to_string(), "127.0.0.1:53");
     }
 
     #[test]
-    fn an_explicit_listen_overrides_everything() {
-        let plan = Plan::resolve(
-            &config("[dns]\nbind = \"127.0.0.1\"\n"),
-            Some("10.0.0.1:5353".parse().expect("addr")),
-            false,
-            false,
-        )
-        .expect("resolves");
-        assert_eq!(plan.address.to_string(), "10.0.0.1:5353");
-    }
-
-    #[test]
-    fn the_transport_flags_are_exclusive() {
-        let udp = Plan::resolve(&config(""), None, true, false).expect("resolves");
-        assert!(udp.udp && !udp.tcp);
-        let tcp = Plan::resolve(&config(""), None, false, true).expect("resolves");
-        assert!(tcp.tcp && !tcp.udp);
-    }
-
-    #[test]
     fn a_bind_that_is_not_an_ip_is_rejected_with_the_field_name() {
-        let error = Plan::resolve(&config("[dns]\nbind = \"not-an-ip\"\n"), None, false, false)
-            .expect_err("must reject");
+        let error =
+            Plan::resolve(&config("[dns]\nbind = \"not-an-ip\"\n")).expect_err("must reject");
         assert!(error.contains("dns.bind"), "{error}");
         assert!(error.contains("not an IP"), "{error}");
     }
@@ -271,13 +161,8 @@ mod tests {
     fn a_port_in_dns_bind_is_rejected_not_guessed() {
         // `dns.bind` is an address, not a socket address: accepting `127.0.0.1:5353` would
         // silently ignore the port or bind something unexpected.
-        let error = Plan::resolve(
-            &config("[dns]\nbind = \"127.0.0.1:5353\"\n"),
-            None,
-            false,
-            false,
-        )
-        .expect_err("must reject");
+        let error =
+            Plan::resolve(&config("[dns]\nbind = \"127.0.0.1:5353\"\n")).expect_err("must reject");
         assert!(error.contains("dns.bind"), "{error}");
     }
 
@@ -316,7 +201,7 @@ upstream = [
         let error = check_upstreams(&config).expect_err("must reject");
         assert!(error.contains("dns.upstream"), "{error}");
         // The resolver must agree: one parse, two callers.
-        assert!(Resolver::from_config(&config).is_err());
+        assert!(daer_dns::Resolver::from_config(&config).is_err());
     }
 
     #[test]
@@ -338,7 +223,7 @@ upstream = [
                 "{entry} must be usable, got {:?}",
                 report.unavailable
             );
-            assert!(transport_for(&spec).is_ok(), "{entry} must build");
+            assert!(spec.build().is_ok(), "{entry} must build");
         }
     }
 

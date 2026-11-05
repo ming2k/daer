@@ -43,7 +43,7 @@ WARN datapath policy published as a deferral: every flow is handed to the contro
 
 Both are correct; only the first keeps direct traffic out of userspace. The second costs one
 userspace relay hop per flow and is what most real configurations get today, because `domain(...)`
-is common. `daer route explain` and `daer route nodes` describe the same generation the daemon
+is common. `daer route` and `daer check --nodes` describe the same generation the daemon
 serves, so they cannot disagree with it — that agreement is enforced by sharing one loader
 ([ADR-0006](docs/adr/0006-wiring-ownership.md)).
 
@@ -53,14 +53,15 @@ serves, so they cannot disagree with it — that agreement is enforced by sharin
 | --- | --- | --- |
 | `daer-common` | shared constants and network primitives | done |
 | `daer-config` | TOML schema, rule expression language, loader, validation | done |
-| `daer-routing` | rule lowering, userspace matching, policy identity, `geosite:`/`geoip:` expansion | done, matcher is indexed and allocation-free |
+| `daer-routing` | rule lowering, userspace matching, policy identity, DRB (`provider(...)`) lowering | done, matcher is indexed and allocation-free |
 | `daer-geodata` | streaming geodata reader, asset locator | done |
+| `geodrb` | DRB (daer Rule Binary) compiler, converter, inspector, and tester | done |
 | `daer-ebpf` | datapath object loading, map/program ABI, section normalization | done |
 | `daer-outbound` | latency statistics, alive-set selection, groups, policies, direct / SOCKS5 / HTTP `CONNECT` / shadowsocks AEAD / trojan / **REALITY** (own TLS 1.3 client, ADR-0010), health checks (HTTP, TCP, UDP-DNS), datagram legs, subscription fetch + decode + `persist` cache | partial: vmess, plain vless, QUIC families pending |
 | `daer-dns` | wire format, routing, cache, pipeline, UDP+TCP server, **all four upstream transports** (UDP, TCP, DoT, DoH) | partial: no bootstrap resolver; upstream addresses must be literal IPs |
 | `daer-sniff` | TLS SNI and HTTP `Host` prefix sniffing | partial: no QUIC |
 | `daer-control` | transparent ingress, sniffing, routing verdict, outbound dial, TCP relay + splice, UDP datagram relay (per-peer sessions, driven by `Daemon::serve`), accept loop, flow supervisor, health scheduling, one shared configuration loader, configuration generations and handover | partial: kernel policy is published per ADR-0005, which for `domain(...)`/`pname(...)` rules means "defer to userspace" |
-| `daer-cli` | `config validate`, `config fmt`, `config example`, `config schema`, `route explain --why --domain`, `route nodes`, `dns check`, `dns serve`, `run`, `version` | done |
+| `daer-cli` | `run`, `check --nodes`, `route --why`, `probe`, `schema`, `version` | done |
 
 Network capabilities above the socket — TLS, HTTP, DNS resolution, proxy
 handshakes, socket options, RTT sampling, and everything datagram-shaped — belong
@@ -102,12 +103,18 @@ filters = ["subtag(my-sub) && !name(keyword: 'ExpireAt:')"]
 [routing]
 rules = [
     "pname(NetworkManager) -> direct",
-    "dip(geoip:private) -> direct",
+    "provider(private) -> direct",
     "l4proto(udp) && dport(443) -> block",
-    "domain(geosite:cn) -> direct",
+    "provider(cn) -> direct",
 ]
 fallback = "proxy"
 ```
+
+GeoIP and GeoSite are **rule providers** now: a compiled `.drb` set fetched from a URL or read
+from a file, declared once under `[[rule-provider]]` and named in a rule as
+`provider(<tag>)`. The Protobuf `.dat` reader is not linked into the daemon (ADR-0014,
+ADR-0015); [`geodrb`](https://github.com/daeuniverse/geodrb) converts an existing `.dat` once,
+and publishes the common tags daily.
 
 ### Subscriptions
 
@@ -127,7 +134,7 @@ endpoint that returns an error page at restart cannot take a working proxy down.
 
 Supported node schemes today: `ss://` (shadowsocks AEAD), `trojan://`, `socks5://`,
 `http://`, and `vless://` **with `security=reality`**. `vmess://`, plain `vless://`
-(`security=tls`) and the QUIC families are **not** implemented; `daer config validate`
+(`security=tls`) and the QUIC families are **not** implemented; `daer check`
 names every node this build cannot select rather than letting it disappear into an
 empty group. A chained link (`a -> b`) is rejected loudly instead of being silently
 truncated to its first hop.
@@ -140,7 +147,7 @@ configuration error at load. `flow=xtls-rprx-vision` and a wrapping transport
 
 A `[[subscription]]` node carries the tag of the subscription it came from, so
 `subtag(...)` selects it. That provenance used to be dropped, which made every
-subscription node invisible to every `subtag` filter while `daer route nodes` still listed
+subscription node invisible to every `subtag` filter while `daer check --nodes` still listed
 it — the two diagnostics disagreed and the group silently had no members.
 
 Rules may be written with IPv6 and MAC literals directly: `dip(2001:db8::/32)`,
@@ -151,39 +158,34 @@ the language is a word rather than a run of hex digits — so `domain(suffix:exa
 
 ### Inspecting decisions
 
-`daer route explain <source> <destination> -c config.toml` prints the routing
-decision for one flow — the rule that fires, the outbound and its mark — from the
+`daer route <target> -c config.toml` (e.g. `daer route bilibili.com` or `daer route 1.1.1.1`) prints the routing
+decision for a target domain, IP, or flow — the rule that fires, the outbound and its mark — from the
 same compiled configuration a running daer uses, and exits non-zero when the flow
-would be dropped. `--domain www.example.com` supplies the name sniffing would have
-found, which is the only way to verify a `domain(...)` rule from the command line.
+would be dropped. Classic 4-tuple flows (`daer route <source> <destination>`) are also supported.
 `--why` adds a per-rule, per-predicate trace, including rules that would have
 matched but were shadowed, and the selected node's security identity
 (`cipher aes-256-gcm`, `tls sni=…`) is printed with the decision.
-`daer route nodes` lists every node the same way, subscriptions resolved. See
+`daer probe node <name>` actively diagnoses L3 DNS, L4 TCP reachability, and L7 protocol handshake.
+`daer check --nodes` lists every node the same way, subscriptions resolved. See
 [`docs/how-to/diagnostics.md`](docs/how-to/diagnostics.md).
 
-### Running the DNS resolver
-
-The resolver is a complete subsystem and does not need the data path, so it has its own
-subcommand:
+### Running the daemon
 
 ```sh
-daer dns check -c config.toml     # which upstreams this build can actually use
-daer dns serve -c config.toml     # UDP + TCP on dns.bind, port 53
-daer dns serve -c config.toml --listen 127.0.0.1:5353 --udp-only
+daer check -c config.toml      # will it run: subscriptions, rules, groups, nodes, DNS
+daer run -c config.toml        # the daemon; serves DNS when dns.bind or fake-ip asks
 ```
 
-`dns check` exits non-zero when an upstream cannot be used, so it is usable in CI. `serve`
-stops on `SIGINT`/`SIGTERM` after letting in-flight queries finish.
+`daer check` is the one pre-bind gate: it resolves subscriptions and rule providers,
+compiles every rule, builds every group, names every node and every DNS upstream this build
+cannot use, and parses `dns.bind`. Its exit status is the deployment contract, so a systemd
+`ExecStartPre=` can call it. `daer run` starts the resolver itself — there is no standalone
+DNS subcommand — and stops on `SIGINT`/`SIGTERM` after letting in-flight work finish.
 
-`daer config example` prints the fully commented reference configuration
-([`daer.example.toml`](./daer.example.toml)); `daer config fmt` prints the
-canonical form of a file; `daer config validate` loads the whole tree (including
-`include`), applies defaults and dry-runs routing, groups and outbound name
-resolution; `daer config schema` prints the JSON Schema
-([`daer.schema.json`](./daer.schema.json)), which editors use for completion
-(`#:schema` in the reference config) and CI uses to validate a file without
-building daer.
+`daer schema` prints the JSON Schema ([`daer.schema.json`](./daer.schema.json)), which editors
+use for completion (`#:schema` in the reference config) and CI uses to validate a file without
+building daer. The commented reference configuration is
+[`daer.example.toml`](./daer.example.toml), and a test asserts it validates.
 
 Three things are *expressions* rather than data — routing rules, group filters and
 policy names. A boolean combination over arbitrary predicates has no faithful

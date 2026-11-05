@@ -98,14 +98,15 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // the daemon. One pool for the process also survives a reload, which is what a client's
     // open connections to a synthetic address require.
     let (dns, fake_ip, snooper) = start_dns(&loaded, &options).await?;
-    let base_options = RouterOptions::with_assets_beside(&options.config)
+    let base_options = RouterOptions::for_config(&options.config)
         .with_socket_mark(so_mark)
         .with_fake_ip(fake_ip)
         .with_dns_snooper(Some(snooper))
         // A dial's span reaches the journal. Without this the transport's recorder is filled
         // by netune and dropped, so "why is this node slow" has no answer in any log — which is
         // exactly the state the daemon was in before the observer existed.
-        .with_dial_observer(Some(std::sync::Arc::new(daer_outbound::LogObserver)));
+        .with_dial_observer(Some(std::sync::Arc::new(daer_outbound::LogObserver)))
+        .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
     let daemon =
         Daemon::bind(&loaded, &base_options).map_err(|error| anyhow::anyhow!("{error}"))?;
     tracing::info!(
@@ -170,6 +171,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
 
     let result = serve_until_signal(
         &daemon,
+        &loaded,
         &options,
         &options_router,
         ebpf.as_ref(),
@@ -256,30 +258,29 @@ async fn start_dns(
         return Ok((None, Some(fake_ip), snooper));
     }
 
-    let plan = crate::dns::Plan::resolve(config, None, false, false).map_err(anyhow::Error::msg)?;
+    let plan = crate::dns::Plan::resolve(config).map_err(anyhow::Error::msg)?;
     let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut udp_shutdown = shutdown.subscribe();
     let mut tcp_shutdown = shutdown.subscribe();
-    let udp = plan.udp.then(|| {
+    let address = plan.address;
+    let udp = {
         let resolver = std::sync::Arc::clone(&resolver);
-        let address = plan.address;
         tokio::spawn(async move {
             daer_dns::serve_udp(resolver, address, async move {
                 let _ = udp_shutdown.recv().await;
             })
             .await
         })
-    });
-    let tcp = plan.tcp.then(|| {
+    };
+    let tcp = {
         let resolver = std::sync::Arc::clone(&resolver);
-        let address = plan.address;
         tokio::spawn(async move {
             daer_dns::serve_tcp(resolver, address, async move {
                 let _ = tcp_shutdown.recv().await;
             })
             .await
         })
-    });
+    };
     tracing::info!(
         plan = %plan.describe(),
         fake_ip = fake_ip.is_enabled(),
@@ -299,15 +300,15 @@ async fn start_dns(
 /// every receiver's `recv` return, which is how the two servers stop together.
 struct DnsHandle {
     shutdown: tokio::sync::broadcast::Sender<()>,
-    udp: Option<tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>>,
-    tcp: Option<tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>>,
+    udp: tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>,
+    tcp: tokio::task::JoinHandle<Result<(), daer_dns::ServerError>>,
 }
 
 impl DnsHandle {
     /// Signals both servers and waits for them.
     async fn stop(self) {
         let _ = self.shutdown.send(());
-        for handle in [self.udp, self.tcp].into_iter().flatten() {
+        for handle in [self.udp, self.tcp] {
             match handle.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "dns server stopped with an error"),
@@ -435,9 +436,10 @@ fn resolve_object_path_in(
 /// kernel, which is exactly the case that causes self-capture.
 pub const DEFAULT_SOCKET_MARK: u32 = 0x0dae;
 
-/// Serves until a signal, reloading on `SIGHUP`.
+/// Serves until a signal, reloading on `SIGHUP` or provider refresh interval.
 async fn serve_until_signal(
     daemon: &Daemon,
+    config: &daer_config::Config,
     options: &RunOptions,
     router_options: &RouterOptions,
     ebpf: Option<&daer_control::datapath::Attached>,
@@ -465,6 +467,18 @@ async fn serve_until_signal(
     });
     tokio::pin!(serve);
 
+    let provider_refresh_interval = config
+        .rule_provider
+        .iter()
+        .filter_map(|p| p.interval)
+        .filter_map(|span| span.as_std())
+        .filter(|d| !d.is_zero())
+        .min();
+    let mut provider_ticker = provider_refresh_interval.map(tokio::time::interval);
+    if let Some(ticker) = &mut provider_ticker {
+        ticker.reset();
+    }
+
     loop {
         #[cfg(unix)]
         tokio::select! {
@@ -483,6 +497,15 @@ async fn serve_until_signal(
                 return Ok(());
             }
             _ = hangup.recv() => {
+                reload(daemon, options, router_options, ebpf, health);
+            }
+            _ = async {
+                match &mut provider_ticker {
+                    Some(ticker) => ticker.tick().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::info!("rule provider refresh interval elapsed; refreshing rule providers");
                 reload(daemon, options, router_options, ebpf, health);
             }
         }
@@ -652,7 +675,10 @@ fn reload(
             return;
         }
     };
-    match daemon.reload(&loaded.config, router_options) {
+    let reloaded_options = router_options
+        .clone()
+        .with_rule_providers(Some(loaded.rule_providers.pool.clone()));
+    match daemon.reload(&loaded.config, &reloaded_options) {
         Ok(()) => {
             let generation = daemon.generation();
             let router = generation.router();

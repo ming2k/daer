@@ -12,7 +12,7 @@ use super::lexer::{Lexer, TokenKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    /// Empty for positional params, e.g. the `geosite:cn` in `domain(geosite:cn)`
+    /// Empty for positional params, e.g. the `cn` in `provider(cn)`.
     /// has a key while the `cn` in `domain(cn)` does not.
     pub key: String,
     pub value: ParamValue,
@@ -275,11 +275,11 @@ mod tests {
         let rule = RoutingRule {
             and_functions: vec![Function::with_params(
                 "domain",
-                vec![Param::literal("geosite", "cn")],
+                vec![Param::literal("suffix", "example.com")],
             )],
             outbound: Function::new("direct"),
         };
-        assert_eq!(rule.to_string(), "domain(geosite: cn) -> direct");
+        assert_eq!(rule.to_string(), "domain(suffix: example.com) -> direct");
     }
 
     #[test]

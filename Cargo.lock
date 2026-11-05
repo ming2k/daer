@@ -549,6 +549,7 @@ dependencies = [
  "daer-ebpf",
  "daer-outbound",
  "daer-routing",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -669,7 +670,6 @@ dependencies = [
  "daer-common",
  "daer-config",
  "daer-ebpf",
- "daer-geodata",
  "ipnet",
  "regex",
  "sha2",
@@ -899,6 +899,18 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "geodrb"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "daer-geodata",
+ "daer-routing",
+ "ipnet",
+ "regex",
 ]
 
 [[package]]

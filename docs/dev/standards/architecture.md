@@ -12,8 +12,8 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Layer 4: Host Binary & CLI (`crates/daer-cli`)                        │
 │  - Unified single public executable (`daer`)                           │
-│  - Service runtime (`run`, `dns serve`)                                │
-│  - Inspection & diagnostics (`config`, `route explain`, `dns check`)   │
+│  - Service runtime (`run`, which also serves DNS)                     │
+│  - Inspection & diagnostics (`check`, `explain`, `schema`)             │
 ├────────────────────────────────────────────────────────────────────────┤
 │  Layer 3: Control Plane & Ingress Relay                                │
 │  - Transparent ingress & flow supervisor: `crates/daer-control`        │
@@ -43,8 +43,8 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 - **Enforcement**: Without the socket mark, traffic dialed by the proxy itself would be recaptured by the redirect firewall rule and forced back into the transparent port, causing an infinite loop that hangs connections without error logs. Enforced via `RouterOptions::with_socket_mark` and netune's `SocketConfig::mark`.
 
 ### 2.2 Single Configuration Loader SSOT ([INV-LOADER-01])
-- **Red-Line**: Diagnostic commands (`daer route explain`, `daer route nodes`, `daer config validate`) and the runtime daemon (`daer run`) MUST load and compile configuration through the exact same loader (`daer_control::load_resolved`).
-- **Enforcement**: Diagnostics and runtime share identical generation lowering, alias optimization, and subscription caching. A node or rule that appears in `daer route explain` is guaranteed to exist identically in the running daemon (ADR-0006).
+- **Red-Line**: Diagnostic commands (`daer explain`, `daer check --nodes`, `daer check`) and the runtime daemon (`daer run`) MUST load and compile configuration through the exact same loader (`daer_control::load_resolved`).
+- **Enforcement**: Diagnostics and runtime share identical generation lowering, alias optimization, and subscription caching. A node or rule that appears in `daer explain` is guaranteed to exist identically in the running daemon (ADR-0006).
 
 ### 2.3 Kernel Policy Fidelity or Explicit Deferral ([INV-KERNEL-01])
 - **Red-Line**: The eBPF kernel policy table must either be provably equivalent to userspace rule evaluation, or explicitly defer the decision to the userspace control plane with logged reasons (ADR-0005).

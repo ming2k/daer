@@ -1,6 +1,7 @@
 # Command Line Interface (CLI) Reference
 
-The `daer` binary provides subcommands for running the transparent proxy, inspecting routing verdicts, testing DNS, and validating configuration files.
+The `daer` CLI provides the runtime daemon, deployment gates, and diagnostics for the
+transparent proxy. Build-time producers and converter toolchains live in the companion tool [`geodrb`](#4-drb-producer-tooling-geodrb).
 
 ---
 
@@ -19,8 +20,10 @@ daer [OPTIONS] <COMMAND>
 
 ## 2. Subcommands
 
-### 2.1 `run`
-Runs the transparent proxy daemon.
+### 2.1 `run` — run the daemon
+
+Runs the transparent proxy: eBPF datapath, transparent ingress, TCP/UDP relay, and the DNS
+resolver when `dns.bind` or `[dns.fake-ip]` asks for one.
 
 ```bash
 daer run [OPTIONS]
@@ -28,59 +31,126 @@ daer run [OPTIONS]
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `-c`, `--config <PATH>` | `/etc/daer/config.toml` | Path to configuration file. |
-| `--object <PATH>` | `target/ebpf/datapath.o` (with fallback to system paths) | Path to compiled eBPF datapath object. |
-| `--no-datapath` | `false` | Serve without attaching the kernel eBPF program (for development and unprivileged testing). |
-| `--dry-run` | `false` | Attach the eBPF datapath and exit immediately without serving traffic. |
+| `-c`, `--config <PATH>` | `/etc/daer/config.toml` | Path to the configuration file. |
+| `--object <PATH>` | `target/ebpf/datapath.o` | Compiled eBPF datapath object. |
+| `--no-datapath` | `false` | Serve without attaching the kernel program, for unprivileged development and testing. No traffic is redirected, so nothing is proxied. |
+| `--dry-run` | `false` | Attach the datapath and exit immediately without serving. |
 
-### 2.2 `config`
-Inspects and manipulates configuration files without running the daemon.
+Reloads on `SIGHUP`, and refreshes `[[rule-provider]]` entries on their configured `interval`.
 
-```bash
-daer config <COMMAND>
-```
+### 2.2 `check` — will this configuration run
 
-| Subcommand | Description |
-| :--- | :--- |
-| `validate [-c <PATH>]` | Validates configuration syntax, schema types, group filters, and routing rules. Exits 0 on success. |
-| `fmt [-c <PATH>]` | Formats the configuration file according to canonical TOML style. |
-| `schema` | Outputs the complete JSON Schema (`daer.schema.json`) for editor integration. |
-| `example` | Prints the complete reference configuration example (`daer.example.toml`). |
-
-### 2.3 `route`
-Inspects how flows would be routed against a configuration without running the daemon.
+The single pre-bind gate. It performs every step `daer run` performs before it binds a socket:
+resolve subscriptions and rule providers, compile and lower every rule, build every group,
+verify every node this build can speak, verify every DNS upstream, and parse `dns.bind`.
 
 ```bash
-daer route <COMMAND>
+daer check [OPTIONS]
 ```
 
-| Subcommand | Description |
+| Option | Description |
 | :--- | :--- |
-| `explain <SRC> <DST> [-c <PATH>] [--domain <DOMAIN>] [--why]` | Explains the routing decision for a source/destination pair (`ip:port`). Use `--why` to display evaluation of every rule and predicate. |
-| `nodes [-c <PATH>]` | Lists all resolved nodes, groups, and security identities. |
+| `-c`, `--config <PATH>` | Path to the configuration file. |
+| `--nodes` | Also print every node in every group with its protocol and security identity. |
 
-### 2.4 `node`
-Converts and manages outbound nodes.
+Exit status is the contract: `0` when the configuration would run, non-zero otherwise. That is
+what a deployment gate or a systemd `ExecStartPre=` should call.
+
+### 2.3 `route` — resolve routing decisions offline
+
+Evaluates how the routing engine would decide a flow, domain, or IP without sending actual traffic.
 
 ```bash
-daer node <COMMAND>
+# Resolve single domain (port defaults to 443)
+daer route bilibili.com
+
+# Resolve single IP
+daer route 1.1.1.1
+
+# Resolve with custom port and detailed rule trace
+daer route google.com:8443 --why
+
+# Resolve classic 4-tuple flow with sniffed domain
+daer route 192.168.1.10:41234 93.184.216.34:443 --domain example.com
 ```
 
-| Subcommand | Description |
+| Argument / Option | Description |
 | :--- | :--- |
-| `convert [<LINK>]` | Converts an outbound URI link (`vless://`, `ss://`, `trojan://`, `socks5://`, `http://`, `direct://`) into a structured `[[node]]` TOML block. If `<LINK>` is omitted, reads links from standard input. |
+| `<TARGET>` | Target domain, IP, or IP:port (or source address when 2 arguments are provided). |
+| `[DESTINATION]` | Destination address (`ip:port` or `ip`) when target is used as source. |
+| `--source <IP:PORT>` | Client source address (defaults to `127.0.0.1:12345`). |
+| `-c`, `--config <PATH>` | Path to configuration file. |
+| `--domain <NAME>` | The sniffed domain a `domain(...)` rule would see (auto-inferred if target is a domain). |
+| `--why` | Print every rule and predicate evaluation trace, including shadowed rules. |
 
-### 2.5 `dns`
-Runs or verifies the DNS subsystem.
+Exit status: `0` when the flow has a usable outbound, non-zero when it would be dropped
+(`block`, a missing group, or an empty group).
+
+### 2.4 `probe` — active online network diagnostics
+
+Performs active network probing across layers (L3 DNS, L4 TCP handshake, L7 proxy protocol handshake, and end-to-end HTTP access).
 
 ```bash
-daer dns <COMMAND>
+# 1. Probe a specific node in configuration
+daer probe node hk-01
+
+# 2. Probe a node with custom timeout and end-to-end test URL
+daer probe node us-02 --timeout 10 --url http://cp.cloudflare.com/generate_204
+
+# 3. Probe an HTTP endpoint directly or through a node
+daer probe url https://www.google.com --node hk-01
 ```
 
-| Subcommand | Description |
-| :--- | :--- |
-| `serve [-c <PATH>]` | Runs the standalone DNS server listening on configured ports. |
-| `check [-c <PATH>]` | Probes configured upstream DNS resolvers (UDP, TCP, DoT, DoH) and prints latency/availability report. |
+Phased diagnostic reporting:
+- **L3 DNS Resolution**: Resolves node server hostname to IP.
+- **L4 TCP Connect**: Tests if server IP:Port is reachable (detects firewall/GFW SYN drops).
+- **L7 Protocol Handshake**: Connects through `NodeDialer` (VLESS/SS/Trojan/etc.) to verify UUID, password, TLS SNI, or REALITY keys.
+- **End-to-End Probe**: Sends HTTP probe request through the proxy tunnel to verify internet egress.
 
-### 2.6 `version`
-Prints detailed version and build information.
+### 2.5 `schema` — JSON Schema for editors
+
+Prints the JSON Schema of a configuration file to stdout. Point an editor at it
+(`#:schema ./daer.schema.json`) or validate a file in CI.
+
+```bash
+daer schema
+```
+
+### 2.6 `version` — build information
+
+```bash
+daer version
+```
+
+---
+
+## 3. What is deliberately not in `daer`
+
+| Not in `daer` | Use instead |
+| :--- | :--- |
+| Compiling rules to `.drb`, converting `geoip.dat` / `geosite.dat`, inspecting or unit-testing `.drb` | Companion tool [`geodrb`](#4-drb-producer-tooling-geodrb). |
+| Converting a `vless://` / `ss://` link into a `[[node]]` table | Any subscription converter, or declare a `[[subscription]]`: `daer` parses links at runtime. |
+| Running a standalone DNS server | `daer run` serves DNS; `daer check` reports unusable upstreams. |
+| Formatting a configuration | An editor plus [`daer.example.toml`](https://github.com/daeuniverse/daer/blob/main/daer.example.toml). |
+
+---
+
+## 4. DRB Producer Tooling: `geodrb`
+
+`geodrb` is the companion CLI dedicated to building, converting, inspecting, and unit-testing DRB rule sets.
+
+```bash
+# Compile plain-text rules to .drb
+geodrb compile company-direct.rules -o company-direct.drb
+
+# Inspect metadata and counts of a .drb file
+geodrb inspect company-direct.drb
+
+# Convert legacy geoip.dat or geosite.dat to .drb
+geodrb convert geosite.dat --code cn -o geosite-cn.drb
+geodrb convert geoip.dat --code cn -o geoip-cn.drb --type geoip
+
+# Unit-test whether a domain or IP matches a .drb file
+geodrb test geosite-cn.drb bilibili.com
+geodrb test geoip-cn.drb 1.2.3.4
+```

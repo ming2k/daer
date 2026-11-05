@@ -20,10 +20,10 @@ pub struct FakeIpPool {
     /// The compiled exclusion list.
     ///
     /// Compiled rather than compared as strings: ADR-0012 documents
-    /// `exclude = ["geosite:cn", "domain(suffix: local)"]`, and the previous
-    /// `ends_with` comparison would have looked for a domain literally ending in
-    /// `.geosite:cn` — matching nothing, so the exclusion the operator wrote was silently
-    /// inert and every Chinese domain got a synthetic address.
+    /// `exclude = ["domain(suffix: local)"]`, and the previous `ends_with` comparison would
+    /// have looked for a domain literally ending in `.domain(suffix: local)` — matching
+    /// nothing, so the exclusion the operator wrote was silently inert and every matching
+    /// domain got a synthetic address.
     exclude: Exclusions,
     state: Mutex<PoolState>,
 }
@@ -35,7 +35,10 @@ pub struct FakeIpPool {
 /// * `example.com` — a suffix (the bare name and its subdomains), the common case;
 /// * `full:example.com` / `suffix:example.com` / `keyword:ads` / `regex:^ads\.` — the same
 ///   keys a routing rule uses;
-/// * `geosite:cn` — a category from `geosite.dat`, resolved before this type is built.
+/// * anything else with a `:` is refused by name: a `geosite:`/`geoip:` category is a
+///   Protobuf `.dat` reference, and that format is retired (ADR-0014). The exclusion list
+///   takes domain patterns only, so an operator who wants a whole category writes the
+///   category's domains as patterns (or excludes by address in `[routing]` instead).
 #[derive(Debug, Default)]
 struct Exclusions {
     /// Plain suffixes and `suffix:` patterns.
@@ -66,9 +69,10 @@ impl Exclusions {
             if trimmed.is_empty() {
                 continue;
             }
-            // `geosite:` cannot be resolved here: this type has no dat reader. The loader
-            // expands it before building the pool, so reaching this arm means the expansion
-            // did not happen, and guessing would be worse than refusing.
+            // A `geosite:`/`geoip:`/`ext:` category is a `.dat` reference, and the `.dat`
+            // reader is gone (ADR-0014/ADR-0015). Refusing by name is the honest answer:
+            // silently ignoring the exclusion would hand out synthetic addresses for exactly
+            // the domains the operator excluded.
             if trimmed.contains(':') {
                 let (key, value) = trimmed.split_once(':').expect("contains a colon");
                 let key = key.trim();
@@ -80,8 +84,9 @@ impl Exclusions {
                     "regex" => regexes.push(value),
                     "geosite" | "geoip" | "ext" => {
                         return Err(format!(
-                            "dns.fake-ip.exclude: {trimmed:?} is a category, not a domain \
-                             pattern; expand it before building the pool"
+                            "dns.fake-ip.exclude: {trimmed:?} names a Protobuf .dat category, \
+                             which this build no longer reads (ADR-0014); write the domains as \
+                             patterns (suffix:/full:/keyword:/regex:) instead"
                         ));
                     }
                     other => {
@@ -377,11 +382,10 @@ mod tests {
 
     #[test]
     fn the_exclusion_list_understands_the_documented_pattern_syntax() {
-        // ADR-0012 documents `exclude = ["geosite:cn", "domain(suffix: local)"]`. The old
-        // matcher compared strings with `ends_with`, so `suffix:local` only matched a domain
-        // literally ending in `.suffix:local` — the exclusion the operator wrote was inert
-        // and every excluded name got a synthetic address. This is the falsifier: each form
-        // the ADR names must match the names it is supposed to.
+        // The old matcher compared strings with `ends_with`, so `suffix:local` only matched a
+        // domain literally ending in `.suffix:local` — the exclusion the operator wrote was
+        // inert and every excluded name got a synthetic address. This is the falsifier: each
+        // accepted form must match the names it is supposed to.
         let config = FakeIpConfig {
             enabled: true,
             inet: "198.18.0.0/15".to_owned(),
@@ -414,10 +418,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolvable_category_is_refused_rather_than_ignored() {
-        // `geosite:cn` needs a dat reader, which this type does not have. Accepting the
-        // pattern and matching nothing would silently disable an exclusion; refusing it
-        // makes the loader expand it first, and makes a missed expansion visible.
+    fn a_dat_category_is_refused_by_name_rather_than_ignored() {
+        // `geosite:cn` is a Protobuf `.dat` reference, retired by ADR-0014. Accepting the
+        // pattern and matching nothing would silently disable an exclusion the operator
+        // believes is active, so it is refused and the message says what to write instead.
         let config = FakeIpConfig {
             enabled: true,
             inet: "198.18.0.0/15".to_owned(),
@@ -426,6 +430,10 @@ mod tests {
         };
         let error = FakeIpPool::from_config(&config).expect_err("must refuse");
         assert!(error.contains("geosite"), "{error}");
+        assert!(
+            error.contains("ADR-0014"),
+            "the error must say why the category is gone: {error}"
+        );
     }
 
     #[test]

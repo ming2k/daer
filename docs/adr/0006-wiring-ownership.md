@@ -35,13 +35,17 @@ with **no selectable node**, because a latency policy's alive set is empty until
 probe records something, and no probe ever runs:
 
 ```text
-$ daer route explain 10.0.0.2:1234 1.1.1.1:443 -c config.toml
+$ daer explain 10.0.0.2:1234 1.1.1.1:443 -c config.toml
   verdict    : undeliverable, group "proxy" has no selectable node
 ```
 
-Meanwhile `daer route nodes` happily lists the node, so the two diagnostics
+Meanwhile `daer check --nodes` happily lists the node, so the two diagnostics
 disagree. A test suite that is green about each part while the composition does
 nothing is the failure mode this ADR is about.
+
+> **Command names renewed by [ADR-0015](0015-cli-is-four-verbs.md).** The verbs below are
+> the ones this decision was written against; today `daer route explain` is `daer explain`
+> and `daer route nodes` is `daer check --nodes`. The decision itself is unchanged.
 
 ## Decision
 
@@ -61,7 +65,7 @@ removed. Concretely, `daer run` gains, before it serves:
 
 ### 2. One configuration loader for the data path
 
-`daer run` and `daer config validate` must load the same configuration, or the
+`daer run` and `daer check` must load the same configuration, or the
 diagnostic answers about a node pool that does not exist. Both go through
 `load_resolved` (parse → resolve subscriptions → report warnings), which moves out
 of `daer-cli/src/main.rs` into `daer-control` so `run.rs` and `main.rs` share one
@@ -113,7 +117,7 @@ below are the ones daer actually uses". Every default is asserted against
 - Subscription nodes become selectable, so a configuration whose only nodes come
   from a subscription stops being silently empty.
 - The configuration surface shrinks. That is a breaking change for anyone who set a
-  removed key; `daer config validate` names it, which is the point.
+  removed key; `daer check` names it, which is the point.
 - `docs/how-to/deployment.md` stops promising a `tier` the daemon does not implement, and
   gains a section on which tier the current configuration is in.
 - The datagram relay being wired means UDP flows are *proxied* only over nodes that

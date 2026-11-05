@@ -138,6 +138,7 @@ mod tests {
             "subscription",
             "node",
             "group",
+            "rule-provider",
             "routing",
             "dns",
         ] {

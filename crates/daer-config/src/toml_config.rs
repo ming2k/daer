@@ -26,7 +26,7 @@
 //! filters = ["subtag(sub) && !name(keyword: 'ExpireAt:')"]
 //!
 //! [routing]
-//! rules = ["dip(geoip:private) -> direct", "domain(geosite:cn) -> direct"]
+//! rules = ["provider(private) -> direct", "provider(cn) -> direct"]
 //! fallback = "proxy"
 //! ```
 //!
