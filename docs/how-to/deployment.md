@@ -10,7 +10,7 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 | `CAP_BPF`, `CAP_NET_ADMIN` | load and attach the datapath; `IP_TRANSPARENT` on the listener |
 | `ip` | creates the `daer0`/`daer0peer` pair |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
-| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from disk, an `http` one is cached under `~/.cache/daer/rules` |
+| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from disk, an `http` one is cached under `$XDG_CACHE_HOME/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it to `/var/cache/daer/rules`, which is the only path `ProtectHome=true` leaves writable) |
 
 ## Build
 
@@ -220,7 +220,9 @@ LimitMEMLOCK=infinity
 OOMScoreAdjust=-100
 
 # Validate configuration before starting. A broken configuration exits with non-zero
-# and prevents starting or restarting with an invalid state.
+# and prevents starting or restarting with an invalid state. `daer check` is the one
+# pre-bind gate: it resolves subscriptions and rule providers, compiles every rule and
+# builds every group, so a configuration that would fail at runtime fails here instead.
 ExecStartPre=/usr/bin/daer check -c /etc/daer/config.toml
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
 ExecReload=/usr/bin/kill -HUP $MAINPID
@@ -250,6 +252,14 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # Configuration directory and write access for subscription persistence (persist.d)
 ConfigurationDirectory=daer
 ReadWritePaths=/etc/daer
+
+# Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
+# `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is
+# best-effort, so the failure is silent and only shows up as a provider that cannot survive
+# the network going away. `CacheDirectory=daer` creates /var/cache/daer and grants write
+# access to exactly it, and the variable points the loader there.
+CacheDirectory=daer
+Environment=DAER_RULE_CACHE_DIR=/var/cache/daer/rules
 
 [Install]
 WantedBy=multi-user.target

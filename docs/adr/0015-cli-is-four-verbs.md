@@ -2,6 +2,7 @@
 id: ADR-0015
 title: "The CLI is four verbs: producers are not shipped inside the runtime"
 status: accepted
+amended-by: [ADR-0016]
 date: 2026-02-15
 scope: [cli/surface, architecture/boundary, routing/drb, dns]
 supersedes: []
@@ -11,6 +12,8 @@ supersedes: []
 
 - Status: Accepted
 - Date: 2026-02-15
+- Amended by: [ADR-0016](0016-cli-route-and-probe.md) — the four verbs keep their boundary, but
+  `explain` became `route <TARGET>` and `probe` was added, so the surface is now six names.
 - Deciders: Ming Li
 - Related: [ADR-0006](0006-wiring-ownership.md), [ADR-0014](0014-drb-rule-binary-and-providers.md)
 
@@ -59,6 +62,12 @@ daer explain <SRC> <DST>     which rule decides this flow, and why
 daer schema                  the JSON Schema, for an editor
 daer version                 build information
 ```
+
+> **Amended by ADR-0016.** The boundary this decision draws — a runtime, with no producer and
+> no second service linked into it — is unchanged and is still enforced structurally by
+> `crates/daer-cli/tests/surface.rs`. Two names did change on usability grounds: `explain` is
+> now `route <TARGET>`, because routing lookup is the vocabulary operators already have, and
+> `probe` was added for the active diagnostics that an offline evaluator cannot answer.
 
 ### 1. Producers are removed from the runtime
 

@@ -9,7 +9,7 @@ This guide walks operators through creating, compiling, and distributing high-pe
 As specified in [ADR-0014](../adr/0014-drb-rule-binary-and-providers.md), `daer` uses **DRB** (`.drb`) as its native, pre-compiled rule artifact format.
 
 - **Fastest Cold-Start**: Pre-sorted IP intervals and pre-indexed domain patterns load in microseconds (`< 0.01ms`), bypassing all protobuf streaming and interval merging.
-- **Non-Root Operation**: Rule caches live under user XDG cache directories (`~/.cache/daer/rules`), avoiding privileged file access to `/usr/share/daer`.
+- **Non-Root Operation**: Rule caches live under user XDG cache directories (`$XDG_CACHE_HOME/daer/rules`, or `~/.cache/daer/rules`), so an unprivileged run needs no `/usr/share/daer` access. `DAER_RULE_CACHE_DIR` overrides the location; under the shipped systemd unit (`ProtectHome=true`) it points at `/var/cache/daer/rules`, because a hardened `$HOME` makes the default unwritable.
 - **Automated Lifecycle**: When an HTTP rule provider defines an `interval`, `daer` periodically checks for updates in the background, downloads updates conditionally using `If-None-Match` (ETag), and hot-reloads the active eBPF datapath generation with zero dropped connections.
 
 ---

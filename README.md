@@ -17,7 +17,9 @@ packet enters the TCP/IP stack, so direct traffic never touches userspace.
 > able to fail: it installs its own `nftables tproxy` rule, has the origin answer a per-run nonce,
 > asserts the daemon counted the flow, and carries a negative control that fails if the fixture
 > ever bypasses the proxy ([ADR-0007](docs/adr/0007-verification.md)). Outbound REALITY with XTLS
-> Vision is the one node protocol interop-tested against a live server.
+> Vision is interop-tested against a local reference `xray` inbound that the test starts itself,
+> so the one protocol whose bugs are invisible to a self-consistent client is checked against an
+> implementation nobody here wrote.
 >
 > The honest gaps, all of them named where they matter:
 > `docs/dev/roadmap.md` lists what is missing; UDP is relayed but not yet proven on the wire through

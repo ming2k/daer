@@ -90,7 +90,7 @@ fallback = "proxy"
 - **Non-Root & XDG Compliance**:
   Downloaded artifacts are stored in `$XDG_CACHE_HOME/daer/rules` or `$HOME/.cache/daer/rules` (with `/tmp` fallback). No root or `sudo` privilege is required.
 - **Invariant `[INV-PROVIDER-01]` (Rule Provider SSOT)**:
-  Rule providers are resolved in `daer_control::load_resolved` prior to generation creation, ensuring diagnostic commands (`daer explain`, `daer check --nodes`) never diverge from the running daemon.
+  Rule providers are resolved in `daer_control::load_resolved` prior to generation creation, ensuring diagnostic commands (`daer route`, `daer check --nodes`) never diverge from the running daemon.
 - **Offline Resilience**:
   If an HTTP provider is temporarily unreachable, the loader uses the cached DRB and emits a warning rather than failing the proxy.
 

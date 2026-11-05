@@ -35,7 +35,7 @@ with **no selectable node**, because a latency policy's alive set is empty until
 probe records something, and no probe ever runs:
 
 ```text
-$ daer explain 10.0.0.2:1234 1.1.1.1:443 -c config.toml
+$ daer route 10.0.0.2:1234 1.1.1.1:443 -c config.toml
   verdict    : undeliverable, group "proxy" has no selectable node
 ```
 
@@ -43,8 +43,9 @@ Meanwhile `daer check --nodes` happily lists the node, so the two diagnostics
 disagree. A test suite that is green about each part while the composition does
 nothing is the failure mode this ADR is about.
 
-> **Command names renewed by [ADR-0015](0015-cli-is-four-verbs.md).** The verbs below are
-> the ones this decision was written against; today `daer route explain` is `daer explain`
+> **Command names renewed by [ADR-0015](0015-cli-is-four-verbs.md) and
+> [ADR-0016](0016-cli-route-and-probe.md).** The verbs below are the ones this decision was
+> written against; today `daer route explain` is `daer route <TARGET>`, `daer explain` is gone,
 > and `daer route nodes` is `daer check --nodes`. The decision itself is unchanged.
 
 ## Decision

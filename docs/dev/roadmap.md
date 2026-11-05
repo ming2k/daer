@@ -13,7 +13,8 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Protocol: XTLS Vision (`flow=xtls-rprx-vision`) | ✅ verified end to end (uplink and downlink) against a local reference `xray` inbound, in CI |
 | Configuration (TOML schema, expression language, loader, validation) | ✅ |
 | Configuration tooling (JSON Schema + drift check; `fmt`/`example` removed by ADR-0015) | ✅ |
-| Decision tooling (`daer explain --why --domain`, `daer check --nodes`, node security identity) | ✅ |
+| Decision tooling (`daer route --why --domain`, `daer check --nodes`, node security identity) | ✅ |
+| Active diagnostics (`daer probe node`, `daer probe url` — L3/L4/L7 tiers, ADR-0016) | ✅ |
 | Routing semantics (lowering, matching, policy identity, geodata) | ✅ reference implementation |
 | Routing matcher performance | ✅ indexed, allocation-free: `suffix` is a label walk over a hash set, `keyword` Aho–Corasick, `regex` a `RegexSet`, `full` a hash set, `dip`/`sip` merged intervals + binary search. Measured on `geosite:cn` (110,249 domains): 368 µs → **89 ns** on a miss, 28.9 µs → **82 ns** on a hit. `tests/hot_path.rs` asserts the cost does not scale with set size and that a decision allocates nothing |
 | Subscriptions (fetch, base64 / SIP008 / plain decoding, `persist` cache) | ✅ `daer-outbound::subscription` + `daer-control::subscription`; resolved before a generation is built, so `Router::new` stays a pure function of its configuration |
@@ -27,7 +28,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
 | Health checks: the configured `tcp-url`, `tcp-method` and `udp-dns` are what probes use | ✅ |
 | Outbound: Vision (`xtls-rprx-vision`) | ⬜ refused at load with the reason. The TLS record layer now exists, so the blocking condition moved from "ADR-0002 forbids it" to "the splice logic is not written" |
-| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
+| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
 | Datagrams: netune transport + SOCKS5 UDP associate (netune side) | ✅ |
 | Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; not yet wired to a daemon entry point |
 | Health checks: probes + scheduler (`UdpDnsChecker`, `Scheduler`) | ✅ probe instrument follows the node's claims; results record into the live generation |
@@ -87,7 +88,7 @@ The largest piece. Order matters: this is what makes the binary useful.
    `Ingress`/`Decide` traits, so its failure modes are tested without privileges.
 2. **Kernel wiring** ✅ — attach the datapath programs to the LAN/WAN tc hooks,
    create `daer0`/`daer0peer`, publish the listener fds, the outbound connectivity and
-   the routing table itself into the maps ([ADR-0005](adr/0005-kernel-policy-encoding.md)).
+   the routing table itself into the maps ([ADR-0005](../adr/0005-kernel-policy-encoding.md)).
    The table is either provably equivalent to the userspace evaluator or a one-entry
    deferral, never empty and never partial: an empty table makes `route()` return
    `-EPERM`, which every caller turns into `TC_ACT_SHOT`, so "no policy" was never a
@@ -110,7 +111,7 @@ The largest piece. Order matters: this is what makes the binary useful.
    port never being unbound. Each reload reports whether the *routing* changed (a
    semantic hash, not a file diff).
 
-   The kernel half is designed in [ADR-0004](adr/0004-routing-epochs.md) and its two
+   The kernel half is designed in [ADR-0004](../adr/0004-routing-epochs.md) and its two
    privilege-free halves are implemented: every map is classified as per-generation or
    shared (an unclassified map fails a test), and the publish sequence — fill the
    inactive slot, stamp it, verify the stamp, then switch — is written against a
@@ -206,7 +207,7 @@ identity rather than rustls' default one. Trojan has no confidentiality of its o
 no plaintext constructor: a `trojan://` node without `?sni=` and a bare-IP server is rejected
 at parse time, because a certificate cannot be verified against an address.
 
-Done as well: **REALITY**, per [ADR-0010](adr/0010-reality-client-ownership.md). `rustls`
+Done as well: **REALITY**, per [ADR-0010](../adr/0010-reality-client-ownership.md). `rustls`
 cannot be told what to put in `legacy_session_id`, so `daer-outbound` owns a minimal TLS 1.3
 client (`reality/tls13`): the key schedule matches the RFC 8448 vectors, the record layer
 rejects tampering, and the REALITY tag is asserted on the wire in `tests`. The client is

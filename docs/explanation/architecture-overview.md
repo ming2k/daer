@@ -61,4 +61,4 @@ A common failure mode in transparent proxies is the "self-proxy loop": when the 
 Configuration in `daer` is compiled into immutable **Generations**.
 - When `daer run` starts, it compiles Generation 1, publishes policy maps into the kernel eBPF datapath, and begins serving.
 - Upon receiving `SIGHUP`, the daemon loads and compiles Generation 2 in the background. If compilation succeeds, it updates the kernel eBPF tables, flips the active generation pointer, and smoothly drains old flows without dropping active connections.
-- Diagnostics (`daer explain`) share the identical generation loader as the daemon (`[INV-LOADER-01]`), guaranteeing that what the CLI tool explains matches what the running kernel and daemon execute.
+- Diagnostics (`daer route`) share the identical generation loader as the daemon (`[INV-LOADER-01]`), guaranteeing that what the CLI tool explains matches what the running kernel and daemon execute.
