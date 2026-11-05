@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Control plane and transparent proxy data path for daer"
+description = "Routing decisions, node selection and health scheduling for daer"
 
 [dependencies]
 anyhow.workspace = true
@@ -17,11 +17,11 @@ daer-dns.workspace = true
 daer-ebpf.workspace = true
 aya.workspace = true
 daer-outbound.workspace = true
+daer-relay.workspace = true
 daer-routing.workspace = true
 daer-sniff.workspace = true
 libc.workspace = true
 tracing.workspace = true
-socket2.workspace = true
 tokio.workspace = true
 
 [[test]]

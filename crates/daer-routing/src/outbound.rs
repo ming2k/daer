@@ -12,35 +12,33 @@ use crate::error::RoutingError;
 
 /// Reserved outbound: marks the following rules as "must", without terminating
 /// the rule (see `patchMustOutbound` and `tproxy.c`).
-pub const MUST_RULES: &str = "must_rules";
+///
+/// Defined in `daer-common` so the rule lowering, the kernel id mapping and the configuration
+/// validator cannot disagree about the spelling.
+pub use daer_common::consts::outbound_name::MUST_RULES;
 
 /// Reserved outbound used by the implicit sniff-punt projection.
 ///
 /// The Go constant is `OutboundControlPlaneRouting.String()`; the angle brackets
 /// are part of the name and cannot collide with a configured group.
-pub const CONTROL_PLANE_ROUTING: &str = "<Control Plane Routing>";
+pub use daer_common::consts::outbound_name::CONTROL_PLANE_ROUTING;
 
 /// Name of the logical-or marker (`OutboundLogicalOr.String()`).
-pub const LOGICAL_OR: &str = "<OR>";
+pub use daer_common::consts::outbound_name::LOGICAL_OR;
 
 /// Name of the logical-and marker (`OutboundLogicalAnd.String()`).
-pub const LOGICAL_AND: &str = "<AND>";
+pub use daer_common::consts::outbound_name::LOGICAL_AND;
 
 /// Built-in outbounds that may appear in a rule without being declared in a
 /// `group` section.
-pub const BUILTIN_OUTBOUNDS: [&str; 6] = [
-    "direct",
-    "block",
-    MUST_RULES,
-    CONTROL_PLANE_ROUTING,
-    LOGICAL_OR,
-    LOGICAL_AND,
-];
+///
+/// Defined once, in `daer-common`: `daer-config` uses the same list to reject a `[[group]]` whose
+/// name would shadow a builtin, which is how a configuration and the daemon are kept from
+/// disagreeing about what `direct` means.
+pub use daer_common::consts::BUILTIN_OUTBOUNDS;
 
 /// True for the implicit outbounds the control plane always provides.
-pub fn is_builtin_outbound(name: &str) -> bool {
-    BUILTIN_OUTBOUNDS.contains(&name)
-}
+pub use daer_common::consts::is_builtin_outbound;
 
 /// A resolved outbound: the immutable identity a flow is sent to.
 ///

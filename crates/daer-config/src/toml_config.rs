@@ -123,7 +123,16 @@ impl std::error::Error for LoadError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Syntax { source, .. } => Some(source),
-            Self::Invalid { source, .. } => Some(source),
+            // Deliberately not exposed: `Display` above already renders the `ConfigError` inline,
+            // and returning it here made `anyhow`'s `{:#}` (the CLI's error format) print the same
+            // sentence twice:
+            //
+            //   failed to load c.toml: invalid configuration: global.wan-interface: must name …
+            //                          : global.wan-interface: must name …
+            //
+            // `Display` is the one place this message is composed; a chain that repeats it is a
+            // bug the operator sees on every validation failure.
+            Self::Invalid { .. } => None,
             Self::Include { .. } | Self::Conflict { .. } => None,
         }
     }

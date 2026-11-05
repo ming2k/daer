@@ -132,6 +132,55 @@ pub mod outbound_param {
     pub const MARK: &str = "mark";
 }
 
+/// The names of the outbounds the control plane always provides.
+///
+/// One definition for the whole workspace: `daer-routing` re-exports these for rule lowering,
+/// `kernel.rs` maps two of them to the datapath's own ids, and `daer-config` uses
+/// [`BUILTIN_OUTBOUNDS`] to reject a `[[group]]` that would shadow one of them. Spelling a name
+/// twice is how a value gets changed in one place and compared in another.
+pub mod outbound_name {
+    /// Match, do not proxy.
+    pub const DIRECT: &str = "direct";
+    /// Match, drop the flow.
+    pub const BLOCK: &str = "block";
+    /// Reserved marker: the following rules are "must" (`<OutboundMustRules>` in the datapath).
+    pub const MUST_RULES: &str = "must_rules";
+    /// Reserved marker for the implicit sniff-punt projection.
+    pub const CONTROL_PLANE_ROUTING: &str = "<Control Plane Routing>";
+    /// Reserved marker: the match set continues as a disjunction.
+    pub const LOGICAL_OR: &str = "<OR>";
+    /// Reserved marker: the match set continues as a conjunction.
+    pub const LOGICAL_AND: &str = "<AND>";
+}
+
+/// Names the control plane always provides, so a rule may name them without a `[[group]]`.
+///
+/// # Why shadowing is an error rather than a preference
+///
+/// `direct` and `block` are the datapath's own ids (`OUTBOUND_DIRECT = 0`,
+/// `OUTBOUND_BLOCK = 1`), and the marker names are what the lowering uses to encode AND/OR
+/// structure. A group called `direct` therefore does not override the builtin — the compiled
+/// program treats the name as the builtin and the group's nodes are unreachable, while
+/// `daer route` and `daer check --nodes` happily report the group's node as the selected
+/// outbound. That divergence was observed directly: with `[[group]] name = "direct"` whose only
+/// node pointed at a closed port, `daer route` printed `node: direct: dead-socks [socks5]` and the
+/// daemon dialled the flow *directly*, returning the origin's bytes. A configuration that says one
+/// thing while the daemon does another is the exact failure mode this workspace refuses.
+pub const BUILTIN_OUTBOUNDS: [&str; 6] = [
+    outbound_name::DIRECT,
+    outbound_name::BLOCK,
+    outbound_name::MUST_RULES,
+    outbound_name::CONTROL_PLANE_ROUTING,
+    outbound_name::LOGICAL_OR,
+    outbound_name::LOGICAL_AND,
+];
+
+/// True for a name in [`BUILTIN_OUTBOUNDS`].
+#[must_use]
+pub fn is_builtin_outbound(name: &str) -> bool {
+    BUILTIN_OUTBOUNDS.contains(&name)
+}
+
 /// How a group picks a node for a new connection.
 ///
 /// Mirrors `consts.DialerSelectionPolicy` in the Go implementation.

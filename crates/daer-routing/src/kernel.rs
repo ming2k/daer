@@ -37,7 +37,7 @@
 
 use std::net::IpAddr;
 
-use daer_common::{MacAddr, PortRange};
+use daer_common::{MacAddr, PortRange, consts::outbound_name};
 use daer_ebpf::abi::{
     LpmKey, MAX_MATCH_SET_LEN, MatchSet as KernelMatchSet, match_type, outbound as kernel_outbound,
 };
@@ -223,9 +223,12 @@ impl OutboundIds {
 
     /// The datapath's own id for a reserved outbound name, or `None` for a group.
     fn reserved(name: &str) -> Option<u8> {
+        // The names come from `daer_common::consts::outbound_name`, not from literals here: this
+        // is the mapping between a userspace name and a kernel constant, and a typo on either
+        // side would silently route `direct` flows into the group-id window.
         match name {
-            "direct" => Some(kernel_outbound::DIRECT),
-            "block" => Some(kernel_outbound::BLOCK),
+            outbound_name::DIRECT => Some(kernel_outbound::DIRECT),
+            outbound_name::BLOCK => Some(kernel_outbound::BLOCK),
             _ => None,
         }
     }

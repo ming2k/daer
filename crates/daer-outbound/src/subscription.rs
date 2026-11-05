@@ -739,7 +739,8 @@ mod tests {
         // The rendered link must be a shadowsocks link the strict parser accepts.
         let link = &decoded.links[0];
         assert!(link.starts_with("ss://"), "{link}");
-        let parsed = crate::shadowsocks::Link::parse(link).expect("the rendered link parses");
+        let parsed =
+            daer_proxy_protocols::shadowsocks::Link::parse(link).expect("the rendered link parses");
         assert_eq!(parsed.cipher.to_string(), "aes-256-gcm");
         assert_eq!(parsed.server, "1.2.3.4:8388");
     }

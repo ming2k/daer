@@ -33,10 +33,17 @@ stated reason** when it is absent (ADR-0007 — a skip that says why is a fact).
 | Fixture | Suite | Without it |
 | :--- | :--- | :--- |
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-outbound/tests/reality_interop.rs` | REALITY + Vision interop is skipped, which is the only end-to-end coverage of that path |
+| `xray` on `PATH` or `$XRAY_BIN` | `daer-outbound/tests/vision_tls_inside.rs` | the only coverage of Vision's **raw-copy** path. Plaintext through the tunnel does not exercise it, so a client that cannot carry a TLS stream passes every plaintext test — that is how the `Direct` defect shipped, with `curl https://…` failing on every request while the suite was green |
 | `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the kernel datapath tests are skipped; CI runs them under `unshare -Urn` via `scripts/kernel-check.sh` |
+| `nftables` + `CAP_NET_ADMIN` | `daer-cli/tests/reload.rs` | the `SIGHUP` test needs the transparent port, so it skips with a reason; `scripts/kernel-check.sh` section 8 runs it |
 
 A release should not be cut from a run where the interop suite skipped: the `✅` in
 `docs/dev/roadmap.md` for REALITY means "CI exercised it", and a skip is the absence of that.
+
+`DAER_REQUIRE` is what enforces that in `scripts/kernel-check.sh`: a comma-separated list of
+check keys (`7-tcp`, `8`, …) whose **skip is a failure**. Without it, a green run over a skipped
+check is indistinguishable from a green run over a passing one — and that is precisely the failure
+ADR-0007 exists to prevent.
 
 ### Why `-j<nproc/2>`
 

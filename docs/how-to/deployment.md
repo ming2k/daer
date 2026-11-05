@@ -242,16 +242,18 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
-ProtectKernelTunables=true
+# ProtectKernelTunables must remain false: daer needs to tune sysctls on its peer
+# devices (/proc/sys/net/ipv4/conf/daer0peer) and pin eBPF maps to /sys/fs/bpf.
+ProtectKernelTunables=false
 LockPersonality=true
 RestrictRealtime=true
 PrivateTmp=true
 # The listener and the device pair need the network, so `PrivateNetwork` is off.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# Configuration directory and write access for subscription persistence (persist.d)
+# Configuration directory, BPF filesystem, and write access for subscription persistence
 ConfigurationDirectory=daer
-ReadWritePaths=/etc/daer
+ReadWritePaths=/etc/daer /sys/fs/bpf
 
 # Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
 # `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is

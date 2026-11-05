@@ -44,7 +44,7 @@ use daer_config::{Config, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_NAMES, FunctionOrSt
 use daer_outbound::{FilterSet, parse_group_policy};
 use daer_routing::{
     AliasOptimizer, DeduplicateParamsOptimizer, MergeAndSortOptimizer, NormalizedProgram, Outbound,
-    RoutingError, RulesBuilder, ValidationSink, is_builtin_outbound, parse_outbound,
+    RoutingError, RulesBuilder, ValidationSink, is_builtin_outbound, outbound_name, parse_outbound,
 };
 
 #[derive(Debug, Parser)]
@@ -570,7 +570,7 @@ async fn explain_route(
             }
         }
     }
-    if &*explanation.outbound.name == "block" {
+    if &*explanation.outbound.name == outbound_name::BLOCK {
         println!("  verdict    : dropped by a rule");
         anyhow::bail!("the flow would be blocked");
     }
@@ -821,6 +821,15 @@ fn validate_runtime(config: &Config, warnings: &mut Vec<String>) -> anyhow::Resu
     // The DNS plan is what `daer run` binds; validating it here is the only way `check` and
     // the daemon cannot disagree.
     crate::dns::Plan::resolve(config).map_err(|message| anyhow::anyhow!("{message}"))?;
+
+    // The Fake-IP pool is built by the same constructor the daemon calls, for the same reason:
+    // `inet` is parsed there, so `[dns.fake-ip] inet = "not-a-cidr"` used to pass `check` and
+    // then fail `daer run` with "invalid fake-ip inet" — one more green light for a
+    // configuration that could not run. Building the pool here (rather than re-implementing
+    // CIDR validation in `daer-config`) means there is exactly one parser, and it is the one
+    // the daemon uses.
+    daer_dns::FakeIpPool::from_config(&config.dns.fake_ip)
+        .map_err(|error| anyhow::anyhow!("dns.fake-ip: {error}"))?;
 
     // Every declared upstream must be one this build can speak. `daer check` is a load-time
     // gate, so an unusable upstream is an error here rather than a silent "no such upstream"

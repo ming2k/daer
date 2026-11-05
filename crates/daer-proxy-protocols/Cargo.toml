@@ -1,0 +1,84 @@
+[package]
+name = "daer-proxy-protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Proxy protocol implementations (Shadowsocks, Trojan, REALITY, Hysteria 2, AnyTLS) for daer"
+autotests = false
+
+[dependencies]
+bytes.workspace = true
+daer-common.workspace = true
+daer-config.workspace = true
+libc.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+fastrand.workspace = true
+getrandom.workspace = true
+netune.workspace = true
+netune-trace.workspace = true
+regex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-platform-verifier = "0.6"
+socket2.workspace = true
+ml-kem.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+
+# `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
+# targets explicitly is what keeps cargo from compiling it as a binary of its own.
+[[test]]
+name = "shadowsocks_interop"
+
+[[test]]
+name = "trojan_interop"
+
+[[test]]
+name = "anytls_interop"
+
+[[test]]
+name = "hysteria2_interop"
+
+[[test]]
+name = "reality_live"
+
+[[test]]
+name = "reality_interop"
+
+[[test]]
+name = "client_hello_probe"
+
+[[test]]
+name = "reality_tag_audit"
+
+[[test]]
+name = "vision_lab"
+
+# A TLS stream through the tunnel: the case that broke while every plaintext test passed.
+[[test]]
+name = "vision_tls_inside"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# A real TLS server for the Trojan interop test: a certificate has to come from somewhere, and
+# a hard-coded one would expire.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

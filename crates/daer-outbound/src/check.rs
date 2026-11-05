@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use daer_config::TimeSpan;
 use netune::{
-    Client, ClientConfig, Connector, DatagramConnector, Method, Pool, RequestHead, Target,
-    TcpConnector, TlsRouterConnector, UdpConnector,
+    Client, ClientConfig, Connector, DatagramConnector, Established, Method, Pool, RequestHead,
+    Target, TcpConnector, TlsRouterConnector, UdpConnector,
 };
 use netune_trace::Recorder;
 use tokio::time::timeout;
@@ -253,6 +253,51 @@ impl HttpChecker {
         }
     }
 
+    /// Performs the same request **through an already-established tunnel**.
+    ///
+    /// # Why this exists
+    ///
+    /// `daer probe node --url` used to write a hand-built `GET … HTTP/1.1` line straight into the
+    /// tunnel stream. That is correct for `http://` and wrong for every `https://` URL: the
+    /// bytes then go in cleartext to port 443, the peer answers a TLS alert (or a `400` from an
+    /// edge that tolerates it), and the probe reports a broken node. Against a local reference
+    /// node this was reproducible: the tunnel authenticated, `Xtls Unpadding` showed the block
+    /// arriving, and the e2e tier still said `remote server closed connection without response
+    /// bytes`.
+    ///
+    /// The fix reuses this crate's own HTTP stack rather than hand-writing a second one: a
+    /// [`TunnelConnector`] hands the established stream to netune's client as if it were a fresh
+    /// connection, and `TlsRouterConnector` then performs the TLS handshake *inside* the tunnel
+    /// — which is what a TLS-bearing probe means.
+    pub async fn check_through(
+        &self,
+        established: Established,
+        url: &CheckUrl,
+    ) -> Result<TimeSpan, CheckError> {
+        let connector = TunnelConnector::new(established);
+        let connector = TlsRouterConnector::new(connector);
+        let config = ClientConfig {
+            max_redirects: 0,
+            ..ClientConfig::default()
+        };
+        let client = Client::new(connector, Pool::default(), config);
+        let target = match url.scheme() {
+            Scheme::Http => Target::plain(url.host_header()),
+            Scheme::Https => Target::tls(url.host_header(), url.host().to_owned()),
+        };
+        let head = RequestHead::new(self.method.as_netune(), url.path())
+            .with_header("host", url.host_header());
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(self.timeout, client.request(&target, head, None))
+            .await
+            .map_err(|_| CheckError::Timeout)?
+            .map_err(|err| CheckError::Request(err.to_string()))?;
+        let elapsed = started.elapsed();
+        drop(response);
+        Ok(TimeSpan::from_nanos(elapsed.as_nanos() as i64))
+    }
+
     /// Requests `url` from `addr` and returns the time to the response head.
     pub async fn check(&self, url: &CheckUrl, addr: IpAddr) -> Result<TimeSpan, CheckError> {
         let authority = format!("{addr}:{}", url.port());
@@ -274,13 +319,57 @@ impl HttpChecker {
     }
 }
 
+/// A [`Connector`] that yields one already-established stream and then refuses.
+///
+/// The seam that lets netune's HTTP client run *inside* a proxy tunnel: the tunnel is
+/// established by the node dialer (VLESS + REALITY + Vision, SOCKS5, …), and the client then
+/// speaks TLS and HTTP over it as if it had dialled the target itself.
+///
+/// One-shot on purpose. A pool that reused this connector would hand a second request a stream
+/// that is already carrying the first one's bytes, so a second `connect` is an error rather than
+/// a silent alias.
+struct TunnelConnector {
+    established: Mutex<Option<Established>>,
+}
+
+impl TunnelConnector {
+    fn new(established: Established) -> Self {
+        Self {
+            established: Mutex::new(Some(established)),
+        }
+    }
+}
+
+impl fmt::Debug for TunnelConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelConnector").finish_non_exhaustive()
+    }
+}
+
+impl Connector for TunnelConnector {
+    async fn connect(
+        &self,
+        _target: &Target,
+        _recorder: &Arc<Mutex<Recorder>>,
+    ) -> Result<Established, netune::NetError> {
+        self.established
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| {
+                netune::NetError::Connect(
+                    "the tunnel stream was already consumed; one request per tunnel".to_owned(),
+                )
+            })
+    }
+}
+
 /// Measures a bare TCP handshake through netune's connector, so the probe
 /// shares the DNS, confinement and timeout behaviour of the data path.
 pub struct TcpChecker {
     connector: TcpConnector,
     timeout: Duration,
 }
-
 impl fmt::Debug for TcpChecker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TcpChecker")

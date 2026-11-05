@@ -3,7 +3,10 @@
 - Status: accepted
 - Amended by: [ADR-0010](0010-reality-client-ownership.md) — `daer` does not implement TLS
   for any dial **netune can perform**; REALITY is a dial netune cannot perform, so its TLS
-  1.3 client lives in `daer-outbound` and nowhere else.
+  1.3 client lives in `daer` and nowhere else.
+- Amended by: [ADR-0017](0017-proxy-protocols-crate-boundary.md) — proxy product protocols
+  (shadowsocks, trojan, anytls, hysteria2, reality) and the minimal TLS 1.3 client are decoupled
+  from `daer-outbound` into `daer-proxy-protocols`.
 - Date: 2026-01-07
 - Related: `Cargo.lock`
 

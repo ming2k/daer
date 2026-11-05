@@ -141,3 +141,50 @@ For organization-wide or community distribution of pre-compiled `.drb` artifacts
 3. Run `geodrb convert` for each target category (`cn`, `google`, `apple`, `openai`, `telegram`, `category-ads-all`, etc.).
 4. Publish the output `.drb` artifacts to a `release` branch or GitHub Releases.
 5. End users reference the raw URLs in `[[rule-provider]]`, receiving automated daily updates without manual maintenance or root privileges.
+
+---
+
+## 6. Architecture Best Practices: Coarse-Grained Providers vs. Anti-Patterns
+
+For complete mathematical and kernel-level performance proofs, read the deep dive in [Routing Performance, Kernel Datapath Bounds, and Rule Asset Topology](../explanation/routing-performance-and-rule-organization.md) and [ADR-0019](../adr/0019-rule-asset-topology-and-lookup-mechanics.md).
+
+### The Recommended Topology: 3 to 6 Coarse-Grained Providers
+
+Organize rules strictly by **outbound action** and **independent update lifecycle**:
+
+```text
+/etc/daer/
+├── daer.toml
+└── providers/
+    ├── block-ads.drb          # Action: block (high update frequency, upstream)
+    ├── geosite-cn.drb         # Action: direct (medium update frequency, upstream)
+    ├── geoip-cn.drb           # Action: direct (low update frequency, upstream)
+    ├── proxy-special.drb      # Action: designated proxy group (e.g. streaming, AI)
+    └── corporate.drb          # Action: direct (internal IP subnets + private domains)
+```
+
+In `daer.toml`:
+```toml
+[routing]
+rules = [
+    "provider(block-ads) -> block",
+    "provider(corporate) -> direct",
+    "provider(geosite-cn) -> direct",
+    "provider(geoip-cn) -> direct",
+    "provider(proxy-special) -> specialized_proxy_group",
+]
+fallback = "proxy"
+```
+
+### Critical Anti-Patterns to Avoid
+
+- **Anti-Pattern: Granular Per-Site Files**:
+  Do not create individual files or providers for each website (e.g. `github.toml`, `youtube.toml`, `steam.toml`).
+  - **Reason**: The outer rule iteration across `MatchSet` elements is an $O(N)$ sequential walk. Splitting rules into hundreds of statements causes CPU cache line thrashing and destroys L1/L2 cache locality.
+  - **The Kernel Danger**: Lowering $> 1024$ match sets exceeds the eBPF datapath's fixed array ceiling (`MAX_MATCH_SET_LEN`), causing `daer` to emit `DeferReason::TooManySets`. When this happens, **line-rate eBPF hardware offload is immediately aborted**, forcing 100% of all packet flows to fall back to the userspace relay.
+- **Anti-Pattern: Splitting IP and Domain for Composite Assets**:
+  Do not maintain separate IP and domain files for a single business entity (e.g. `corp-ips.txt` and `corp-domains.txt`).
+  - Combine them into a single `.rules` source file (`ip: ...` and `suffix: ...`) and compile them into a unified `.drb`. `daer-routing` automatically links them with a zero-cost logical-OR predicate under a single rule statement.
+- **Format Selection**:
+  - Use `format = "drb"` for external subscriptions, production workloads, and large rule sets ($> 1,000$ entries) for instant sub-millisecond cold start.
+  - Use `format = "text"` only for small, human-edited local override files during active prototyping.

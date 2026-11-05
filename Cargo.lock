@@ -583,10 +583,10 @@ dependencies = [
  "daer-dns",
  "daer-ebpf",
  "daer-outbound",
+ "daer-relay",
  "daer-routing",
  "daer-sniff",
  "libc",
- "socket2",
  "tokio",
  "tracing",
 ]
@@ -627,6 +627,22 @@ version = "0.0.5"
 name = "daer-outbound"
 version = "0.0.5"
 dependencies = [
+ "daer-common",
+ "daer-config",
+ "daer-proxy-protocols",
+ "fastrand",
+ "netune",
+ "netune-trace",
+ "regex",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daer-proxy-protocols"
+version = "0.0.5"
+dependencies = [
  "aes-gcm",
  "bytes",
  "chacha20poly1305",
@@ -650,15 +666,29 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-platform-verifier",
- "serde_json",
  "sha1",
  "sha2",
  "socket2",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "daer-relay"
+version = "0.0.5"
+dependencies = [
+ "daer-sniff",
+ "libc",
+ "netune",
+ "netune-trace",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

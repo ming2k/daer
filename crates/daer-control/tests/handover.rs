@@ -20,9 +20,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daer_control::{
-    Generations, Ingress, IngressError, RouterOptions, Supervisor, bind_shared, serve_ingress,
-};
+use daer_control::{Generations, RouterOptions};
+use daer_relay::{Accepted, Ingress, RelayError, Relayed, Supervisor, bind_shared, serve_ingress};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -37,9 +36,9 @@ struct PlainIngress {
 }
 
 impl Ingress for PlainIngress {
-    async fn accept(&self) -> Result<daer_control::Accepted, IngressError> {
-        let (stream, source) = self.listener.accept().await.map_err(IngressError::Accept)?;
-        Ok(daer_control::Accepted {
+    async fn accept(&self) -> Result<Accepted, RelayError> {
+        let (stream, source) = self.listener.accept().await.map_err(RelayError::Accept)?;
+        Ok(Accepted {
             stream,
             source,
             destination: self.destination,
@@ -93,7 +92,7 @@ fallback = "direct"
 struct Accepting {
     address: SocketAddr,
     stop: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<Result<daer_control::Stopped, IngressError>>,
+    task: tokio::task::JoinHandle<Result<daer_relay::Stopped, RelayError>>,
 }
 
 impl Accepting {
@@ -317,7 +316,7 @@ async fn stopping_a_loop_does_not_reset_the_service() {
     // A bare flow, so no sockets are involved: this is about ownership.
     supervisor.spawn(async {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        daer_control::Relayed::default()
+        Relayed::default()
     });
     assert_eq!(supervisor.in_flight(), 1);
 
@@ -325,7 +324,7 @@ async fn stopping_a_loop_does_not_reset_the_service() {
     supervisor.drain().await;
     assert_eq!(supervisor.in_flight(), 0);
     // The supervisor is still usable after a drain: generations do not own it.
-    supervisor.spawn(async { daer_control::Relayed::default() });
+    supervisor.spawn(async { Relayed::default() });
     supervisor.drain().await;
     let _ = generations;
 }

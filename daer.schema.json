@@ -57,7 +57,9 @@
         },
         "tproxy-port": 12345,
         "tproxy-port-protect": true,
-        "wan-interface": []
+        "wan-interface": [
+          "auto"
+        ]
       }
     },
     "group": {
@@ -339,7 +341,9 @@
         },
         "wan-interface": {
           "type": "array",
-          "default": [],
+          "default": [
+            "auto"
+          ],
           "items": {
             "type": "string"
           }

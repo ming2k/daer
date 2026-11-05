@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use daer_config::NodeEndpoint;
 use daer_outbound::{DialerOptions, NodeDialer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use daer_routing::outbound_name;
 use tokio::net::TcpStream;
 
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ pub struct ProbeUrlOptions {
 }
 
 pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
-    if options.node == "direct" {
+    if options.node == outbound_name::DIRECT {
         println!("probing node: direct [direct]");
         println!("  endpoint        : local direct interface");
         println!("  verdict         : ok (direct outbound requires no remote server probe)");
@@ -179,8 +179,7 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to construct node dialer: {e}"))?;
 
     let handshake_start = Instant::now();
-    let mut stream = match tokio::time::timeout(options.timeout, dialer.connect(&probe_authority))
-        .await
+    let stream = match tokio::time::timeout(options.timeout, dialer.connect(&probe_authority)).await
     {
         Ok(Ok(stream)) => {
             let handshake_ms = handshake_start.elapsed().as_millis();
@@ -206,42 +205,43 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
         }
     };
 
-    // Phase 4: End-to-end HTTP Probe
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: daer-probe\r\nConnection: close\r\n\r\n",
-        check_url.path(),
-        check_url.host_header()
-    );
-
+    // Phase 4: End-to-end HTTP(S) Probe
+    //
+    // Through netune's HTTP client, not a hand-written `GET` line. The hand-written version was
+    // only ever correct for `http://`: an `https://` probe wrote cleartext into port 443, the peer
+    // (correctly) reset, and the probe blamed the node. `check_through` hands the established
+    // tunnel to the same client the health checker uses, so TLS for an `https://` URL is
+    // negotiated *inside* the tunnel, which is what a TLS probe means.
+    let checker = daer_outbound::HttpChecker::new(daer_outbound::HttpMethod::Get, options.timeout);
     let e2e_start = Instant::now();
-    if let Err(e) = stream.stream.write_all(req.as_bytes()).await {
-        println!("  e2e probe       : send failed ({e})");
-        bail!("e2e HTTP probe request write failed: {e}");
-    }
-    let mut buf = [0u8; 1024];
-    match tokio::time::timeout(options.timeout, stream.stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
+    match checker.check_through(stream, &check_url).await {
+        Ok(_) => {
             let e2e_ms = e2e_start.elapsed().as_millis();
-            let response = String::from_utf8_lossy(&buf[..n]);
-            let status_line = response.lines().next().unwrap_or("HTTP/1.1 200 OK");
-            println!("  e2e probe       : ok in {e2e_ms}ms [{status_line}]");
+            println!(
+                "  e2e probe       : ok in {e2e_ms}ms [{} {}]",
+                match check_url.scheme() {
+                    daer_outbound::Scheme::Http => "http",
+                    daer_outbound::Scheme::Https => "https",
+                },
+                check_url.host_header()
+            );
             println!("  verdict         : node is fully operational");
             Ok(())
         }
-        Ok(Ok(_)) => {
-            println!("  e2e probe       : remote server closed connection without response bytes");
-            bail!("e2e HTTP probe closed without response");
-        }
-        Ok(Err(e)) => {
-            println!("  e2e probe       : read failed ({e})");
-            bail!("e2e HTTP probe read failed: {e}");
-        }
-        Err(_) => {
+        Err(error) => {
+            match &error {
+                daer_outbound::CheckError::Timeout => println!(
+                    "  e2e probe       : timed out after {}s",
+                    options.timeout.as_secs()
+                ),
+                other => println!("  e2e probe       : failed ({other})"),
+            }
             println!(
-                "  e2e probe       : timed out after {}s",
-                options.timeout.as_secs()
+                "  verdict         : the tunnel authenticated but the request did not complete; \
+                 the node cannot reach {}",
+                check_url.host_header()
             );
-            bail!("e2e HTTP probe timed out");
+            bail!("e2e HTTP probe failed: {error}")
         }
     }
 }

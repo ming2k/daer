@@ -45,8 +45,8 @@ own demultiplexing where the wire format already requires it.
 
 | Need | Where in daer | State |
 | --- | --- | --- |
-| UDP relay for proxied traffic | `daer-control::datagram` | ✅ per-peer sessions, bounded table, idle reaping |
-| UDP relay ingress | `daer-control::ingress_udp` | ✅ `TransparentDatagramListener`; not wired to a daemon entry point |
+| UDP relay for proxied traffic | `daer-relay::relay::datagram` | ✅ per-peer sessions, bounded table, idle reaping (ADR-0018) |
+| UDP relay ingress | `daer-relay::inbound::udp` | ✅ `TransparentDatagramListener`, wired into the daemon (ADR-0018) |
 | DNS upstream over UDP (direct) | `daer-dns::transport` | ✅ plain `UdpSocket`, **does not use netune** |
 | `udp_check_dns` health probe | `daer-outbound` health check | ✅ `UdpDnsChecker` |
 | SOCKS5 UDP associate | proxy protocol support | ✅ via `Socks5DatagramConnector` (literal IP destinations) |

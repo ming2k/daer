@@ -27,7 +27,8 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: `[global.tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
 | Health checks: the configured `tcp-url`, `tcp-method` and `udp-dns` are what probes use | ✅ |
-| Outbound: Vision (`xtls-rprx-vision`) | ⬜ refused at load with the reason. The TLS record layer now exists, so the blocking condition moved from "ADR-0002 forbids it" to "the splice logic is not written" |
+| Outbound: Vision (`xtls-rprx-vision`) | ✅ framing both ways, and the peer's `Direct` is honoured with a raw read (see below). The uplink never claims `Direct` — it sends `End` — because a splice on our side is not implemented; that costs throughput on a TLS stream and nothing else |
+| Outbound: Vision, **inner TLS** | ✅ a TLS stream through the tunnel works (`curl https://…`, three runs, against a local reference node with a local TLS origin). This was broken until the peer's `Direct` was implemented: the node stops encrypting and a client that keeps decrypting reads ciphertext as plaintext (`the record was altered`). Plaintext (HTTP) inside the tunnel always worked, which is exactly why the gap survived — the e2e probe tier was a plaintext GET, so `daer probe node` reported "fully operational" for a node that could not carry a single HTTPS request |
 | Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
 | Datagrams: netune transport + SOCKS5 UDP associate (netune side) | ✅ |
 | Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; not yet wired to a daemon entry point |
@@ -52,7 +53,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Control plane: routing verdict + outbound dialing per flow | ✅ |
 | Control plane: reload generations (atomic swap, reports, rejection) | ✅ |
 | Control plane: routing-epoch design + publish sequence (ADR-0004) | ✅ userland |
-| Control plane: interfaces, tc attach, kernel map writes | ✅ attach + `PARAM` + epoch/meta + routing table + LPM tries + outbound connectivity (ADR-0005); republishing on reload pending |
+| Control plane: interfaces, tc attach, kernel map writes | ✅ attach + `PARAM` + epoch/meta + routing table + LPM tries + outbound connectivity (ADR-0005); `run::reload` calls `republish_policy` after a userspace swap, so a reload reaches the kernel table too |
 | Daemon (`daer run`, SIGHUP reload, drain, logging, health scheduling, UDP relay, one shared loader) | ✅ |
 
 **`daer run` now proxies traffic.** The wiring that was missing —
@@ -77,15 +78,16 @@ identifiers belong to another project.
 **Exit:** `make ebpf` builds from `ebpf/kern` with no external checkout, and
 `names.rs` is generated.
 
-## 2. Data path (`daer-control`) 🟡
+## 2. Data path (`daer-relay` + `daer-control`) 🟡
 
 The largest piece. Order matters: this is what makes the binary useful.
 
-1. **Ingress and relay** ✅ — transparent listener (`IP_TRANSPARENT` for both
-   families, `SO_REUSEPORT` for reload handover), original destination from the
-   accepted socket, self-connect rejection, half-close-correct relay, accept loop
-   with resource-exhaustion backoff and live counters. The loop is driven through
-   `Ingress`/`Decide` traits, so its failure modes are tested without privileges.
+1. **Ingress and relay** ✅ — `daer-relay` (ADR-0018): transparent listener
+   (`IP_TRANSPARENT` for both families, `SO_REUSEPORT` for reload handover),
+   original destination from the accepted socket, self-connect rejection,
+   half-close-correct relay, accept loop with resource-exhaustion backoff and live
+   counters. The loop is driven through `Ingress`/`Decide` traits, so its failure
+   modes are tested without privileges, a configuration or a protocol.
 2. **Kernel wiring** ✅ — attach the datapath programs to the LAN/WAN tc hooks,
    create `daer0`/`daer0peer`, publish the listener fds, the outbound connectivity and
    the routing table itself into the maps ([ADR-0005](../adr/0005-kernel-policy-encoding.md)).
@@ -116,11 +118,20 @@ The largest piece. Order matters: this is what makes the binary useful.
    shared (an unclassified map fails a test), and the publish sequence — fill the
    inactive slot, stamp it, verify the stamp, then switch — is written against a
    `MapWriter` trait and asserted to leave the active slot unchanged on every failure.
-   Remaining: republishing the kernel table on reload. The publish sequence runs at
-   attach and is proven by test; `Daemon::reload` still swaps only the userspace
-   generation, so a reload changes *decisions* immediately and reaches the kernel on
-   the next attach. **Exit:** 1000 reloads under a long-lived connection with zero
-   drops, and the kernel table rewritten on each.
+   Remaining: 1000 reloads under a long-lived connection with zero drops — the soak that
+   would turn "the swap is correct" into "the swap is correct under load". The kernel half is
+   wired: `run::reload` calls `datapath::republish_policy` after publishing a new userspace
+   generation, so a reload now reaches the kernel table as well as the decisions. What that
+   path lacked until recently was a test that could fail at all — the *first* `SIGHUP` used to
+   panic the daemon (`reload` called `block_on` from inside the runtime), which no unit test
+   saw because none of them signalled a running process. `crates/daer-cli/tests/reload.rs`
+   now starts the real binary, sends `SIGHUP`, and asserts the process is alive **and** that
+   generation 2 was published; `scripts/kernel-check.sh` section 8 runs it where the
+   transparent port can bind. **Exit:** 1000 reloads under a long-lived connection with zero
+   drops, and a kernel-tier assertion that the table was rewritten rather than merely
+   republished in userspace. A reload is also synchronous inside the signal loop, so a slow
+   subscription fetch delays new accepts (they queue in the listener's backlog rather than
+   being dropped); spawning the reload is the fix and belongs with the soak that can measure it.
 
 ## 3. DNS (`daer-dns`) 🟡
 
@@ -276,6 +287,21 @@ public node, so nothing in CI exercised the path, and a `✅` in this table reco
 result whose relevance nobody had to re-establish. `tests/reality_interop.rs` closes that:
 it starts the reference server itself, so REALITY + Vision is a fixture that CI runs on every
 commit, and a skip is stated rather than silently absent.
+
+That fixture then had to be made honest twice over, and both are worth recording because each
+looked like a transport bug:
+
+- it pointed `dest` at `www.microsoft.com:443`, so the gate depended on a third party's uptime
+  and failed intermittently with `the peer closed during the handshake`. It now starts its own
+  TLS 1.3 destination from checked-in fixture certificates, sized so the handshake has the record
+  lengths REALITY needs to mimic;
+- the tunnel assertion asked the node to reach `example.com:80`. Since Xray v26.4.15 a `freedom`
+  outbound **blocks private and reserved addresses by default** for flows that arrived through a
+  proxy inbound and blackholes them for 30-90 s — so a local origin was refused silently and the
+  client timed out with an empty reply while the tunnel was fine. The fixture grants
+  `finalRules: [{action: allow, ip: ["127.0.0.0/8"]}]`, and the assertion is now on the local
+  origin's body: deterministic, offline, and unable to pass unless the bytes really made the
+  round trip through REALITY + Vision.
 
 Remaining, in subscription-usage order: vmess → plain vless → anytls → hysteria2 → tuic.
 vmess, plain vless and anytls are connectors over a raw stream, so they compose with

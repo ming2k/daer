@@ -118,6 +118,30 @@ fn check_global(config: &mut Config) -> Result<(), ConfigError> {
             "must not be 0: the eBPF program redirects to this port",
         ));
     }
+    // An empty `wan-interface` is unrunnable, and `daer check` has to say so.
+    //
+    // The daemon's own guard (`run::wait_for_interfaces`) refused it with "daer cannot know which
+    // interface carries proxied traffic", so `check` — the command whose entire contract is "will
+    // this configuration run" — reported a file as `ok` that `daer run` then exited on. This is
+    // the same divergence as a builtin-named group, caught one layer later: validation has to be
+    // the place a configuration is judged, or every caller grows its own idea of validity.
+    if config.global.wan_interface.is_empty() {
+        return Err(ConfigError::new(
+            "global.wan-interface",
+            "must name at least one interface (use [\"auto\"] to follow the default route)",
+        ));
+    }
+    if let Some(blank) = config
+        .global
+        .wan_interface
+        .iter()
+        .find(|entry| entry.trim().is_empty())
+    {
+        return Err(ConfigError::new(
+            "global.wan-interface",
+            format!("names an empty interface ({blank:?}); remove it or use \"auto\""),
+        ));
+    }
     for (name, range) in [
         (
             "global.tls.fragment-length",
@@ -160,6 +184,20 @@ fn check_groups(config: &Config) -> Result<(), ConfigError> {
     for group in &config.group {
         if group.name.trim().is_empty() {
             return Err(ConfigError::new("group.name", "must not be empty"));
+        }
+        // A group that shadows a builtin outbound is not an override: the compiled program
+        // resolves the name to the builtin, so the group's nodes are unreachable while
+        // `daer route`/`daer check --nodes` report them as selected. Rejecting it at load time
+        // is the only outcome that keeps the configuration and the daemon saying the same thing.
+        if daer_common::consts::is_builtin_outbound(&group.name) {
+            return Err(ConfigError::new(
+                "group.name",
+                format!(
+                    "{:?} is a built-in outbound and cannot be redeclared as a group; rename it \
+                     (for example \"proxy-{}\") and route to that name instead",
+                    group.name, group.name
+                ),
+            ));
         }
         if !seen.insert(group.name.as_str()) {
             return Err(ConfigError::new(
@@ -380,5 +418,67 @@ mod tests {
             },
         ];
         assert!(normalize(&mut config).is_err());
+    }
+
+    /// A group may not shadow a builtin outbound.
+    ///
+    /// The falsifier is the observed divergence: `[[group]] name = "direct"` with one node
+    /// pointing at a dead SOCKS port loaded fine, `daer route` reported that node as the
+    /// selected outbound, and the daemon dialled the flow *directly* and returned the origin's
+    /// bytes. Either the name is the builtin everywhere or it is an error everywhere; the
+    /// configuration is not allowed to mean two things.
+    /// An empty `wan-interface` is rejected here, not only by the daemon.
+    ///
+    /// The falsifier is one command pair: `printf 'schema = 1\n[global]\nwan-interface = []\n'`
+    /// used to be `check` → `ok` and `run` → exit 1, so the gate that promises "will this
+    /// configuration run" disagreed with the process that runs it. The default is `["auto"]`,
+    /// which is why a plain `schema = 1` file still passes.
+    #[test]
+    fn an_empty_wan_interface_fails_validation_even_though_the_default_is_not_empty() {
+        let mut config = valid();
+        config.global.wan_interface = Vec::new();
+        let error = normalize(&mut config).expect_err("the daemon cannot honour this");
+        assert_eq!(error.field, "global.wan-interface");
+
+        // The control: the defaults pass, so the check is about the empty list and not about
+        // `wan-interface` being present at all.
+        let mut config = valid();
+        normalize(&mut config).expect("the default [\"auto\"] must still validate");
+
+        // And a blank entry, which `run` would otherwise try to resolve as an interface name.
+        let mut config = valid();
+        config.global.wan_interface = vec!["  ".to_owned()];
+        let error = normalize(&mut config).expect_err("a blank interface name is not a name");
+        assert_eq!(error.field, "global.wan-interface");
+    }
+
+    #[test]
+    fn a_group_may_not_shadow_a_builtin_outbound() {
+        for name in ["direct", "block", "must_rules", "<OR>", "<AND>"] {
+            let mut config = valid();
+            config.group = vec![crate::model::Group {
+                name: name.to_owned(),
+                filters: Vec::new(),
+                policy: FunctionOrString::Name("min_moving_avg".to_owned()),
+                health_check: crate::model::HealthCheckOverride::default(),
+            }];
+            let error = normalize(&mut config)
+                .expect_err("a group named after a builtin outbound must be rejected");
+            assert_eq!(error.field, "group.name", "{name}: {error}");
+            assert!(
+                error.message.contains("built-in"),
+                "{name}: the message must say why: {error}"
+            );
+
+            // The control: the same group under a name that is not reserved loads.
+            let mut config = valid();
+            config.group = vec![crate::model::Group {
+                name: format!("proxy-{name}"),
+                filters: Vec::new(),
+                policy: FunctionOrString::Name("min_moving_avg".to_owned()),
+                health_check: crate::model::HealthCheckOverride::default(),
+            }];
+            normalize(&mut config).expect("a non-reserved name is fine");
+        }
     }
 }

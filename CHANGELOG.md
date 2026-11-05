@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The crate graph is split by reason-to-change, not by history.** Three boundaries were made
+  explicit, each recorded in an ADR:
+  - **ADR-0017** — proxy product protocols (shadowsocks, trojan, anytls, hysteria2, reality) and
+    the minimal TLS 1.3 client moved out of `daer-outbound` into a new `daer-proxy-protocols`.
+    `daer-outbound` drops from ~13k to ~4.7k lines and from 30 dependencies to 13: it is now
+    only outbound governance (groups, alive sets, measured latency, probes, filters,
+    subscriptions) and no longer pulls `quinn`, `h3`, `rustls`, `x25519-dalek` or `ml-kem` into
+    anything that merely wants a health check.
+  - **ADR-0018** — transparent ingress, `splice`, the UDP session table and flow supervision
+    moved out of `daer-control` into a new `daer-relay`. `daer-control` decides; `daer-relay`
+    carries. The seam is `Decide` and `DatagramRouter`, and neither names a `Verdict`, a group or
+    a policy, so adding a routing concept no longer touches the accept loop and the accept loop's
+    tests no longer need a configuration.
+  - The ingress half is spelled `inbound` in one place everywhere (`inbound::tcp`,
+    `inbound::udp`). It previously mixed `inbound` and `ingress_udp` — the packet-direction
+    vocabulary and the proxy vocabulary — inside the same crate.
+- `OpenDatagram` now returns the dial target **with** the connector (`DatagramLeg`) instead of
+  the relay asking twice (`dial_target` then `open_datagram`). The two calls could straddle a
+  reload, so a datagram flow could be dialed to a target the rule that opened its leg had never
+  chosen.
+
+### Fixed
+
+- **HTTPS through a REALITY + Vision node did not work at all.** A reference node switches its
+  downlink to an XTLS **raw copy** — `Direct` — on the first application-data record after the
+  inner `ServerHello`, and stops encrypting: Xray's `VisionWriter` then writes through
+  `buf.NewWriter(rawConn)`. daer's reader understood `Direct` as "stop unpadding" only, so its
+  record layer kept decrypting plain socket bytes and the session died with
+  `AES-128-GCM open failed: the record was altered`. `curl http://…` through the node always
+  worked and `curl https://…` never did, which is why `daer probe node` (whose e2e tier was a
+  plaintext GET) reported the node as fully operational while every real browsing session broke.
+  `Tls13Connection` now carries a `raw_read` switch that Vision sets when it parses `Direct`, and
+  `poll_read` hands back socket bytes from that point on. Verified against a local reference node
+  with a local TLS origin: before, `unexpected eof while reading` on every attempt; after,
+  `<!DOCTYPE HTML>` three runs in a row, with `probe node --url https://…` reaching a public site.
+  `a_direct_block_asks_the_layer_below_to_stop_decrypting` pins the reporting, with `Continue` and
+  `End` as the negative controls.
+- **`daer probe node --url https://…` wrote a plaintext request to port 443.** The e2e tier
+  hand-built `GET … HTTP/1.1` and wrote it into the tunnel, which is only correct for `http://`.
+  For an HTTPS URL the bytes went out in cleartext, the peer reset, and the probe blamed the node;
+  against a public site it "passed" only because an edge answered `400`. It now uses the crate's
+  own HTTP client through a one-shot `TunnelConnector`, so TLS is negotiated *inside* the tunnel —
+  which is what a TLS probe means.
+- **The REALITY interop gate was failing for reasons that were the fixture's fault, not the
+  transport's.** `tests/reality_interop.rs` pointed the node's `dest` at `www.microsoft.com:443`,
+  so the one test able to catch a REALITY/Vision regression depended on Microsoft's uptime and on
+  the machine's egress: it failed intermittently with `the peer closed during the handshake` and
+  nothing wrong in this crate. It now starts its own TLS 1.3 destination from checked-in fixture
+  certificates (`crates/daer-outbound/tests/fixtures/`, a 7-certificate chain chosen so the
+  handshake has realistic record sizes — a small one makes the *node* fail its own padding check),
+  and the tunnel is asserted end to end against a **local** HTTP origin instead of
+  `example.com:80`. Three separate fixture defects were hiding behind that:
+  - the node's log was sent to `Stdio::null()`, so every failure that said "the node's own log
+    said:" printed an empty string — the one piece of evidence REALITY and Vision need, because
+    both fail silently;
+  - since Xray v26.4.15 a `freedom` outbound blocks private and reserved addresses by default for
+    flows that arrived through a proxy inbound, and blackholes them for 30-90 s. A local origin is
+    a private address, so the node accepted the request, logged `blocked target … blackholing
+    connection`, and the client timed out with an empty reply — indistinguishable from a broken
+    tunnel. The fixture now grants `finalRules: [{action: allow, ip: ["127.0.0.0/8"]}]`, which is
+    a fixture permission and not something a production node should do;
+  - a hang reported only "the reply must not hang"; it now prints the partial reply and the node's
+    log.
+  `DAER_REALITY_DEST` still overrides the destination with a real site,
+  `DAER_REALITY_SNI` names the SNI when the destination is an address.
+- **The shell's data path check called a pass a skip.** `scripts/kernel-check.sh` section 7
+  grepped for any `skipped:` line and reported the whole section as a skip, so a box that cannot
+  create a second network namespace (the UDP test's stated prerequisite) read as "nothing was
+  proven" even though the TCP redirect, the proxy, and the nonce assertion all passed. The two
+  paths are now reported separately.
+- **A `SIGHUP` killed the daemon.** `reload` was synchronous and called `block_on(...)` to re-run
+  the shared configuration loader, but it runs inside `daemon.serve`'s `select!` — inside the
+  multi-threaded runtime — so Tokio refused it outright (`Cannot start a runtime from within a
+  runtime`). The main task panicked, the process exited, and every in-flight flow died with it,
+  on the *first* reload. Awaiting the loader directly is both the fix and the compile-time
+  guarantee: `load_resolved` is `async`, so nothing in the reload path can block a worker again.
+  `crates/daer-cli/tests/reload.rs` starts the real binary, sends `SIGHUP`, and asserts the
+  process is alive *and* that generation 2 was published; it fails against the old code within
+  milliseconds. `scripts/kernel-check.sh` section 8 is what runs it, because a skip in a bare
+  container is not evidence about a signal handler.
+- **An empty configuration was unrunnable.** `Global::default()` had `wan-interface = []` while
+  `daer run` refuses an empty list ("cannot know which interface carries proxied traffic") — so
+  `printf 'schema = 1\n'` was reported valid by `daer check` and rejected by `daer run`, and both
+  `docs/reference/configuration.md` and `daer.example.toml` said the default was `["auto"]`. The
+  default is now `["auto"]`, which is what the reference and the example always promised, and
+  `the_defaults_are_a_configuration_the_daemon_can_run` pins it.
+- **A `[[group]]` named after a builtin outbound silently meant the builtin.** A configuration
+  with `[[group]] name = "direct"` whose only node pointed at a dead SOCKS port loaded cleanly,
+  `daer route` reported that node as the selected outbound, and the daemon dialled the flow
+  *directly* and returned the origin's bytes — the configuration said one thing and the daemon
+  did another. `direct`, `block`, `must_rules`, `<OR>`, `<AND>` and `<Control Plane Routing>` are
+  now rejected as group names at load time, from one list in `daer-common` that the rule lowering
+  also uses, so the two cannot drift apart.
+
+### Removed
+
+- **`dial-mode` from the configuration reference.** It was documented (and in an ADR's key list)
+  but never existed in the model, so `deny_unknown_fields` rejected it. `daer` sniffs whenever a
+  rule can use a domain; there is no separate knob. The reference now also documents the keys it
+  had been omitting (`sniffing-timeout`, `auto-sniff-punt`, `allow-insecure`, all of
+  `[global.health-check]` and `[dns.fake-ip]`) and drops `cache-size`, which is spelled
+  `max-cache-size`.
+
 ## [0.0.5] - 2026-11-05
 
 ### Added

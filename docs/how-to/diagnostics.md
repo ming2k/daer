@@ -529,8 +529,8 @@ routes nothing.
 | `daer-dns::resolver` | the cache lock is never held across an `.await`; a self-referential failover is ignored, not followed; the OPT record's TTL word is never rewritten |
 | `daer-dns::transport` | a reply with a mismatched id or no response bit is refused; every exchange has a hard timeout; an unimplemented protocol names itself instead of silently answering |
 | `daer-dns::server` | a malformed datagram is dropped, never crashes the loop; an oversized UDP answer sets `TC`; `asis` produces silence on both transports |
-| `daer-outbound::shadowsocks` | only authenticated ciphers; nonce and salt continue from the handshake into the stream; a truncated record is an error, never a short read |
-| `daer-outbound::trojan` | no plaintext constructor; a bare-IP node without `sni` is rejected at parse time; the password never reaches a log line |
+| `daer-proxy-protocols::shadowsocks` | only authenticated ciphers; nonce and salt continue from the handshake into the stream; a truncated record is an error, never a short read |
+| `daer-proxy-protocols::trojan` | no plaintext constructor; a bare-IP node without `sni` is rejected at parse time; the password never reaches a log line |
 | `daer-outbound::property` | a node's security identity is derived structurally and cannot contain a credential |
 | `daer-ebpf::epoch` | a failed publish leaves the active slot unchanged; a stamp is verified before the commit; generation 0 is never published |
 | `daer-sniff` | no panic on hostile bytes; `NeedMore` is bounded by `MAX_SNIFF_LEN`; a name is reported only when it is actually present |

@@ -11,7 +11,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use daer_control::{Generations, Ingress, IngressError, Supervisor, serve_ingress};
+use daer_control::Generations;
+use daer_relay::{Accepted, Ingress, RelayError, Supervisor, serve_ingress};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -27,9 +28,9 @@ struct PlainIngress {
 }
 
 impl Ingress for PlainIngress {
-    async fn accept(&self) -> Result<daer_control::Accepted, IngressError> {
-        let (stream, source) = self.listener.accept().await.map_err(IngressError::Accept)?;
-        Ok(daer_control::Accepted {
+    async fn accept(&self) -> Result<Accepted, RelayError> {
+        let (stream, source) = self.listener.accept().await.map_err(RelayError::Accept)?;
+        Ok(Accepted {
             stream,
             source,
             destination: self.destination,

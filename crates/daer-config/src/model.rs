@@ -366,7 +366,13 @@ impl Default for Global {
             so_mark: None,
             log_level: "info".to_owned(),
             lan_interface: Vec::new(),
-            wan_interface: Vec::new(),
+            // `["auto"]`, not `[]`. The daemon refuses an empty list ("daer cannot know which
+            // interface carries proxied traffic"), so an empty default made the *defaults* —
+            // and therefore an otherwise empty configuration file — unrunnable, while the
+            // reference documentation and `daer.example.toml` both promised `["auto"]`.
+            // A default that `run` rejects is a trap; the honest default is the one the
+            // example and the docs already named.
+            wan_interface: vec!["auto".to_owned()],
             allow_insecure: false,
             disable_waiting_network: false,
             sniffing_timeout: TimeSpan::from_millis(30),
@@ -1880,6 +1886,28 @@ mod tests {
             error.to_string().contains("tproxy-prt"),
             "unexpected error: {error}"
         );
+    }
+
+    /// The defaults must be a configuration `daer run` accepts.
+    ///
+    /// `daer run` refuses an empty `wan-interface` ("daer cannot know which interface carries
+    /// proxied traffic"), so while the default was `[]` the documented smallest valid file —
+    /// and the reference documentation's own default column, and `daer.example.toml`, which
+    /// both said `["auto"]` — produced a daemon that exited immediately. The falsifier is one
+    /// command: `printf 'schema = 1\n' > c.toml && daer run -c c.toml --no-datapath` used to
+    /// fail with that message; the default is now the value the documentation promised.
+    #[test]
+    fn the_defaults_are_a_configuration_the_daemon_can_run() {
+        let parsed = config("");
+        assert_eq!(
+            parsed.global.wan_interface,
+            vec!["auto".to_owned()],
+            "an empty configuration must name a WAN interface the daemon can resolve"
+        );
+        // And the default survives semantic validation, which is what `run` performs first.
+        let mut validated = parsed;
+        crate::validate::normalize(&mut validated).expect("the defaults must validate");
+        assert_eq!(validated.global.wan_interface, vec!["auto".to_owned()]);
     }
 
     #[test]

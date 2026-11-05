@@ -27,7 +27,7 @@
                                      │
                                      ▼
                             ┌─────────────────┐
-                            │  daer-control   │
+                            │   daer-relay    │
                             │  - IP_TRANSPARENT
                             │  - Sniff SNI/Host
                             │  - Relay / Splice
@@ -41,8 +41,8 @@
    Packets entering from client LAN interfaces hit the eBPF classifier before the kernel allocates heavyweight socket buffers or enters the local IP stack.
    - Traffic matched to a `direct` rule bypasses userspace entirely and continues routing natively in Linux.
    - Traffic requiring proxying is redirected to the transparent proxy port.
-2. **Userspace Control Plane (`daer-control`)**:
-   Listens on the transparent port with `IP_TRANSPARENT`. It recovers original destination IPs via `getsockopt(SO_ORIGINAL_DST)`, sniffs early domain names from TLS ClientHello or HTTP headers, selects outbound nodes from groups, and relays payload streams via zero-copy `splice(2)`.
+2. **Userspace Data Path (`daer-relay`) and Decision Plane (`daer-control`)**:
+   `daer-relay` listens on the transparent port with `IP_TRANSPARENT`, recovers original destination IPs via `getsockopt(SO_ORIGINAL_DST)`, sniffs early domain names from TLS ClientHello or HTTP headers, and relays payload streams via zero-copy `splice(2)`. It decides nothing: `daer-control` resolves each flow to an outbound (a rule, a group and a node) and hands back the other leg (ADR-0018).
 
 ---
 

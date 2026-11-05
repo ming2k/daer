@@ -1,0 +1,26 @@
+[package]
+name = "daer-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Transparent ingress and byte relaying for daer: the stable userspace data path"
+
+[dependencies]
+daer-sniff.workspace = true
+libc.workspace = true
+netune.workspace = true
+netune-trace.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `tests/architecture.rs` asserts the crate's dependency closure, and `cargo metadata`
+# answers in JSON. A dev-only dependency, so it is not in the closure under test.
+serde_json.workspace = true
+
+[lints]
+workspace = true

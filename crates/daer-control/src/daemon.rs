@@ -30,11 +30,16 @@ use std::sync::Arc;
 
 use daer_config::Config;
 
+use daer_relay::relay::datagram::{
+    DatagramService, DatagramStats as DatagramCounters, RelayOptions,
+};
+use daer_relay::{
+    DatagramIngress, Decide, FlowFacts, RelayError, ServeStats, Supervisor,
+    TransparentDatagramListener, TransparentListener, serve_ingress as serve_loop,
+};
+
 use crate::decide::{Router, RouterOptions};
 use crate::generation::{Generations, ReloadError};
-use crate::inbound::TransparentListener;
-use crate::serve::{self, ServeStats};
-use crate::supervise::Supervisor;
 
 /// What the datapath needs to know about this run.
 ///
@@ -89,13 +94,13 @@ pub struct Daemon {
     ///
     /// Readable so a deployment can tell working UDP from silently dropped UDP: without a
     /// counter, "the client says UDP is broken" has no answer that is not a packet capture.
-    pub datagram_stats: Option<Arc<crate::datagram::DatagramStats>>,
+    pub datagram_stats: Option<Arc<DatagramCounters>>,
     /// The transparent UDP socket, when the datagram relay could be bound.
     ///
     /// `None` means the relay is not running, and that is a decision the daemon reports at
     /// `WARN`: a client that believes its UDP is tunnelled and gets silence instead has been
     /// lied to, which is worse than a refusal it can see (ADR-0006).
-    pub datagrams: Option<Arc<dyn crate::ingress_udp::DatagramIngress>>,
+    pub datagrams: Option<Arc<dyn DatagramIngress>>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -131,13 +136,8 @@ impl Daemon {
         // The datagram half. A failure here is not fatal: the box can still proxy TCP, and a
         // daemon that refuses to start because UDP could not bind would take a working proxy
         // down over a secondary transport.
-        let datagrams = match crate::ingress_udp::TransparentDatagramListener::bind(
-            Ipv4Addr::UNSPECIFIED,
-            port,
-        ) {
-            Ok(listener) => {
-                Some(Arc::new(listener) as Arc<dyn crate::ingress_udp::DatagramIngress>)
-            }
+        let datagrams = match TransparentDatagramListener::bind(Ipv4Addr::UNSPECIFIED, port) {
+            Ok(listener) => Some(Arc::new(listener) as Arc<dyn DatagramIngress>),
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -155,7 +155,7 @@ impl Daemon {
             supervisor: Supervisor::new(),
             datapath: DatapathStatus::default(),
             datagrams: datagrams.clone(),
-            datagram_stats: datagrams.map(|_| Arc::new(crate::datagram::DatagramStats::default())),
+            datagram_stats: datagrams.map(|_| Arc::new(DatagramCounters::default())),
         })
     }
 
@@ -180,7 +180,7 @@ impl Daemon {
 
     /// The datagram relay's counters, if the relay is running.
     #[must_use]
-    pub fn datagram_stats(&self) -> Option<Arc<crate::datagram::DatagramStats>> {
+    pub fn datagram_stats(&self) -> Option<Arc<DatagramCounters>> {
         self.datagram_stats.as_ref().map(Arc::clone)
     }
 
@@ -236,7 +236,7 @@ impl Daemon {
     pub async fn serve(
         &self,
         shutdown: impl std::future::Future<Output = ()>,
-    ) -> Result<(), crate::error::IngressError> {
+    ) -> Result<(), RelayError> {
         // The generation is re-read per flow, so a reload is visible to the next flow
         // without restarting the loop.
         let supervisor = self.supervisor.clone();
@@ -245,23 +245,23 @@ impl Daemon {
         };
         let Some(ingress) = self.datagrams.as_ref() else {
             // No datagram socket: TCP only, which is what `Daemon::bind` reported at `WARN`.
-            serve::serve(&self.listener, &loop_router, &supervisor, shutdown).await?;
+            serve_loop(&self.listener, &loop_router, &supervisor, shutdown).await?;
             return Ok(());
         };
 
         // Both halves need to observe the same shutdown, and a `Future` is not `Clone`, so it is
         // driven once inside a broadcast: the TCP loop and the datagram relay each hold a
         // receiver and stop when the sender fires.
-        let service = crate::datagram::DatagramService {
+        let service = DatagramService {
             ingress: Arc::clone(ingress),
             router: Arc::new(DatagramRouterForGeneration {
                 generations: Arc::clone(&self.generations),
             }),
-            options: crate::datagram::RelayOptions::default(),
-            stats: self.datagram_stats.as_ref().map_or_else(
-                || Arc::new(crate::datagram::DatagramStats::default()),
-                Arc::clone,
-            ),
+            options: RelayOptions::default(),
+            stats: self
+                .datagram_stats
+                .as_ref()
+                .map_or_else(|| Arc::new(DatagramCounters::default()), Arc::clone),
         };
         let signal = Arc::new(tokio::sync::Notify::new());
         let notify = Arc::clone(&signal);
@@ -278,8 +278,8 @@ impl Daemon {
             async move { signal.notified().await }
         };
         let (stopped, datagrams, ()) = tokio::join!(
-            crate::serve::serve(&self.listener, &loop_router, &supervisor, tcp),
-            crate::datagram::serve_datagrams(
+            serve_loop(&self.listener, &loop_router, &supervisor, tcp),
+            daer_relay::relay::serve_datagrams(
                 Arc::clone(&service.ingress),
                 Arc::clone(&service.router),
                 service.options,
@@ -321,7 +321,7 @@ impl Daemon {
 #[derive(Debug)]
 pub enum BindError {
     /// The transparent port could not be bound.
-    Ingress(crate::error::IngressError),
+    Ingress(RelayError),
     /// The configuration does not compile.
     Config(ReloadError),
 }
@@ -337,7 +337,7 @@ impl std::fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
-/// A [`Decide`](crate::serve::Decide) that reads the *current* generation per flow.
+/// A [`Decide`](Decide) that reads the *current* generation per flow.
 ///
 /// Without this the loop would hold the router of the generation it started with, and a
 /// reload would change nothing until the loop restarted — which is exactly the connection
@@ -346,27 +346,27 @@ struct RouterForGeneration {
     generations: Arc<Generations>,
 }
 
-impl crate::serve::Decide for RouterForGeneration {
-    type Upstream = <Router as crate::serve::Decide>::Upstream;
+impl Decide for RouterForGeneration {
+    type Upstream = <Router as Decide>::Upstream;
     type Future<'a>
-        = <Router as crate::serve::Decide>::Future<'a>
+        = <Router as Decide>::Future<'a>
     where
         Self: 'a;
 
-    fn decide<'a>(&'a self, flow: &'a crate::inbound::Accepted) -> Self::Future<'a> {
+    fn decide<'a>(&'a self, flow: &'a daer_relay::Accepted) -> Self::Future<'a> {
         // `current()` is an atomic read of an `Arc`, so this is cheap on the hot path. The
         // `Arc` is moved into the future: it is what pins this flow to the rules it arrived
         // under, even if a reload swaps the generation while the flow is being opened.
         let generation = self.generations.current();
         Box::pin(async move {
             let router = generation.router();
-            crate::serve::Decide::decide(router, flow).await
+            Decide::decide(router, flow).await
         })
     }
 }
 
-/// A [`DatagramRouter`](crate::datagram::DatagramRouter) that reads the *current*
-/// generation per session.
+/// A [`DatagramRouter`](daer_relay::DatagramRouter) that reads the *current* generation
+/// per session.
 ///
 /// The datagram half had no equivalent of [`RouterForGeneration`]: it captured one
 /// `Arc<Router>` when the relay started, so a `SIGHUP` reload changed nothing for UDP. New
@@ -382,7 +382,7 @@ impl std::fmt::Debug for DatagramRouterForGeneration {
     }
 }
 
-impl crate::datagram::DatagramRouter for DatagramRouterForGeneration {
+impl daer_relay::DatagramRouter for DatagramRouterForGeneration {
     fn known_domain(&self, destination: SocketAddr) -> Option<String> {
         self.generations
             .current()
@@ -390,44 +390,22 @@ impl crate::datagram::DatagramRouter for DatagramRouterForGeneration {
             .known_domain(destination)
     }
 
-    fn verdict_for_datagram(
-        &self,
-        facts: crate::inbound::FlowFacts,
-        domain: Option<&str>,
-    ) -> crate::decide::Verdict {
-        self.generations
-            .current()
-            .router()
-            .verdict_for_datagram(facts, domain)
-    }
-
-    fn dial_target(&self, facts: crate::inbound::FlowFacts, domain: Option<&str>) -> String {
-        self.generations
-            .current()
-            .router()
-            .dial_target(facts, domain)
-    }
-
     fn open_datagram<'a>(
         &'a self,
-        facts: crate::inbound::FlowFacts,
-        verdict: &'a crate::decide::Verdict,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Arc<dyn daer_outbound::DatagramConnector>,
-                        crate::error::IngressError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        // The generation is pinned into an `Arc` before the future is created: it is what
-        // keeps this session's rules alive even if a reload swaps the generation mid-dial.
+        facts: FlowFacts,
+        domain: Option<&'a str>,
+    ) -> daer_relay::OpenDatagram<'a> {
+        // The generation is pinned into an `Arc` *before* the future is created: it is what
+        // keeps this session's rules alive, and what stops a reload landing between the
+        // verdict and the dial from changing where the flow goes.
         let generation = self.generations.current();
         Box::pin(async move {
-            crate::decide::Router::open_datagram(generation.router(), facts, verdict).await
+            let router = generation.router();
+            let verdict = router.verdict_for_datagram(facts, domain);
+            router
+                .open_datagram(facts, &verdict, domain)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 }

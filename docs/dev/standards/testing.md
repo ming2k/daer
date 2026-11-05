@@ -56,6 +56,7 @@ cargo xtask ci
 # Run tests for a specific crate
 cargo test -p daer-routing
 cargo test -p daer-control
+cargo test -p daer-relay
 
 # Run eBPF kernel check (requires root and CAP_BPF / CAP_NET_ADMIN)
 cargo xtask kernel-check

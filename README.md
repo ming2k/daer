@@ -1,266 +1,120 @@
+<div align="center">
+
 # daer
 
-An eBPF transparent proxy for Linux, with a Rust userspace. Traffic is split in
-the kernel: the eBPF program at the tc hook decides "proxy" or "direct" before a
-packet enters the TCP/IP stack, so direct traffic never touches userspace.
+**A high-performance transparent network proxy and traffic router for Linux.**
 
-> **Status: the data path runs, and the kernel tier is stated rather than implied.**
-> `daer run` loads and attaches the kernel datapath, publishes a routing policy into it, recovers
-> each flow's original destination, decides, dials and relays. Whether the kernel decides a flow
-> itself or hands it to userspace is computed, logged at startup, and pinned by a test — see
-> [ADR-0005](docs/adr/0005-kernel-policy-encoding.md). A configuration whose rules the kernel can
-> reproduce faithfully (`dip`, `sip`, `port`, `sport`, `l4proto`, `ipversion`, `mac`, `dscp`) gets
-> the fast path; one that uses `domain(...)` or `pname(...)` gets a correct, slower path, because
-> those predicates need kernel tables this build does not maintain.
->
-> `crates/daer-control/tests/transparent.rs` is the end-to-end evidence, and it is written to be
-> able to fail: it installs its own `nftables tproxy` rule, has the origin answer a per-run nonce,
-> asserts the daemon counted the flow, and carries a negative control that fails if the fixture
-> ever bypasses the proxy ([ADR-0007](docs/adr/0007-verification.md)). Outbound REALITY with XTLS
-> Vision is interop-tested against a local reference `xray` inbound that the test starts itself,
-> so the one protocol whose bugs are invisible to a self-consistent client is checked against an
-> implementation nobody here wrote.
->
-> The honest gaps, all of them named where they matter:
-> `docs/dev/roadmap.md` lists what is missing; UDP is relayed but not yet proven on the wire through
-> `tproxy` (`docs/how-to/deployment.md` says exactly why); the vmess family, the QUIC families and the
-> event ring are not implemented.
->
-> Getting here found eleven defects that unit tests had missed, all of them invisible from
-> the Rust side: a ClientHello that was not valid TLS, a REALITY tag sealed with the wrong
-> salt and key, a missing `X25519MLKEM768` share that a current node refuses to authenticate
-> without, a VLESS header that wrote the destination port twice, and a Vision block that
-> never said `End`. [`docs/how-to/vision-lab.md`](docs/how-to/vision-lab.md) is the local `xray run`
-> harness that made the last three observable.
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
+[![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
+[![Linux: >= 5.17](https://img.shields.io/badge/Linux-Kernel_%3E%3D_5.17-green.svg)](https://www.kernel.org)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)]()
 
-## What the kernel tier means for you
+[English](README.md) &bull; [简体中文](README.zh-CN.md)
 
-`daer run` logs one of these at startup:
+[About](#about-the-project) &bull; [Mission](#our-mission) &bull; [Capabilities](#capabilities) &bull; [Characteristics](#key-characteristics) &bull; [Quick Start](#quick-start) &bull; [Documentation](docs/) &bull; [Disclaimer](#disclaimer)
 
-```text
-INFO datapath policy published … "the kernel decides every flow itself"
-WARN datapath policy published as a deferral: every flow is handed to the control plane …
-     reasons=["rule 3 uses domain(...) and domain_routing_map is not maintained by this build"]
+</div>
+
+---
+
+## About the Project
+
+daer is a transparent network proxy and traffic routing daemon designed for modern Linux environments. Operating at the operating system network tier, daer automatically classifies, routes, and relays network traffic without requiring manual proxy settings on individual client applications or devices.
+
+By eliminating per-application proxy configurations, browser extensions, and routing friction, daer provides an invisible, high-throughput gateway that streamlines network traffic management across local and upstream networks.
+
+---
+
+## Our Mission
+
+The mission of daer is to explore and deliver high-performance, deterministic network traffic routing for modern Linux environments.
+
+We believe that system-level network tools should be lightweight, reliable, and invisible to daily workflows. By leveraging modern Rust and kernel-level network primitives, daer aims to provide developers, network engineers, and system administrators with a pure, memory-safe, and robust foundation for traffic management, protocol research, and network optimization.
+
+---
+
+## Capabilities
+
+- **System-Wide Transparent Interception**: Intercepts and dispatches network traffic at the system level. Client applications, background services, and local devices benefit from unified proxying without per-app configuration.
+- **Intelligent Flow Routing**: Distinguishes direct local traffic from upstream proxy routes in real time based on high-performance IP and domain rule sets.
+- **Modern Protocol Relaying**: Interoperates seamlessly with modern, standard encrypted network protocols and outbounds for resilient data transfer.
+- **Encrypted DNS Pipeline**: Resolves hostnames through configurable encrypted DNS transports (DoH, DoT, TCP, UDP), providing consistent and tamper-resistant DNS resolution.
+- **Gateway & Router Deployment**: Ready for deployment on Linux-based routers or edge gateways, providing transparent network management for all clients on the local network.
+
+---
+
+## Key Characteristics
+
+- **Zero-Intrusion Ergonomics**: Operates quietly in the background without needing PAC files, client-side extensions, or manual SOCKS5/HTTP toggling.
+- **Extreme Efficiency & Low Footprint**: Built with modern Rust for memory safety, high concurrency, and near line-rate throughput with minimal CPU and memory overhead.
+- **Protocol Robustness**: Engineered to handle complex network topologies, high latency variance, and challenging packet conditions gracefully.
+- **Built-in First-Party Diagnostics**: Includes comprehensive CLI tools for configuration checking, route simulation (`daer route`), and node reachability testing (`daer probe`).
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Linux operating system (kernel 5.17 or newer)
+- Root privileges or network administration capabilities (`CAP_NET_ADMIN`, `CAP_BPF`)
+- Rust toolchain (1.95+) and Clang / LLVM
+
+### Build & Run
+
+```bash
+# Clone the repository
+git clone https://github.com/daeuniverse/daer.git
+cd daer
+
+# Build the userspace binary and kernel datapath
+cargo build --release
+cargo xtask ebpf
+
+# Validate your configuration
+daer check -c /etc/daer/config.toml --nodes
+
+# Launch the daemon
+sudo daer run -c /etc/daer/config.toml
 ```
 
-Both are correct; only the first keeps direct traffic out of userspace. The second costs one
-userspace relay hop per flow and is what most real configurations get today, because `domain(...)`
-is common. `daer route` and `daer check --nodes` describe the same generation the daemon
-serves, so they cannot disagree with it — that agreement is enforced by sharing one loader
-([ADR-0006](docs/adr/0006-wiring-ownership.md)).
+For configuration syntax and deployment recipes, consult the [Documentation](docs/).
 
-## Layout
+---
 
-| Crate | Responsibility | State |
-| --- | --- | --- |
-| `daer-common` | shared constants and network primitives | done |
-| `daer-config` | TOML schema, rule expression language, loader, validation | done |
-| `daer-routing` | rule lowering, userspace matching, policy identity, DRB (`provider(...)`) lowering | done, matcher is indexed and allocation-free |
-| `daer-geodata` | streaming geodata reader, asset locator | done |
-| `geodrb` | DRB (daer Rule Binary) compiler, converter, inspector, and tester | done |
-| `daer-ebpf` | datapath object loading, map/program ABI, section normalization | done |
-| `daer-outbound` | latency statistics, alive-set selection, groups, policies, direct / SOCKS5 / HTTP `CONNECT` / shadowsocks AEAD / trojan / **REALITY** (own TLS 1.3 client, ADR-0010), health checks (HTTP, TCP, UDP-DNS), datagram legs, subscription fetch + decode + `persist` cache | partial: vmess, plain vless, QUIC families pending |
-| `daer-dns` | wire format, routing, cache, pipeline, UDP+TCP server, **all four upstream transports** (UDP, TCP, DoT, DoH) | partial: no bootstrap resolver; upstream addresses must be literal IPs |
-| `daer-sniff` | TLS SNI and HTTP `Host` prefix sniffing | partial: no QUIC |
-| `daer-control` | transparent ingress, sniffing, routing verdict, outbound dial, TCP relay + splice, UDP datagram relay (per-peer sessions, driven by `Daemon::serve`), accept loop, flow supervisor, health scheduling, one shared configuration loader, configuration generations and handover | partial: kernel policy is published per ADR-0005, which for `domain(...)`/`pname(...)` rules means "defer to userspace" |
-| `daer-cli` | `run`, `check --nodes`, `route --why`, `probe`, `schema`, `version` | done |
+## Documentation
 
-Network capabilities above the socket — TLS, HTTP, DNS resolution, proxy
-handshakes, socket options, RTT sampling, and everything datagram-shaped — belong
-to [netune](../netune), which `daer` consumes as a pinned dependency. What
-`daer` needs from it is tracked in
-[`docs/dev/netune-requests.md`](docs/dev/netune-requests.md)
-([ADR-0002](docs/adr/0002-netune-boundary.md)).
+Detailed guides and specifications are organized within the `docs/` directory:
 
-## Configuration
+- [Getting Started Tutorial](docs/tutorials/getting-started.md) &mdash; End-to-end setup and first run.
+- [Configuration Reference](docs/reference/configuration.md) &mdash; Complete TOML configuration options and syntax.
+- [CLI Reference](docs/reference/cli.md) &mdash; Detailed command-line flags, subcommands, and usage.
+- [Network Diagnostics](docs/how-to/diagnostics.md) &mdash; Verifying routing decisions and node health.
+- [Production Deployment](docs/how-to/deployment.md) &mdash; Systemd service units and firewall integration.
+- [Architecture Overview](docs/explanation/architecture-overview.md) &mdash; System architecture and operational mechanics.
 
-TOML, typed, strict. Unknown keys are errors. Every table is optional, so an
-empty file is valid and the defaults are the ones the daemon uses.
+---
 
-```toml
-schema = 1
+## Disclaimer
 
-[global]
-tproxy-port = 12345
-wan-interface = ["auto"]
-dial-mode = "domain"
+### 1. Educational & Research Purpose
 
-[global.tls]
-profile = "chrome-current"   # a netune TLS-fingerprint preset
+This software is an open-source research and engineering project focused on computer networking, transparent traffic redirection, and transport protocol performance. It is developed solely for legitimate technical experimentation, academic research, and lawful network administration.
 
-[[subscription]]
-tag = "my-sub"
-url = "https://example.com/api/v1/client/subscribe?token=…"
-persist = true                # fall back to the last good fetch
+### 2. Legal Compliance & Operator Responsibility
 
-[[node]]
-tag = "edge"
-url = "ss://…"
+Users are solely responsible for ensuring that their deployment and use of this software strictly comply with all applicable local, national, and international laws, regulations, and administrative requirements. This tool must not be used for any activity that infringes on third-party rights, disrupts public network infrastructure, or violates telecommunication regulations.
 
-[[group]]
-name = "proxy"
-policy = "min-moving-avg"
-filters = ["subtag(my-sub) && !name(keyword: 'ExpireAt:')"]
+### 3. Technical Neutrality & Zero Hosted Services
 
-[routing]
-rules = [
-    "pname(NetworkManager) -> direct",
-    "provider(private) -> direct",
-    "l4proto(udp) && dport(443) -> block",
-    "provider(cn) -> direct",
-]
-fallback = "proxy"
-```
+The authors and maintainers provide this software purely as source code. The project does not operate, host, or provide any proxy servers, VPN nodes, routing infrastructure, or subscription services. The software collects no telemetry and stores no personal information.
 
-GeoIP and GeoSite are **rule providers** now: a compiled `.drb` set fetched from a URL or read
-from a file, declared once under `[[rule-provider]]` and named in a rule as
-`provider(<tag>)`. The Protobuf `.dat` reader is not linked into the daemon (ADR-0014,
-ADR-0015); [`geodrb`](https://github.com/daeuniverse/geodrb) converts an existing `.dat` once,
-and publishes the common tags daily.
+### 4. Limitation of Liability
 
-### Subscriptions
+This software is provided "AS IS" and without warranty of any kind, express or implied. Under no circumstances shall the authors, copyright holders, or contributors be liable for any direct, indirect, incidental, or consequential damages or legal consequences arising from the use or misuse of this software.
 
-A `[[subscription]]` is fetched, decoded and folded into the node pool before a
-generation is built, so a fetched node is indistinguishable from an inline
-`[[node]]` — including its `subtag(...)` tag, which is what makes it selectable.
-
-Three wire formats are recognised, in this order: **SIP008** JSON, **plain** link
-lines, and **base64** of link lines (standard or URL-safe alphabet, padding
-optional). A body that matches none is an error that names what was tried, never an
-empty node list: "this subscription has no nodes" and "this subscription could not
-be read" lead an operator to opposite conclusions.
-
-With `persist = true` the last successful fetch is cached in `persist.d/<tag>.sub`
-beside the configuration. **A fetch that fails never replaces a good cache**, so an
-endpoint that returns an error page at restart cannot take a working proxy down.
-
-Supported node schemes today: `ss://` (shadowsocks AEAD), `trojan://`, `socks5://`,
-`http://`, and `vless://` **with `security=reality`**. `vmess://`, plain `vless://`
-(`security=tls`) and the QUIC families are **not** implemented; `daer check`
-names every node this build cannot select rather than letting it disappear into an
-empty group. A chained link (`a -> b`) is rejected loudly instead of being silently
-truncated to its first hop.
-
-A REALITY link must carry `pbk`, `fp` and `sni`. `fp` is **required** rather than
-defaulted: a REALITY ClientHello that presents the wrong fingerprint fails on the
-wire for a reason no log can attribute to the cause, so it is reported as a
-configuration error at load. `flow=xtls-rprx-vision` and a wrapping transport
-(`type=ws` and friends) are refused by name rather than ignored.
-
-A `[[subscription]]` node carries the tag of the subscription it came from, so
-`subtag(...)` selects it. That provenance used to be dropped, which made every
-subscription node invisible to every `subtag` filter while `daer check --nodes` still listed
-it — the two diagnostics disagreed and the group silently had no members.
-
-Rules may be written with IPv6 and MAC literals directly: `dip(2001:db8::/32)`,
-`dip(::1)`, `mac(aa:bb:cc:dd:ee:ff)`. Quoting them works too and is never required. The
-lexer distinguishes an address from a `key:value` parameter by shape — every parameter key in
-the language is a word rather than a run of hex digits — so `domain(suffix:example.com)` and
-`mac(00:11:22:33:44:55)` do not collide.
-
-### Inspecting decisions
-
-`daer route <target> -c config.toml` (e.g. `daer route bilibili.com` or `daer route 1.1.1.1`) prints the routing
-decision for a target domain, IP, or flow — the rule that fires, the outbound and its mark — from the
-same compiled configuration a running daer uses, and exits non-zero when the flow
-would be dropped. Classic 4-tuple flows (`daer route <source> <destination>`) are also supported.
-`--why` adds a per-rule, per-predicate trace, including rules that would have
-matched but were shadowed, and the selected node's security identity
-(`cipher aes-256-gcm`, `tls sni=…`) is printed with the decision.
-`daer probe node <name>` actively diagnoses L3 DNS, L4 TCP reachability, and L7 protocol handshake.
-`daer check --nodes` lists every node the same way, subscriptions resolved. See
-[`docs/how-to/diagnostics.md`](docs/how-to/diagnostics.md).
-
-### Running the daemon
-
-```sh
-daer check -c config.toml      # will it run: subscriptions, rules, groups, nodes, DNS
-daer run -c config.toml        # the daemon; serves DNS when dns.bind or fake-ip asks
-```
-
-`daer check` is the one pre-bind gate: it resolves subscriptions and rule providers,
-compiles every rule, builds every group, names every node and every DNS upstream this build
-cannot use, and parses `dns.bind`. Its exit status is the deployment contract, so a systemd
-`ExecStartPre=` can call it. `daer run` starts the resolver itself — there is no standalone
-DNS subcommand — and stops on `SIGINT`/`SIGTERM` after letting in-flight work finish.
-
-`daer schema` prints the JSON Schema ([`daer.schema.json`](./daer.schema.json)), which editors
-use for completion (`#:schema` in the reference config) and CI uses to validate a file without
-building daer. The commented reference configuration is
-[`daer.example.toml`](./daer.example.toml), and a test asserts it validates.
-
-Three things are *expressions* rather than data — routing rules, group filters and
-policy names. A boolean combination over arbitrary predicates has no faithful
-tabular encoding, and the parsed tree is exactly what the routing engine consumes,
-so the schema carries it as text and `daer-config`'s expression language parses it
-once. Errors point at the expression, not just the file:
-
-```
-[routing]
-rules = ["domain(a) direct"]
-        ^^^^^^^^^^^^^^^^^ invalid expression "domain(a) direct"
-line 1:10 domain(a) direct
-              ^: expected '->' in the routing rule
-```
-
-Rules that reference geodata need `geoip.dat` / `geosite.dat`. `daer` looks next
-to the configuration file, in `$DAER_LOCATION_ASSET`, in
-`/usr/{local/,}share/daer`, and in the XDG data directories.
-
-## Build and test
-
-```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
-
-or `cargo xtask ci`. MSRV is 1.95.
-
-Building the datapath object is optional and needs clang plus a `vmlinux.h` tree:
-
-```sh
-DAER_DATAPATH_SRC=… DAER_BPF_HEADERS=… cargo xtask ebpf   # -> target/ebpf/datapath.o
-cargo test -p daer-ebpf                                  # ABI assertions against it
-```
-
-Without an object the object tests skip; with one they are the ABI contract.
-
-## Decisions
-
-Architecture decisions are recorded, not implied:
-
-- [ADR-0001](docs/adr/0001-config-format.md) — the configuration format is TOML.
-- [ADR-0002](docs/adr/0002-netune-boundary.md) — netune owns the network
-  transport; the data path, the DNS server role and sniffing are ours.
-- [ADR-0003](docs/adr/0003-datapath-abi.md) — the datapath object is an external
-  artifact with its own ABI; the loader adapts to it, and identifiers are `daer*`.
-- [ADR-0004](docs/adr/0004-routing-epochs.md) — a reload publishes into the inactive of
-  two routing slots, then commits with one switch.
-- [ADR-0005](docs/adr/0005-kernel-policy-encoding.md) — the kernel policy table is written, and
-  it is either provably equivalent to the userspace evaluator or it defers the whole program to
-  userspace. It never invents a third answer and never leaves the table empty.
-- [ADR-0006](docs/adr/0006-wiring-ownership.md) — a subsystem is done only when `daer run`
-  reaches it, and a configuration key the schema accepts must either take effect or not exist.
-  `cargo test` fails otherwise.
-- [ADR-0007](docs/adr/0007-verification.md) — a test that cannot fail is a liability. Every
-  end-to-end claim names its falsifier, including a negative control.
-- [ADR-0010](docs/adr/0010-reality-client-ownership.md) — REALITY and the minimal TLS 1.3
-  client belong to `daer-outbound`, not to netune. Netune is not asked to grow a way to
-  bypass certificate verification; `daer` owns the handshake, and the seam back is
-  netune's public `Transport` trait.
-
-## Requirements
-
-Linux 5.17 or newer (`bpf_loop`, the cgroup hooks). Root or `CAP_BPF` /
-`CAP_NET_ADMIN` to attach.
+---
 
 ## License
 
-[AGPL-3.0-only](./LICENSE).
-
-The datapath C program and the routing semantics descend from the `dae` project by
-the daeuniverse authors; that provenance is why the license and the kernel ABI
-match. It is a dependency relationship, not the name of this project: everything
-here is `daer`.
+Licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE).

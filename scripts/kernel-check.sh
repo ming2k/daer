@@ -33,7 +33,27 @@ skips=0
 say()   { printf '%s%s%s\n' "$1" "$2" "$OFF"; }
 ok()    { printf '%s  ok  %s %s\n' "$GREEN" "$OFF" "$1"; }
 bad()   { printf '%s fail %s %s\n' "$RED" "$OFF" "$1"; failures=$((failures + 1)); }
-skip()  { printf '%s skip %s %s\n' "$YELLOW" "$OFF" "$1"; skips=$((skips + 1)); }
+skip()  {
+    # A skip is a fact on a developer's box and a hole in CI. `DAER_REQUIRE` names the checks that
+    # must **not** skip here, as a comma-separated list of keys (`"7-tcp,8"`); a skip in one of
+    # them is a failure, because a green run that proved nothing is the exact failure mode
+    # ADR-0007 exists to prevent.
+    #
+    # Keys rather than section numbers: the UDP half of section 7 has a named prerequisite (a
+    # second network namespace) that a container cannot satisfy, so promoting it to a failure
+    # would make the whole gate unrunnable where it matters most. It stays a skip that states
+    # its reason, and `docs/dev/roadmap.md` carries it as the open gap it is.
+    local key="$1" message="$2"
+    if [[ -n "$key" && ",${DAER_REQUIRE:-}," == *",$key,"* ]]; then
+        printf '%s fail %s %s (check %s is in DAER_REQUIRE=%s, so a skip is a failure)\n' \
+            "$RED" "$OFF" "$message" "$key" "$DAER_REQUIRE"
+        failures=$((failures + 1))
+        return
+    fi
+    printf '%s skip %s %s\n' "$YELLOW" "$OFF" "$message"
+    skips=$((skips + 1))
+}
+
 # Not named `head`: defining a function called `head` shadows the command for the rest of
 # the script, so any later `head -3` calls the function instead. That is what silently broke
 # the failure output the first time this ran.
@@ -98,7 +118,7 @@ if command -v capsh >/dev/null 2>&1; then
     fi
 fi
 if [[ "$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo 0)" != "0" ]]; then
-    skip "unprivileged_bpf_disabled is set; only real capabilities work (this is fine as root)"
+    skip "env-bpf" "unprivileged_bpf_disabled is set; only real capabilities work (this is fine as root)"
 fi
 
 section "2. datapath object"
@@ -140,12 +160,28 @@ else
     fi
 fi
 
+# Section 8 sends `SIGHUP` to a live `daer run`, which needs the transparent port — so the binary
+# is built here as well. Its own skip path covers a box where the bind fails anyway.
+if ! as_builder env -u SUDO_USER cargo test -p daer-cli --test reload --no-run \
+        >"$logs/build-reload.log" 2>&1; then
+    bad "the reload test binary did not build; see $logs/build-reload.log"
+    binary_reload=""
+else
+    binary_reload="$(ls -t target/debug/deps/reload-* 2>/dev/null \
+        | grep -v '\.d$' | head -n 1)"
+    if [[ -z "$binary_reload" ]]; then
+        bad "no reload test binary under target/debug/deps"
+    else
+        ok "binary: $binary_reload"
+    fi
+fi
+
 # Runs one test by name with root privileges, logs it, and reports pass/fail.
 # `sudo` wraps the binary only — never cargo.
 run_one() {
     local name="$1" log="$2" description="$3"
     if [[ -z "$binary" ]]; then
-        skip "$description (no binary)"
+        skip "kernel-binary" "$description (no binary)"
         return
     fi
     if [[ ! -x "$binary" ]]; then
@@ -212,25 +248,61 @@ fi
 # (ADR-0007: "an ignored test that no script runs is how a vacuous test survives").
 section "7. the transparent data path (a real tproxy redirect into a real origin)"
 if ! command -v nft >/dev/null 2>&1; then
-    skip "nft is not installed; the transparent-path test cannot install its redirect"
+    skip "7-tcp" "nft is not installed; the transparent-path test cannot install its redirect"
 elif [[ -z "$binary_transparent" ]]; then
-    skip "no transparent test binary (run \`cargo test --no-run\`)"
+    skip "7-tcp" "no transparent test binary (run \`cargo test --no-run\`)"
 else
     # The test needs a working loopback address and the daemon's transparent port; a fresh
     # namespace is not required, and this script must not disturb the operator's rules — the
     # test creates and removes its own `ip daer-test` table.
     if "$binary_transparent" --nocapture --test-threads=1 >"$logs/transparent.log" 2>&1 \
             && grep -q "test result: ok" "$logs/transparent.log"; then
-        if grep -q "^skipped:" "$logs/transparent.log"; then
-            skip "the transparent tests skipped themselves; see $logs/transparent.log"
-        else
+        # Report each data path separately. Grepping for *any* `skipped:` line and calling the
+        # whole section a skip was wrong: the datagram test skips itself on a box that cannot
+        # create a second network namespace while the TCP path — the one that matters — passes,
+        # and the operator read "skip" as "nothing was proven".
+        if grep -q "a_redirected_flow_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
             ok "a redirected flow reached the daemon, was proxied, and the origin's nonce came back"
-            grep -E "test result|^test " "$logs/transparent.log" | sed 's/^/       /'
+        else
+            bad "the TCP data path did not report a pass; see $logs/transparent.log"
         fi
+        if grep -q "a_redirected_datagram_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
+            ok "a redirected datagram reached the daemon and the reply came back to the client port"
+        else
+            skip "7-udp" "the UDP path skipped itself (a second network namespace is needed); see $logs/transparent.log"
+        fi
+        grep -E "^test " "$logs/transparent.log" | sed 's/^/       /'
     else
         bad "the transparent data path failed; see $logs/transparent.log"
         perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent.log" 2>/dev/null \
             | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
+    fi
+fi
+
+section "8. reload: a SIGHUP must not abort the daemon"
+#
+# `daer run` used to panic on its *first* `SIGHUP` — `reload` called `block_on` from inside the
+# multi-threaded runtime ("Cannot start a runtime from within a runtime"), so the main task died
+# and every in-flight flow with it. No unit test could have caught it: the defect is in the
+# interaction between the signal loop and the runtime, so it needs a real process and a real
+# signal. Section 7 is the detour that made it look like a configuration problem.
+if [[ -z "$binary_reload" ]]; then
+    skip "8" "no reload test binary (run \`cargo test --no-run\`)"
+elif [[ ! -x "$binary_reload" ]]; then
+    bad "reload test binary is not executable: $binary_reload"
+else
+    if "$binary_reload" --nocapture --test-threads=1 >"$logs/reload.log" 2>&1 \
+            && grep -q "test result: ok" "$logs/reload.log"; then
+        if grep -q "skipped: the daemon could not start here" "$logs/reload.log"; then
+            skip "8" "the reload test skipped itself; see $logs/reload.log"
+        else
+            ok "the daemon survived SIGHUP and published generation 2"
+        fi
+    else
+        bad "reload failed; see $logs/reload.log"
+        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/reload.log" 2>/dev/null \
+            | awk '/panicked|Cannot start a runtime|did not publish|must not abort/\
+                   {print "       " $0; if (++n == 3) exit}'
     fi
 fi
 

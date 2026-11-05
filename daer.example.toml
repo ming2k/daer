@@ -132,7 +132,9 @@ ipversion-prefer = 0
 # A name instead of an address is rejected for now — bootstrapping an upstream is a
 # resolver problem of its own — so the address is written out.
 upstream = ["alidns:udp://223.5.5.5:53", "googledns:tcp://8.8.8.8:53"]
-# An IP, not an address: the port is always 53. `--listen ip:port` overrides it.
+# An IP, not an address: the port is always 53 (the removed `daer dns` verb's `--listen`
+# flag is what used to override it, and nothing replaces it — a resolver that is not on 53 is
+# not the box's resolver).
 #bind = "0.0.0.0"
 optimistic-cache = true
 optimistic-cache-ttl = 60

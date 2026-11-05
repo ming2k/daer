@@ -24,6 +24,59 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # `docs/dev/standards/workflow.md` says the kernel datapath and the REALITY interop are
+  # fixtures CI exercises, and until this job existed that sentence was false: `cargo test
+  # --workspace` runs `tests/transparent.rs` on a stock runner where it skips itself (no
+  # CAP_NET_ADMIN), and it does not install `xray`, so `tests/reality_interop.rs` skipped too.
+  # Two green ticks over two skips is exactly what ADR-0007 forbids, so both get a job here and
+  # `DAER_REQUIRE` turns a skip in either into a failure.
+  kernel-datapath:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the fixture tools
+        # `xray` is the reference implementation the interop test spawns; `nftables` is what the
+        # transparent test installs its own redirect with. Both are released binaries, not
+        # services, so the gate needs no credential and no uptime from anyone.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables curl unzip
+          curl -fsSL -o /tmp/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip
+          sudo unzip -o -q /tmp/xray.zip xray -d /usr/local/bin
+          xray version
+      - name: Kernel datapath and reload (tproxy, eBPF attach, SIGHUP)
+        # Sections 7 (TCP) and 8 are the ones a stock kernel can satisfy; 7-udp needs a second
+        # network namespace, which a container cannot create, so it stays a stated skip.
+        env:
+          DAER_REQUIRE: "7-tcp,8"
+        run: cargo xtask kernel-check
+      - name: REALITY + Vision interop against the reference node
+        # Captured, then inspected: the test skips itself when it cannot find `xray`, and a skip
+        # that reads as a pass is the failure this job exists to end.
+        run: |
+          set -o pipefail
+          cargo test -p daer-proxy-protocols --test reality_interop --locked -- --nocapture \
+            2>&1 | tee /tmp/interop.log
+          if grep -q "skipped: no \`xray\` binary" /tmp/interop.log; then
+            echo "::error::the REALITY interop suite skipped; it is the only end-to-end gate on that path"
+            exit 1
+          fi
+      - name: A TLS stream through the tunnel (the case plaintext tests cannot see)
+        # Vision only takes its raw-copy path for TLS, so a plaintext payload passes even when the
+        # client is broken — which is exactly how the `Direct` defect shipped. This is the gate
+        # that would have caught it.
+        run: |
+          set -o pipefail
+          cargo test -p daer-proxy-protocols --test vision_tls_inside --locked -- --nocapture \
+            2>&1 | tee /tmp/tls-inside.log
+          if grep -q "skipped: no \`xray\` binary" /tmp/tls-inside.log; then
+            echo "::error::the inner-TLS suite skipped; it is the only gate on Vision's raw-copy path"
+            exit 1
+          fi
+
   # The datapath is C from upstream; the object test is the ABI contract with it.
   # It is a separate job because it needs clang and the kernel headers, which the
   # fast job must not wait for.

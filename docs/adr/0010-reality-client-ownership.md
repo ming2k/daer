@@ -9,10 +9,11 @@ supersedes: []
 
 # 0010. REALITY and the minimal TLS 1.3 client belong to daer-outbound
 
-- Status: Accepted
+- Status: Accepted (Amended by [ADR-0017](0017-proxy-protocols-crate-boundary.md): migrated to `daer-proxy-protocols`)
 - Date: 2026-10-29
 - Deciders: Ming Li
 - Related: [ADR-0002](0002-netune-boundary.md),
+  [ADR-0017](0017-proxy-protocols-crate-boundary.md),
   [netune ADR-0009](../../../netune/docs/adr/0009-reality-client-authentication-not-a-netune-capability.md),
   [netune ADR-0004](../../../netune/docs/adr/0004-tls-fingerprint-profiles-pool-isolation.md)
 

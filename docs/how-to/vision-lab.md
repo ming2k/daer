@@ -77,7 +77,7 @@ Then:
 ```sh
 setsid /tmp/xray run -c server.json > /tmp/lab/reality.log 2>&1 < /dev/null &
 DAER_REALITY_LINK='vless://<uuid>@127.0.0.1:18443?encryption=none&security=reality&flow=xtls-rprx-vision&sni=www.microsoft.com&pbk=<PublicKey>&sid=ef37119567cd97&type=tcp&fp=chrome#lab' \
-    cargo test -p daer-outbound --test vision_uplink_dump -- --nocapture --include-ignored
+    cargo test -p daer-proxy-protocols --test vision_uplink_dump -- --nocapture --include-ignored
 ```
 
 `dest` must be a **real** site on 443. REALITY mimics the target's handshake record lengths,
@@ -101,7 +101,7 @@ frames:
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout key.pem -out cert.pem -days 2 -nodes -subj /CN=apple.com
-cargo test -p daer-outbound --test vision_lab -- --nocapture --include-ignored
+cargo test -p daer-proxy-protocols --test vision_lab -- --nocapture --include-ignored
 ```
 
 Use an **ECDSA** certificate: `rustls` offers a narrow signature-algorithm list and the
@@ -133,17 +133,34 @@ Run the ignored ones with `-- --include-ignored`.
 the one CI relies on. It needs no configuration and no credential:
 
 ```sh
-cargo test -p daer-outbound --test reality_interop -- --nocapture
-XRAY_BIN=../Xray-core/xray cargo test -p daer-outbound --test reality_interop
+cargo test -p daer-proxy-protocols --test reality_interop -- --nocapture
+XRAY_BIN=../Xray-core/xray cargo test -p daer-proxy-protocols --test reality_interop
 ```
 
-It generates a key pair with `xray x25519`, starts an inbound on a free port, and asserts that
-a request comes back as a bare `HTTP/1.` response — then asserts the *two* negations that make
-that assertion mean something: a wrong `pbk` must be refused rather than forwarded, and a
-server that speaks no REALITY must not be accepted. Without those, a client that accepted any
-TLS server would pass.
+It generates a key pair with `xray x25519`, starts a REALITY inbound on a free port **and its own
+TLS 1.3 impersonation target** from `crates/daer-proxy-protocols/tests/fixtures/` (a seven-certificate
+chain, so the handshake has the record lengths REALITY needs to mimic), points the node's
+`freedom` outbound at a local HTTP origin, and asserts that the origin's body comes back through
+the tunnel: `Content-Length`, then the exact bytes. Then it asserts the *two* negations that make
+that assertion mean something: a wrong `pbk` must be refused rather than forwarded, and a server
+that speaks no REALITY must not be accepted. Without those, a client that accepted any TLS server
+would pass.
 
-`DAER_REALITY_DEST` overrides the impersonated site (default `www.microsoft.com:443`). It must
-be a **real** site on 443: REALITY mimics the target's handshake record lengths, so a small
-certificate makes the *server* fail its own padding check with `payload[0]: 8, padding: -4`,
-which reads like a client bug and is not one.
+Everything is local, so the gate is deterministic: it used to point `dest` at
+`www.microsoft.com:443` and ask the node to reach `example.com:80`, which made the one test able
+to catch a REALITY regression depend on two third parties.
+
+Two fixture details are load-bearing and were both wrong at first:
+
+- the local TLS target must present a **realistically large** chain. REALITY mimics the
+  destination's handshake record lengths, and a small certificate makes the **node** fail its own
+  padding check (`payload[0]: 8, padding: -4`), which reads like a client bug;
+- since Xray v26.4.15 a `freedom` outbound blocks private and reserved destinations by default
+  for flows that arrived through a proxy inbound, and **blackholes** them for 30-90 s. A local
+  origin is a private address, so the node answers `blocked target: … blackholing connection` and
+  the client sees an empty reply — indistinguishable from a broken tunnel. The fixture grants
+  `finalRules: [{action: allow, ip: ["127.0.0.0/8"]}]`; a production node must not.
+
+`DAER_REALITY_DEST` overrides the impersonated site with a real one instead
+(`DAER_REALITY_DEST=www.microsoft.com:443`), and `DAER_REALITY_SNI` names the SNI when the
+destination is an address rather than a hostname.

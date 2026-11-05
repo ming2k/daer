@@ -9,6 +9,8 @@ members = [
     "crates/daer-ebpf",
     "crates/daer-geodata",
     "crates/daer-outbound",
+    "crates/daer-proxy-protocols",
+    "crates/daer-relay",
     "crates/daer-routing",
     "crates/daer-sniff",
     "crates/geodrb",
@@ -41,6 +43,8 @@ daer-dns = { path = "crates/daer-dns" }
 daer-ebpf = { path = "crates/daer-ebpf" }
 daer-geodata = { path = "crates/daer-geodata" }
 daer-outbound = { path = "crates/daer-outbound" }
+daer-proxy-protocols = { path = "crates/daer-proxy-protocols" }
+daer-relay = { path = "crates/daer-relay" }
 daer-routing = { path = "crates/daer-routing" }
 daer-sniff = { path = "crates/daer-sniff" }
 

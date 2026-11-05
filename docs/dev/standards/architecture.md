@@ -12,18 +12,22 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Layer 4: Host Binary & CLI (`crates/daer-cli`)                        │
 │  - Unified single public executable (`daer`)                           │
-│  - Service runtime (`run`, which also serves DNS)                     │
-│  - Inspection & diagnostics (`check`, `route`, `probe`, `schema`)       │
+│  - Service runtime (`run`, which also serves DNS)                      │
+│  - Inspection & diagnostics (`check`, `route`, `probe`, `schema`)      │
 ├────────────────────────────────────────────────────────────────────────┤
-│  Layer 3: Control Plane & Ingress Relay                                │
-│  - Transparent ingress & flow supervisor: `crates/daer-control`        │
+│  Layer 3: Decision Plane & Userspace Data Path                         │
+│  - Routing decisions, node selection, health scheduling:               │
+│    `crates/daer-control`                                               │
+│  - Transparent ingress, splice, UDP sessions, flow supervision:        │
+│    `crates/daer-relay` (ADR-0018)                                      │
 │  - Integrated DNS pipeline & cache: `crates/daer-dns`                  │
 │  - Generation management & zero-downtime hot reload                    │
 ├────────────────────────────────────────────────────────────────────────┤
 │  Layer 2: Domain Engines & Capabilities                                │
 │  - Rule lowering & indexed matching: `crates/daer-routing`             │
-│  - Outbound dialers, groups & REALITY client: `crates/daer-outbound`   │
-│  - Prefix protocol sniffing (TLS SNI, HTTP Host, QUIC): `daer-sniff`  │
+│  - Outbound groups, alive sets, probes: `crates/daer-outbound`         │
+│  - Proxy protocol implementations: `crates/daer-proxy-protocols`       │
+│  - Prefix protocol sniffing (TLS SNI, HTTP Host, QUIC): `daer-sniff`   │
 │  - Streaming geo database reader: `crates/daer-geodata`                │
 ├────────────────────────────────────────────────────────────────────────┤
 │  Layer 1: Kernel Datapath & Core Foundation                            │
@@ -52,11 +56,20 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 
 ### 2.4 Netune Boundary Purity ([INV-NETUNE-01])
 - **Red-Line**: Generic network capabilities belong to `netune`; proxy appliance data path, eBPF maps, transparent accept, and proxy protocols stay in `daer` (ADR-0002).
-- **Enforcement**: `daer` consumes `netune` as a pinned dependency. `daer` does not implement generic TLS, HTTP codecs, or raw SOCKS5/CONNECT framing. The only exception is REALITY (ADR-0010), where custom unauthenticated TLS 1.3 client mechanics are owned directly by `daer-outbound`.
+- **Enforcement**: `daer` consumes `netune` as a pinned dependency. `daer` does not implement generic TLS, HTTP codecs, or raw SOCKS5/CONNECT framing. The only exception is REALITY (ADR-0010), where custom unauthenticated TLS 1.3 client mechanics are owned directly by `daer-proxy-protocols`.
 
 ### 2.5 Dual-Slot Epoch Atomic Handover ([INV-EPOCH-01])
 - **Red-Line**: Kernel policy updates during reload must NEVER mutate live active routing tables in-place.
 - **Enforcement**: The datapath maintains two alternating policy slots (`slot 0` and `slot 1`). The userspace daemon fully compiles and populates the inactive slot before flipping the atomic `active_slot` integer, guaranteeing zero-downtime hot reload without transient policy gaps (ADR-0004).
+
+### 2.6 Data Path Stays Stable ([INV-RELAY-01])
+- **Red-Line**: `daer-relay` decides nothing. It must not depend on `daer-config`, `daer-outbound`, `daer-routing` or `daer-proxy-protocols`, and its public seam must not name a routing concept (ADR-0018).
+- **Enforcement**: The seam is `daer_relay::Decide` (a stream per accepted flow) and `daer_relay::DatagramRouter` (a `DatagramLeg` per datagram flow). A `Verdict`, a group or a policy appearing in either signature is a red-line breach: it would make every new selection concept a change to the code that forwards bytes, and it would put the accept loop's failure modes behind a routing configuration instead of a test double.
+
+### 2.7 Proxy Protocols Are Not Re-Exported ([INV-PROTO-01])
+- **Red-Line**: `daer-outbound` owns outbound governance, not protocol implementations, and does not re-export the latter's types (ADR-0017). The only exception is `daer_outbound::fragment`, which `DialerOptions` carries as a value.
+- **Enforcement**: `cargo tree -p daer-outbound --depth 1` must show no `quinn`, `h3`, `rustls`, `x25519-dalek`, `ml-kem` or AEAD crate. A protocol type reachable through the governance crate's root would announce a boundary it does not own, and would let a future selection feature reach a handshake without naming `daer-proxy-protocols`.
+
 
 ---
 

@@ -59,6 +59,18 @@ impl Protocol {
     }
 }
 
+impl From<daer_proxy_protocols::ProxyProtocol> for Protocol {
+    fn from(proto: daer_proxy_protocols::ProxyProtocol) -> Self {
+        match proto {
+            daer_proxy_protocols::ProxyProtocol::ShadowSocks => Self::ShadowSocks,
+            daer_proxy_protocols::ProxyProtocol::Trojan => Self::Trojan,
+            daer_proxy_protocols::ProxyProtocol::AnyTls => Self::AnyTls,
+            daer_proxy_protocols::ProxyProtocol::Hysteria2 => Self::Hysteria2,
+            daer_proxy_protocols::ProxyProtocol::Reality => Self::Reality,
+        }
+    }
+}
+
 /// What a dialer is, independent of how it connects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Property {
@@ -330,7 +342,7 @@ fn security_of(protocol: &Protocol, link: &str, address: &str) -> Security {
         Protocol::ShadowSocks => {
             // A shadowsocks link carries the cipher in its base64 credentials; only the name is
             // needed, and an unparseable link reports why rather than a guess.
-            match crate::shadowsocks::Link::parse(link) {
+            match daer_proxy_protocols::shadowsocks::Link::parse(link) {
                 Ok(parsed) => Security::Cipher {
                     name: parsed.cipher.to_string(),
                     authenticated: true,
@@ -345,7 +357,7 @@ fn security_of(protocol: &Protocol, link: &str, address: &str) -> Security {
                 }
             }
         }
-        Protocol::Trojan => match crate::trojan::Link::parse(link) {
+        Protocol::Trojan => match daer_proxy_protocols::trojan::Link::parse(link) {
             Ok(parsed) => Security::Tls {
                 server_name: parsed.server_name,
                 allow_insecure_requested: parsed.allow_insecure,
@@ -402,7 +414,7 @@ fn security_of(protocol: &Protocol, link: &str, address: &str) -> Security {
         // An unknown scheme is not evidence of plaintext. `vmess://` and
         // `vless://` carry their own cryptography; reporting them as plaintext
         // would be a false alarm that trains an operator to ignore the report.
-        Protocol::Reality => match crate::reality::connector::Link::parse(link) {
+        Protocol::Reality => match daer_proxy_protocols::reality::connector::Link::parse(link) {
             Ok(parsed) => Security::Reality {
                 server_name: parsed.server_name().to_owned(),
                 fingerprint: parsed.fingerprint().to_owned(),

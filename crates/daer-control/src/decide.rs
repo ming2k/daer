@@ -49,21 +49,21 @@ use std::time::Duration;
 use daer_common::net::MacAddr;
 use daer_config::{Config, FunctionOrString};
 use daer_outbound::{
-    DatagramConnector, Dialer, DialerGroup, DialerId, DialerOptions, DirectDialer, FilterSet,
-    NodeDialer, NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
+    Dialer, DialerGroup, DialerId, DialerOptions, DirectDialer, FilterSet, NodeDialer,
+    NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
     parse_group_policy,
 };
 
+use daer_relay::relay::DatagramLeg;
+use daer_relay::{Accepted, FlowFacts, RelayError};
 use daer_routing::{
     AliasOptimizer, DeduplicateParamsOptimizer, MatchFacts, MatchSet, MergeAndSortOptimizer,
     NormalizedProgram, Outbound, RecordingSink, RoutingError, RulesBuilder, Trace, first_hit,
-    is_builtin_outbound, parse_outbound,
+    is_builtin_outbound, outbound_name, parse_outbound,
 };
 use daer_routing::{L4ProtoMask, ProcessName};
 
-use crate::error::IngressError;
 use crate::generation::GenerationId;
-use crate::inbound::{Accepted, FlowFacts};
 
 /// What the routing program decided for one flow.
 ///
@@ -164,7 +164,7 @@ impl Explanation {
     /// meaningless.
     #[must_use]
     pub fn outbound_is_actionable(&self) -> bool {
-        if &*self.outbound.name == "block" {
+        if &*self.outbound.name == outbound_name::BLOCK {
             return false;
         }
         // `direct` and any built-in outbound are always actionable; only a group has
@@ -552,10 +552,10 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`IngressError::Relay`] when the veredict is `block`, when the group
+    /// Returns [`RelayError::Relay`] when the veredict is `block`, when the group
     /// has no selectable node, or when the dial fails. The flow is closed by the
     /// caller in every one of those cases.
-    pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, IngressError> {
+    pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, RelayError> {
         // 1. Check if destination IP maps to a domain via Fake-IP or DNS Snooping.
         let known_domain = self.known_domain(flow.destination);
 
@@ -601,7 +601,7 @@ impl Router {
     }
 
     /// Dials the outbound leg for a decided flow.
-    pub async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, IngressError> {
+    pub async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, RelayError> {
         self.dial_with_authority(flow, verdict, None).await
     }
 
@@ -611,7 +611,7 @@ impl Router {
         flow: &Accepted,
         verdict: Verdict,
         domain_override: Option<&str>,
-    ) -> Result<Upstream, IngressError> {
+    ) -> Result<Upstream, RelayError> {
         let outbound = &verdict.outbound;
         // One structured event per decision: the first thing anyone needs when
         // asking "why did *this* connection go there?".
@@ -626,21 +626,21 @@ impl Router {
             "flow decided"
         );
 
-        if &*outbound.name == "block" {
-            return Err(IngressError::Rejected(crate::error::Reject::Blocked {
+        if &*outbound.name == outbound_name::BLOCK {
+            return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
                 destination: flow.destination,
             }));
         }
 
-        if &*outbound.name == "direct" {
+        if &*outbound.name == outbound_name::DIRECT {
             let direct_authority = flow.destination.to_string();
             let established = self
                 .direct
                 .connect(&direct_authority)
                 .await
-                .map_err(|error| IngressError::Dial {
+                .map_err(|error| RelayError::Dial {
                     destination: flow.destination,
-                    source: error,
+                    reason: error.to_string(),
                 })?;
             return Ok(established.stream);
         }
@@ -663,7 +663,7 @@ impl Router {
         destination: SocketAddr,
         group: &str,
         authority: &str,
-    ) -> Result<daer_outbound::Established, IngressError> {
+    ) -> Result<daer_outbound::Established, RelayError> {
         let node = self.select_node(destination, group)?;
         // The dial is wrapped so its span reaches the observer when one is installed. A group
         // whose dials are never measured is a group whose slowness has no explanation in any
@@ -676,9 +676,9 @@ impl Router {
         observed
             .connect(authority)
             .await
-            .map_err(|error| IngressError::Dial {
+            .map_err(|error| RelayError::Dial {
                 destination,
-                source: error,
+                reason: error.to_string(),
             })
     }
 
@@ -692,24 +692,24 @@ impl Router {
         &self,
         destination: SocketAddr,
         group: &str,
-    ) -> Result<Arc<NodeDialer>, IngressError> {
+    ) -> Result<Arc<NodeDialer>, RelayError> {
         let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
         let Some(route) = groups.get(group) else {
-            return Err(IngressError::Dial {
+            return Err(RelayError::Dial {
                 destination,
-                source: OutboundError::UnknownGroup(group.to_owned()),
+                reason: OutboundError::UnknownGroup(group.to_owned()).to_string(),
             });
         };
-        let dialer = route.group.select(None).ok_or_else(|| IngressError::Dial {
+        let dialer = route.group.select(None).ok_or_else(|| RelayError::Dial {
             destination,
-            source: OutboundError::NoAliveNode(group.to_owned()),
+            reason: OutboundError::NoAliveNode(group.to_owned()).to_string(),
         })?;
         route
             .node(dialer.id())
             .map(Arc::clone)
-            .ok_or_else(|| IngressError::Dial {
+            .ok_or_else(|| RelayError::Dial {
                 destination,
-                source: OutboundError::NoAliveNode(group.to_owned()),
+                reason: OutboundError::NoAliveNode(group.to_owned()).to_string(),
             })
     }
 
@@ -747,7 +747,7 @@ impl Router {
     #[must_use]
     pub fn dial_target(&self, facts: FlowFacts, domain: Option<&str>) -> String {
         let verdict = self.verdict_for_datagram(facts, domain);
-        if &*verdict.outbound.name == "direct" {
+        if &*verdict.outbound.name == outbound_name::DIRECT {
             return facts.destination.to_string();
         }
         match domain {
@@ -789,13 +789,14 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// [`Reject::Blocked`] when a rule matched `block`, and [`IngressError::Dial`]
+    /// [`Reject::Blocked`] when a rule matched `block`, and [`RelayError::Dial`]
     /// when the outbound cannot be resolved or the session cannot be opened.
     pub async fn open_datagram(
         &self,
         facts: FlowFacts,
         verdict: &Verdict,
-    ) -> Result<Arc<dyn DatagramConnector>, IngressError> {
+        domain: Option<&str>,
+    ) -> Result<DatagramLeg, RelayError> {
         let outbound = &verdict.outbound;
         tracing::debug!(
             generation = %self.generation,
@@ -808,25 +809,34 @@ impl Router {
             "datagram flow decided"
         );
 
-        if &*outbound.name == "block" {
-            return Err(IngressError::Rejected(crate::error::Reject::Blocked {
+        if &*outbound.name == outbound_name::BLOCK {
+            return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
                 destination: facts.destination,
             }));
         }
 
-        if &*outbound.name == "direct" {
+        // The target is *this* decision's answer and is returned with the connector. The
+        // relay must not ask again: a reload between two calls would let the flow be dialed
+        // to a target the rule that opened the leg never chose.
+        let target = self.dial_target(facts, domain);
+
+        if &*outbound.name == outbound_name::DIRECT {
             // The mark is already baked into `datagram_direct` when the generation
             // was built, so a per-flow copy would only add a rebuild.
-            return Ok(Arc::new(self.datagram_direct.clone()));
+            return Ok(DatagramLeg {
+                target,
+                connector: Arc::new(self.datagram_direct.clone()),
+            });
         }
 
         let group_name = outbound.name.clone();
         let node = self.select_node(facts.destination, &group_name)?;
 
-        node.datagram().ok_or(IngressError::Dial {
+        let connector = node.datagram().ok_or(RelayError::Dial {
             destination: facts.destination,
-            source: OutboundError::NoDatagramSupport(group_name.to_string()),
-        })
+            reason: OutboundError::NoDatagramSupport(group_name.to_string()).to_string(),
+        })?;
+        Ok(DatagramLeg { target, connector })
     }
 
     /// What a group would select right now, for diagnostics.
@@ -1445,11 +1455,11 @@ fn build_groups(
     Ok(groups)
 }
 
-impl crate::serve::Decide for Router {
+impl daer_relay::Decide for Router {
     type Upstream = Upstream;
     type Future<'a>
         = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Upstream, IngressError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Upstream, RelayError>> + Send + 'a>,
     >
     where
         Self: 'a;

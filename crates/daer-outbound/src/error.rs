@@ -54,3 +54,15 @@ impl fmt::Display for OutboundError {
 }
 
 impl std::error::Error for OutboundError {}
+
+impl From<daer_proxy_protocols::ProxyProtocolError> for OutboundError {
+    fn from(err: daer_proxy_protocols::ProxyProtocolError) -> Self {
+        match err {
+            daer_proxy_protocols::ProxyProtocolError::Timeout => Self::Timeout,
+            daer_proxy_protocols::ProxyProtocolError::Connect(msg) => Self::Connect(msg),
+            daer_proxy_protocols::ProxyProtocolError::UnsupportedLink(msg) => {
+                Self::UnsupportedLink(msg)
+            }
+        }
+    }
+}

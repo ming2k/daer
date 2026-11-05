@@ -497,7 +497,7 @@ async fn serve_until_signal(
                 return Ok(());
             }
             _ = hangup.recv() => {
-                reload(daemon, options, router_options, ebpf, health);
+                reload(daemon, options, router_options, ebpf, health).await;
             }
             _ = async {
                 match &mut provider_ticker {
@@ -506,7 +506,7 @@ async fn serve_until_signal(
                 }
             } => {
                 tracing::info!("rule provider refresh interval elapsed; refreshing rule providers");
-                reload(daemon, options, router_options, ebpf, health);
+                reload(daemon, options, router_options, ebpf, health).await;
             }
         }
         #[cfg(not(unix))]
@@ -658,7 +658,32 @@ impl HealthScheduler {
 }
 
 /// Re-reads the configuration and publishes it, reporting what happened.
-fn reload(
+/// Reloads on `SIGHUP`, keeping the running generation when anything fails.
+///
+/// # Why this is `async` and must stay that way
+///
+/// It used to be a synchronous function that called `super::block_on(...)` to re-run the shared
+/// loader. `block_on` builds a runtime and calls `Runtime::block_on`, and this function is
+/// called from inside `daemon.serve`'s `select!` — i.e. from inside the multi-threaded runtime.
+/// Tokio refuses that outright ("Cannot start a runtime from within a runtime"), so the *first*
+/// `SIGHUP` panicked the daemon in its main task: the accept loop stopped, the process printed a
+/// panic and exited, and every in-flight flow died with it. Reload is the one operation an
+/// operator reaches for to avoid a restart, so it failing by aborting the process is the worst
+/// possible shape for this bug.
+///
+/// Awaiting the loader directly is the fix and the compile-time guarantee: `load_resolved` is
+/// `async`, so nothing here can block a worker again without the compiler objecting.
+///
+/// # What a reload does *not* do
+///
+/// It runs inside the signal loop, so the accept loop is not polled while it awaits. A
+/// subscription fetch with a slow endpoint (the loader's budget is 20 s) therefore delays new
+/// accepts for up to that long: the kernel keeps the connections in the listener's backlog and
+/// nothing is dropped, but they are not served until the reload finishes. Moving it to a spawned
+/// task would fix the latency and is the right shape once reload also republishes kernel state
+/// under a lock — that is tracked in `docs/dev/roadmap.md` §2.5, together with the 1000-reload
+/// soak that would measure it.
+async fn reload(
     daemon: &Daemon,
     options: &RunOptions,
     router_options: &RouterOptions,
@@ -666,7 +691,7 @@ fn reload(
     health: &mut HealthScheduler,
 ) {
     let started = std::time::Instant::now();
-    let loaded = match super::block_on(daer_control::load_resolved(&options.config)) {
+    let loaded = match daer_control::load_resolved(&options.config).await {
         Ok(loaded) => loaded,
         Err(error) => {
             // A file that no longer parses is the common reload failure; the running policy
