@@ -7,34 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **REALITY sessions died immediately after authenticating** (`daer-outbound`). A REALITY node
-  flushes a legal zero-length `application_data` record right after the handshake;
-  `Tls13Connection::poll_read` answered it with `Ready(Ok(()))` and nothing written, which is
-  `AsyncRead`'s encoding for end-of-stream. Every proxied connection through every REALITY node
-  returned zero bytes while the node's own log showed the request served. The record is now
-  skipped and the loop pulls the next one; termination remains the peer's.
-- **`daer node convert` produced output that could not be loaded** (`daer-config`). Two defects,
-  both invisible in the printed text and fatal when pasted back: a nested table rendered as
-  `[reality]` instead of `[node.reality]`, and `tag` was emitted twice (once from `Node`, once
-  from its flattened endpoint), which TOML rejects as a duplicate key. The command now
-  serializes a one-element document so `toml` owns the table headers, and validates the node
-  before printing it, so a mistyped cipher reports
-  `unknown method 'aes-128-grm'` instead of emitting a block that fails later.
+## [0.0.5] - 2026-11-05
 
 ### Added
 
+- **DRB (daer Rule Binary) rule artifacts ([ADR-0014](docs/adr/0014-drb-rule-binary-and-providers.md), `[INV-DRB-01]`)**.
+  `geoip.dat` and `geosite.dat` are Protobuf streams, so loading `geosite:cn` meant running
+  varint decoding, string allocation, and a runtime sort and interval merge on every start —
+  a CPU burst on exactly the low-power gateways this runs on. A `.drb` artifact carries
+  intervals already merged and domain patterns already sorted by kind, behind a 56-byte header
+  with magic, format version, and a SHA-256 checksum, so loading performs zero merging and zero
+  normalization and a corrupt or truncated file is refused rather than half-loaded.
+  `crates/daer-routing/src/drb.rs`, with `IpIndex::from_merged` and
+  `DomainIndex::from_composite` building the indexes directly from those sections.
+- **`[[rule-provider]]` declarations (`[INV-PROVIDER-01]`)** — a rule set is
+  `type = "file"` or `"http"`, `format = "drb"` or `"text"`, with an optional `interval`.
+  Rules reach one through `provider(tag)`, or `ip(provider: tag)` / `domain(provider: tag)` to
+  take only part of it (`rule-set`/`ruleset` are accepted as aliases). HTTP providers cache
+  under `XDG_CACHE_HOME`, so a non-root user needs no `/etc` write to hold a rule set.
+- **`geodrb`, a separate binary for the producers** — `compile`, `inspect`, `convert`, `test`.
+  `daer` links no geodata reader and no converter, because a runtime that links a converter
+  grows a converter.
+- **`daer probe`** — tiered active diagnostics. `probe node <name>` reports L3 resolution, L4
+  TCP reachability, and L7 protocol handshake separately, so a firewall-dropped SYN and a wrong
+  REALITY key are distinguishable instead of both reading as "unreachable"; `probe url` drives
+  a request end to end.
+- **`daer route <target>`** — `daer route bilibili.com`, `daer route 1.1.1.1`. Routing lookup
+  in the vocabulary network engineers already use, without inventing a source IP and port for a
+  query that only concerns a destination. The 4-tuple form still works, and `--why` still
+  traces every rule and predicate including the shadowed ones.
 - **`daer-outbound/tests/reality_interop.rs`** — REALITY + Vision carried end to end against a
   local reference `xray` inbound that the test starts itself. This is the CI gate the path was
   missing: the pre-existing `reality_live.rs` is `#[ignore]` and needs a credentialed public
-  node, so nothing in CI exercised the code that the defect above broke. Two negative controls
+  node, so nothing in CI exercised the code that the defect below broke. Two negative controls
   make the positive assertion falsifiable: a wrong `pbk` must be refused rather than forwarded
   to the impersonated site, and a server that speaks no REALITY must not be accepted. Skips
   with a stated reason when no `xray` binary is present.
 
 ### Changed
 
+- **The CLI is `run`, `check`, `route`, `probe`, `schema`, `version`
+  ([ADR-0015](docs/adr/0015-cli-is-four-verbs.md), [ADR-0016](docs/adr/0016-cli-route-and-probe.md))**.
+  `dns serve`, `config validate|fmt|example`, `node convert`, and `rule compile|inspect|convert`
+  are gone; what they did is either a producer (`geodrb`), a declaration in the configuration
+  (`[[subscription]]` fills the node pool), or part of `daer check`. `daer check` resolves
+  subscriptions and rule providers, compiles every rule, builds every group, names every node
+  and upstream this build cannot use, and exits non-zero — it is the deployment gate, and
+  `daer run` starts the resolver itself rather than exposing a second entry point to it.
+  `crates/daer-cli/tests/surface.rs` asserts the dependency closure cannot regrow a producer.
+- **Every `geoip:`/`geosite:` reference is now an error that names its replacement** rather
+  than a silently empty rule set. `dip(geoip:cn)` reports that the `.dat` format is retired and
+  that `provider(<tag>)` is what to write.
 - **Build profiles trimmed for a workspace with 23 test targets** (`Cargo.toml`). `dev` and
   `test` now use `debug = "line-tables-only"` with `split-debuginfo = "unpacked"`, and
   dependencies carry no debuginfo. Measured effect: a test binary went from 77–192 MB to
@@ -44,6 +67,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cargo xtask ci` bounds its parallelism** to `nproc/2` (`DAER_CI_JOBS` overrides). Cargo's
   default starts all 23 test linkers at once, and the wall-clock cost was dominated by their
   contention rather than their work. The suite now runs in 37 s.
+
+### Removed
+
+- `crates/daer-routing/src/dat_reader.rs` — the streaming Protobuf reader for `geoip.dat` and
+  `geosite.dat`, replaced by DRB. `daer-geodata` keeps only what `geodrb convert` needs.
+- The `dns`, `config`, `node`, and `rule` verbs, and `route explain`/`route nodes`. They remain
+  as hidden stubs whose error names the replacement, so an existing script fails with a
+  sentence rather than silence.
+
+### Fixed
+
+- **The shipped systemd unit could not use the features it documented** (`install/daer.service`).
+  `ExecStartPre` called `daer config validate`, a verb ADR-0015 removed, so the unit's own
+  pre-start gate failed and the service never started; it now calls `daer check`. Separately,
+  HTTP rule providers cache under `$XDG_CACHE_HOME`/`$HOME/.cache` and that write is
+  best-effort, while `ProtectHome=true` makes the path unwritable — so under this unit a
+  provider silently lost its cache and the offline-resilience promise in ADR-0014 was
+  unreachable. `CacheDirectory=daer` with `DAER_RULE_CACHE_DIR` points the cache at a path the
+  sandbox actually grants.
+- **REALITY sessions died immediately after authenticating** (`daer-outbound`). A REALITY node
+  flushes a legal zero-length `application_data` record right after the handshake;
+  `Tls13Connection::poll_read` answered it with `Ready(Ok(()))` and nothing written, which is
+  `AsyncRead`'s encoding for end-of-stream. Every proxied connection through every REALITY node
+  returned zero bytes while the node's own log showed the request served. The record is now
+  skipped and the loop pulls the next one; termination remains the peer's.
+- **A converted node was TOML that could not be loaded** (`daer-config`). Two defects,
+  both invisible in the printed text and fatal when pasted back: a nested table rendered as
+  `[reality]` instead of `[node.reality]`, and `tag` was emitted twice (once from `Node`, once
+  from its flattened endpoint), which TOML rejects as a duplicate key. `to_toml_node` now
+  serializes a one-element document so `toml` owns the table headers, and validates the node
+  before returning it, so a mistyped cipher reports `unknown method 'aes-128-grm'` instead of
+  emitting a block that fails later. `from_link` stays parse-only: for a subscription, "well
+  formed and unsupported" has to survive to be reported by name.
 
 ## [0.0.4] - 2026-11-01
 
