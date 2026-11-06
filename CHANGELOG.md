@@ -7,6 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-11-06
+
+Three subsystems were reworked around one theme: a single declaration, and a gate that proves
+it is the single one. This is a patch bump because no configuration key was removed and no
+node type was dropped — a 0.0.6 configuration still loads — but the rule-artifact format, the
+protocol layer types and the generated kernel ABI all changed shape.
+
+### Added
+
+- **DRB v2 and the canonical rule source ([ADR-0031](docs/adr/0031-drb-v2-and-canonical-rules.md),
+  [ADR-0027](docs/adr/0027-one-intermediate-rule-set.md), `[INV-DRB-01]`).** `daer-rule-ast` is
+  the new intermediate form: every source is read into one `RuleSet`, and `daer-drb` — which
+  replaces `geodrb` — writes DRB v2 from it and nothing else. Two sources naming the same rules
+  therefore produce **byte-identical** artifacts, and `compile(decompile(drb)) == drb`.
+  `daer-geodata` and its Protobuf decoder are deleted, so the runtime can no longer be the
+  thing that speaks `.dat`. `daer-drb compile|decompile|inspect|test` is the operator's entry
+  point, and `crates/daer-cli/tests/surface.rs` asserts the daemon links none of it.
+- **A flat, front-coded domain table ([ADR-0032](docs/adr/0032-flat-front-coded-domain-table.md)).**
+  The reverse-label radix from ADR-0031 was measured at 1.002 nodes per rule — no sharing at
+  all — and 7x slower than a flat table on miss-heavy input. A reversed-label-sorted,
+  front-coded flat table replaces it: every published artifact is now smaller than its DRB v1
+  equivalent (geosite-cn −37%), and `crates/daer-routing/tests/artifact_budget.rs` pins size,
+  decode cost and the miss-vs-hit ratio so the next such change has to argue with numbers.
+- **VLESS as orthogonal layers ([ADR-0028](docs/adr/0028-protocol-layering.md)).** Transport
+  (`tcp`, `ws`) × security (`none`, `tls`, `reality`) × flow (`none`, `xtls-rprx-vision`), one
+  type per layer, composed in one place per protocol. Vision belongs to VLESS and REALITY is a
+  security layer, so neither can be configured on a protocol that cannot carry it, and an
+  unimplemented combination is a load error that names it — Vision over `ws` is refused because
+  the reference refuses it on both ends. `tests/layer_matrix.rs` starts one local `xray` with
+  five inbounds and takes a round trip through each reachable row, with a plaintext listener
+  dialled as `security=tls` as the negative control.
+- **VMess AEAD ([ADR-0030](docs/adr/0030-vmess-aead-only.md)).** The reference's KDF is a
+  nested HMAC over aliasing hashers, pinned by six vectors taken from `aead.KDF` itself; the
+  sealed header, the three size modes, both ciphers and both data planes are implemented. The
+  legacy handshake is not expressible — a non-zero `alterId` is a load error rather than a
+  silent downgrade to a replayable format. `tests/vmess_live.rs` takes a round trip through a
+  real `xray` inbound for `auto`, `aes-128-gcm` and `chacha20-poly1305`.
+- **Hysteria 2, complete ([ADR-0029](docs/adr/0029-hysteria2-socket-stack.md)).** The QUIC
+  endpoint is built from `AsyncUdpSocket` layers via
+  `Endpoint::new_with_abstract_socket`, so a wrapper cannot be forgotten: Salamander and Gecko
+  obfuscation, per-flow session ids, fragmentation and reassembly, the server's congestion-
+  control answer and Brutal are all on the datapath. Port hopping uses
+  `Endpoint::rebind_abstract`. `tests/hysteria2_live.rs` starts the reference server itself,
+  including one configured **with** Salamander, so the obfuscation is proven on the wire rather
+  than in a struct.
+- **`daer check --object` and `daer run --dry-run`
+  ([ADR-0025](docs/adr/0025-verification-at-the-privilege-boundary.md), `[INV-PREFLIGHT-01]`).**
+  `--object` validates a compiled datapath object — names, sections and BTF `func_info` —
+  against the ABI without loading it, which is the gate a packaging pipeline runs against the
+  artifact it is about to install. `--dry-run` reports the generation, the object and the
+  capabilities the next phase needs, and returns before the port is bound, the device pair is
+  created, any sysctl or policy route is written, or `bpf()` is called. Both need no
+  capability, and `crates/daer-cli/src/preflight.rs` enforces the separation by type: the
+  mutating calls live behind `Daemon::bind` and `datapath::attach`, which it never names.
+- **`daer probe` for links and subscriptions.** `probe node` accepts a direct node link as well
+  as a configured name, `--all` probes every node in a configuration, and `--file` probes every
+  node a subscription lists (one link per line, base64, or SIP008 JSON). All of them resolve
+  through one decoder, so a link in a file and the same link in a configuration cannot probe
+  differently.
+
+### Changed
+
+- **The kernel ABI is generated, and the checks that guard it are gates rather than prose
+  ([ADR-0021](docs/adr/0021-kernel-abi-single-source.md), `[INV-ABI-01]`).** `ebpf/abi.toml` is
+  the only declaration of map names, program names, discriminants and struct layouts;
+  `cargo xtask abi` writes both `ebpf/kern/daer_abi.h` and `crates/daer-ebpf/src/generated.rs`
+  from it, and the header emits `_Static_assert` for every size, alignment and field offset.
+  Three things had to change for that to be a mechanism instead of a claim:
+  - **The generated files are tracked.** `generated.rs` is a `pub mod` of a crate
+    `cargo test --workspace` compiles, and the generator lives in `xtask`, not in a `build.rs`.
+    Untracked — which is what ADR-0021 originally said, on reasoning that holds for the C header
+    and not for the Rust module — a fresh clone, a `git archive` tarball and the CI `test` job
+    all fail with `E0583: file not found for module 'generated'`, and the tree builds only where
+    a previous run happened to leave the file behind.
+  - **The drift gate runs on pull requests.** `cargo xtask abi --check` regenerates and compares
+    byte for byte, and is now a step in the `test` job. Its only caller had been
+    `cargo xtask ci`, which `.github/workflows/ci.yml` does not run, so `[INV-ABI-01]` was
+    enforced on a developer's machine and nowhere else.
+  - **Two privileged CI gates could skip without the job noticing.** `kernel-datapath` set
+    `DAER_REQUIRE: "7-tcp,8"` and `scripts/kernel-check.sh` emits neither key; an entry that
+    matches no skip is inert, so every check in that job could skip while it stayed green. The
+    keys are now the script's own (`kernel-binary,7`), the job builds the test object only
+    `cargo xtask ebpf --tests` produces (without it section 7 skipped for a second reason), and
+    `3-tcp,4` — the transparent data path and the `SIGHUP` reload — get the `e2e-ingress` job
+    they never had, because `scripts/e2e-check.sh` could already do that work with no caller.
+- **The datapath is a set of modules, and its tests are Rust
+  ([ADR-0024](docs/adr/0024-datapath-source-layout.md),
+  [ADR-0022](docs/adr/0022-datapath-tests-are-rust.md),
+  [ADR-0020](docs/adr/0020-datapath-is-daer-own.md)).** `ebpf/kern/tproxy.c` drops from 4,436
+  lines to an include list plus the licence string, with the logic split under
+  `ebpf/kern/src/` by **map ownership and attach domain** — the cut lines are what a module
+  writes and where it attaches, not directory convention. One translation unit is kept
+  deliberately: the 512-byte stack budget depends on clang seeing the whole call graph, so the
+  split is a source boundary and not a link boundary. The Go harness is replaced by
+  `crates/daer-ebpf/tests/datapath.rs`, which discovers the `pktgen_`/`setup_`/`check_` triples
+  from the object itself — a case list enumerated in Rust would be a second source that goes
+  stale the first time somebody adds a case.
+- **The loader loads; it does not repair.** `crates/daer-ebpf/src/elf.rs` is deleted. The C
+  spells section names the way `aya` parses them, so the load-time ELF/BTF rewrite that used to
+  paper over a mismatch is not just unnecessary but has nowhere to be added back silently. The
+  section-prefix rule is checked from `ebpf/abi.toml` instead.
+- **`DomainIndex`/`DomainKey` are gone
+  ([ADR-0033](docs/adr/0033-one-domain-table-two-vocabularies.md)).** One `DomainTable` serves
+  the artifact, the evaluator and inline rules, which removes the 38 ms per-generation bridge
+  between two structures that meant the same thing. Routing accepts only `full:` and `suffix:`
+  (a bare name is a suffix in both the configuration and a `.rules` file); `keyword:` and
+  `regex:` move to `daer-dns`, which owns the exclusion language that actually needs them, and
+  `aho-corasick` leaves `daer-routing`.
+- **`OpenDatagram` returns the dial target with the connector** (`DatagramLeg`) instead of the
+  relay asking twice (`dial_target` then `open_datagram`). The two calls could straddle a
+  reload, so a datagram flow could be dialed to a target that the rule which opened its leg had
+  never chosen.
+
+### Fixed
+
+- **`--dry-run` claimed to attach the datapath.** Its help text said "attach the datapath and
+  exit without serving", which is the opposite of what it does and of what
+  [ADR-0025](docs/adr/0025-verification-at-the-privilege-boundary.md) promises: the command
+  returns before any mutation, which is the only reason it needs no capability and the only
+  reason a dry run can be believed. The text now says what the code does, and distinguishes
+  itself from `--no-datapath`, which does serve and skips only the kernel half.
+- **The packaging plan installed a binary that no longer exists and gated on the network.**
+  `packaging/daer.plan.toml` shipped `geodrb`, deleted with ADR-0031, so a package build would
+  have failed at `install`; it installs `daer-drb` now. Its compile-time gate ran
+  `daer check --config daer.example.toml`, whose `[[rule-provider]]` tables are `http` sources,
+  so the gate needed the network and a published artifact to exist — and failed for reasons that
+  had nothing to do with the object it is supposed to validate. It now checks a self-contained
+  configuration, the same minimal one `cargo xtask preflight` writes, for the same reason.
+- **`cargo xtask e2e-check` did not exist.** `scripts/e2e-check.sh` was written to verify the
+  user-space ingress path and the `SIGHUP` reload, and nothing invoked it: `xtask` dispatched
+  only `kernel-check`. The two scripts answer different questions over different dependency
+  closures, so both are now named subcommands rather than one entry point.
+- **Documentation that pointed at what the tree no longer has.** `AGENTS.md` routed to
+  `docs/dev/standards/testing.md`, deleted in favour of
+  [ADR-0007](docs/adr/0007-verification.md); `docs/dev/standards/workflow.md` told contributors
+  to run `make ci`, and there is no `Makefile` — the gates live in `cargo xtask ci` — and named
+  `daer-outbound/tests/*` for suites that moved to `daer-proxy-protocols`. `docs/dev/build-and-run.md`
+  named crates (`daer-daemon`, `daer-ctl`), a script (`scripts/run-in-netns.sh`) and a
+  configuration path that have never existed in this tree; it now describes the tasks the
+  repository actually has.
+
 ## [0.0.6] - 2026-11-06
 
 ### Changed
@@ -31,28 +172,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the relay asking twice (`dial_target` then `open_datagram`). The two calls could straddle a
   reload, so a datagram flow could be dialed to a target the rule that opened its leg had never
   chosen.
-- **The kernel ABI and the checks that guard it are now a build artifact, not a convention.**
-  `ebpf/abi.toml` is the only place a map name, program name, discriminant or struct layout is
-  declared, and `cargo xtask abi` writes both `ebpf/kern/daer_abi.h` and
-  `crates/daer-ebpf/src/generated.rs` from it (ADR-0021, `[INV-ABI-01]`). Three things make
-  that hold rather than read well:
-  - **The generated files are tracked.** `generated.rs` is a `pub mod` of a crate
-    `cargo test --workspace` compiles, and the generator lives in `xtask`, not in a `build.rs`.
-    Untracked — which is what ADR-0021 originally said, on reasoning that holds for the C
-    header and not for the Rust module — a fresh clone, a `git archive` tarball and the CI
-    `test` job all fail with `E0583: file not found for module 'generated'`, and the tree
-    builds only where a previous run happened to leave the file.
-  - **The drift gate runs on pull requests.** `cargo xtask abi --check` compares
-    `abi.toml`, the header and the module byte for byte, and is now a step in the `test` job.
-    Its only caller used to be `cargo xtask ci`, which CI does not run, so the invariant was
-    enforced on a developer's machine and nowhere else.
-  - **The privileged CI gates can no longer skip silently.** `kernel-datapath` set
-    `DAER_REQUIRE: "7-tcp,8"` and `scripts/kernel-check.sh` emits neither key — an entry that
-    matches no skip is inert, so every check in that job could skip while it stayed green. The
-    keys are now the script's own (`kernel-binary,7`), the job builds the test object only
-    `cargo xtask ebpf --tests` produces (absent, section 7 skipped for a second reason), and
-    `3-tcp,4` — the transparent data path and the `SIGHUP` reload — get the `e2e-ingress` job
-    they never had, because `scripts/e2e-check.sh` existed with no caller.
 
 ### Fixed
 
@@ -126,6 +245,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did another. `direct`, `block`, `must_rules`, `<OR>`, `<AND>` and `<Control Plane Routing>` are
   now rejected as group names at load time, from one list in `daer-common` that the rule lowering
   also uses, so the two cannot drift apart.
+
 ### Removed
 
 - **`dial-mode` from the configuration reference.** It was documented (and in an ADR's key list)

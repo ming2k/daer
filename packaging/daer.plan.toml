@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.0.6"
+version = "0.0.7"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"
@@ -19,7 +19,21 @@ link_deps = [
 
 [[sources]]
 type = "http"
-sha256 = "157908247a66e97c2c71bd2d36fafd03e82e1d83bf4c4281e87a7623f83307b5"
+# Digest of the release tarball built from tag v${VERSION}.
+#
+# `packaging/` is excluded from the archive by `.gitattributes` (`export-ignore`). That is
+# not tidiness: this file pins the digest of the tarball it is used to build, so if it were
+# inside that tarball the digest would have to describe a file containing itself — changing
+# the digest changes the archive, which changes the digest. There is no fixed point, so the
+# package could never verify its own source. Excluding it is also the honest boundary: a
+# build recipe is not an input to the build it describes.
+#
+# Recompute after tagging, with the same recipe the plan requires:
+#   git archive --format=tar --prefix=daer-${VERSION}/ v${VERSION} | gzip -6 -n | sha256sum
+#
+# Empty means "not yet computed for this tag", and it is a hard error rather than a silent
+# pass: a package with no pinned source digest is a package nobody checked.
+sha256 = ""
 url = "https://github.com/ming2k/daer/archive/refs/tags/v${VERSION}.tar.gz"
 extract_to = "source"
 
