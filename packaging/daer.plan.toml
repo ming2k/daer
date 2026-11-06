@@ -22,17 +22,21 @@ type = "http"
 # Digest of the release tarball built from tag v${VERSION}.
 #
 # `packaging/` is excluded from the archive by `.gitattributes` (`export-ignore`). That is
-# not tidiness: this file pins the digest of the tarball it is used to build, so if it were
-# inside that tarball the digest would have to describe a file containing itself — changing
-# the digest changes the archive, which changes the digest. There is no fixed point, so the
-# package could never verify its own source. Excluding it is also the honest boundary: a
-# build recipe is not an input to the build it describes.
+# necessary but *not sufficient*: this file pins the digest of the tarball it is used to
+# build, so if it were inside that tarball the digest would have to describe a file containing
+# itself. Excluding it removes that self-reference and leaves the archive computable.
 #
-# Recompute after tagging, with the same recipe the plan requires:
-#   git archive --format=tar --prefix=daer-${VERSION}/ v${VERSION} | gzip -6 -n | sha256sum
+# It still cannot be committed, for a second reason: `git archive` writes a pax global header
+# carrying `comment=<commit sha>`, so the digest of a tree is a function of the commit that
+# contains it. Committing the value changes the commit, which changes the header, which changes
+# the digest — the same fixed point does not exist one level up. Pinning it inside the tree it
+# hashes is therefore impossible by construction, not merely inconvenient.
 #
-# Empty means "not yet computed for this tag", and it is a hard error rather than a silent
-# pass: a package with no pinned source digest is a package nobody checked.
+# A package build fills this in from the tag it is building:
+#   sha256=$(git archive --format=tar --prefix=daer-${VERSION}/ v${VERSION} \
+#            | gzip -6 -n | sha256sum | cut -d' ' -f1)
+# using exactly the recipe `[[sources]].url` resolves to. Empty is a hard error rather than a
+# silent pass: a package with no pinned source digest is a package nobody checked.
 sha256 = ""
 url = "https://github.com/ming2k/daer/archive/refs/tags/v${VERSION}.tar.gz"
 extract_to = "source"

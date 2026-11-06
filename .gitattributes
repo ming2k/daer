@@ -3,9 +3,11 @@
 #
 # `packaging/` is excluded because `packaging/daer.plan.toml` pins the SHA-256 of the
 # release tarball it is used to build. If the plan were inside that tarball, the digest
-# would have to describe a file containing itself: changing the digest changes the
-# archive, which changes the digest. There is no fixed point, so the package could never
-# verify its own source. Excluding the directory makes the digest computable and stable —
-# and it is the honest boundary anyway, since a build recipe is not an input to the build
-# it describes. `docs/`, `crates/` and `ebpf/` stay in: the package compiles and reads them.
+# would have to describe a file containing itself, and there is no fixed point — so the
+# package could never verify its own source. Excluding the directory makes the digest
+# computable, and it is the honest boundary anyway: a build recipe is not an input to the
+# build it describes. (The value still cannot be committed, because `git archive` embeds the
+# commit SHA in the archive's pax header; the plan explains why and names the recipe that
+# fills it in at package-build time.) `docs/`, `crates/` and `ebpf/` stay in: the package
+# compiles and reads them.
 packaging/ export-ignore
