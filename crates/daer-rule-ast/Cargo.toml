@@ -1,0 +1,18 @@
+[package]
+name = "daer-rule-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The format-neutral rule set: the single intermediate representation between rule readers and the DRB writer"
+
+[dependencies]
+ipnet.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

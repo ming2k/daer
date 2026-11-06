@@ -20,9 +20,12 @@ pub enum Protocol {
     AnyTls,
     /// Hysteria 2: proxy over QUIC with HTTP/3 authentication and UDP datagrams.
     Hysteria2,
-    /// REALITY: `vless` authenticated by a ClientHello session-id tag, with the presented
-    /// certificate belonging to an impersonated site rather than to the node.
-    Reality,
+    /// VLESS: a UUID-authenticated session, with any of the three security layers
+    /// (ADR-0028). The identity is the protocol, not the handshake: `vless` over TLS and `vless`
+    /// over REALITY are the same protocol.
+    Vless,
+    /// VMess AEAD (ADR-0030).
+    Vmess,
     /// Any other link scheme; kept verbatim until the protocol layer claims it.
     Other(String),
 }
@@ -38,7 +41,8 @@ impl Protocol {
             "trojan" | "trojan-go" => Self::Trojan,
             "anytls" => Self::AnyTls,
             "hysteria2" | "hy2" => Self::Hysteria2,
-            "vless" => Self::Reality,
+            "vless" => Self::Vless,
+            "vmess" => Self::Vmess,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -53,7 +57,8 @@ impl Protocol {
             Self::Trojan => "trojan",
             Self::AnyTls => "anytls",
             Self::Hysteria2 => "hysteria2",
-            Self::Reality => "vless",
+            Self::Vless => "vless",
+            Self::Vmess => "vmess",
             Self::Other(other) => other,
         }
     }
@@ -66,7 +71,8 @@ impl From<daer_proxy_protocols::ProxyProtocol> for Protocol {
             daer_proxy_protocols::ProxyProtocol::Trojan => Self::Trojan,
             daer_proxy_protocols::ProxyProtocol::AnyTls => Self::AnyTls,
             daer_proxy_protocols::ProxyProtocol::Hysteria2 => Self::Hysteria2,
-            daer_proxy_protocols::ProxyProtocol::Reality => Self::Reality,
+            daer_proxy_protocols::ProxyProtocol::Vless => Self::Vless,
+            daer_proxy_protocols::ProxyProtocol::Vmess => Self::Vmess,
         }
     }
 }
@@ -117,8 +123,6 @@ pub enum Security {
     Reality {
         /// The site being impersonated.
         server_name: String,
-        /// The TLS fingerprint the node expects.
-        fingerprint: String,
     },
     /// A scheme this build does not implement.
     ///
@@ -163,10 +167,9 @@ impl Security {
                     format!("cipher {name} (unauthenticated, rejected)")
                 }
             }
-            Self::Reality {
-                server_name,
-                fingerprint,
-            } => format!("reality impersonating {server_name} (fp={fingerprint})"),
+            Self::Reality { server_name } => {
+                format!("reality impersonating {server_name}")
+            }
             Self::Unimplemented { scheme } => {
                 format!("{scheme} (not implemented by this build)")
             }
@@ -242,29 +245,27 @@ impl Property {
             ),
             daer_config::NodeEndpoint::Hysteria2(n) => (
                 Protocol::Hysteria2,
-                format!("{}:{}", n.server, n.port),
+                format!("{}:{}", n.server, n.ports.to_link_port()),
                 true,
                 Security::Tls {
                     server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
                     allow_insecure_requested: n.allow_insecure,
                 },
             ),
+            // The security layer decides what is reported, not the protocol: a `vless` node over
+            // plain TLS is not REALITY, and claiming it is would be a false statement about the
+            // wire (ADR-0028).
             daer_config::NodeEndpoint::Vless(n) => (
-                Protocol::Reality,
+                Protocol::Vless,
                 format!("{}:{}", n.server, n.port),
-                false,
-                Security::Reality {
-                    server_name: n
-                        .reality
-                        .as_ref()
-                        .map(|r| r.sni.clone())
-                        .unwrap_or_else(|| n.server.clone()),
-                    fingerprint: n
-                        .reality
-                        .as_ref()
-                        .and_then(|r| r.fingerprint.clone())
-                        .unwrap_or_else(|| "chrome".to_owned()),
-                },
+                n.flow.is_vision(),
+                security_property(&n.security, &n.server),
+            ),
+            daer_config::NodeEndpoint::Vmess(n) => (
+                Protocol::Vmess,
+                format!("{}:{}", n.server, n.port),
+                true,
+                security_property(&n.security, &n.server),
             ),
             daer_config::NodeEndpoint::Unsupported { scheme, .. } => (
                 Protocol::Other(scheme.clone()),
@@ -414,13 +415,20 @@ fn security_of(protocol: &Protocol, link: &str, address: &str) -> Security {
         // An unknown scheme is not evidence of plaintext. `vmess://` and
         // `vless://` carry their own cryptography; reporting them as plaintext
         // would be a false alarm that trains an operator to ignore the report.
-        Protocol::Reality => match daer_proxy_protocols::reality::connector::Link::parse(link) {
-            Ok(parsed) => Security::Reality {
-                server_name: parsed.server_name().to_owned(),
-                fingerprint: parsed.fingerprint().to_owned(),
+        Protocol::Vless | Protocol::Vmess => match daer_config::NodeEndpoint::from_link(link) {
+            Ok(endpoint) => match &endpoint {
+                daer_config::NodeEndpoint::Vless(node) => {
+                    security_property(&node.security, &node.server)
+                }
+                daer_config::NodeEndpoint::Vmess(node) => {
+                    security_property(&node.security, &node.server)
+                }
+                _ => Security::Unimplemented {
+                    scheme: "not a vless/vmess link".to_owned(),
+                },
             },
             Err(error) => Security::Unimplemented {
-                scheme: format!("vless ({error})"),
+                scheme: format!("vless/vmess ({error})"),
             },
         },
         Protocol::Other(scheme) => Security::Unimplemented {
@@ -508,6 +516,30 @@ pub fn parse_group_policy(policy: &FunctionOrString) -> Result<GroupPolicy, Stri
     }
 }
 
+/// Reports what security layer a parsed node actually applies.
+///
+/// A report that called every `vless` node REALITY would be wrong for a node over plain TLS,
+/// and a wrong report about which handshake is on the wire trains an operator to ignore the
+/// report (ADR-0028).
+fn security_property(security: &daer_config::SecurityConfig, server: &str) -> Security {
+    match security {
+        daer_config::SecurityConfig::None {} => Security::None,
+        daer_config::SecurityConfig::Tls(tls) => Security::Tls {
+            server_name: tls.sni.clone().unwrap_or_else(|| server.to_owned()),
+            allow_insecure_requested: tls.allow_insecure,
+        },
+        // REALITY's ClientHello is built by `daer-proxy-protocols` byte by byte, not by a
+        // netune fingerprint preset: `RealityParams` carries an SNI, a public key, a short-id
+        // and an ALPN list, and no fingerprint. Reporting `fp=<alpn[0]>` here (which is what
+        // this did) put a value in a report that no code path reads, and reading `h2` where a
+        // fingerprint belongs is worse than reading nothing. The honest report is what the
+        // layer actually holds.
+        daer_config::SecurityConfig::Reality(reality) => Security::Reality {
+            server_name: reality.sni.clone(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,9 +548,14 @@ mod tests {
     fn maps_protocol_schemes() {
         assert_eq!(Protocol::from_scheme("SOCKS5"), Protocol::Socks5);
         assert_eq!(Protocol::from_scheme("socks"), Protocol::Socks5);
+        // `vmess` and `vless` are protocols now (ADR-0028/ADR-0030), not "other". A scheme with
+        // no layer behind it stays `Other`, which is what the report uses to say "unimplemented"
+        // rather than guessing.
+        assert_eq!(Protocol::from_scheme("vmess"), Protocol::Vmess);
+        assert_eq!(Protocol::from_scheme("vless"), Protocol::Vless);
         assert_eq!(
-            Protocol::from_scheme("vmess"),
-            Protocol::Other("vmess".to_owned())
+            Protocol::from_scheme("tuic"),
+            Protocol::Other("tuic".to_owned())
         );
     }
 
@@ -535,9 +572,19 @@ mod tests {
         assert_eq!(property.address, "proxy.example:8080");
         assert!(!property.udp);
 
+        // A `vmess://` payload that is not base64 JSON still reports the *protocol* correctly:
+        // the report's job is to name what the link claims, and the dial-time refusal names why
+        // it cannot be used.
         let property = Property::from_link("future", "vmess://eyJhZGQiOiJ4In0", "");
-        assert_eq!(property.protocol, Protocol::Other("vmess".to_owned()));
-        assert_eq!(property.address, "eyJhZGQiOiJ4In0");
+        assert_eq!(property.protocol, Protocol::Vmess);
+        assert!(
+            matches!(
+                property.security,
+                Security::Unimplemented { ref scheme } if scheme.contains("vmess")
+            ),
+            "{:?}",
+            property.security
+        );
     }
 
     #[test]

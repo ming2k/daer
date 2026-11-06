@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Kernel-side ABI shared with `control/kern/tproxy.c`.
+//! Kernel-side ABI shared with `ebpf/kern/tproxy.c`.
 //!
-//! The datapath C program is not rewritten in this migration phase; daer loads
-//! the same object the loader consumes. These types therefore have to stay byte-compatible
-//! with the C declarations, and the assertions at the bottom of the module fail
-//! the build if they ever drift.
+//! Both sides are daer's own source (ADR-0020), so these types have to stay
+//! byte-compatible with the C declarations that live in the same repository, and the
+//! assertions at the bottom of the module fail the build if they ever drift. The C
+//! declarations are the ones in `ebpf/kern/tproxy.c`; the doc blocks below quote them
+//! so a reader can compare without opening a second file.
 
 /// Key of the connection-tracking maps (`fast_sock`, `tcp_offload_pause`,
 /// `conn_state_map`, ...).
@@ -55,22 +56,21 @@ pub use daer_common::net::PortRange;
 
 /// Runtime parameters written to the `PARAM` global before load.
 ///
-/// The C field names below belong to the *object*: they are its ABI, not daer's
-/// vocabulary. The Rust fields are named for what they carry, and only their
-/// order and size matter — `repr(C)` makes the layout positional.
+/// The Rust fields are named for what they carry, and only their order and size
+/// matter — `repr(C)` makes the layout positional.
 ///
 /// ```c
-/// struct dae_param {
+/// struct daer_param {
 ///     __u32 tproxy_port;
 ///     __u32 control_plane_pid;
-///     __u32 dae0_ifindex;
-///     __u32 dae_netns_id;
-///     __u8 dae0peer_mac[6];
+///     __u32 daer0_ifindex;
+///     __u32 daer_netns_id;
+///     __u8 daer0peer_mac[6];
 ///     __u8 padding_after_mac[2];
 ///     __u8 use_redirect_peer;
 ///     __u8 has_bpf_get_current_task;
 ///     __u16 datapath_generation;
-///     __u32 dae_socket_mark;
+///     __u32 daer_socket_mark;
 /// };
 /// ```
 #[repr(C)]
@@ -129,68 +129,27 @@ pub const MAX_MATCH_SET_LEN: usize = 1024;
 pub const ROUTING_EPOCH_SLOTS: u32 = 2;
 
 /// The width of one `struct match_set` in the kernel's layout.
-pub const MATCH_SET_SIZE: usize = 24;
+///
+/// Taken from the generated layout table rather than written here, so it cannot disagree
+/// with what `ebpf/abi.toml` declares and what the C compiles to (ADR-0021).
+pub const MATCH_SET_SIZE: usize = crate::generated::layout::match_set::SIZE;
 
 /// The width of one `struct lpm_key` in the kernel's layout.
-pub const LPM_KEY_SIZE: usize = 20;
+pub const LPM_KEY_SIZE: usize = crate::generated::layout::lpm_key::SIZE;
 
-/// The `enum MatchType` discriminants, as the object declares them.
+/// The `enum MatchType` discriminants.
 ///
-/// ```c
-/// enum __attribute__((packed)) MatchType {
-///     MatchType_DomainSet = 0,  MatchType_IpSet = 1,     MatchType_SourceIpSet = 2,
-///     MatchType_Port = 3,       MatchType_SourcePort = 4, MatchType_L4Proto = 5,
-///     MatchType_IpVersion = 6,  MatchType_Mac = 7,       MatchType_ProcessName = 8,
-///     MatchType_Dscp = 9,       MatchType_Fallback = 10, MatchType_MustRules = 11,
-///     MatchType_Upstream = 12,  MatchType_QType = 13,
-/// };
-/// ```
-///
-/// The enum is `packed`, so it occupies **one byte** inside `match_set`, not four. Writing it
-/// as a `u32` would shift `outbound`, `must` and `mark` and produce a table whose every entry
-/// the datapath misreads — which is why the encoder builds bytes explicitly rather than
-/// casting a `repr(C)` struct.
-pub mod match_type {
-    pub const DOMAIN_SET: u8 = 0;
-    pub const IP_SET: u8 = 1;
-    pub const SOURCE_IP_SET: u8 = 2;
-    pub const PORT: u8 = 3;
-    pub const SOURCE_PORT: u8 = 4;
-    pub const L4_PROTO: u8 = 5;
-    pub const IP_VERSION: u8 = 6;
-    pub const MAC: u8 = 7;
-    pub const PROCESS_NAME: u8 = 8;
-    pub const DSCP: u8 = 9;
-    pub const FALLBACK: u8 = 10;
-    pub const MUST_RULES: u8 = 11;
-}
+/// Re-exported from the generated module: the enum is `packed`, so it occupies **one byte**
+/// inside `match_set`, not four. Writing it as a `u32` would shift `outbound`, `must` and
+/// `mark` and produce a table whose every entry the datapath misreads — which is why the
+/// encoder builds bytes explicitly rather than casting a `repr(C)` struct.
+pub use crate::generated::match_type;
 
 /// The reserved outbound ids the datapath interprets itself.
 ///
-/// ```c
-/// #define OUTBOUND_DIRECT 0x0
-/// #define OUTBOUND_BLOCK  0x1
-/// #define OUTBOUND_MUST_RULES          0xFC
-/// #define OUTBOUND_CONTROL_PLANE_ROUTING 0xFD
-/// #define OUTBOUND_LOGICAL_OR          0xFE
-/// #define OUTBOUND_LOGICAL_AND         0xFF
-/// ```
-pub mod outbound {
-    /// The traffic leaves directly; the datapath returns `TC_ACT_OK`.
-    pub const DIRECT: u8 = 0x00;
-    /// The traffic is dropped.
-    pub const BLOCK: u8 = 0x01;
-    /// User-defined outbound ids start here and run to [`BLOCK`] − 1.
-    pub const FIRST_GROUP: u8 = 0x02;
-    /// The last id a group may use; `0xFC` begins the reserved range (ADR-0005).
-    pub const LAST_GROUP: u8 = 0xFB;
-    /// Marks the following rules `must`, without terminating the rule.
-    pub const MUST_RULES: u8 = 0xFC;
-    /// Hand the flow to the control plane instead of deciding it in the kernel.
-    pub const CONTROL_PLANE_ROUTING: u8 = 0xFD;
-    pub const LOGICAL_OR: u8 = 0xFE;
-    pub const LOGICAL_AND: u8 = 0xFF;
-}
+/// Re-exported from the generated module; `OUTBOUND_LOGICAL_MASK` is the bit mask that
+/// isolates the logical markers, which is why `OR` and `AND` share their high bits.
+pub use crate::generated::outbound;
 
 /// One `struct match_set`, in the object's byte layout.
 ///
@@ -433,7 +392,15 @@ pub struct RoutingResult {
 }
 
 /// `TASK_COMM_LEN`, the size of the kernel's `pname` field.
+///
+/// Derived from the generated `routing_result` layout: `pname` is 16 bytes there, and the
+/// kernel's `TASK_COMM_LEN` is what that field is sized from.
 pub const TASK_COMM_LEN: usize = 16;
+
+const _: () = assert!(
+    TASK_COMM_LEN == crate::generated::layout::routing_result::SIZE - 20,
+    "TASK_COMM_LEN must match the pname field width the datapath declares"
+);
 
 /// One `routing_handoff_map` value.
 #[repr(C)]

@@ -280,20 +280,34 @@ without dropping a connection.
 
 ## Verifying the kernel datapath
 
-`./scripts/kernel-check.sh` (as root) checks everything the userspace cannot: whether the
-object loads and passes the verifier, whether a tc program attaches, and whether the device
-pair and its MAC/ifindex are readable. Run it before `daer run` on a new machine:
+Two scripts, two questions. They are separate because a failure in one must not be readable as
+a failure in the other:
+
+| Script | Question | Depends on |
+| --- | --- | --- |
+| `sudo ./scripts/kernel-check.sh` | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
+| `sudo ./scripts/e2e-check.sh` | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
+
+Run the kernel one before `daer run` on a new machine:
 
 ```sh
 sudo ./scripts/kernel-check.sh
 ```
 
-The step that matters is 3:
+The steps that matter are 4 and 7:
 
 ```text
-3. loading the object into the kernel (this runs the verifier)
-  ok  the object loaded and passed the verifier
+4. loading the object (this runs the verifier)
+  ok   the object loaded and passed the verifier
+
+7. the in-kernel datapath cases (BPF_PROG_TEST_RUN)
+  ok   every in-kernel datapath case passed
 ```
+
+Step 7 runs 58 self-checking BPF programs (`pktgen`/`setup`/`check` triples from
+`ebpf/kern/tests/bpf_test.c`) through `BPF_PROG_TEST_RUN`. It is the only check in the
+repository that executes the datapath's own routing, conntrack and redirect logic inside the
+kernel, so a green step 4 with a skipped step 7 means the object loads and nothing more.
 
 A failure there is almost always one of:
 
@@ -301,9 +315,39 @@ A failure there is almost always one of:
 | --- | --- |
 | `PermissionDenied` creating a map | no `CAP_BPF` — a "root" user namespace is not enough, `unprivileged_bpf_disabled` blocks it |
 | a struct offset or a `bpf_*` helper | `vmlinux.h` came from a different kernel than the target |
-| `InvalidProgramSection` | the object was built without `cargo xtask ebpf`, which normalizes `ebpf-go` section syntax |
+| `InvalidProgramSection` | the object's section names are not ones `aya` parses. The loader does not rewrite them (ADR-0020): a section prefix that is not `classifier/`, `cgroup/`, `sk_skb/stream_verdict`, `fentry/` or `kprobe/` is a build failure — `cargo xtask abi --check` catches it from `ebpf/abi.toml`, and `cargo xtask ebpf` rebuilds |
+| `nonzero insn_off N for the first func info record` | the program's own BTF `func_info` was dropped, so the first record belongs to a linked `.text` callee. See below |
 
-Userspace tests cannot catch any of those, which is why this script exists.
+### `nonzero insn_off ... for the first func info record`
+
+This one is worth recognising on sight, because it reaches the kernel and comes back as a
+bare `EINVAL` (os error 22) that reads like a verifier complaint about the *program* when it
+is really a complaint about its *metadata*:
+
+```text
+cannot attach the datapath: eBPF program error: the BPF_PROG_LOAD syscall returned
+Invalid argument (os error 22). Verifier output: nonzero insn_off 3 for the first func
+info record
+stack depth max 0
+processed 0 insns (limit 1000000)
+```
+
+`processed 0 insns` is the tell: the verifier rejected the load before looking at a single
+instruction, so no amount of inspecting the C is going to explain it. The kernel requires a
+program's first `func_info` record to be at instruction 0 (`check_btf_func()` in
+`kernel/bpf/check_btf.c`). `aya` builds that list by appending each linked `.text` callee's
+records rebased to the instruction where the callee was placed; if the program's own record
+is missing, the list starts at that callee's offset instead.
+
+The program's own record goes missing when the ELF section names and the `.BTF` string table
+disagree, which is what a loader that renames sections in only one of the two places
+produces. `daer` no longer renames anything: the C source spells sections the way `aya`
+parses them (ADR-0020), so the two can never disagree. `cargo test -p daer-ebpf` asserts the
+invariant after reproducing `aya`'s call relocation, so this failure cannot ship again without
+a red test.
+
+Userspace tests cannot catch any of the *kernel-side* failures above, which is why this
+script exists; this one they can, and it is cheaper than a reboot.
 
 ## Verifying it works
 

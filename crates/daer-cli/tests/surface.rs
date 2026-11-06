@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::process::Command;
 
 /// Crates that must not appear in `daer-cli`'s normal dependency closure.
-const PRODUCER_CRATES: &[&str] = &["daer-geodata", "geodrb"];
+const PRODUCER_CRATES: &[&str] = &["daer-geodata", "daer-drb"];
 
 /// Protobuf readers: the format ADR-0014 exists to retire, and the reason `daer-geodata`
 /// exists at all. A daemon that links one can decode a rule set it should only consume.
@@ -114,7 +114,7 @@ fn the_daemon_links_no_producer() {
         assert!(
             !dependencies.contains(*forbidden),
             "`daer-cli` links `{forbidden}`, which is a build-time producer (ADR-0015). \
-             The DRB compiler lives in `geodrb`; the daemon consumes `.drb` and never reads \
+             The DRB compiler lives in `daer-drb`; the daemon consumes `.drb` and never reads \
              Protobuf. Full closure: {dependencies:?}"
         );
     }

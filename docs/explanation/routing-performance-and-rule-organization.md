@@ -155,7 +155,7 @@ suffix: corp.internal
 full: vpn.company.com
 ```
 
-Compiled via `geodrb compile corporate.rules -o corporate.drb`, this artifact loads into `daer` under one provider:
+Compiled via `daer-drb compile corporate.rules -o corporate.drb`, this artifact loads into `daer` under one provider:
 ```toml
 [routing]
 rules = [

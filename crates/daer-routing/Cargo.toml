@@ -11,10 +11,9 @@ description = "Routing rule lowering, matching and policy identity for daer"
 [dependencies]
 daer-common.workspace = true
 daer-config.workspace = true
+daer-rule-ast.workspace = true
 daer-ebpf.workspace = true
-aho-corasick.workspace = true
 ipnet.workspace = true
-regex.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
@@ -22,6 +21,8 @@ sha2.workspace = true
 # `aya-obj` reads the compiled object so the layout assertions can pin the encoder
 # against the real `struct match_set` rather than against a comment (ADR-0005).
 aya-obj = "0.3"
+# The boundary test reads `cargo metadata` to prove the crate graph, not to parse anything.
+serde_json.workspace = true
 
 [lints]
 workspace = true

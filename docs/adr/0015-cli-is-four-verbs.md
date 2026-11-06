@@ -73,7 +73,7 @@ daer version                 build information
 
 | removed | where it lives now |
 | --- | --- |
-| `rule compile` / `inspect` / `convert` | `geodrb`, the DRB producer (ADR-0014). `daer` links no `daer-geodata`. |
+| `rule compile` / `inspect` / `convert` | `daer-drb`, the DRB producer (ADR-0014). `daer` links no `daer-geodata`. |
 | `node convert` | Third-party tooling. `[[subscription]]` already parses links at runtime, so hand-converting a link is no longer on any supported path. |
 | `dns serve` | Deleted. `daer run` starts the resolver when `dns.bind` or Fake-IP asks for it; a standalone server is a different product. |
 | `config fmt`, `config example` | Deleted. A configuration is hand-written TOML; the sample is a repository file the docs link to, and one test asserts it validates. |
@@ -108,5 +108,5 @@ change rather than leaving them to diff help output.
 - Existing scripts and documentation that call `daer config validate`, `daer route explain`,
   `daer node convert`, `daer dns check`, or `daer rule *` break. Per project policy there is no
   compatibility shim: the migration is a rename, and the error message names it.
-- A user who wants to build a `.drb` now needs `geodrb`. That is the intended boundary: the
+- A user who wants to build a `.drb` now needs `daer-drb`. That is the intended boundary: the
   runtime consumes, the producer builds.

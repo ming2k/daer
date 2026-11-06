@@ -1,7 +1,7 @@
 ---
 id: ADR-0014
 title: "DRB (daer Rule Binary) compiled artifacts and declarative Rule Providers"
-status: accepted
+status: superseded
 date: 2026-02-15
 scope: [routing/drb, config/rule-providers, cli/rules, control-plane/loader]
 supersedes: []
@@ -94,13 +94,23 @@ fallback = "proxy"
 - **Offline Resilience**:
   If an HTTP provider is temporarily unreachable, the loader uses the cached DRB and emits a warning rather than failing the proxy.
 
-### 3. Producer Tooling in `geodrb`
+### 3. Producer Tooling in `daer-drb`
 
-The DRB producer is `geodrb`, a separate binary (ADR-0015), so the daemon links no geodata
-reader:
-- `geodrb compile <input.rules> -o <output.drb>`: compiles plain-text rules into a DRB artifact.
-- `geodrb inspect <input.drb>`: verifies checksum and displays section counts and binary metadata.
-- `geodrb convert <input.dat> --code <code> -o <output.drb>`: converts legacy `geoip.dat` or `geosite.dat` files into DRB.
+The DRB producer is `daer-drb`, a separate binary (ADR-0015), so the daemon links no geodata
+reader. Its verbs follow the pipeline rather than the source format, because a verb per format is
+a conversion per format — the arrangement [ADR-0027](0027-one-intermediate-rule-set.md) replaced:
+
+- `daer-drb read <src> -o <output.rules>`: reads any source into the intermediate rule set and
+  writes it as reviewable text.
+- `daer-drb compile <input.rules> -o <output.drb>`: encodes the intermediate rule set.
+- `daer-drb decompile <input.drb> -o <output.rules>`: turns an artifact back into rules, so a
+  release is auditable.
+- `daer-drb inspect <input.drb>`: verifies checksum and displays section counts and binary metadata.
+- `daer-drb test <input.drb> <target>`: reports whether an address or name matches.
+- `daer-drb convert <src> --code <code> -o <output.drb>`: `read` then `compile`, for the batch case.
+
+Both source formats in this ADR's scope — legacy `.dat` and rule text — reach the encoder through
+one intermediate type, so a reader cannot introduce its own normalisation.
 
 ---
 

@@ -19,6 +19,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # The ABI drift gate (ADR-0021, [INV-ABI-01]). It has to be here and not only inside
+      # `cargo xtask ci`, which CI never runs: until this step existed, `abi.toml`, the C
+      # header and the generated Rust module could disagree and every check above stayed
+      # green. The generated files are tracked, so this compares committed bytes.
+      - name: Kernel ABI drift
+        run: cargo xtask abi --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
@@ -47,11 +53,20 @@ jobs:
             https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip
           sudo unzip -o -q /tmp/xray.zip xray -d /usr/local/bin
           xray version
-      - name: Kernel datapath and reload (tproxy, eBPF attach, SIGHUP)
-        # Sections 7 (TCP) and 8 are the ones a stock kernel can satisfy; 7-udp needs a second
-        # network namespace, which a container cannot create, so it stays a stated skip.
+      - name: Build the datapath objects (the production one and the test one)
+        # `kernel-check.sh` needs both: `datapath.o` for the verifier and attach cases, and
+        # `datapath-test.o` — which only `--tests` compiles — for the in-kernel cases. The
+        # `--tests` half used to be missing here, so section 7 skipped and `DAER_REQUIRE`
+        # never named a key that would have noticed.
+        run: cargo xtask ebpf --tests
+      - name: Kernel datapath (verifier, tc attach, in-kernel cases)
+        # The keys are the script's own (`scripts/kernel-check.sh`), not section numbers: a
+        # key in `DAER_REQUIRE` turns its *skip* into a failure. This list said
+        # `7-tcp,8` — neither of which this script emits — so every check could skip and
+        # the job still exited zero. The UDP half of the in-kernel cases still has a named
+        # prerequisite this runner cannot meet, which is why `7` is the key and not `7-udp`.
         env:
-          DAER_REQUIRE: "7-tcp,8"
+          DAER_REQUIRE: "kernel-binary,7"
         run: cargo xtask kernel-check
       - name: REALITY + Vision interop against the reference node
         # Captured, then inspected: the test skips itself when it cannot find `xray`, and a skip
@@ -76,6 +91,27 @@ jobs:
             echo "::error::the inner-TLS suite skipped; it is the only gate on Vision's raw-copy path"
             exit 1
           fi
+
+  # The user-space ingress path. `e2e-check.sh` answers a different question from
+  # `kernel-check.sh` — does a real tproxy redirect reach `daer run` and come back — and it
+  # is the only job that runs `daer-control/tests/transparent.rs` and `daer-cli/tests/reload.rs`
+  # with the capability they need. Both skip themselves on the `test` job above, and a suite
+  # that skips is not coverage (ADR-0007), so without this job the ingress path and the
+  # `SIGHUP` fix had no CI evidence at all.
+  e2e-ingress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the fixture tools
+        run: sudo apt-get update && sudo apt-get install -y nftables curl
+      - name: The transparent data path and a real SIGHUP
+        # `3-udp` is deliberately absent: a second network namespace is a stated skip that a
+        # container runner cannot satisfy, so promoting it would make the job unrunnable.
+        env:
+          DAER_REQUIRE: "3-tcp,4"
+        run: cargo xtask e2e-check
 
   # The datapath is C from upstream; the object test is the ABI contract with it.
   # It is a separate job because it needs clang and the kernel headers, which the

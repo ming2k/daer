@@ -143,6 +143,33 @@ impl IpIndex {
         self.len == 0
     }
 
+    /// Compiles directly from closed intervals, deriving minimal CIDRs on demand for kernel LPM.
+    #[must_use]
+    pub fn from_intervals(v4: Vec<(u32, u32)>, v6: Vec<(u128, u128)>) -> Self {
+        let mut prefixes = Vec::new();
+        for &(start, end) in &v4 {
+            prefixes.extend(
+                daer_rule_ast::decompose_v4_interval(start, end)
+                    .into_iter()
+                    .map(IpNet::V4),
+            );
+        }
+        for &(start, end) in &v6 {
+            prefixes.extend(
+                daer_rule_ast::decompose_v6_interval(start, end)
+                    .into_iter()
+                    .map(IpNet::V6),
+            );
+        }
+        let total = v4.len() + v6.len();
+        Self {
+            v4,
+            v6,
+            len: prefixes.len().max(total),
+            prefixes,
+        }
+    }
+
     /// Compiles directly from pre-merged intervals and prefixes (e.g. from a DRB).
     #[must_use]
     pub fn from_merged(v4: Vec<(u32, u32)>, v6: Vec<(u128, u128)>, prefixes: Vec<IpNet>) -> Self {

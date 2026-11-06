@@ -1,0 +1,115 @@
+name = "daer"
+version = "0.0.6"
+release = 1
+description = "eBPF transparent proxy for Linux with a Rust userspace"
+license = "AGPL-3.0-only"
+arch = "x86_64"
+url = "https://github.com/ming2k/daer"
+
+build_deps = [
+    "rust-bin",
+    "llvm:clang",
+    "cmake",
+    "git",
+]
+link_deps = [
+    "gcc:gcc-libs",
+    "glibc",
+]
+
+[[sources]]
+type = "http"
+sha256 = "157908247a66e97c2c71bd2d36fafd03e82e1d83bf4c4281e87a7623f83307b5"
+url = "https://github.com/ming2k/daer/archive/refs/tags/v${VERSION}.tar.gz"
+extract_to = "source"
+
+[pipeline.compile]
+isolation = "relaxed"
+script = '''
+cd source/daer-${VERSION}
+export CARGO_HOME="${WORKDIR}/.cargo"
+
+# Compile eBPF C datapath into target/ebpf/datapath.o.
+#
+# `xtask ebpf` regenerates the kernel ABI from ebpf/abi.toml before it compiles, so this
+# step is what makes the object buildable at all. The generated files are tracked (ADR-0021,
+# amended), and regenerating anyway is deliberate: it means a hand-edited header cannot
+# survive a package build unnoticed.
+cargo run --package xtask -- ebpf
+
+# Compile the userspace binaries: the daemon and the rule-artifact producer.
+cargo build --release --locked
+
+# The unprivileged gate (ADR-0029): the object must be one `daer check` accepts before
+# anything is packaged, and if it is not, no archive is produced.
+#
+# The configuration is written here rather than taken from daer.example.toml on purpose.
+# That file's `[[rule-provider]]` tables are `http` sources, so checking it needs the network
+# and a published artifact to exist — a gate that then fails for reasons that have nothing to
+# do with the object it claims to validate. This mirrors `cargo xtask preflight`, which writes
+# the same minimal file for the same reason.
+cat > packaging-check.toml << 'EOF'
+schema = 1
+
+[global]
+wan-interface = ["auto"]
+EOF
+./target/release/daer check --config packaging-check.toml --object target/ebpf/datapath.o'''
+
+[pipeline.staging]
+script = '''
+cd source/daer-${VERSION}
+
+# Binaries.
+#
+# `geodrb` is gone (ADR-0031): the producer is `daer-drb`, and it is shipped because operators
+# compile their own `.rules` into `.drb`. The daemon never links it — `crates/daer-cli/tests/
+# surface.rs` asserts that closure, so installing it beside `daer` cannot make it reachable
+# from the running service.
+install -Dm755 target/release/daer ${STAGING_DIR}/usr/bin/daer
+install -Dm755 target/release/daer-drb ${STAGING_DIR}/usr/bin/daer-drb
+
+# eBPF datapath object
+install -Dm644 target/ebpf/datapath.o ${STAGING_DIR}/usr/lib/daer/datapath.o
+
+# Systemd service unit
+install -Dm644 install/daer.service ${STAGING_DIR}/usr/lib/systemd/system/daer.service
+
+# Configuration files
+install -dm755 ${STAGING_DIR}/etc/daer
+install -Dm644 daer.example.toml ${STAGING_DIR}/etc/daer/example.toml
+cat << 'EOF' > ${STAGING_DIR}/etc/daer/config.toml
+# daer transparent proxy configuration
+# See /etc/daer/example.toml for reference documentation.
+
+schema = 1
+
+[global]
+wan-interface = ["auto"]
+EOF
+chmod 0640 ${STAGING_DIR}/etc/daer/config.toml
+
+# JSON schema definition
+install -Dm644 daer.schema.json ${STAGING_DIR}/usr/share/daer/daer.schema.json
+
+# Validate the object as installed, not as built (ADR-0029). The path below is the one the
+# service unit passes to `daer run`, so this asserts what will actually be loaded — a stale or
+# drifted object is rejected here instead of crash-looping under systemd. This is the only
+# place the packaged artifact is checked before it reaches a machine.
+${STAGING_DIR}/usr/bin/daer check \
+    --config ${STAGING_DIR}/etc/daer/config.toml \
+    --object ${STAGING_DIR}/usr/lib/daer/datapath.o''
+
+[[output]]
+backup = ["/etc/daer/config.toml"]
+
+[output.hooks]
+post_install = '''
+systemctl daemon-reload 2>/dev/null || true
+echo ":: Configure daer in /etc/daer/config.toml"
+echo ":: Verify configuration with: daer check -c /etc/daer/config.toml"
+echo ":: Ensure permissions are restricted: chmod 0640 /etc/daer/config.toml"
+echo ":: Enable service with: systemctl enable --now daer.service"'''
+post_upgrade = "systemctl daemon-reload 2>/dev/null || true"
+pre_remove = "systemctl disable --now daer.service 2>/dev/null || true"
+post_remove = "systemctl daemon-reload 2>/dev/null || true"

@@ -109,8 +109,7 @@ fn realistic_sets() -> Vec<MatchSet> {
         .map(|index| format!("site{index}.example.cn"))
         .collect();
     let borrowed: Vec<&str> = domains.iter().map(String::as_str).collect();
-    let domain =
-        daer_routing::DomainIndex::new(daer_routing::DomainKey::Suffix, &borrowed, &mut warnings);
+    let domain = daer_routing::DomainTable::compile(&borrowed, &mut warnings);
     assert!(warnings.is_empty(), "{warnings:?}");
 
     let prefixes: Vec<ipnet::IpNet> = (0..5_000u32)
@@ -246,6 +245,6 @@ fn outbound_identity_is_shared_not_copied() {
 fn an_empty_set_matches_nothing_without_work() {
     let index = daer_routing::IpIndex::new(&[]).expect("index");
     assert!(!index.contains(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-    let domains = daer_routing::DomainIndex::new(daer_routing::DomainKey::Suffix, &[], &mut vec![]);
+    let domains = daer_routing::DomainTable::compile(&[], &mut Vec::new());
     assert!(!domains.matches("example.com"));
 }

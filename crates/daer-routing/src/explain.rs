@@ -290,9 +290,8 @@ fn describe_rule(set: &MatchSet, facts: &MatchFacts<'_>) -> String {
 /// trace would bury the answer in a megabyte of text and make the diagnostic
 /// useless at exactly the moment it is needed. The summary names the key, the
 /// count, and enough examples to identify the rule.
-fn describe_domain(patterns: &crate::domain::DomainIndex) -> String {
+fn describe_domain(patterns: &crate::domain::DomainTable) -> String {
     const SHOWN: usize = 3;
-    let key = patterns.key().as_str();
     let all = patterns.patterns();
     let listed = if all.len() <= SHOWN {
         all.iter()
@@ -307,11 +306,9 @@ fn describe_domain(patterns: &crate::domain::DomainIndex) -> String {
             .join(", ");
         format!("{head}, … ({} total)", all.len())
     };
-    if key == "full" {
-        format!("domain({listed})")
-    } else {
-        format!("domain({key}: {listed})")
-    }
+    // One table holds full and suffix patterns together (ADR-0033), so there is no single key
+    // to name; the patterns themselves carry their spelling.
+    format!("domain({listed})")
 }
 
 /// Renders a prefix list, summarized when a geodata expansion made it huge.

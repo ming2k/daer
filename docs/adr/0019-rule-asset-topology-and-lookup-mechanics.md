@@ -1,7 +1,7 @@
 ---
 id: ADR-0019
 title: "Rule asset topology: coarse-grained provider envelopes over monolithic archives and fragmented rule sets"
-status: accepted
+status: superseded
 date: 2026-10-31
 scope: [routing/lookup, config/rule-providers, architecture/data-path, ebpf/kernel-policy]
 supersedes: []
@@ -121,5 +121,5 @@ The recommended and supported rule topology aggregates traffic by **outbound act
 - **Composite Simplicity**: Enterprises and operators package hybrid IP/domain assets as single atomic `.drb` files.
 
 ### Negative & Operational Costs
-- Operators migrating from legacy configurations with hundreds of individual rule lines must consolidate them into `.rules` source files and compile them via `geodrb`.
+- Operators migrating from legacy configurations with hundreds of individual rule lines must consolidate them into `.rules` source files and compile them via `daer-drb`.
 - Subscribing to multiple fine-grained categories requires declaring individual `[[rule-provider]]` blocks, though this is bounded by design to 3–6 entries.

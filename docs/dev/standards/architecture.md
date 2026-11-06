@@ -28,7 +28,7 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 │  - Outbound groups, alive sets, probes: `crates/daer-outbound`         │
 │  - Proxy protocol implementations: `crates/daer-proxy-protocols`       │
 │  - Prefix protocol sniffing (TLS SNI, HTTP Host, QUIC): `daer-sniff`   │
-│  - Streaming geo database reader: `crates/daer-geodata`                │
+│  - Canonical rule source & DRB producer: `crates/daer-rule-ast`, `crates/daer-drb` │
 ├────────────────────────────────────────────────────────────────────────┤
 │  Layer 1: Kernel Datapath & Core Foundation                            │
 │  - eBPF object loader & map ABI: `crates/daer-ebpf`                    │

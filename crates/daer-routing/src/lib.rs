@@ -39,7 +39,7 @@ pub use builder::{MatchSink, RecordingSink, RulesBuilder, ValidationSink};
 /// outbound name spells it once: `outbound_name::DIRECT` in a comparison and in the list
 /// `is_builtin_outbound` consults cannot drift apart the way two string literals can.
 pub use daer_common::consts::outbound_name;
-pub use domain::{DomainIndex, DomainKey, SuffixScope};
+pub use domain::{DomainTable, SuffixScope, validate_patterns};
 pub use drb::{DRB_MAGIC, DRB_VERSION, DrbError, DrbSet, DrbSummary, RuleProviderPool};
 pub use error::RoutingError;
 pub use explain::{PredicateTrace, RuleTrace, Trace, explain};

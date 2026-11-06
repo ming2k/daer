@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::exclusions::Exclusions;
 use daer_config::FakeIpConfig;
 use ipnet::Ipv4Net;
 
@@ -26,124 +27,6 @@ pub struct FakeIpPool {
     /// domain got a synthetic address.
     exclude: Exclusions,
     state: Mutex<PoolState>,
-}
-
-/// A compiled `dns.fake-ip.exclude` list.
-///
-/// Three pattern forms, because that is what an operator writes:
-///
-/// * `example.com` — a suffix (the bare name and its subdomains), the common case;
-/// * `full:example.com` / `suffix:example.com` / `keyword:ads` / `regex:^ads\.` — the same
-///   keys a routing rule uses;
-/// * anything else with a `:` is refused by name: a `geosite:`/`geoip:` category is a
-///   Protobuf `.dat` reference, and that format is retired (ADR-0014). The exclusion list
-///   takes domain patterns only, so an operator who wants a whole category writes the
-///   category's domains as patterns (or excludes by address in `[routing]` instead).
-#[derive(Debug, Default)]
-struct Exclusions {
-    /// Plain suffixes and `suffix:` patterns.
-    suffixes: daer_routing::domain::DomainIndex,
-    /// `full:` patterns.
-    exact: daer_routing::domain::DomainIndex,
-    /// `keyword:` patterns.
-    keywords: daer_routing::domain::DomainIndex,
-    /// `regex:` patterns.
-    regexes: daer_routing::domain::DomainIndex,
-}
-
-impl Exclusions {
-    /// Compiles the configured patterns.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the pattern whose key is not one of the four accepted
-    /// spellings. A silently ignored pattern would disable an exclusion the operator
-    /// believes is active.
-    fn compile(patterns: &[String]) -> Result<Self, String> {
-        let mut suffixes = Vec::new();
-        let mut exact = Vec::new();
-        let mut keywords = Vec::new();
-        let mut regexes = Vec::new();
-        for pattern in patterns {
-            let trimmed = pattern.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // A `geosite:`/`geoip:`/`ext:` category is a `.dat` reference, and the `.dat`
-            // reader is gone (ADR-0014/ADR-0015). Refusing by name is the honest answer:
-            // silently ignoring the exclusion would hand out synthetic addresses for exactly
-            // the domains the operator excluded.
-            if trimmed.contains(':') {
-                let (key, value) = trimmed.split_once(':').expect("contains a colon");
-                let key = key.trim();
-                let value = value.trim();
-                match key {
-                    "full" => exact.push(value),
-                    "suffix" => suffixes.push(value),
-                    "keyword" => keywords.push(value),
-                    "regex" => regexes.push(value),
-                    "geosite" | "geoip" | "ext" => {
-                        return Err(format!(
-                            "dns.fake-ip.exclude: {trimmed:?} names a Protobuf .dat category, \
-                             which this build no longer reads (ADR-0014); write the domains as \
-                             patterns (suffix:/full:/keyword:/regex:) instead"
-                        ));
-                    }
-                    other => {
-                        return Err(format!(
-                            "dns.fake-ip.exclude: {other:?} is not a domain matcher key \
-                             (expected full, suffix, keyword, or regex)"
-                        ));
-                    }
-                }
-            } else {
-                suffixes.push(trimmed);
-            }
-        }
-        let mut warnings = Vec::new();
-        let exclusions = Self {
-            suffixes: daer_routing::domain::DomainIndex::new(
-                daer_routing::domain::DomainKey::Suffix,
-                &suffixes,
-                &mut warnings,
-            ),
-            exact: daer_routing::domain::DomainIndex::new(
-                daer_routing::domain::DomainKey::Full,
-                &exact,
-                &mut warnings,
-            ),
-            keywords: daer_routing::domain::DomainIndex::new(
-                daer_routing::domain::DomainKey::Keyword,
-                &keywords,
-                &mut warnings,
-            ),
-            regexes: daer_routing::domain::DomainIndex::new(
-                daer_routing::domain::DomainKey::Regex,
-                &regexes,
-                &mut warnings,
-            ),
-        };
-        for warning in warnings {
-            tracing::warn!(%warning, "dns.fake-ip.exclude");
-        }
-        Ok(exclusions)
-    }
-
-    /// True when `domain` matches any pattern.
-    fn matches(&self, domain: &str) -> bool {
-        self.suffixes.matches(domain)
-            || self.exact.matches(domain)
-            || self.keywords.matches(domain)
-            || self.regexes.matches(domain)
-    }
-
-    /// True when no pattern was configured.
-    fn is_empty(&self) -> bool {
-        self.suffixes.is_empty()
-            && self.exact.is_empty()
-            && self.keywords.is_empty()
-            && self.regexes.is_empty()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -211,9 +94,10 @@ impl FakeIpPool {
     /// Whether a domain is excluded from Fake-IP synthesis.
     ///
     /// The pattern syntax is the one ADR-0012 documents (`suffix:`/`full:`/`keyword:`/
-    /// `regex:`, and a bare name as a suffix), evaluated by the same `DomainIndex` the
-    /// routing matcher uses, so an exclusion cannot mean something different from an
-    /// identical routing rule.
+    /// `regex:`, and a bare name as a suffix). The matcher itself is
+    /// [`crate::routing::NameMatch`], shared with the DNS router, so `keyword:` and `regex:`
+    /// mean here exactly what they mean in a `[routing]` rule — while routing's own compiled
+    /// artifacts stay limited to `full:`/`suffix:` (ADR-0033).
     #[must_use]
     pub fn is_excluded(&self, domain: &str) -> bool {
         if self.exclude.is_empty() {
@@ -431,7 +315,7 @@ mod tests {
         let error = FakeIpPool::from_config(&config).expect_err("must refuse");
         assert!(error.contains("geosite"), "{error}");
         assert!(
-            error.contains("ADR-0014"),
+            error.contains("ADR-0031"),
             "the error must say why the category is gone: {error}"
         );
     }

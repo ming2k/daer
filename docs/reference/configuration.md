@@ -71,20 +71,54 @@ Common fields for all structured nodes:
 | `tag` | string | Optional unique identifier for the node. |
 | `type` | string | Node protocol: `"vless"`, `"shadowsocks"` (or `"ss"`), `"trojan"`, `"socks5"` (or `"socks"`), `"http"`, `"direct"`. |
 
-#### `type = "vless"` (REALITY)
+#### `type = "vless"`
+
+The security layer is a **sub-table named by its type** (`[node.security]`), not
+`[node.reality]`: a `vless` node may run over no security, over TLS, or over REALITY, and which
+one it is has to be stated rather than inferred from the presence of a table (ADR-0028). A
+`[node.reality]` table is rejected by name, because the schema has no such key.
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
 | `server` | string | Remote server hostname or IP address. |
 | `port` | integer | Port number (1-65535). |
 | `uuid` | string | Client user ID (UUID). |
-| `flow` | string | Flow framing (e.g. `"xtls-rprx-vision"`). Optional. |
-| `[node.reality]` | table | REALITY security parameters (required). |
-| `reality.sni` | string | SNI presented in ClientHello (impersonated site). |
-| `reality.public-key` | string | Server X25519 public key (`pbk`). |
-| `reality.short-id` | string | Hexadecimal short ID (`sid`). Optional. |
-| `reality.fingerprint` | string | TLS ClientHello fingerprint (e.g. `"chrome"`). Required. |
-| `reality.alpn` | list of string | Offered ALPN protocols (e.g. `["h2", "http/1.1"]`). Optional. |
+| `flow` | string | Flow framing: `"xtls-rprx-vision"`, `"xtls-rprx-vision-udp443"`. Optional. |
+| `transport` | table | `type = "tcp"` (default) or `type = "ws"` with `path`/`host`. Optional. |
+| `[node.security]` | table | The security layer. `type = "none"` (default), `"tls"`, or `"reality"`. |
+
+With `type = "reality"`, the accepted keys are exactly:
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `sni` | string | The impersonated site. Required; REALITY impersonates a *named* site. |
+| `public-key` | string | Server X25519 public key (`pbk` in a link). Required. |
+| `short-id` | string | Hexadecimal short ID (`sid`). Optional. |
+| `alpn` | list of string | Offered ALPN protocols (e.g. `["h2", "http/1.1"]`). Optional. |
+
+There is **no `fingerprint` key on the REALITY layer.** A REALITY ClientHello is built byte by
+byte by `daer-proxy-protocols` (`reality/tls13`), not by a netune fingerprint preset, and
+`RealityParams` carries an SNI, a public key, a short-id and an ALPN list — no fingerprint. A
+link's `fp=` is accepted for compatibility with the panels that always send it, and has nothing
+to consume it; a *config file* that sets `fingerprint` under `[node.security]` with
+`type = "reality"` is refused by name rather than silently ignored. `fingerprint` **is** a real
+key on `type = "tls"`, where it selects a netune preset.
+
+```toml
+[[node]]
+tag = "hk-01"
+type = "vless"
+server = "203.0.113.7"
+port = 443
+uuid = "2aec6a09-fb60-4461-9f28-ff6ccd184824"
+flow = "xtls-rprx-vision"
+
+[node.security]
+type = "reality"
+sni = "download.docker.com"
+public-key = "1qA2ff-bTrVm4R-UAkRa6GGI5Dd_OrNDAELO1pxXVjI"
+short-id = "d9268b533cd4d860"
+```
 
 #### `type = "shadowsocks"` / `"ss"`
 
@@ -189,7 +223,8 @@ Defines flow matching rules and default verdicts.
 - `sip(cidr)` — Match source IP.
 - `dport(port_range)` — Match destination port.
 - `sport(port_range)` — Match source port.
-- `domain(suffix|full|keyword|regex: pattern)` — Match the sniffed domain by kind.
+- `domain(suffix|full: pattern)` — Match the sniffed domain by kind. A bare name is a
+  suffix. `keyword:` and `regex:` were removed (ADR-0033); expand them into concrete patterns.
 - `provider(tag)` / `rule-set(tag)` — Match IP intervals or domains from a declared `[[rule-provider]]`.
 - `dip(provider:tag)` / `ip(provider:tag)` — Match only IP intervals from a declared rule provider.
 - `domain(provider:tag)` — Match only domains from a declared rule provider.
@@ -231,10 +266,32 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 The retired Protobuf `geoip:` / `geosite:` databases are gone (ADR-0014/ADR-0015): domestic and
 regional routing is expressed as a `[[rule-provider]]` holding a compiled `.drb` set plus
-`provider(tag)` in a rule. `geodrb` converts an existing `.dat` once.
+`provider(tag)` in a rule. `daer-drb` converts an existing `.dat` once.
 
 An outbound chain (`a -> b`) is rejected at load time rather than silently truncated to its first
-hop. `vmess`, plain `vless` without REALITY, `hysteria2`, `tuic`, `anytls` and the QUIC families
-are not implemented; a node using one is listed and reported as unselectable by
-`daer check --nodes` rather than downgraded to `direct`.
+hop.
+
+`tuic` and the QUIC families other than Hysteria 2 are not implemented; a node using one is listed
+and reported as unselectable by `daer check --nodes` rather than downgraded to `direct`.
+
+`vless` and `vmess` are three orthogonal layers (ADR-0028): a **transport** (`tcp`, `ws`), a
+**security layer** (`none`, `tls`, `reality`) and a **flow** (`none`, `xtls-rprx-vision`,
+`xtls-rprx-vision-udp443`). The transport sits *above* the security layer, so `transport = ws`
+with `security = tls` is `wss://` — the upgrade request travels inside the tunnel. A combination
+the reference cannot carry is a load-time error that names the layer:
+
+| Rejected | Why |
+| :--- | :--- |
+| `flow = xtls-rprx-vision` with `security = none` | Vision splices a record layer; there is none |
+| `flow = xtls-rprx-vision` with `transport = ws` | the reference requires TLS/REALITY *directly* under the protocol |
+| `security = reality` on a `vmess` node | REALITY authenticates a `vless` flow; no VMess REALITY client exists |
+| `transport = grpc`/`httpupgrade`/`xhttp`/`kcp`/`quic` | the framing is not implemented, and silently treating it as `tcp` sends nonsense |
+| a `vmess` link with a non-zero `aid` | that selects the legacy handshake; only VMess AEAD is spoken (ADR-0030) |
+
+`hysteria2` (ADR-0029) exposes `ports`, `obfs` (`salamander`, `gecko`), `congestion`
+(`bbr`, `cubic`, `new-reno`, `brutal`), `hop-interval`/`hop-min-interval`/`hop-max-interval`,
+`pin-sha256` and a `[node.quic]` table. `brutal` needs `up-mbps` or `down-mbps`; a hop
+interval shorter than 5 s is refused; and `[node.quic].max-stream-receive-window` /
+`max-conn-receive-window` are refused rather than ignored, because quinn's flow control has no
+growing window — set the `init-*-receive-window` keys instead.
 

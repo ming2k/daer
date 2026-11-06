@@ -719,6 +719,6 @@ fn object() -> Option<aya_obj::Object> {
         return None;
     }
     let bytes = std::fs::read(&path).expect("reads the object");
-    let bytes = daer_ebpf::normalize_section_names(&bytes).expect("normalizes sections");
+    // The loader hands these bytes to `aya` unchanged (ADR-0020), and so does this test.
     Some(aya_obj::Object::parse(&bytes).expect("parses"))
 }

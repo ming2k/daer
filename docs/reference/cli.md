@@ -1,7 +1,7 @@
 # Command Line Interface (CLI) Reference
 
 The `daer` CLI provides the runtime daemon, deployment gates, and diagnostics for the
-transparent proxy. Build-time producers and converter toolchains live in the companion tool [`geodrb`](#4-drb-producer-tooling-geodrb).
+transparent proxy. Build-time producers and converter toolchains live in the companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb).
 
 ---
 
@@ -34,7 +34,7 @@ daer run [OPTIONS]
 | `-c`, `--config <PATH>` | `/etc/daer/config.toml` | Path to the configuration file. |
 | `--object <PATH>` | `target/ebpf/datapath.o` | Compiled eBPF datapath object. |
 | `--no-datapath` | `false` | Serve without attaching the kernel program, for unprivileged development and testing. No traffic is redirected, so nothing is proxied. |
-| `--dry-run` | `false` | Attach the datapath and exit immediately without serving. |
+| `--dry-run` | `false` | Report what the daemon would do and **change nothing**: no port bind, no device pair, no sysctl, no policy route, no `bpf()`. Needs no capability. |
 
 Reloads on `SIGHUP`, and refreshes `[[rule-provider]]` entries on their configured `interval`.
 
@@ -44,6 +44,10 @@ The single pre-bind gate. It performs every step `daer run` performs before it b
 resolve subscriptions and rule providers, compile and lower every rule, build every group,
 verify every node this build can speak, verify every DNS upstream, and parse `dns.bind`.
 
+With `--object` it also validates the compiled datapath object against the ABI — names,
+sections, and the BTF `func_info` invariant the kernel enforces — without loading it, so the
+check needs no capability and can gate a packaged artifact (ADR-0029).
+
 ```bash
 daer check [OPTIONS]
 ```
@@ -52,6 +56,7 @@ daer check [OPTIONS]
 | :--- | :--- |
 | `-c`, `--config <PATH>` | Path to the configuration file. |
 | `--nodes` | Also print every node in every group with its protocol and security identity. |
+| `--object <PATH>` | Also validate the compiled datapath object. Pass `--object none` to skip it. |
 
 Exit status is the contract: `0` when the configuration would run, non-zero otherwise. That is
 what a deployment gate or a systemd `ExecStartPre=` should call.
@@ -88,24 +93,44 @@ Exit status: `0` when the flow has a usable outbound, non-zero when it would be 
 
 ### 2.4 `probe` — active online network diagnostics
 
-Performs active network probing across layers (L3 DNS, L4 TCP handshake, L7 proxy protocol handshake, and end-to-end HTTP access).
+Performs active network probing across layers (L3 DNS, L4 TCP handshake, L7 proxy protocol handshake, and end-to-end HTTP access). A node is only reported operational when **real traffic** passed through it: the probe writes a request into the established tunnel and reads the destination's reply.
 
 ```bash
-# 1. Probe a specific node in configuration
+# 1. Probe a specific node declared in the configuration
 daer probe node hk-01
 
-# 2. Probe a node with custom timeout and end-to-end test URL
-daer probe node us-02 --timeout 10 --url http://cp.cloudflare.com/generate_204
+# 2. Probe a node link directly, with no configuration file at all
+daer probe node 'vless://uuid@203.0.113.7:443?security=reality&sni=…&pbk=…&sid=…&flow=xtls-rprx-vision#hk-01'
 
-# 3. Probe an HTTP endpoint directly or through a node
+# 3. Shorthand: the link as the verb's argument
+daer probe 'vless://uuid@203.0.113.7:443?security=reality&…#hk-01'
+
+# 4. Every node in the configuration
+daer probe node --all
+
+# 5. Every node in a subscription file (plain links, base64, or SIP008 JSON)
+daer probe node --file ~/sub.txt
+
+# 6. Custom timeout and end-to-end URL
+daer probe node us-02 --timeout 10 --url https://www.google.com/generate_204
+
+# 7. Probe an HTTP endpoint directly, or through a node
 daer probe url https://www.google.com --node hk-01
 ```
+
+`NODE` is one of three things, resolved in this order: a `scheme://` **link** (parsed with no configuration file), an empty value (lists the configuration's nodes and exits), or a **name/label** looked up in `--config`.
+
+`--file` decodes the body with the same `daer_outbound::subscription::decode` the daemon uses at load time ([INV-LOADER-01](../dev/standards/invariants.md)), so a list that probes clean here is the list the runtime would build. A line the format rejects is reported, never silently dropped. The command exits non-zero when any node fails, and prints `N/M node(s) operational`.
+
+The `--file` and `--all` forms stop at the first failure only in the sense that the summary line reports it: every node is probed first, so one dead node does not hide the state of the rest.
 
 Phased diagnostic reporting:
 - **L3 DNS Resolution**: Resolves node server hostname to IP.
 - **L4 TCP Connect**: Tests if server IP:Port is reachable (detects firewall/GFW SYN drops).
-- **L7 Protocol Handshake**: Connects through `NodeDialer` (VLESS/SS/Trojan/etc.) to verify UUID, password, TLS SNI, or REALITY keys.
-- **End-to-End Probe**: Sends HTTP probe request through the proxy tunnel to verify internet egress.
+- **L7 Protocol Handshake**: Connects through `NodeDialer` (VLESS/SS/Trojan/etc.) to verify UUID, password, TLS SNI, or REALITY keys. A REALITY node that cannot authenticate this client **forwards** the flow to the impersonated site; `reality/verify.rs` turns that silent redirection into the explicit failure `the peer is not the REALITY node`.
+- **End-to-End Probe**: Sends a real HTTP(S) request through the proxy tunnel and reads the reply. For an `https://` URL the TLS handshake happens *inside* the tunnel, which is what a TLS probe means.
+
+A single probe is subject to the usual loss on a long-haul link; `--timeout` interacts with that (the default 5 s is tight for a node at 200 ms RTT on a lossy path), and a handshake reset is retried once before being reported. That is a property of the path being measured, not of `daer`: `xray` against the same node shows the same distribution.
 
 ### 2.5 `schema` — JSON Schema for editors
 
@@ -128,29 +153,30 @@ daer version
 
 | Not in `daer` | Use instead |
 | :--- | :--- |
-| Compiling rules to `.drb`, converting `geoip.dat` / `geosite.dat`, inspecting or unit-testing `.drb` | Companion tool [`geodrb`](#4-drb-producer-tooling-geodrb). |
+| Compiling rules to `.drb`, converting `geoip.dat` / `geosite.dat`, inspecting or unit-testing `.drb` | Companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb). |
 | Converting a `vless://` / `ss://` link into a `[[node]]` table | Any subscription converter, or declare a `[[subscription]]`: `daer` parses links at runtime. |
 | Running a standalone DNS server | `daer run` serves DNS; `daer check` reports unusable upstreams. |
-| Formatting a configuration | An editor plus [`daer.example.toml`](https://github.com/daeuniverse/daer/blob/main/daer.example.toml). |
+| Formatting a configuration | An editor plus `daer.example.toml`. |
 
 ---
 
-## 4. DRB Producer Tooling: `geodrb`
+## 4. DRB Producer Tooling: `daer-drb`
 
-`geodrb` is the companion CLI dedicated to building, converting, inspecting, and unit-testing DRB rule sets.
+`daer-drb` is the DRB producer: it compiles Canonical Rule Source (`.rules`) into DRB v2
+(`.drb`), decompiles an artifact back to that text, inspects it, and tests a target against it.
+It links no Protobuf reader and no `.dat` converter (ADR-0031).
 
 ```bash
 # Compile plain-text rules to .drb
-geodrb compile company-direct.rules -o company-direct.drb
+daer-drb compile company-direct.rules -o company-direct.drb
 
 # Inspect metadata and counts of a .drb file
-geodrb inspect company-direct.drb
+daer-drb inspect company-direct.drb
 
-# Convert legacy geoip.dat or geosite.dat to .drb
-geodrb convert geosite.dat --code cn -o geosite-cn.drb
-geodrb convert geoip.dat --code cn -o geoip-cn.drb --type geoip
+# Decompile an artifact back to reviewable rules (recompiling reproduces identical bytes)
+daer-drb decompile geosite-cn.drb -o cn.rules
 
 # Unit-test whether a domain or IP matches a .drb file
-geodrb test geosite-cn.drb bilibili.com
-geodrb test geoip-cn.drb 1.2.3.4
+daer-drb test geosite-cn.drb bilibili.com
+daer-drb test geoip-cn.drb 1.2.3.4
 ```

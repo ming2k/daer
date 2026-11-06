@@ -179,11 +179,8 @@ pub async fn resolve_rule_providers_with(
 
                 match load_file_provider(&file_path, &tag, format) {
                     Ok(set) => {
-                        let intervals = set.v4.len() + set.v6.len();
-                        let domains = set.domain_full.len()
-                            + set.domain_suffix.len()
-                            + set.domain_keyword.len()
-                            + set.domain_regex.len();
+                        let intervals = set.v4_intervals.len() + set.v6_intervals.len();
+                        let domains = set.domain_patterns();
                         pool.insert(tag.clone(), set);
                         resolution.providers.push(ResolvedRuleProvider {
                             tag,
@@ -225,11 +222,8 @@ pub async fn resolve_rule_providers_with(
                 let cache_file = cache_dir.join(format!("{tag}.drb"));
                 match fetch_http_provider(url, &cache_file, &tag, format, timeout).await {
                     Ok((set, from_cache)) => {
-                        let intervals = set.v4.len() + set.v6.len();
-                        let domains = set.domain_full.len()
-                            + set.domain_suffix.len()
-                            + set.domain_keyword.len()
-                            + set.domain_regex.len();
+                        let intervals = set.v4_intervals.len() + set.v6_intervals.len();
+                        let domains = set.domain_patterns();
                         pool.insert(tag.clone(), set);
                         resolution.providers.push(ResolvedRuleProvider {
                             tag,
@@ -375,8 +369,8 @@ mod tests {
         assert_eq!(res.pool.len(), 1);
 
         let set = res.pool.get("corp").expect("found corp");
-        assert_eq!(set.v4.len(), 1);
-        assert_eq!(set.domain_suffix.len(), 1);
+        assert_eq!(set.v4_intervals.len(), 1);
+        assert_eq!(set.domain_patterns(), 1);
 
         let _ = fs::remove_dir_all(&temp);
     }

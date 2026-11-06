@@ -12,7 +12,7 @@ use daer_common::{MacAddr, PortRange};
 use daer_config::{Function, Param, RoutingRule};
 use ipnet::IpNet;
 
-use crate::domain::{DomainIndex, DomainKey};
+use crate::domain::DomainTable;
 use crate::drb::{DrbSet, RuleProviderPool};
 use crate::error::RoutingError;
 use crate::ipset::IpIndex;
@@ -25,11 +25,12 @@ use crate::values::{
 
 /// Receives one call per `(function, parameter key)` group.
 pub trait MatchSink {
+    /// Adds a domain predicate. `patterns` are complete `kind:value` spellings, so the sink
+    /// never has to reassemble a key and a value into one rule.
     fn add_domain(
         &mut self,
         negated: bool,
-        key: DomainKey,
-        values: &[&str],
+        patterns: &[String],
         target: &MatchTarget,
     ) -> Result<(), RoutingError>;
 
@@ -119,7 +120,7 @@ pub trait MatchSink {
     fn add_domain_index(
         &mut self,
         negated: bool,
-        index: DomainIndex,
+        index: DomainTable,
         target: &MatchTarget,
     ) -> Result<(), RoutingError> {
         let _ = (negated, index, target);
@@ -225,16 +226,22 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                         } else {
                             MatchTarget::logical_or(target.mark(), target.must())
                         };
-                        if let Some(dom) = set.to_domain_index() {
-                            self.sink.add_domain_index(negated, dom, &t)?;
+                        if !set.domains().is_empty() {
+                            self.sink
+                                .add_domain_index(negated, set.domains().clone(), &t)?;
                         }
                     }
                     Ok(())
                 } else if is_retired_dat_key(key) {
                     Err(retired_dat_key("domain", key))
                 } else {
-                    let key = DomainKey::parse(key)?;
-                    self.sink.add_domain(negated, key, values, target)
+                    // The rule spells `domain(suffix: a, full: b)`; hand the sink complete
+                    // patterns rather than a key it would have to reassemble.
+                    let patterns: Vec<String> = values
+                        .iter()
+                        .map(|value| format!("{key}:{value}"))
+                        .collect();
+                    self.sink.add_domain(negated, &patterns, target)
                 }
             }
             "ip" => {
@@ -332,13 +339,13 @@ fn is_retired_dat_key(key: &str) -> bool {
 /// These named a Protobuf `.dat` file. Both the file and the reader are gone (ADR-0014,
 /// ADR-0015), so the honest answer is to name the replacement rather than say "unsupported key":
 /// an operator migrating a working configuration needs to know where the category went, and the
-/// data is still available — as a compiled `.drb` from `geodrb`.
+/// data is still available — as a compiled `.drb` from `daer-drb`.
 fn retired_dat_key(function: &str, key: &str) -> RoutingError {
     RoutingError::new(format!(
         "{function}({key}: ...): the `{key}:` key names a Protobuf .dat file, which this build \
          no longer reads (ADR-0014). Declare the category as a `[[rule-provider]]` and write \
          `provider(<tag>)`, or `{function}(provider: <tag>)` to use only that provider's \
-         {}. See `geodrb`: https://github.com/daeuniverse/geodrb",
+         {}. See `daer-drb`.",
         if function == "domain" {
             "domains"
         } else {
@@ -381,12 +388,12 @@ impl MatchSink for RecordingSink {
     fn add_domain(
         &mut self,
         negated: bool,
-        key: DomainKey,
-        values: &[&str],
+        patterns: &[String],
         target: &MatchTarget,
     ) -> Result<(), RoutingError> {
-        let patterns = DomainIndex::new(key, values, &mut self.warnings);
-        self.push(MatchValue::Domain(patterns), target, negated);
+        let borrowed: Vec<&str> = patterns.iter().map(String::as_str).collect();
+        let table = DomainTable::compile(&borrowed, &mut self.warnings);
+        self.push(MatchValue::Domain(table), target, negated);
         Ok(())
     }
 
@@ -516,7 +523,7 @@ impl MatchSink for RecordingSink {
     fn add_domain_index(
         &mut self,
         negated: bool,
-        index: DomainIndex,
+        index: DomainTable,
         target: &MatchTarget,
     ) -> Result<(), RoutingError> {
         self.push(MatchValue::Domain(index), target, negated);
@@ -563,11 +570,11 @@ impl MatchSink for ValidationSink {
     fn add_domain(
         &mut self,
         _negated: bool,
-        key: DomainKey,
-        values: &[&str],
+        patterns: &[String],
         _target: &MatchTarget,
     ) -> Result<(), RoutingError> {
-        let _ = DomainIndex::new(key, values, &mut self.warnings);
+        let borrowed: Vec<&str> = patterns.iter().map(String::as_str).collect();
+        let _ = DomainTable::compile(&borrowed, &mut self.warnings);
         Ok(())
     }
 
@@ -774,16 +781,41 @@ mod tests {
         assert!(error.message.starts_with("in 'ip("), "{error}");
     }
 
+    /// A bare name is a suffix, exactly as it is in rule text.
+    ///
+    /// The old matcher refused `domain(example.com)` and demanded `domain(suffix: example.com)`,
+    /// which meant the same text had two meanings depending on whether it came from a config
+    /// rule or a `.rules` file. One vocabulary (ADR-0033) makes the bare name mean the suffix it
+    /// obviously reads as, and keeps the explicit spelling working.
     #[test]
-    fn domain_requires_an_authoritative_key() {
-        let rules = rules("routing { domain(example.com) -> direct }");
+    fn a_bare_domain_is_a_suffix() {
+        let bare = rules("routing { domain(example.com) -> direct }");
         let mut sink = RecordingSink::default();
-        let error = RulesBuilder::new(&mut sink)
-            .apply(&rules)
-            .expect_err("must fail");
+        RulesBuilder::new(&mut sink)
+            .apply(&bare)
+            .expect("a bare name is a suffix");
+
+        let explicit = rules("routing { domain(suffix: example.com) -> direct }");
+        let mut sink = RecordingSink::default();
+        RulesBuilder::new(&mut sink)
+            .apply(&explicit)
+            .expect("the explicit spelling still works");
+    }
+
+    /// A retired key is refused by name and says where it went, rather than matching nothing.
+    #[test]
+    fn a_removed_domain_key_names_its_replacement() {
+        let retired = rules("routing { domain(regex: ^a.*z$) -> direct }");
+        let mut sink = RecordingSink::default();
+        RulesBuilder::new(&mut sink)
+            .apply(&retired)
+            .expect("compiling is not the failure point");
         assert!(
-            error.message.contains("addDomain: unsupported key"),
-            "{error}"
+            sink.warnings
+                .iter()
+                .any(|warning| warning.contains("not a routing predicate")),
+            "a removed key must be reported: {:?}",
+            sink.warnings
         );
     }
 

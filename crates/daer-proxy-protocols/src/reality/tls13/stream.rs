@@ -281,9 +281,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Connection<S> {
                         )
                     })?;
                     match crate::reality::verify::verify(&leaf, &auth_key) {
-                        crate::reality::verify::Identity::Node => {
-                            let _ = server_name;
-                        }
+                        // The certificate's signature is an HMAC under the auth key, which only
+                        // the node can produce. Nothing else is concluded from it — REALITY has no
+                        // chain to validate, and the impersonated site's certificate is exactly
+                        // what a forwarded flow presents.
+                        crate::reality::verify::Identity::Node => {}
                         crate::reality::verify::Identity::Forwarded { subject } => {
                             return fail(format!(
                                 "the peer is not the REALITY node: its certificate is not \

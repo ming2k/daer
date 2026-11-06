@@ -23,6 +23,7 @@
 //! `SIGHUP` re-reads the configuration and publishes a new generation. A generation that
 //! fails to build publishes nothing, so a typo cannot stop a working proxy.
 
+use crate::preflight;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,7 +42,11 @@ pub struct RunOptions {
     pub object: PathBuf,
     /// Serve without attaching the kernel program.
     pub no_datapath: bool,
-    /// Exit once the datapath is attached instead of serving.
+    /// Report what would happen and change nothing.
+    ///
+    /// A dry run builds the generation, validates the object and reads the capabilities, then
+    /// exits — before the port is bound, before the device pair is created, before any sysctl
+    /// or policy route is written, and before `bpf()`. It needs no capability (ADR-0029).
     pub dry_run: bool,
 }
 
@@ -80,10 +85,18 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     .await?;
     tracing::info!(?lan, ?wan, "interfaces resolved");
 
+    // ADR-0029: the dry run ends here. Everything above this line reads the box; everything
+    // below it mutates the box (bind, veth pair, sysctls, policy route) or the kernel (BPF
+    // load, tc attach). Returning before the first mutation is what makes "--dry-run" mean
+    // "changed nothing" rather than "did everything, then exited".
+    if options.dry_run {
+        return report_plan(&loaded, &options, &lan, &wan).await;
+    }
+
     // The socket mark, decided once for the whole run.
     //
     // Three consumers have to agree or the proxy captures its own traffic and loops: the
-    // generation's dialers (`ROUTER_OPTIONS`), the datapath's `PARAM.dae_socket_mark`, and the
+    // generation's dialers (`ROUTER_OPTIONS`), the datapath's `PARAM.socket_mark`, and the
     // operator's nftables exclusion. `--no-datapath` deliberately gets `None`: without
     // `CAP_NET_ADMIN` a marked dial fails outright, and nothing is redirected anyway.
     let so_mark = if options.no_datapath {
@@ -159,11 +172,6 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         }
         None => base_options,
     };
-
-    if options.dry_run {
-        tracing::info!("--dry-run: datapath attached, exiting without serving");
-        return Ok(());
-    }
 
     // ADR-0006: health scheduling is part of the daemon, not an optional extra. Without it a
     // latency policy's alive set stays empty and every flow to such a group is refused.
@@ -318,6 +326,94 @@ impl DnsHandle {
     }
 }
 
+/// Prints the preflight report and returns, changing nothing.
+///
+/// This is the unprivileged gate (ADR-0029). It builds the generation the daemon would
+/// serve, validates the compiled object against the ABI, computes the runtime parameter and
+/// reads the capabilities — none of which binds a port, creates a device, writes a sysctl,
+/// installs a route or calls `bpf()`.
+///
+/// # Errors
+///
+/// Returns when the configuration does not compile, or when an object was requested and is
+/// invalid. Both are things a preflight is supposed to catch, so they are errors rather than
+/// warnings: a dry run that reports a broken object and exits zero is the failure mode this
+/// exists to prevent.
+async fn report_plan(
+    loaded: &daer_config::Config,
+    options: &RunOptions,
+    lan: &[String],
+    wan: &[String],
+) -> anyhow::Result<()> {
+    let router_options = RouterOptions::for_config(&options.config);
+    let object = resolve_object_path(&options.object);
+    let object_arg = (!options.no_datapath).then_some(object.as_path());
+
+    let plan = preflight::plan(loaded, &router_options, lan, wan, object_arg)
+        .map_err(|error| anyhow::anyhow!("{}", error.source))?;
+
+    tracing::info!("--dry-run: nothing is bound, created or attached; this is a report only");
+
+    tracing::info!(
+        generation = %plan.generation.describe(),
+        rules = plan.generation.rules(),
+        "configuration compiles"
+    );
+
+    // The tier is a performance property with a large blast radius (ADR-0005/ADR-0011), and
+    // before this line it was only discoverable from a running daemon's log.
+    match preflight::deferral_reason(&plan) {
+        None => tracing::info!(
+            "kernel policy: equivalent — the datapath reproduces userspace's verdict for every flow"
+        ),
+        Some(reason) => tracing::warn!(
+            %reason,
+            "kernel policy: defer — every flow is handed to the control plane, so the kernel \
+             fast path is not used"
+        ),
+    }
+
+    let param = preflight::planned_param(plan.port, plan.socket_mark);
+    tracing::info!(
+        port = plan.port,
+        so_mark = ?plan.socket_mark,
+        control_plane_pid = param.control_plane_pid,
+        "would listen for redirected flows"
+    );
+    tracing::info!(?plan.lan, ?plan.wan, "would attach to these interfaces");
+
+    if options.no_datapath {
+        tracing::warn!("--no-datapath: the kernel object would not be loaded or attached");
+    } else if let Some(report) = &plan.object {
+        tracing::info!(
+            object = %report.path.display(),
+            maps = report.detail.maps,
+            programs = report.detail.programs,
+            "datapath object is valid: names, sections and BTF func_info match the ABI"
+        );
+    } else if let Some(error) = &plan.object_error {
+        anyhow::bail!("datapath object is not usable: {error}");
+    }
+
+    let (device, peer) = preflight::device_pair_present();
+    let pair_state = if device && peer {
+        "the device pair exists and would be reused"
+    } else {
+        "the device pair would be created"
+    };
+    tracing::info!(device_present = device, peer_present = peer, "{pair_state}");
+
+    match preflight::privileged_blocker(plan.capabilities) {
+        None => tracing::info!(
+            "capabilities present: `daer run` would bind, create the pair and attach here"
+        ),
+        Some(reason) => tracing::warn!(%reason, "the privileged phase would not run here"),
+    }
+
+    tracing::info!("--dry-run: report complete, nothing was changed");
+    Ok(())
+}
+
 /// Prepares the device pair and attaches the datapath.
 async fn attach(
     daemon: &Daemon,
@@ -395,7 +491,7 @@ async fn attach(
     Ok(ebpf)
 }
 
-fn resolve_object_path(path: &Path) -> PathBuf {
+pub fn resolve_object_path(path: &Path) -> PathBuf {
     resolve_object_path_in(path, INSTALLED_OBJECT_PATHS)
 }
 

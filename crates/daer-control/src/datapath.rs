@@ -188,22 +188,32 @@ impl Family {
     }
 }
 
-/// The `fwmark` selector the datapath's redirected packets carry.
-const MARK_SPEC: &str = "0x8000000/0x8000000";
 /// The routing table number, as `ip` spells it.
 const TABLE_SPEC: &str = "2023";
 
+/// The `fwmark` selector `ip rule` takes, `0x8000000/0x8000000`, formatted from
+/// [`daer_common::consts::TPROXY_MARK`] so the mark the datapath stamps and the mark
+/// this rule matches cannot drift (ADR-0023).
+fn mark_spec() -> String {
+    let mark = daer_common::consts::TPROXY_MARK;
+    format!("{mark:#x}/{mark:#x}")
+}
+
 impl Family {
     /// The full argument vector for `ip <flag> rule add ...`.
-    const fn rule(self) -> [&'static str; 7] {
-        [
-            self.flag(),
-            "rule",
-            "add",
-            "fwmark",
-            MARK_SPEC,
-            "table",
-            TABLE_SPEC,
+    ///
+    /// The mark selector comes from [`mark_spec`], which formats
+    /// [`daer_common::consts::TPROXY_MARK`]: the mark the C stamps and the mark this
+    /// rule matches cannot drift (ADR-0023).
+    fn rule(self) -> Vec<String> {
+        vec![
+            self.flag().to_owned(),
+            "rule".to_owned(),
+            "add".to_owned(),
+            "fwmark".to_owned(),
+            mark_spec(),
+            "table".to_owned(),
+            TABLE_SPEC.to_owned(),
         ]
     }
 
@@ -233,15 +243,15 @@ impl Family {
     }
 
     /// The deletion form of [`Self::rule`].
-    const fn rule_del(self) -> [&'static str; 7] {
-        [
-            self.flag(),
-            "rule",
-            "del",
-            "fwmark",
-            MARK_SPEC,
-            "table",
-            TABLE_SPEC,
+    fn rule_del(self) -> Vec<String> {
+        vec![
+            self.flag().to_owned(),
+            "rule".to_owned(),
+            "del".to_owned(),
+            "fwmark".to_owned(),
+            mark_spec(),
+            "table".to_owned(),
+            TABLE_SPEC.to_owned(),
         ]
     }
 
@@ -309,17 +319,22 @@ fn install_family(family: Family) -> Result<(), DatapathError> {
     Ok(())
 }
 
-fn run(line: &[&str]) -> Result<String, DatapathError> {
+fn run<S: AsRef<std::ffi::OsStr>>(line: &[S]) -> Result<String, DatapathError> {
     let Some((program, arguments)) = line.split_first() else {
         return Err(DatapathError::Missing(String::new()));
     };
     let output = Command::new(program)
         .args(arguments)
         .output()
-        .map_err(|_| DatapathError::Missing((*program).to_owned()))?;
+        .map_err(|_| DatapathError::Missing(program.as_ref().to_string_lossy().into_owned()))?;
     if !output.status.success() {
+        let command = line
+            .iter()
+            .map(|part| part.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(DatapathError::Command {
-            command: line.join(" "),
+            command,
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }

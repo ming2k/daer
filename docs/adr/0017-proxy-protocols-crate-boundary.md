@@ -9,7 +9,9 @@ supersedes: []
 
 # 0017. Proxy protocols and crypto engines belong to daer-proxy-protocols
 
-- Status: Accepted
+- Status: Accepted (Amended by [ADR-0028](0028-protocol-layering.md): the crate now holds
+  orthogonal *layers* rather than one module per product protocol, so `reality` is a security
+  layer, `vless`/`vmess` are protocol layers, and `transport` is a layer of its own)
 - Date: 2026-10-31
 - Related: [ADR-0002](0002-netune-boundary.md), [ADR-0010](0010-reality-client-ownership.md)
 

@@ -18,7 +18,7 @@ supersedes: []
 
 ## Context and Problem Statement
 
-ADR-0015 successfully purged build-time producers (such as Protobuf readers and `.dat` converters) from `daer-cli` into the standalone `geodrb` tool.
+ADR-0015 successfully purged build-time producers (such as Protobuf readers and `.dat` converters) from `daer-cli` into the standalone `daer-drb` tool.
 
 However, real-world operational experience revealed two usability bottlenecks:
 
@@ -52,7 +52,13 @@ We adopt a clean, non-compromising CLI architecture:
   2. *L4 TCP Handshake*: Measures TCP connect latency and verifies server IP:port reachability.
   3. *L7 Proxy Handshake*: Authenticates through `NodeDialer` (VLESS/SS/Trojan/etc.) to verify protocol credentials.
   4. *End-to-End HTTP Probe*: Sends an HTTP request through the tunnel to verify internet egress.
+- `daer probe node '<LINK>'` / `daer probe '<LINK>'`: the same four tiers against a node **link** with no configuration file. A link is how a provider hands over a single node, so requiring a hand-written `config.toml` first made the one question an operator actually has ("is this node usable") the hardest one to ask. `NODE` is resolved in a fixed order — a `scheme://` link, then an empty value (list what the configuration holds), then a name looked up in `--config` — so no input is interpreted two ways. The link is parsed by `daer_config::Node::from_link`, the same parser the loader uses for a `[[node]]` table written as a link; this is not a second parser, and it is why the shortcut does not violate [INV-LOADER-01](../../dev/standards/invariants.md) (a link has no configuration to disagree with).
+- `daer probe node --all` / `daer probe node --file <PATH>`: probe a whole pool. `--all` walks the configuration's nodes; `--file` decodes a subscription body with `daer_outbound::subscription::decode`, the same decoder the daemon runs when it resolves a `[[subscription]]`, so the probed list is the list the runtime would build. A line the format rejects is reported and skipped, and the command exits non-zero if any node fails, printing `N/M node(s) operational`.
 - `daer probe url <URL> [--node <NODE>]`: Direct or proxy-tunneled endpoint probe.
+
+The `--file` form is why "test a subscription" is a verb and not a shell loop: the answer an operator needs is *which* of forty nodes are alive, and a loop over `probe node` prints forty unrelated reports with no total.
+
+A probe retries a reset handshake once. A single attempt against a node 200 ms away on a lossy path fails perhaps half the time — measured identically through `xray` against the same node — and reporting that as "the node is broken" is a lie about the node. The retry does not blur a bad credential: a REALITY `pbk` mismatch forwards the flow and fails with `the peer is not the REALITY node` on every attempt.
 
 ### 3. Surface Verbs
 The `daer` CLI surface is structured as:
@@ -73,3 +79,8 @@ daer version                 build information
 - Intuitive mental model matching standard network engineering practices.
 - Instant, multi-tiered root cause identification for proxy node failures.
 - Zero extra external dependencies added to `daer-cli`.
+- A single link, a whole configuration, or a subscription file are all probeable through one verb, and `--file` shares its decoder with the daemon, so "the node list the probe saw" and "the node list the daemon loaded" cannot diverge.
+
+### Negative
+- `NODE` carries three meanings. The order is fixed and each branch is total, but the help text has to state the order, and a user who names a node the same as a link scheme would get the link branch. This is acceptable because a link always contains `://`, which no sane node label does.
+- `--all` and `--file` serialize their probes. Probing forty nodes concurrently would finish faster, but would also make the report's ordering depend on which node answered first, and the per-node latency numbers are the point.

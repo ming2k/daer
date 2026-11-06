@@ -24,12 +24,13 @@
 //! | `config fmt`, `config example` | a configuration is hand-written TOML; a formatter and a sample belong in an editor and in the docs. |
 //! | `explain` | replaced by `daer route <TARGET>`: natural routing lookup mental model. |
 //! | `node convert` | [ADR-0014] put subscription parsing in the runtime, so a URI no longer needs hand-converting. A text transformer is a third-party tool. |
-//! | `rule compile` / `inspect` / `convert` | the rule compiler is a **producer**. It lives in `geodrb`, so the daemon links no `daer-geodata` and can never be the thing that speaks Protobuf. |
+//! | `rule compile` / `inspect` / `convert` | the rule compiler is a **producer**. It lives in `daer-drb`, so the daemon links no `daer-geodata` and can never be the thing that speaks Protobuf. |
 //! | `dns serve` / `dns check` | the resolver is part of `daer run` (Fake-IP has no meaning without it) and upstream usability is part of `daer check`. A standalone DNS server is a different product. |
 //!
-//! [ADR-0014]: https://github.com/daeuniverse/daer/blob/main/docs/adr/0014-drb-rule-binary-and-providers.md
+//! [ADR-0014]: ../docs/adr/0014-drb-rule-binary-and-providers.md
 
 mod dns;
+mod preflight;
 mod probe;
 mod run;
 
@@ -75,7 +76,15 @@ enum Command {
         /// proxied: it exists to exercise the accept/relay path without `CAP_NET_ADMIN`.
         #[arg(long)]
         no_datapath: bool,
-        /// Attach the datapath and exit without serving.
+        /// Report what would happen, and change nothing.
+        ///
+        /// Resolves the configuration, builds the generation, validates the object against
+        /// the ABI, computes the runtime parameter and reports the capabilities the next
+        /// phase would need — then exits before the port is bound, the device pair is
+        /// created, any sysctl or policy route is written, or `bpf()` is called. It needs no
+        /// capability, which is what makes it usable as a deployment gate (ADR-0029).
+        ///
+        /// It is not `--no-datapath`: that one serves and skips only the kernel half.
         #[arg(long)]
         dry_run: bool,
     },
@@ -91,6 +100,16 @@ enum Command {
         /// Print every node in every group, with its protocol and security identity.
         #[arg(long)]
         nodes: bool,
+        /// The compiled datapath object to validate against the ABI.
+        ///
+        /// Defaults to the path `daer run` resolves — the same fallback chain, including the
+        /// packaged install locations — so an installed artifact is validated without a flag.
+        /// Pass `--object none` to skip the object entirely.
+        ///
+        /// This validates names, sections and BTF `func_info` without loading anything into
+        /// the kernel, so it needs no capability (ADR-0029).
+        #[arg(long, value_name = "PATH")]
+        object: Option<PathBuf>,
     },
     /// Route a flow, IP, or domain through the routing engine without running the daemon.
     ///
@@ -161,9 +180,16 @@ enum Command {
 enum ProbeCommand {
     /// Probe an outbound node's reachability, TLS/protocol handshake, and health.
     Node {
-        /// Name or label of the node declared in configuration.
+        /// Name or label of the node declared in configuration, or a direct node URI link (vless://, ss://, etc.).
+        #[arg(default_value = "")]
         node: String,
-        /// Configuration file. Defaults to `/etc/daer/config.toml`.
+        /// Probe all nodes declared in the configuration file.
+        #[arg(long)]
+        all: bool,
+        /// Probe every node a subscription file lists (one link per line, base64, or SIP008 JSON).
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Configuration file. Defaults to `/etc/daer/config.toml` (ignored for direct URI links).
         #[arg(short, long, value_name = "PATH")]
         config: Option<PathBuf>,
         /// Probe timeout in seconds.
@@ -188,6 +214,9 @@ enum ProbeCommand {
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
     },
+    /// Direct node link or node name probe.
+    #[command(external_subcommand)]
+    Direct(Vec<String>),
 }
 
 /// A subcommand placeholder that exists only to carry the migration message.
@@ -287,8 +316,12 @@ fn main() -> ExitCode {
                 .await
             })
         }),
-        Command::Check { config, nodes } => resolve_config(config)
-            .and_then(|path| block_on(async move { check(&path, nodes).await })),
+        Command::Check {
+            config,
+            nodes,
+            object,
+        } => resolve_config(config)
+            .and_then(|path| block_on(async move { check(&path, nodes, object).await })),
         Command::Route {
             target,
             destination,
@@ -312,36 +345,62 @@ fn main() -> ExitCode {
         Command::Probe { command } => match command {
             ProbeCommand::Node {
                 node,
+                all,
+                file,
                 config,
                 timeout,
                 url,
-            } => resolve_config(config).and_then(|path| {
-                block_on(async move {
-                    probe::probe_node(probe::ProbeNodeOptions {
-                        node,
-                        config: path,
-                        timeout: std::time::Duration::from_secs(timeout),
-                        url,
-                    })
-                    .await
+            } => block_on(async move {
+                probe::probe_node(probe::ProbeNodeOptions {
+                    node,
+                    all,
+                    file,
+                    config,
+                    timeout: std::time::Duration::from_secs(timeout),
+                    url,
                 })
+                .await
             }),
             ProbeCommand::Url {
                 url,
                 config,
                 timeout,
                 node,
-            } => resolve_config(config).and_then(|path| {
-                block_on(async move {
-                    probe::probe_url(probe::ProbeUrlOptions {
-                        url,
-                        config: path,
-                        timeout: std::time::Duration::from_secs(timeout),
-                        node,
-                    })
-                    .await
+            } => block_on(async move {
+                probe::probe_url(probe::ProbeUrlOptions {
+                    url,
+                    config,
+                    timeout: std::time::Duration::from_secs(timeout),
+                    node,
                 })
+                .await
             }),
+            ProbeCommand::Direct(args) => {
+                // `daer probe <LINK>` is sugar for `daer probe node <LINK>`, and nothing else:
+                // it carries no flags, so a mistyped `daer probe --file sub.txt` cannot be read
+                // as a node named `--file sub.txt` and silently probe the wrong thing. Given
+                // flags, it names the explicit verb instead of guessing what was meant.
+                if let Some(flag) = args.iter().find(|argument| argument.starts_with('-')) {
+                    Err(anyhow::anyhow!(
+                        "`daer probe {flag} …` is not a form: the LINK shortcut takes a node \
+                         link and no options. Use `daer probe node <NODE> {flag} …` (NODE may \
+                         itself be a vless://… link), or `daer probe url <URL>`."
+                    ))
+                } else {
+                    let node = args.join(" ");
+                    block_on(async move {
+                        probe::probe_node(probe::ProbeNodeOptions {
+                            node,
+                            all: false,
+                            file: None,
+                            config: None,
+                            timeout: std::time::Duration::from_secs(5),
+                            url: None,
+                        })
+                        .await
+                    })
+                }
+            }
         },
         Command::Schema => {
             println!("{}", daer_config::schema::json_schema());
@@ -378,7 +437,7 @@ fn main() -> ExitCode {
         )),
         Command::Rule { .. } => Err(removed_verb(
             "rule",
-            "the DRB producer is `geodrb`: `geodrb compile`, `geodrb convert`, `geodrb inspect`",
+            "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb convert`, `daer-drb inspect`",
         )),
     };
 
@@ -406,7 +465,7 @@ fn removed_verb(verb: &str, replacement: &str) -> anyhow::Error {
 /// every group, check every node this build can speak — so a configuration that passes here
 /// is one the daemon can serve. `--nodes` additionally prints the resolved node pool, which is
 /// what `daer route nodes` used to be.
-async fn check(path: &Path, nodes: bool) -> anyhow::Result<()> {
+async fn check(path: &Path, nodes: bool, object: Option<PathBuf>) -> anyhow::Result<()> {
     let report = validate_config(path).await?;
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
@@ -414,6 +473,31 @@ async fn check(path: &Path, nodes: bool) -> anyhow::Result<()> {
 
     if nodes {
         list_nodes(path).await?;
+    }
+
+    // The object half of the gate (ADR-0029). It runs by default: "not asked for" and "asked
+    // to skip" are different, and conflating them left `daer check -c …` validating no
+    // artifact at all, which is exactly the hole this gate exists to close. `--object none`
+    // is the only way to skip, and it says so.
+    let object = match object.as_deref() {
+        Some(path) if path == Path::new("none") => None,
+        Some(path) => Some(path.to_path_buf()),
+        // The same literal `run`'s `--object` defaults to, and the same resolution: a
+        // packaged install puts the object in libdir, not in the working directory.
+        None => Some(run::resolve_object_path(Path::new(
+            "target/ebpf/datapath.o",
+        ))),
+    };
+    if let Some(object) = object.as_deref() {
+        match daer_ebpf::inspect_object(object) {
+            Ok(detail) => println!(
+                "{}: ok, {} maps, {} programs (names, sections and BTF func_info match the ABI)",
+                object.display(),
+                detail.maps,
+                detail.programs
+            ),
+            Err(error) => anyhow::bail!("{}: {error}", object.display()),
+        }
     }
 
     println!(
@@ -426,7 +510,7 @@ async fn check(path: &Path, nodes: bool) -> anyhow::Result<()> {
 }
 
 /// Resolves `--config`, falling back to the first conventional path that exists.
-fn resolve_config(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_config(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
@@ -1118,13 +1202,18 @@ fallback = "direct"
     }
 
     #[test]
-    fn rejects_a_node_whose_protocol_this_build_cannot_speak() {
+    fn a_protocol_this_build_cannot_speak_is_named_by_its_scheme() {
+        // `vmess` *is* implemented now (ADR-0030), so the test's original subject moved: what
+        // must still be refused is a scheme with no layer behind it, and the refusal must name
+        // the scheme rather than reporting a generic parse failure.
         let dir = TempDir::new("badproto");
         let config = dir.write(
             "config.toml",
             br#"[[node]]
 tag = "v"
-type = "vmess"
+type = "tuic"
+server = "198.51.100.1"
+port = 443
 
 [[group]]
 name = "g"
@@ -1136,7 +1225,7 @@ fallback = "g"
         );
         let error = block_on(validate_config(&config)).expect_err("must fail");
         let message = format!("{error:#}");
-        assert!(message.contains("vmess"), "{message}");
+        assert!(message.contains("tuic"), "{message}");
     }
 
     #[test]
@@ -1418,11 +1507,11 @@ server = "198.51.100.1"
 port = 443
 uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 flow = "xtls-rprx-vision"
-[node.reality]
+[node.security]
+type = "reality"
 sni = "impersonate.example.com"
 public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
 short-id = "ab01cd02"
-fingerprint = "chrome"
 
 [[node]]
 tag = "us-ss"
@@ -1456,7 +1545,7 @@ fallback = "proxy"
             .iter()
             .find(|n| n.node == "hk-vless")
             .expect("vless node");
-        assert_eq!(vless.protocol, daer_outbound::Protocol::Reality);
+        assert_eq!(vless.protocol, daer_outbound::Protocol::Vless);
         assert!(vless.security.is_confidential());
         assert!(vless.describe().contains("reality"));
 
@@ -1613,7 +1702,7 @@ fallback = "direct"
             ("explain", "daer route"),
             ("node", "[[subscription]]"),
             ("dns", "daer run"),
-            ("rule", "geodrb"),
+            ("rule", "daer-drb"),
         ] {
             let error = block_on(async { cli_error(verb).await });
             let message = format!("{error:#}");
@@ -1652,8 +1741,8 @@ fallback = "direct"
             )),
             Command::Rule { .. } => Err(removed_verb(
                 "rule",
-                "the DRB producer is `geodrb`: `geodrb compile`, `geodrb convert`, \
-                 `geodrb inspect`",
+                "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb convert`, \
+                 `daer-drb inspect`",
             )),
             other => panic!("{other:?} is not a removed verb"),
         };

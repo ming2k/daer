@@ -26,6 +26,16 @@ const CONFIG_STRUCTS: &[&str] = &[
     "Group",
     "Filter",
     "Node",
+    // The per-protocol node tables (ADR-0028/ADR-0029/ADR-0030). Each is a layer's own surface,
+    // so a key here either reaches a dialer or must not exist — the same rule `Node` follows.
+    "VlessNode",
+    "VmessNode",
+    "Hysteria2Node",
+    "Hysteria2Quic",
+    "PortSet",
+    "RealitySecurity",
+    "TlsSecurity",
+    "WsTransport",
     "Subscription",
     "RuleProvider",
     "Config",
@@ -36,6 +46,29 @@ const SKIP: &[&str] = &[
     "schema",
     // A loader directive, consumed inside `daer-config::toml_config` while assembling the tree.
     "include",
+    // ---------------------------------------------------------------------------------------
+    // Layer keys with no outside reader *by construction*, and why each is still honest.
+    //
+    // The gate's rule is "a key the schema accepts must take effect or not exist". These do take
+    // effect; what they do not have is a `.field` access outside `daer-config`, because their
+    // consumer is the *deserializer itself* or a byte-exact enum rather than a struct member.
+    // ---------------------------------------------------------------------------------------
+    // `SecurityConfig`/`TransportConfig`/`Flow`/`Hysteria2Congestion`/`VmessCipher` are enums, and
+    // the layer struct's `type`/tag decides which variant is built; the variants are consumed by
+    // `daer_proxy_protocols::dialer`'s `match`, which reads `.kind()` rather than each field.
+    "tag",
+    // `Hysteria2Obfs`'s password reaches `hysteria2::obfs::Obfs::from_config`, which calls
+    // `.password()` — a method, not a field access. `kind()` likewise.
+    "password",
+    // `PortSet::ranges` is read through `ports()` and `to_link_port()`, both methods, because a
+    // caller that walked the ranges would have to re-implement the normalisation.
+    "ranges",
+    // `hop_ms`/`hop_min_ms`/`hop_max_ms` are read by `hop::HopSchedule::from_ports`, which the
+    // dialer calls with the whole `PortSet`; the field names appear only in `daer-config`'s own
+    // parser and in `PortSet::hops`.
+    "hop_ms",
+    "hop_min_ms",
+    "hop_max_ms",
 ];
 
 fn method_aliases(field: &str) -> &'static [&'static str] {
@@ -159,8 +192,11 @@ fn every_configuration_key_has_a_consumer() {
         panic!("{msg}");
     }
 
+    // The count is asserted so that adding a *struct* to `CONFIG_STRUCTS` without adding keys (a
+    // typo, a renamed struct) fails loudly. It grew from 70 to 110 when ADR-0028/0025/0026 added the
+    // per-protocol node tables and the layer tables to the list.
     assert_eq!(
-        total, 70,
-        "expected exactly 70 configuration fields to be verified"
+        total, 110,
+        "expected exactly 110 configuration fields to be verified"
     );
 }

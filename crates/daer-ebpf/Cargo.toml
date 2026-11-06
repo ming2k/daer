@@ -12,10 +12,12 @@ description = "eBPF object loading and map ABI for daer"
 daer-common.workspace = true
 ipnet.workspace = true
 aya = { workspace = true, optional = true }
+# `inspect_bytes` parses an object and reproduces aya's call relocation without loading it,
+# which is what lets `daer check` gate a packaged artifact unprivileged (ADR-0029).
+aya-obj = "0.3"
 
 [dev-dependencies]
 libc.workspace = true
-aya-obj = "0.3"
 
 [features]
 default = ["loader"]

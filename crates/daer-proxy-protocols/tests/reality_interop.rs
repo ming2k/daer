@@ -11,15 +11,17 @@
 //! returned as `Ready(Ok(()))` with nothing written. Every proxied connection through every
 //! REALITY node was dead, while `docs/dev/roadmap.md` called REALITY "live-verified".
 //!
-//! This test closes that gap the way `docs/dev/standards/testing.md` §2.2 requires: a local
-//! server, not a public one, so it is a fixture rather than a dependency on someone else's
-//! uptime. It starts `xray` itself, and **skips with a reason** when `xray` is not installed
-//! (ADR-0007: a skip that states why is a fact; a pass that proved nothing is a lie).
+//! This test closes that gap the way [ADR-0007] requires: a local server, not a public one,
+//! so it is a fixture rather than a dependency on someone else's uptime. It starts `xray`
+//! itself, and **skips with a reason** when `xray` is not installed (ADR-0007: a skip that
+//! states why is a fact; a pass that proved nothing is a lie).
 //!
 //! ```sh
-//! cargo test -p daer-outbound --test reality_interop -- --nocapture
-//! XRAY_BIN=/path/to/xray cargo test -p daer-outbound --test reality_interop
+//! cargo test -p daer-proxy-protocols --test reality_interop -- --nocapture
+//! XRAY_BIN=/path/to/xray cargo test -p daer-proxy-protocols --test reality_interop
 //! ```
+//!
+//! [ADR-0007]: ../../../docs/adr/0007-verification.md
 //!
 //! # The encodings this pins
 //!

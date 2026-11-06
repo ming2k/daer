@@ -8,7 +8,7 @@
 //!
 //! # Why the values are compiled types
 //!
-//! A match set holds an *index*, not a list. `IpIndex` and `DomainIndex` do their
+//! A match set holds an *index*, not a list. `IpIndex` and `DomainTable` do their
 //! work at construction, so a decision costs one hash per distinct prefix length
 //! and one hash per label instead of one comparison per prefix or pattern. The
 //! semantics of the loop below are unchanged; only the cost of asking a predicate
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use daer_common::{MacAddr, PortRange};
 
-use crate::domain::DomainIndex;
+use crate::domain::DomainTable;
 use crate::error::RoutingError;
 use crate::ipset::IpIndex;
 use crate::outbound::{CONTROL_PLANE_ROUTING, MUST_RULES, MatchTarget, Outbound};
@@ -36,7 +36,7 @@ pub enum MatchValue {
     IpVersion(IpVersionMask),
     ProcessName(ProcessName),
     Dscp(u8),
-    Domain(DomainIndex),
+    Domain(DomainTable),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

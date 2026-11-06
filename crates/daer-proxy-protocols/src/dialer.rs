@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Unified dialer dispatching across all supported proxy protocols.
+//!
+//! # One entry point per direction
+//!
+//! [`ProxyDialer::from_link`] and [`ProxyDialer::from_node`] are the whole public surface for
+//! constructing a session (ADR-0028). Everything below them — a handshake, a header codec, a
+//! socket wrapper — is reachable only from a parsed node, which is what keeps a configuration
+//! from reaching a layer it did not ask for.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +19,12 @@ use crate::anytls::AnyTlsConnector;
 use crate::error::ProxyProtocolError;
 use crate::hysteria2::Hysteria2Connector;
 use crate::options::DialerOptions;
-use crate::reality::RealityConnector;
+use crate::security::Security;
 use crate::shadowsocks::ShadowSocksConnector;
+use crate::transport::TransportLayer;
 use crate::trojan::TrojanConnector;
+use crate::vless::VlessConnector;
+use crate::vmess::VmessConnector;
 
 /// Unified proxy protocol dialer.
 #[derive(Debug, Clone)]
@@ -23,57 +33,45 @@ pub enum ProxyDialer {
     Trojan(TrojanConnector),
     AnyTls(AnyTlsConnector),
     Hysteria2(Hysteria2Connector),
-    Reality(RealityConnector),
+    Vless(VlessConnector),
+    Vmess(VmessConnector),
 }
 
 impl ProxyDialer {
     /// Builds a proxy dialer from a protocol link URI.
     pub fn from_link(link: &str, options: DialerOptions) -> Result<Self, ProxyProtocolError> {
-        let link = link.trim();
-        let Some((scheme, _)) = link.split_once("://") else {
-            return Err(ProxyProtocolError::UnsupportedLink(format!(
-                "{link:?} has no scheme"
-            )));
-        };
-
-        if scheme.eq_ignore_ascii_case("ss") || scheme.eq_ignore_ascii_case("shadowsocks") {
-            let connector = ShadowSocksConnector::from_link(link, options)?;
-            return Ok(Self::ShadowSocks(connector));
-        }
-        if scheme.eq_ignore_ascii_case("trojan") || scheme.eq_ignore_ascii_case("trojan-go") {
-            let connector = TrojanConnector::from_link(link, options)?;
-            return Ok(Self::Trojan(connector));
-        }
-        if scheme.eq_ignore_ascii_case("anytls") {
-            let connector = AnyTlsConnector::from_link(link, options)?;
-            return Ok(Self::AnyTls(connector));
-        }
-        if scheme.eq_ignore_ascii_case("hysteria2") || scheme.eq_ignore_ascii_case("hy2") {
-            let connector = Hysteria2Connector::from_link(link, options)?;
-            return Ok(Self::Hysteria2(connector));
-        }
-        if scheme.eq_ignore_ascii_case("vless") {
-            let connector = RealityConnector::from_link(link, options)?;
-            return Ok(Self::Reality(connector));
-        }
-
-        Err(ProxyProtocolError::UnsupportedLink(format!(
-            "unsupported proxy protocol scheme {scheme:?}"
-        )))
+        Self::from_node(
+            &daer_config::NodeEndpoint::from_link(link)
+                .map_err(ProxyProtocolError::UnsupportedLink)?,
+            options,
+        )
     }
 
     /// Builds a proxy dialer from a typed `NodeEndpoint`.
+    ///
+    /// One function, one place where a layer is resolved, so there is no second copy of the
+    /// mapping that can drift (the `config_keys` gate exists for the same reason).
     pub fn from_node(
         endpoint: &daer_config::NodeEndpoint,
         options: DialerOptions,
     ) -> Result<Self, ProxyProtocolError> {
+        use daer_config::NodeEndpoint;
+
+        // Parse and support are different questions, and `NodeEndpoint::from_link` answers only
+        // the first on purpose: a subscription's unusable link must still enter the pool so the
+        // generation builder can report it by name. A *dialer* is the second question, so it
+        // validates first — and the refusal names the field.
+        endpoint
+            .validate()
+            .map_err(ProxyProtocolError::UnsupportedLink)?;
+
         match endpoint {
-            daer_config::NodeEndpoint::Shadowsocks(n) => {
+            NodeEndpoint::Shadowsocks(n) => {
                 let connector =
                     ShadowSocksConnector::new(&n.server, n.port, &n.method, &n.password, options)?;
                 Ok(Self::ShadowSocks(connector))
             }
-            daer_config::NodeEndpoint::Trojan(n) => {
+            NodeEndpoint::Trojan(n) => {
                 let connector = TrojanConnector::new(
                     &n.server,
                     n.port,
@@ -84,7 +82,7 @@ impl ProxyDialer {
                 )?;
                 Ok(Self::Trojan(connector))
             }
-            daer_config::NodeEndpoint::AnyTls(n) => {
+            NodeEndpoint::AnyTls(n) => {
                 let connector = AnyTlsConnector::new(
                     &n.server,
                     n.port,
@@ -96,63 +94,90 @@ impl ProxyDialer {
                 )?;
                 Ok(Self::AnyTls(connector))
             }
-            daer_config::NodeEndpoint::Hysteria2(n) => {
+            NodeEndpoint::Hysteria2(n) => {
                 let connector = Hysteria2Connector::new(
                     crate::hysteria2::connector::Hysteria2Params {
                         server: &n.server,
-                        port: n.port,
+                        ports: &n.ports,
                         password: &n.password,
                         sni: n.sni.as_deref(),
                         allow_insecure: n.allow_insecure,
+                        pin_sha256: n.pin_sha256.as_deref(),
                         up_mbps: n.up_mbps,
                         down_mbps: n.down_mbps,
-                        obfs: n.obfs.as_deref(),
+                        obfs: n.obfs.as_ref(),
+                        congestion: n.congestion,
+                        quic: &n.quic,
                     },
                     options,
                 )?;
                 Ok(Self::Hysteria2(connector))
             }
-            daer_config::NodeEndpoint::Vless(n) => {
-                let reality = n.reality.as_ref().ok_or_else(|| {
-                    ProxyProtocolError::UnsupportedLink(
-                        "vless node requires [node.reality]".to_owned(),
-                    )
-                })?;
-                let connector = RealityConnector::new(
-                    crate::reality::connector::RealityEndpointParams {
+            NodeEndpoint::Vless(n) => {
+                let connector = VlessConnector::new(
+                    crate::vless::connector::VlessParams {
                         server: &n.server,
                         port: n.port,
                         uuid: &n.uuid,
-                        flow: n.flow.as_deref(),
-                        sni: &reality.sni,
-                        public_key: &reality.public_key,
-                        short_id: reality.short_id.as_deref(),
-                        fingerprint: reality.fingerprint.as_deref(),
-                        alpn: &reality.alpn,
+                        flow: match n.flow {
+                            daer_config::Flow::None => crate::vless::Flow::None,
+                            daer_config::Flow::Vision => crate::vless::Flow::Vision,
+                            // The suffix is the *server's* account setting; the client encodes the
+                            // same addons. Keeping the variant means `check --nodes` reports the
+                            // flow the operator wrote rather than silently flattening it.
+                            daer_config::Flow::VisionUdp443 => crate::vless::Flow::VisionUdp443,
+                        },
+                        security: security_of(&n.security)?,
+                        transport: transport_of(&n.transport),
                     },
                     options,
                 )?;
-                Ok(Self::Reality(connector))
+                Ok(Self::Vless(connector))
             }
-            _ => Err(ProxyProtocolError::UnsupportedLink(
-                "not a supported proxy protocol endpoint".to_owned(),
+            NodeEndpoint::Vmess(n) => {
+                let connector = VmessConnector::new(
+                    crate::vmess::connector::VmessParams {
+                        server: &n.server,
+                        port: n.port,
+                        uuid: &n.uuid,
+                        cipher: n.cipher,
+                        authenticated_length: n.authenticated_length,
+                        no_termination_signal: n.no_termination_signal,
+                        security: security_of(&n.security)?,
+                        transport: transport_of(&n.transport),
+                    },
+                    options,
+                )?;
+                Ok(Self::Vmess(connector))
+            }
+            NodeEndpoint::Direct(_) => Err(ProxyProtocolError::UnsupportedLink(
+                "a direct node has no proxy protocol".to_owned(),
+            )),
+            NodeEndpoint::Socks5(_) | NodeEndpoint::Http(_) => {
+                Err(ProxyProtocolError::UnsupportedLink(
+                    "a socks5/http node is a netune connector, not a proxy protocol".to_owned(),
+                ))
+            }
+            NodeEndpoint::Unsupported { scheme, .. } => Err(ProxyProtocolError::UnsupportedLink(
+                format!("unsupported proxy protocol scheme {scheme:?}"),
             )),
         }
     }
 
     /// The protocol variant this dialer executes.
     #[must_use]
-    pub fn protocol(&self) -> ProxyProtocol {
+    pub const fn protocol(&self) -> ProxyProtocol {
         match self {
             Self::ShadowSocks(_) => ProxyProtocol::ShadowSocks,
             Self::Trojan(_) => ProxyProtocol::Trojan,
             Self::AnyTls(_) => ProxyProtocol::AnyTls,
             Self::Hysteria2(_) => ProxyProtocol::Hysteria2,
-            Self::Reality(_) => ProxyProtocol::Reality,
+            Self::Vless(_) => ProxyProtocol::Vless,
+            Self::Vmess(_) => ProxyProtocol::Vmess,
         }
     }
 
-    /// Connects to `authority` (`host:port`) using default recorder.
+    /// Connects to `authority` (`host:port`) using a throwaway recorder.
     pub async fn connect(&self, authority: &str) -> Result<Established, ProxyProtocolError> {
         let recorder = Arc::new(Mutex::new(Recorder::start(16)));
         self.connect_with_recorder(authority, &recorder).await
@@ -169,11 +194,16 @@ impl ProxyDialer {
             Self::Trojan(c) => c.connect(authority, recorder).await,
             Self::AnyTls(c) => c.connect(authority, recorder).await,
             Self::Hysteria2(c) => c.connect(authority, recorder).await,
-            Self::Reality(c) => c.connect(authority, recorder).await,
+            Self::Vless(c) => c.connect(authority, recorder).await,
+            Self::Vmess(c) => c.connect(authority, recorder).await,
         }
     }
 
-    /// Returns the shared datagram connector if supported by this protocol.
+    /// Returns the datagram connector if this protocol carries UDP.
+    ///
+    /// `None` is a fact about the protocol, not a failure: shadowsocks AEAD and trojan in
+    /// this build are stream-only, and a caller that asks must be told so rather than
+    /// handed a connector that would silently drop packets.
     #[must_use]
     pub fn datagram_connector(&self) -> Option<Arc<dyn DatagramConnector>> {
         match self {
@@ -181,7 +211,66 @@ impl ProxyDialer {
             Self::Trojan(_) => None,
             Self::AnyTls(c) => Some(c.datagram_connector()),
             Self::Hysteria2(c) => Some(c.datagram_connector()),
-            Self::Reality(_) => None,
+            Self::Vless(c) => Some(c.datagram_connector()),
+            Self::Vmess(c) => Some(c.datagram_connector()),
         }
+    }
+}
+
+/// Lowers the configuration's security layer onto the crate's (ADR-0028).
+pub(crate) fn security_of(
+    security: &daer_config::SecurityConfig,
+) -> Result<Security, ProxyProtocolError> {
+    use daer_config::SecurityConfig;
+
+    match security {
+        SecurityConfig::None {} => Ok(Security::None),
+        SecurityConfig::Tls(tls) => Ok(Security::Tls(crate::security::tls::TlsParams {
+            server_name: tls.sni.clone(),
+            allow_insecure: tls.allow_insecure,
+            alpn: tls.alpn.clone(),
+            fingerprint: tls.fingerprint.clone(),
+        })),
+        SecurityConfig::Reality(reality) => {
+            let public_key = crate::reality::decode_public_key(&reality.public_key)
+                .map_err(ProxyProtocolError::UnsupportedLink)?;
+            let short_id = match reality.short_id.as_deref() {
+                Some(short_id) if !short_id.is_empty() => crate::reality::decode_short_id(short_id)
+                    .map_err(ProxyProtocolError::UnsupportedLink)?,
+                _ => Vec::new(),
+            };
+            Ok(Security::Reality(
+                crate::security::reality::RealitySecurity::new(
+                    crate::security::reality::RealityParams {
+                        server_name: reality.sni.clone(),
+                        public_key,
+                        short_id,
+                        alpn: reality
+                            .alpn
+                            .iter()
+                            .map(|protocol| protocol.as_bytes().to_vec())
+                            .collect(),
+                    },
+                ),
+            ))
+        }
+    }
+}
+
+/// Lowers the configuration's transport layer onto the crate's (ADR-0028).
+pub(crate) fn transport_of(transport: &daer_config::TransportConfig) -> TransportLayer {
+    use daer_config::TransportConfig;
+
+    match transport {
+        TransportConfig::Tcp => TransportLayer::Tcp,
+        TransportConfig::Ws(ws) => TransportLayer::Ws(crate::transport::WsParams {
+            path: ws.path.clone(),
+            host: ws.host.clone(),
+            headers: ws
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }),
     }
 }

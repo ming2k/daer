@@ -14,6 +14,7 @@ bytes.workspace = true
 daer-common.workspace = true
 daer-config.workspace = true
 libc.workspace = true
+aes.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
@@ -27,19 +28,25 @@ fastrand.workspace = true
 getrandom.workspace = true
 netune.workspace = true
 netune-trace.workspace = true
+netune-ws.workspace = true
 regex.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-platform-verifier = "0.6"
+tokio-rustls = "0.26"
 socket2.workspace = true
 ml-kem.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
+blake2.workspace = true
+sha3.workspace = true
+tokio-util = "0.7"
 
 # `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
 # targets explicitly is what keeps cargo from compiling it as a binary of its own.
@@ -73,6 +80,19 @@ name = "vision_lab"
 # A TLS stream through the tunnel: the case that broke while every plaintext test passed.
 [[test]]
 name = "vision_tls_inside"
+
+# Every layer combination ADR-0028 made expressible, against a local `xray` inbound.
+[[test]]
+name = "layer_matrix"
+
+[[test]]
+name = "ws_upgrade"
+
+[[test]]
+name = "hysteria2_live"
+
+[[test]]
+name = "vmess_live"
 
 [lints]
 workspace = true

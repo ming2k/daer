@@ -1,552 +1,587 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Domain pattern matching, compiled into indexes.
+//! Domain matching over one flat, sorted, front-coded table.
 //!
-//! Semantics (unchanged, and asserted by the tests below):
+//! # Vocabulary
 //!
-//! * the queried name is lowercased and a trailing dot is removed;
-//! * `full` is an exact match;
-//! * `suffix` matches the name itself and any subdomain, but not
-//!   `abcexample.com`; a pattern that starts with `.` matches subdomains only;
-//! * `keyword` is a substring match;
-//! * `regex` keeps its original case and is applied to the normalized name;
-//! * patterns containing characters outside `[0-9a-z._^-]` are rejected for
-//!   full/suffix/keyword, and broken regexes are rejected, instead of silently
-//!   matching everything.
+//! Two pattern kinds, because they are the two questions a routing rule can ask:
 //!
-//! # Why this is an index and not a list
+//! * `full: name`   — does this exact name appear?
+//! * `suffix: name` — is this name, or any name under it, listed? A leading dot
+//!   (`.name`) narrows that to subdomains only.
 //!
-//! A `geosite:cn` expansion is ~110,000 domains. Evaluating that as a linear scan
-//! per flow costs hundreds of microseconds, which is the difference between a
-//! proxy that scales and one that does not. Each key therefore gets the structure
-//! its semantics call for:
+//! `keyword:` and `regex:` were removed (ADR-0032, ADR-0033). They existed because the V2Ray
+//! geodata format had four domain codes and each got its own engine; the routing hot path
+//! carried an Aho-Corasick automaton and a regex set for a corpus in which the measured
+//! distribution was 99.99% suffix, zero keyword, and eight regexes across every published set.
+//! Substring and regex matching are a *data-cleaning* concern: expand them upstream, into the
+//! `.rules` a producer compiles. Anything a routing rule needs to express, it can express as
+//! full and suffix patterns.
 //!
-//! | key | structure | cost per query |
-//! | --- | --- | --- |
-//! | `full` | hash set | one hash |
-//! | `suffix` | pattern hash set + label walk | one hash per label (≤ ~5) |
-//! | `keyword` | Aho–Corasick automaton | one pass, no allocation |
-//! | `regex` | combined `RegexSet` | one pass over the alternation |
+//! # Structure
 //!
-//! The suffix walk is the important one to get right. A name matches a suffix
-//! pattern iff one of its *label-boundary* suffixes is that pattern, so the query
-//! is "does any of `a.b.example.com`, `b.example.com`, `example.com`, `com` appear
-//! in the set?" — at most `labels + 1` lookups, independent of how many patterns
-//! were compiled.
+//! One table, sorted by **reversed label** (`www.example.com` → `com.example.www`) and
+//! front-coded: each record stores only the bytes it adds to its predecessor. Reversed-label
+//! order is what makes both properties work at once:
 //!
-//! Normalization is allocation-free for every name that fits a DNS name (≤255
-//! bytes); the `String` fallback exists only so a hostile over-long input cannot
-//! be silently truncated.
+//! * **size** — sibling names share their TLD and often their domain, and sorting puts them
+//!   next to each other, so the shared bytes are stored once;
+//! * **lookup** — every suffix that could cover a name is a *label-boundary prefix* of that
+//!   name's reversed key, so the query is a handful of binary searches rather than a trie walk
+//!   or a scan.
+//!
+//! Keys live in a single arena rather than one `String` each, so a binary search walks
+//! contiguous memory instead of chasing 110,000 separate allocations.
+//!
+//! # Cost model
+//!
+//! A `DomainTable` is built once per generation and read once per connection (the datapath
+//! defers any rule containing a domain predicate, so eBPF never matches names). Construction may
+//! allocate; lookup does not.
 
-use std::collections::{HashMap, HashSet};
+use std::fmt;
 
-use aho_corasick::AhoCorasick;
-use regex::RegexSet;
+use daer_rule_ast::is_valid_domain_char;
 
 use crate::error::RoutingError;
 
-/// Longest name we normalize on the stack. A DNS name is at most 255 bytes.
-const STACK_DOMAIN_LEN: usize = 255;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum DomainKey {
-    Full,
-    /// The default when a rule writes `domain(...)` without a key.
-    #[default]
-    Suffix,
-    Keyword,
-    Regex,
-    Composite,
-}
-
-impl DomainKey {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Suffix => "suffix",
-            Self::Keyword => "keyword",
-            Self::Regex => "regex",
-            Self::Composite => "composite",
-        }
-    }
-
-    /// Parses the key written in `domain(key: value)`.
-    ///
-    /// An empty or `domain` key means suffix only after the alias optimizer has
-    /// run; lowering validates the authoritative spelling here, exactly like
-    /// the Go registration callback.
-    pub fn parse(key: &str) -> Result<Self, RoutingError> {
-        match key {
-            "full" => Ok(Self::Full),
-            "suffix" => Ok(Self::Suffix),
-            "keyword" => Ok(Self::Keyword),
-            "regex" => Ok(Self::Regex),
-            "composite" => Ok(Self::Composite),
-            other => Err(RoutingError::new(format!(
-                "addDomain: unsupported key: {other}"
-            ))),
-        }
-    }
-}
-
-/// Whether a suffix pattern also matches the bare name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SuffixScope {
-    /// `example.com`: matches `example.com` and `a.example.com`.
-    SelfAndSubdomains,
-    /// `.example.com`: matches only `a.example.com`.
-    SubdomainsOnly,
-}
-
-impl SuffixScope {
-    /// The wider of two scopes. A key declared both ways matches both ways.
-    pub fn widen(self, other: Self) -> Self {
-        if self == Self::SelfAndSubdomains || other == Self::SelfAndSubdomains {
-            Self::SelfAndSubdomains
-        } else {
-            Self::SubdomainsOnly
-        }
-    }
-}
-
-/// A compiled set of domain patterns for one `domain(...)` match set.
+/// Longest key the lookup accepts, in bytes of reversed-label form.
 ///
-/// Construction is where all the work happens: the query path does no allocation
-/// and no work proportional to the number of patterns.
-#[derive(Debug, Clone, Default)]
-pub struct DomainIndex {
-    key: DomainKey,
-    /// Accepted patterns, in configuration order, for diagnostics. For `suffix`
-    /// these keep their leading dot so the report reads back as written.
-    patterns: Vec<Box<str>>,
-    exact: HashSet<Box<str>>,
-    suffix: HashMap<Box<str>, SuffixScope>,
-    keyword: Option<AhoCorasick>,
-    regex: Option<RegexSet>,
+/// A DNS name is at most 253 characters and reversal preserves length, so this is generous.
+/// A longer input is refused rather than truncated: a truncated key could match the wrong
+/// suffix, which is worse than a miss.
+const MAX_KEY_LEN: usize = 512;
+
+/// Most labels a lookup can walk.
+const MAX_LABELS: usize = 128;
+
+// `SuffixScope` has exactly one definition, in `daer-rule-ast`, so a producer and the runtime
+// cannot disagree about what `.example.com` means (ADR-0023, ADR-0033).
+pub use daer_rule_ast::SuffixScope;
+
+/// Per-record flags: which predicates the pattern at this key satisfies.
+mod flags {
+    pub const FULL: u8 = 0x01;
+    pub const SUFFIX_SELF_AND_SUB: u8 = 0x02;
+    pub const SUFFIX_SUB_ONLY: u8 = 0x04;
 }
 
-impl DomainIndex {
-    /// Compiles `patterns`. Rejected patterns are reported through `warnings`
-    /// and are not applied, matching the Go matcher.
-    pub fn new(key: DomainKey, patterns: &[&str], warnings: &mut Vec<String>) -> Self {
-        let mut index = Self {
-            key,
-            ..Self::default()
-        };
-        let mut keywords: Vec<Box<str>> = Vec::new();
-        let mut regexes: Vec<Box<str>> = Vec::new();
+/// One key in the table: where it lives in the arena, and what it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Record {
+    offset: u32,
+    len: u32,
+    flags: u8,
+}
+
+/// A compiled set of domain patterns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DomainTable {
+    /// How this table was written, for diagnostics: the accepted pattern spellings in the order
+    /// they were declared. Suffix patterns keep their leading dot so a report reads back as the
+    /// operator wrote it.
+    patterns: Vec<Box<str>>,
+    /// Records in reversed-label sort order.
+    records: Vec<Record>,
+    /// Every key, concatenated.
+    arena: Vec<u8>,
+}
+
+impl DomainTable {
+    /// Compiles patterns written as the routing vocabulary.
+    ///
+    /// Each entry is `kind: value` (`full:` / `suffix:`), or a bare name read as a suffix — the
+    /// same fallback the rule text reader uses, so `domain(example.com)` and `suffix: example.com`
+    /// mean the same thing.
+    ///
+    /// Rejected patterns are reported through `warnings` and not applied. A pattern the matcher
+    /// cannot represent is a rule that would never fire, so it must be visible rather than
+    /// silently dropped.
+    pub fn compile(patterns: &[&str], warnings: &mut Vec<String>) -> Self {
+        let mut accepted: Vec<(String, u8)> = Vec::with_capacity(patterns.len());
+        let mut declared: Vec<Box<str>> = Vec::with_capacity(patterns.len());
 
         for pattern in patterns {
-            match key {
-                DomainKey::Full | DomainKey::Suffix | DomainKey::Keyword => {
-                    let lowered = pattern.to_ascii_lowercase();
-                    if let Some(bad) = lowered.chars().find(|ch| !is_valid_domain_char(*ch)) {
-                        warnings.push(format!(
-                            "domain matcher: skipped invalid {} pattern \"{pattern}\" \
-                             (unexpected character {bad:?})",
-                            key.as_str()
-                        ));
-                        continue;
-                    }
-                    match key {
-                        DomainKey::Full => {
-                            index.exact.insert(lowered.as_str().into());
-                            index.patterns.push(lowered.into_boxed_str());
-                        }
-                        DomainKey::Suffix => {
-                            // `.example.com` and `example.com` are the same key with
-                            // different scopes; a leading dot is the only thing that
-                            // distinguishes them.
-                            let (bare, scope) = match lowered.strip_prefix('.') {
-                                Some(bare) => (bare, SuffixScope::SubdomainsOnly),
-                                None => (lowered.as_str(), SuffixScope::SelfAndSubdomains),
-                            };
-                            if bare.is_empty() {
-                                warnings.push(format!(
-                                    "domain matcher: skipped suffix pattern \"{pattern}\": \
-                                     no name after the leading dot"
-                                ));
-                                continue;
-                            }
-                            index
-                                .suffix
-                                .entry(bare.into())
-                                .and_modify(|existing| *existing = existing.widen(scope))
-                                .or_insert(scope);
-                            index.patterns.push(lowered.into_boxed_str());
-                        }
-                        DomainKey::Keyword => {
-                            let boxed: Box<str> = lowered.into_boxed_str();
-                            keywords.push(boxed.clone());
-                            index.patterns.push(boxed);
-                        }
-                        DomainKey::Regex => unreachable!("regex is handled in its own arm"),
-                        DomainKey::Composite => {
-                            unreachable!("composite is handled via from_composite")
-                        }
+            let text = pattern.trim();
+            if text.is_empty() {
+                warnings.push("domain matcher: skipped an empty pattern".to_owned());
+                continue;
+            }
+            let (kind, value) = match text.split_once(':') {
+                Some((kind, value)) => (kind.trim(), value.trim()),
+                None => ("suffix", text),
+            };
+            let value = value.trim_start_matches('+');
+
+            let (bare, flag) = match kind {
+                "full" => (value, flags::FULL),
+                "suffix" | "domain" | "root_domain" => {
+                    // `.example.com` and `example.com` are one key with two scopes; the leading
+                    // dot is the only thing that distinguishes them.
+                    match value.strip_prefix('.') {
+                        Some(bare) if !bare.starts_with('.') => (bare, flags::SUFFIX_SUB_ONLY),
+                        _ => (value, flags::SUFFIX_SELF_AND_SUB),
                     }
                 }
-                DomainKey::Regex => match regex::Regex::new(pattern) {
-                    Ok(_) => {
-                        regexes.push(Box::from(*pattern));
-                        index.patterns.push(Box::from(*pattern));
-                    }
-                    Err(err) => {
-                        warnings.push(format!(
-                            "domain matcher: skipped invalid regex \"{pattern}\": {err}"
-                        ));
-                    }
-                },
-                DomainKey::Composite => {
-                    unreachable!("composite is handled via from_composite")
+                other => {
+                    warnings.push(format!(
+                        "domain matcher: skipped \"{pattern}\": `{other}:` is not a routing \
+                         predicate (ADR-0033 accepts `full:` and `suffix:`); expand it into \
+                         concrete patterns upstream"
+                    ));
+                    continue;
                 }
+            };
+
+            let lowered = bare.to_ascii_lowercase();
+            if let Some(bad) = lowered.chars().find(|ch| !is_valid_domain_char(*ch)) {
+                warnings.push(format!(
+                    "domain matcher: skipped invalid pattern \"{pattern}\" (unexpected character {bad:?})"
+                ));
+                continue;
             }
+            declared.push(text.into());
+            accepted.push((lowered, flag));
         }
 
-        if !keywords.is_empty() {
-            match AhoCorasick::new(keywords.iter().map(AsRef::as_ref)) {
-                Ok(ac) => index.keyword = Some(ac),
-                Err(err) => warnings.push(format!(
-                    "domain matcher: could not build the keyword automaton: {err}"
-                )),
-            }
-        }
-        if !regexes.is_empty() {
-            match RegexSet::new(regexes.iter().map(AsRef::as_ref)) {
-                Ok(set) => index.regex = Some(set),
-                Err(err) => warnings.push(format!(
-                    "domain matcher: could not compile the regex set: {err}"
-                )),
-            }
-        }
-
-        index
-    }
-
-    /// Builds a composite domain index holding full, suffix, keyword, and regex patterns
-    /// directly from pre-compiled collections (e.g. from a DRB).
-    pub fn from_composite(
-        exact: &[String],
-        suffix: &[(String, SuffixScope)],
-        keyword: &[String],
-        regex: &[String],
-    ) -> Self {
-        let mut index = Self {
-            key: DomainKey::Composite,
+        let mut table = Self {
+            patterns: declared,
             ..Self::default()
         };
-        for pat in exact {
-            let lowered = pat.to_ascii_lowercase();
-            index.exact.insert(lowered.into_boxed_str());
-            index.patterns.push(pat.clone().into_boxed_str());
-        }
-        for (pat, scope) in suffix {
-            let lowered = pat.to_ascii_lowercase();
-            index
-                .suffix
-                .entry(lowered.clone().into_boxed_str())
-                .and_modify(|existing| *existing = existing.widen(*scope))
-                .or_insert(*scope);
-            index.patterns.push(lowered.into_boxed_str());
-        }
-        if !keyword.is_empty() {
-            let lowered_kw: Vec<String> = keyword.iter().map(|k| k.to_ascii_lowercase()).collect();
-            if let Ok(ac) = AhoCorasick::new(lowered_kw.iter().map(String::as_str)) {
-                index.keyword = Some(ac);
-            }
-            for kw in keyword {
-                index.patterns.push(kw.clone().into_boxed_str());
-            }
-        }
-        if !regex.is_empty() {
-            if let Ok(set) = RegexSet::new(regex.iter().map(String::as_str)) {
-                index.regex = Some(set);
-            }
-            for r in regex {
-                index.patterns.push(r.clone().into_boxed_str());
-            }
-        }
-        index
+        table.build(accepted);
+        table
     }
 
-    pub fn key(&self) -> DomainKey {
-        self.key
+    /// Builds directly from classified patterns. Used by the DRB decoder, which already knows
+    /// each key's flags.
+    pub(crate) fn from_classified(mut entries: Vec<(String, u8)>) -> Self {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut table = Self::default();
+        table.build(entries);
+        // Derive the diagnostic spelling from the built table rather than from the input, so a
+        // table equals the one `decode` reconstructs from its own bytes.
+        table.patterns = table
+            .iter_rules()
+            .map(|(value, scope)| {
+                let spelling = match scope {
+                    None => format!("full: {value}"),
+                    Some(scope) => format!("suffix: {}{value}", scope.marker()),
+                };
+                spelling.into_boxed_str()
+            })
+            .collect();
+        table
     }
 
+    fn build(&mut self, entries: Vec<(String, u8)>) {
+        // 1. Group by reversed-label key, merging predicates that name the same key.
+        let mut by_key: std::collections::BTreeMap<String, u8> = std::collections::BTreeMap::new();
+        for (value, flag) in entries {
+            if value.is_empty() {
+                continue;
+            }
+            let mut labels: Vec<&str> = value.split('.').collect();
+            labels.reverse();
+            *by_key.entry(labels.join(".")).or_insert(0) |= flag;
+        }
+
+        // 2. Drop every record that an enclosing self-and-subdomains suffix already answers.
+        //
+        // `BTreeMap` yields keys in sorted order, so "under a suffix" is "immediately after
+        // it". Removing them shrinks the artifact and means the lookup never has to consider a
+        // rule a broader rule already covers.
+        let mut kept: Vec<(String, u8)> = Vec::with_capacity(by_key.len());
+        let mut covering: Option<(String, bool)> = None;
+        for (key, flag) in by_key {
+            if let Some((suffix_key, include_self)) = &covering
+                && is_under(&key, suffix_key, *include_self)
+            {
+                continue;
+            }
+            covering = if flag & flags::SUFFIX_SELF_AND_SUB != 0 {
+                Some((key.clone(), true))
+            } else if flag & flags::SUFFIX_SUB_ONLY != 0 {
+                // Covers strictly longer keys, but not the bare name.
+                Some((key.clone(), false))
+            } else {
+                None
+            };
+            kept.push((key, flag));
+        }
+
+        // 3. Pack the keys into one arena, preserving sort order so front-coding applies.
+        let mut records = Vec::with_capacity(kept.len());
+        let mut arena = Vec::new();
+        for (key, flag) in kept {
+            let offset = arena.len() as u32;
+            let len = key.len() as u32;
+            arena.extend_from_slice(key.as_bytes());
+            records.push(Record {
+                offset,
+                len,
+                flags: flag,
+            });
+        }
+        self.records = records;
+        self.arena = arena;
+    }
+
+    fn key_of(&self, record: &Record) -> &str {
+        let start = record.offset as usize;
+        let end = start + record.len as usize;
+        std::str::from_utf8(&self.arena[start..end]).expect("keys were UTF-8 when stored")
+    }
+
+    fn find(&self, key: &str) -> Option<&Record> {
+        self.records
+            .binary_search_by(|record| self.key_of(record).cmp(key))
+            .ok()
+            .map(|index| &self.records[index])
+    }
+
+    /// The patterns this table was built from, as written, for diagnostics.
+    #[must_use]
     pub fn patterns(&self) -> &[Box<str>] {
         &self.patterns
     }
 
-    /// How many patterns were accepted, for a report that must not print them all.
+    /// How many keys the table holds after coverage pruning.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.patterns.len()
+        self.records.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
+        self.records.is_empty()
     }
 
-    /// Matches a queried domain name.
+    /// Whether `domain` matches any pattern in this table.
     ///
-    /// Allocation-free for every name that fits in a DNS name.
+    /// Allocation-free and bounded: at most one binary search per label plus one for the whole
+    /// name.
+    #[must_use]
     pub fn matches(&self, domain: &str) -> bool {
-        if self.patterns.is_empty() {
+        if self.records.is_empty() {
             return false;
         }
-        with_normalized(domain, |normalized| self.matches_normalized(normalized))
-    }
+        let trimmed = domain.trim().trim_end_matches('.');
+        if trimmed.is_empty() || trimmed.len() > MAX_KEY_LEN {
+            return false;
+        }
 
-    /// The query path, over an already-normalized (lowercased, dot-stripped) name.
-    fn matches_normalized(&self, normalized: &str) -> bool {
-        if normalized.is_empty() {
-            return false;
-        }
-        match self.key {
-            DomainKey::Full => self.exact.contains(normalized),
-            DomainKey::Suffix => self.matches_suffix(normalized),
-            DomainKey::Keyword => self
-                .keyword
-                .as_ref()
-                .is_some_and(|ac| ac.is_match(normalized)),
-            DomainKey::Regex => self
-                .regex
-                .as_ref()
-                .is_some_and(|set| set.is_match(normalized)),
-            DomainKey::Composite => {
-                if !self.exact.is_empty() && self.exact.contains(normalized) {
-                    return true;
+        let mut buffer = [0u8; MAX_KEY_LEN];
+        let mut length = 0usize;
+        // Where each label starts in the reversed key, so every candidate suffix is a slice.
+        let mut starts = [0usize; MAX_LABELS];
+        let mut labels = 0usize;
+        for label in trimmed.rsplit('.') {
+            if label.is_empty() {
+                return false;
+            }
+            if labels > 0 {
+                if length >= MAX_KEY_LEN {
+                    return false;
                 }
-                if !self.suffix.is_empty() && self.matches_suffix(normalized) {
-                    return true;
+                buffer[length] = b'.';
+                length += 1;
+            }
+            if labels >= MAX_LABELS {
+                return false;
+            }
+            starts[labels] = length;
+            labels += 1;
+            for byte in label.bytes() {
+                if length >= MAX_KEY_LEN {
+                    return false;
                 }
-                if let Some(ac) = &self.keyword
-                    && ac.is_match(normalized)
-                {
-                    return true;
-                }
-                if let Some(set) = &self.regex
-                    && set.is_match(normalized)
-                {
-                    return true;
-                }
-                false
+                buffer[length] = byte.to_ascii_lowercase();
+                length += 1;
             }
         }
+        let key = std::str::from_utf8(&buffer[..length]).expect("ASCII lowercasing keeps UTF-8");
+
+        // The whole name: a `full` or a self-and-subdomains rule on it.
+        if let Some(record) = self.find(key)
+            && record.flags & (flags::FULL | flags::SUFFIX_SELF_AND_SUB) != 0
+        {
+            return true;
+        }
+
+        // Every shorter prefix is a candidate suffix: the first `i` labels, for `i` in
+        // `1..labels`. That ends one byte before label `i` starts (dropping its separator).
+        for &start in &starts[1..labels] {
+            if let Some(record) = self.find(&key[..start - 1])
+                && record.flags & (flags::SUFFIX_SELF_AND_SUB | flags::SUFFIX_SUB_ONLY) != 0
+            {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Walks the label boundaries of `normalized`, checking each candidate.
+    /// The rules this table holds, as `(value, scope)` pairs for a producer to re-emit.
     ///
-    /// `a.b.example.com` is tried as itself, then `b.example.com`, then
-    /// `example.com`, then `com`. The first candidate is the whole name, so a
-    /// `SubdomainsOnly` pattern must not match there.
-    fn matches_suffix(&self, normalized: &str) -> bool {
-        if self.suffix.is_empty() {
-            return false;
+    /// `full` and suffix are distinguished; a key that is both is yielded twice, because they
+    /// are two predicates even though they share a key.
+    pub fn iter_rules(&self) -> impl Iterator<Item = (String, Option<SuffixScope>)> + '_ {
+        self.records.iter().flat_map(move |record| {
+            let value = reverse_labels(self.key_of(record));
+            let mut out: Vec<(String, Option<SuffixScope>)> = Vec::with_capacity(3);
+            if record.flags & flags::FULL != 0 {
+                out.push((value.clone(), None));
+            }
+            if record.flags & flags::SUFFIX_SELF_AND_SUB != 0 {
+                out.push((value.clone(), Some(SuffixScope::SelfAndSubdomains)));
+            }
+            if record.flags & flags::SUFFIX_SUB_ONLY != 0 {
+                out.push((value, Some(SuffixScope::SubdomainsOnly)));
+            }
+            out.into_iter()
+        })
+    }
+
+    /// Serializes into the DRB front-coded record stream.
+    ///
+    /// `shared` is the byte count this key shares with the previous one; because the records are
+    /// sorted, that prefix is always the predecessor's.
+    pub(crate) fn encode_records(&self) -> (Vec<u8>, u32) {
+        let mut out = Vec::new();
+        let mut previous: &str = "";
+        for record in &self.records {
+            let key = self.key_of(record);
+            let shared = common_prefix_len(previous, key);
+            let suffix = &key[shared..];
+            out.push(record.flags);
+            out.extend_from_slice(&(shared as u16).to_le_bytes());
+            out.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
+            out.extend_from_slice(suffix.as_bytes());
+            previous = key;
         }
-        let mut candidate = normalized;
-        let mut is_whole_name = true;
-        loop {
-            if let Some(scope) = self.suffix.get(candidate) {
-                let acceptable = match scope {
-                    SuffixScope::SelfAndSubdomains => true,
-                    SuffixScope::SubdomainsOnly => !is_whole_name,
+        let count = self.records.len() as u32;
+        (out, count)
+    }
+
+    /// Rebuilds from the encoded record stream and the name that was stored with it.
+    pub(crate) fn decode_records(bytes: &[u8], count: usize) -> Result<Self, crate::drb::DrbError> {
+        use crate::drb::DrbError;
+
+        let mut records = Vec::with_capacity(count);
+        let mut arena: Vec<u8> = Vec::new();
+        let mut cur = bytes;
+        let mut previous = String::new();
+        for _ in 0..count {
+            if cur.len() < 5 {
+                return Err(DrbError::Truncated {
+                    field: "domain record header",
+                    needed: 5,
+                    available: cur.len(),
+                });
+            }
+            let flag = cur[0];
+            let shared = u16::from_le_bytes(cur[1..3].try_into().unwrap()) as usize;
+            let suffix_len = u16::from_le_bytes(cur[3..5].try_into().unwrap()) as usize;
+            cur = &cur[5..];
+            if shared > previous.len() || cur.len() < suffix_len {
+                return Err(DrbError::Truncated {
+                    field: "domain record body",
+                    needed: shared + suffix_len,
+                    available: previous.len() + cur.len(),
+                });
+            }
+            let mut key = String::with_capacity(shared + suffix_len);
+            key.push_str(&previous[..shared]);
+            key.push_str(
+                std::str::from_utf8(&cur[..suffix_len])
+                    .map_err(|_| DrbError::InvalidUtf8("domain label"))?,
+            );
+            cur = &cur[suffix_len..];
+            let offset = arena.len() as u32;
+            let len = key.len() as u32;
+            arena.extend_from_slice(key.as_bytes());
+            previous = key;
+            records.push(Record {
+                offset,
+                len,
+                flags: flag,
+            });
+        }
+
+        let mut table = Self {
+            patterns: Vec::new(),
+            records,
+            arena,
+        };
+        table.patterns = table
+            .iter_rules()
+            .map(|(value, scope)| {
+                let spelling = match scope {
+                    None => format!("full: {value}"),
+                    Some(scope) => format!("suffix: {}{value}", scope.marker()),
                 };
-                if acceptable {
-                    return true;
-                }
-            }
-            match candidate.find('.') {
-                Some(dot) => {
-                    candidate = &candidate[dot + 1..];
-                    is_whole_name = false;
-                    if candidate.is_empty() {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
+                spelling.into_boxed_str()
+            })
+            .collect();
+        Ok(table)
     }
 }
 
-/// Calls `f` with the lowercased, trailing-dot-stripped form of `domain`.
-///
-/// The common case is a stack buffer, so the hot path allocates nothing. A name
-/// longer than a DNS name is normalized on the heap rather than truncated: a
-/// truncated comparison could report a match that does not exist.
-fn with_normalized<R>(domain: &str, f: impl FnOnce(&str) -> R) -> R {
-    let stripped = domain.trim_end_matches('.');
-    if stripped.len() <= STACK_DOMAIN_LEN && stripped.is_ascii() {
-        let mut buffer = [0u8; STACK_DOMAIN_LEN];
-        let bytes = &mut buffer[..stripped.len()];
-        bytes.copy_from_slice(stripped.as_bytes());
-        bytes.make_ascii_lowercase();
-        // SAFETY-free: the input was ASCII, and ASCII lowercasing preserves it.
-        let normalized = std::str::from_utf8(bytes).expect("ASCII is valid UTF-8");
-        f(normalized)
+/// Whether `key` is `suffix_key` or descends from it in reversed-label order.
+fn is_under(key: &str, suffix_key: &str, include_self: bool) -> bool {
+    if key == suffix_key {
+        return include_self;
+    }
+    key.len() > suffix_key.len()
+        && key.starts_with(suffix_key)
+        && key.as_bytes()[suffix_key.len()] == b'.'
+}
+
+fn reverse_labels(key: &str) -> String {
+    let mut labels: Vec<&str> = key.split('.').collect();
+    labels.reverse();
+    labels.join(".")
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+impl fmt::Display for DomainTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} domain pattern(s)", self.records.len())
+    }
+}
+
+/// Validates that every pattern is representable, for a caller that wants errors instead of
+/// warnings (the configuration path).
+pub fn validate_patterns(patterns: &[&str]) -> Result<(), RoutingError> {
+    let mut warnings = Vec::new();
+    let table = DomainTable::compile(patterns, &mut warnings);
+    if warnings.is_empty() {
+        let _ = table;
+        Ok(())
     } else {
-        f(&stripped.to_ascii_lowercase())
+        Err(RoutingError::new(warnings.join("; ")))
     }
 }
-
-fn is_valid_domain_char(ch: char) -> bool {
-    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | '_' | '^')
-}
-
-impl PartialEq for DomainIndex {
-    /// Two indexes are equal when they were compiled from the same key and the
-    /// same accepted patterns; the internal structures are an implementation
-    /// detail of that.
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.patterns == other.patterns
-    }
-}
-
-impl Eq for DomainIndex {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn patterns(key: DomainKey, values: &[&str]) -> DomainIndex {
+    fn table(values: &[&str]) -> DomainTable {
         let mut warnings = Vec::new();
-        let patterns = DomainIndex::new(key, values, &mut warnings);
+        let table = DomainTable::compile(values, &mut warnings);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        patterns
+        table
     }
 
     #[test]
-    fn full_matches_exactly_and_case_insensitively() {
-        let matcher = patterns(DomainKey::Full, &["example.com"]);
-        assert!(matcher.matches("example.com"));
-        assert!(matcher.matches("Example.COM"));
-        assert!(matcher.matches("example.com."));
-        assert!(!matcher.matches("a.example.com"));
+    fn full_and_suffix_answer_the_questions_a_rule_asks() {
+        let t = table(&["suffix: example.com", "full: api.other.com"]);
+        assert!(t.matches("example.com"), "suffix includes the bare name");
+        assert!(t.matches("www.example.com"));
+        assert!(t.matches("a.b.example.com"));
+        assert!(t.matches("api.other.com"));
+        assert!(!t.matches("other.com"), "full is exact");
+        assert!(!t.matches("abcexample.com"), "a label boundary is required");
+        assert!(!t.matches("elsewhere.com"));
     }
 
     #[test]
-    fn suffix_matches_the_name_and_subdomains_only() {
-        let matcher = patterns(DomainKey::Suffix, &["example.com"]);
-        assert!(matcher.matches("example.com"));
-        assert!(matcher.matches("a.b.example.com"));
-        assert!(!matcher.matches("abcexample.com"));
-        assert!(!matcher.matches("example.com.evil"));
+    fn a_bare_name_is_a_suffix() {
+        assert!(table(&["example.com"]).matches("x.example.com"));
     }
 
     #[test]
-    fn suffix_with_a_leading_dot_matches_subdomains_only() {
-        let matcher = patterns(DomainKey::Suffix, &[".example.com"]);
-        assert!(matcher.matches("a.example.com"));
-        assert!(!matcher.matches("example.com"));
-    }
-
-    #[test]
-    fn a_key_declared_both_ways_matches_both_ways() {
-        // `.example.com` narrows one declaration but must not narrow the other.
-        let matcher = patterns(DomainKey::Suffix, &[".example.com", "example.com"]);
-        assert!(matcher.matches("example.com"));
-        assert!(matcher.matches("a.example.com"));
-    }
-
-    #[test]
-    fn suffix_does_not_match_a_shared_label_boundary() {
-        // The label walk must not accept `ample.com` inside `example.com`.
-        let matcher = patterns(DomainKey::Suffix, &["ample.com"]);
-        assert!(!matcher.matches("example.com"));
-        assert!(matcher.matches("x.ample.com"));
-    }
-
-    #[test]
-    fn suffix_handles_deep_names_and_single_labels() {
-        let matcher = patterns(DomainKey::Suffix, &["com", "b.example.com"]);
-        assert!(matcher.matches("a.b.example.com"));
-        assert!(matcher.matches("com"));
-        assert!(matcher.matches("anything.com"));
-        assert!(!matcher.matches("comm"));
-    }
-
-    #[test]
-    fn keyword_is_a_case_insensitive_substring() {
-        let matcher = patterns(DomainKey::Keyword, &["google"]);
-        assert!(matcher.matches("www.google.com"));
-        assert!(matcher.matches("GOOGLE"));
-        assert!(!matcher.matches("example.com"));
-    }
-
-    #[test]
-    fn several_keywords_match_any_of_them() {
-        let matcher = patterns(DomainKey::Keyword, &["google", "adsrv"]);
-        assert!(matcher.matches("x.adsrv.example"));
-        assert!(!matcher.matches("example.com"));
-    }
-
-    #[test]
-    fn regex_keeps_its_case() {
-        let matcher = patterns(DomainKey::Regex, &["^ad[0-9]*\\.example\\.com$"]);
-        assert!(matcher.matches("ad1.example.com"));
-        // The queried name is lowercased before matching; only the pattern keeps
-        // its case, so an uppercase query still matches.
-        assert!(matcher.matches("AD1.example.com"));
-        assert!(!matcher.matches("ad.example.org"));
-    }
-
-    #[test]
-    fn rejects_patterns_with_forbidden_characters() {
-        let mut warnings = Vec::new();
-        let matcher = DomainIndex::new(
-            DomainKey::Suffix,
-            &["exa mple.com", "ok.com"],
-            &mut warnings,
+    fn a_leading_dot_narrows_to_subdomains_only() {
+        let t = table(&["suffix: .corp.example"]);
+        assert!(t.matches("a.corp.example"));
+        assert!(
+            !t.matches("corp.example"),
+            "`.corp.example` excludes the bare name"
         );
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(matcher.patterns(), [Box::from("ok.com")]);
     }
 
     #[test]
-    fn rejects_broken_regexes() {
+    fn a_broader_suffix_absorbs_the_patterns_under_it() {
+        let t = table(&[
+            "suffix: example.com",
+            "full: a.example.com",
+            "suffix: b.example.com",
+        ]);
+        assert_eq!(t.len(), 1, "covered records must be pruned: {t:?}");
+        assert!(t.matches("a.example.com"));
+        assert!(t.matches("b.example.com"));
+    }
+
+    #[test]
+    fn keyword_and_regex_are_refused_by_name() {
         let mut warnings = Vec::new();
-        let matcher = DomainIndex::new(DomainKey::Regex, &["["], &mut warnings);
+        DomainTable::compile(&["keyword: ads", "regex: ^a.*z$"], &mut warnings);
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings[0].contains("not a routing predicate"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("expand it"), "{warnings:?}");
+    }
+
+    #[test]
+    fn invalid_characters_are_refused_with_the_offending_character() {
+        let mut warnings = Vec::new();
+        DomainTable::compile(&["suffix: bad domain"], &mut warnings);
         assert_eq!(warnings.len(), 1);
-        assert!(!matcher.matches("anything"));
+        assert!(warnings[0].contains('\''), "{warnings:?}");
     }
 
     #[test]
-    fn parses_keys() {
-        assert_eq!(DomainKey::parse("suffix"), Ok(DomainKey::Suffix));
-        assert!(DomainKey::parse("").is_err());
-        assert!(DomainKey::parse("contains").is_err());
-    }
-
-    #[test]
-    fn an_empty_index_matches_nothing() {
-        let matcher = patterns(DomainKey::Suffix, &[]);
-        assert!(!matcher.matches("example.com"));
-        assert!(matcher.is_empty());
-    }
-
-    #[test]
-    fn an_over_long_name_is_normalized_not_truncated() {
-        // Longer than the stack buffer: the heap path must still be exact.
-        let long = format!("{}.example.com", "a".repeat(300));
-        let matcher = patterns(DomainKey::Suffix, &["example.com"]);
-        assert!(matcher.matches(&long));
-
-        let other = format!("{}.example.org", "a".repeat(300));
-        assert!(!matcher.matches(&other));
-    }
-
-    #[test]
-    fn normalization_is_case_and_dot_insensitive() {
-        let matcher = patterns(DomainKey::Full, &["example.com"]);
-        for probe in [
+    fn round_trips_through_the_encoded_record_stream() {
+        let t = table(&[
+            "suffix: example.com",
+            "full: api.example.com",
+            "suffix: .sub.other.org",
+        ]);
+        let (bytes, count) = t.encode_records();
+        let decoded = DomainTable::decode_records(&bytes, count as usize).expect("decodes");
+        assert_eq!(decoded.len(), t.len());
+        for name in [
             "example.com",
-            "EXAMPLE.com",
-            "example.COM.",
-            "Example.Com..",
+            "api.example.com",
+            "x.sub.other.org",
+            "nope.test",
         ] {
-            assert!(matcher.matches(probe), "{probe}");
+            assert_eq!(decoded.matches(name), t.matches(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_key_that_prefixes_another_survives_front_coding() {
+        let t = table(&["full: a.com", "full: ab.com", "full: abc.com"]);
+        let (bytes, count) = t.encode_records();
+        let decoded = DomainTable::decode_records(&bytes, count as usize).expect("decodes");
+        for name in ["a.com", "ab.com", "abc.com"] {
+            assert!(decoded.matches(name), "{name} must survive front-coding");
+        }
+        assert!(!decoded.matches("abcd.com"));
+    }
+
+    #[test]
+    fn iter_rules_reports_both_predicates_when_a_key_serves_both() {
+        let t = table(&["full: example.com", "suffix: example.com"]);
+        let rules: Vec<_> = t.iter_rules().collect();
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert!(rules.contains(&("example.com".to_owned(), None)));
+        assert!(rules.contains(&(
+            "example.com".to_owned(),
+            Some(SuffixScope::SelfAndSubdomains)
+        )));
+    }
+
+    #[test]
+    fn an_over_long_name_is_refused_rather_than_truncated() {
+        let t = table(&["suffix: example.com"]);
+        let long = format!("{}.example.com", "a".repeat(600));
+        assert!(!t.matches(&long));
     }
 }

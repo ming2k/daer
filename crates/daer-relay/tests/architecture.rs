@@ -32,7 +32,6 @@ const RELAY_FORBIDDEN: &[&str] = &[
     "daer-routing",
     "daer-ebpf",
     "daer-dns",
-    "daer-geodata",
 ];
 
 /// Crates `daer-outbound` must not declare: the protocol engines ADR-0017 moved out.

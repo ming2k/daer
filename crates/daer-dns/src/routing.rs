@@ -176,7 +176,7 @@ impl std::error::Error for RoutingError {}
 /// No `PartialEq`: `regex::Regex` has none, and comparing compiled matchers has no
 /// caller that needs it. Two routers are compared by what they decide, in tests.
 #[derive(Debug, Clone)]
-enum NameMatch {
+pub(crate) enum NameMatch {
     Full(Name),
     Suffix(Name),
     Keyword(String),
@@ -184,7 +184,49 @@ enum NameMatch {
 }
 
 impl NameMatch {
-    fn matches(&self, name: &Name) -> bool {
+    /// Builds a matcher from a `kind:value` spelling.
+    ///
+    /// This is the one place `full`/`suffix`/`keyword`/`regex` are turned into a matcher in this
+    /// crate. `dns.fake-ip.exclude` reuses it rather than parsing a second grammar: two owners of
+    /// "what does `suffix:` mean" is how the exclusion list and the routing rule end up
+    /// disagreeing (ADR-0023).
+    pub(crate) fn parse_kind(kind: &str, value: &str) -> Result<Self, RoutingError> {
+        let value = value.trim();
+        match kind {
+            "full" => Ok(Self::Full(Name::parse(value).map_err(|error| {
+                RoutingError::BadRegex {
+                    pattern: value.to_owned(),
+                    message: error.to_string(),
+                }
+            })?)),
+            "suffix" | "domain" => Ok(Self::Suffix(
+                Name::parse(value.trim_start_matches('.').trim_start_matches('+')).map_err(
+                    |error| RoutingError::BadRegex {
+                        pattern: value.to_owned(),
+                        message: error.to_string(),
+                    },
+                )?,
+            )),
+            "keyword" => Ok(Self::Keyword(value.to_lowercase())),
+            "regex" => Ok(Self::Regex(Regex::new(value).map_err(|error| {
+                RoutingError::BadRegex {
+                    pattern: value.to_owned(),
+                    message: error.to_string(),
+                }
+            })?)),
+            other => Err(RoutingError::UnknownDomainKey(other.to_owned())),
+        }
+    }
+
+    /// Whether `name` matches, taking a text name.
+    pub(crate) fn matches_text(&self, text: &str) -> bool {
+        match Name::parse(text) {
+            Ok(name) => self.matches(&name),
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn matches(&self, name: &Name) -> bool {
         match self {
             Self::Full(expected) => name.eq_ignore_case(expected),
             Self::Suffix(suffix) => name.ends_with(suffix),

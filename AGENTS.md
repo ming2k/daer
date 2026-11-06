@@ -9,7 +9,7 @@
 - **Concentric Layering**: `daer` is an eBPF transparent proxy organized into four strict concentric layers:
   - **Layer 4 (Host CLI)**: `crates/daer-cli` (single public binary, commands, signals, service entry point).
   - **Layer 3 (Control Plane & Ingress)**: `crates/daer-control` (transparent ingress, relay, flow supervisor, handover), `crates/daer-dns` (DNS server, cache, upstreams).
-  - **Layer 2 (Domain Capabilities)**: `crates/daer-routing` (rule lowering, indexed matching), `crates/daer-outbound` (dialers, group policies, health check, REALITY), `crates/daer-sniff` (TLS SNI, HTTP Host, QUIC), `crates/daer-geodata` (dat parser).
+  - **Layer 2 (Domain Capabilities)**: `crates/daer-routing` (rule lowering, indexed matching), `crates/daer-outbound` (dialers, group policies, health check, REALITY), `crates/daer-sniff` (TLS SNI, HTTP Host, QUIC), `crates/daer-rule-ast` (canonical rule source), `crates/daer-drb` (DRB producer).
   - **Layer 1 (Kernel Datapath & Primitives)**: `crates/daer-ebpf` (map/program ABI, loader), `crates/daer-common` (network primitives, constants), `crates/daer-config` (TOML schema, AST, parser), `ebpf/kern` (C eBPF datapath).
 - **Socket Mark Loop Evasion ([INV-MARK-01])**: Outbound dials from `daer` must carry `so-mark` before `connect(2)` to prevent the proxy from capturing and redirecting its own egress traffic.
 - **Single Configuration Loader SSOT ([INV-LOADER-01])**: `daer_control::load_resolved` is the single source of truth for both runtime (`run`) and inspection (`daer route`, `daer check --nodes`). Diagnostic commands must never diverge from daemon state.
@@ -29,10 +29,11 @@ Do not guess repository rules or rely on unverified assumptions. Consult authori
   - Workspace Architecture & Boundaries: `docs/dev/standards/architecture.md`
   - Invariant & Constraint Policy: `docs/dev/standards/invariants.md`
   - Engineering Workflow & PR Gates: `docs/dev/standards/workflow.md`
-  - Testing Strategy & Pyramid: `docs/dev/standards/testing.md`
+  - Testing & Verification Policy: `docs/adr/0007-verification.md`
   - Markdown & Hyperlink Style: `docs/dev/standards/style.md`
   - Architectural Decision Records: `docs/dev/standards/adr.md`
 - Architecture Decision Records Index: `docs/adr/index.md`
+- Build, Run & Verification: `docs/dev/build-and-run.md`
 - Operator Guides & Deployment: `docs/how-to/deployment.md`
 - Reference & Configuration: `docs/reference/configuration.md`
 - Architecture Explanation: `docs/explanation/architecture-overview.md`

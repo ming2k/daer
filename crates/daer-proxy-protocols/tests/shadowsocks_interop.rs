@@ -146,7 +146,17 @@ async fn a_legacy_cipher_link_is_rejected_before_dialing() {
     let (address, _observed) = server::serve(server::Method::Aes256Gcm, "pw").await;
     let link = server::link("aes-256-cfb", "pw", address);
     let error = ProxyDialer::from_link(&link, options()).expect_err("must be rejected");
-    assert!(error.to_string().contains("no authentication"), "{error}");
+    // The message must name the cipher *and* why: `daer-config` rejects a legacy method at load
+    // with "insecure legacy cipher", and the dialer surfaces that text verbatim rather than
+    // replacing it with a generic failure.
+    let message = error.to_string();
+    assert!(message.contains("aes-256-cfb"), "{message}");
+    assert!(
+        message.contains("legacy")
+            || message.contains("AEAD")
+            || message.contains("authentication"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

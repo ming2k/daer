@@ -77,7 +77,16 @@ tolerance = "0s"
 # A chain (`a -> b`) is NOT supported by this build: it is rejected at validation
 # rather than silently truncated to its first hop. Listing one here is an error.
 #
-# Structured VLESS with REALITY example:
+# A `vless` or `vmess` node is three orthogonal layers (ADR-0028):
+#
+#   [node.transport]  tcp (default) or ws — sits *above* the security layer, so
+#                     `transport = ws` + `security = tls` is `wss://`
+#   [node.security]   none (default), tls or reality
+#   flow              none (default) or xtls-rprx-vision, which needs TLS or REALITY
+#                     *directly* under the protocol (not behind ws: the reference
+#                     refuses that combination too)
+#
+# Structured VLESS over REALITY with Vision:
 #[[node]]
 #tag = "edge"
 #type = "vless"
@@ -85,11 +94,56 @@ tolerance = "0s"
 #port = 443
 #uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 #flow = "xtls-rprx-vision"
-#[node.reality]
+#[node.security]
+#type = "reality"
 #sni = "example.com"
 #public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
 #short-id = "ab01cd02"
-#fingerprint = "chrome"
+#
+# Structured VLESS over TLS behind a CDN (wss):
+#[[node]]
+#tag = "cdn"
+#type = "vless"
+#server = "198.51.100.4"
+#port = 443
+#uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+#[node.security]
+#type = "tls"
+#sni = "cdn.example.com"
+#[node.transport]
+#type = "ws"
+#path = "/ray"
+#host = "cdn.example.com"
+#
+# Structured VMess (AEAD only; a non-zero alterId is refused — ADR-0030):
+#[[node]]
+#tag = "vm"
+#type = "vmess"
+#server = "198.51.100.5"
+#port = 443
+#uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+#cipher = "auto"
+#[node.security]
+#type = "tls"
+#sni = "node.example.com"
+#
+# Structured Hysteria 2 (ADR-0029). `ports` accepts one port, a list or a range;
+# `hop-interval` rotates the source port, which is what defeats a per-flow
+# throttle, and needs at least 5s:
+#[[node]]
+#tag = "hy2"
+#type = "hysteria2"
+#server = "198.51.100.6"
+#ports = "443,20000-20010"
+#password = "secret"
+#sni = "hy2.example.com"
+#up-mbps = 100
+#down-mbps = 200
+#congestion = "brutal"
+#hop-interval = "30s"
+#[node.obfs]
+#type = "salamander"
+#password = "cry_me_a_r1ver"
 #
 # Structured Shadowsocks example:
 #[[node]]
@@ -154,14 +208,17 @@ fallback = "googledns"
 rules = []
 fallback = "accept"
 
-# Rule Providers (ADR-0014). A provider is a compiled `.drb` set or a plain-text rule file,
+# Rule Providers (ADR-0014, ADR-0019). A provider is a compiled `.drb` set or a plain-text rule file,
 # local or remote. This is how `geoip:` / `geosite:` are expressed now: the `.dat` format is
-# retired, and `geodrb` converts an existing file once.
+# retired, and `daer-drb` converts an existing file once.
 #
-# Published sets: https://github.com/daeuniverse/geodrb
-#   geodrb convert geosite.dat --code cn -o geosite-cn.drb
-#   geodrb convert geoip.dat  --code cn -o geoip-cn.drb --type geoip
+# Compile with daer-drb (ADR-0027: every source is read into one rule set, then encoded):
+#   python3 scripts/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
+#   daer-drb compile cn.rules -o geosite-cn.drb
+#   python3 scripts/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
+#   daer-drb compile cn-ip.rules -o geoip-cn.drb
 #
+# Dedicated rules distribution repository: https://github.com/daer-proxy/drb-sets
 # These URLs resolve once that repository has published its first build. Until then (or with
 # no network at all) `daer check` names every provider it could not load and the cache path it
 # looked in, rather than starting with an empty rule — that is the intended behaviour, not a
@@ -169,21 +226,21 @@ fallback = "accept"
 [[rule-provider]]
 tag = "private"
 type = "http"
-url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geoip-private.drb"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-private.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "cn"
 type = "http"
-url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geosite-cn.drb"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "cn-ip"
 type = "http"
-url = "https://cdn.jsdelivr.net/gh/daeuniverse/geodrb@release/geoip-cn.drb"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-cn.drb"
 format = "drb"
 interval = "24h"
 

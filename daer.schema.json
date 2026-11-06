@@ -260,6 +260,23 @@
         }
       ]
     },
+    "Flow": {
+      "description": "How a protocol's payload is framed (ADR-0028).\n\nVision is a VLESS flow, not a REALITY feature: the reference applies it from\n`flow`, and a node whose user is configured for it **rejects** a client that omits\nit, so this is not a tuning knob.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none",
+            "xtls-rprx-vision"
+          ]
+        },
+        {
+          "description": "Vision with UDP/443 allowed through the tunnel. The reference refuses UDP/443\nunder plain Vision because a QUIC flow inside XTLS double-encrypts; this is the\nopt-out.",
+          "type": "string",
+          "const": "xtls-rprx-vision-udp443"
+        }
+      ]
+    },
     "Global": {
       "type": "object",
       "properties": {
@@ -491,6 +508,134 @@
           "const": "GET"
         }
       ]
+    },
+    "Hysteria2Congestion": {
+      "description": "Hysteria 2's congestion controller (ADR-0029).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "cubic",
+            "new-reno"
+          ]
+        },
+        {
+          "description": "quinn's BBRv2 implementation.",
+          "type": "string",
+          "const": "bbr"
+        },
+        {
+          "description": "The reference's throughput-pinning controller; needs `up-mbps`/`down-mbps`.",
+          "type": "string",
+          "const": "brutal"
+        }
+      ]
+    },
+    "Hysteria2Obfs": {
+      "description": "Hysteria 2's obfuscation layer (ADR-0029).\n\nTagged by `type` so a password is required by construction: `type = \"salamander\"`\nwithout a `password` does not deserialize, rather than connecting in the clear.",
+      "oneOf": [
+        {
+          "description": "`[salt 8][payload]`, XORed with `BLAKE2b-256(psk ‖ salt)`.",
+          "type": "object",
+          "properties": {
+            "Salamander": {
+              "type": "object",
+              "properties": {
+                "password": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "password"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Salamander"
+          ]
+        },
+        {
+          "description": "Salamander plus fragmentation of QUIC long-header packets.",
+          "type": "object",
+          "properties": {
+            "Gecko": {
+              "type": "object",
+              "properties": {
+                "max_packet_size": {
+                  "type": "integer",
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0
+                },
+                "min_packet_size": {
+                  "type": "integer",
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0
+                },
+                "password": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "password"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Gecko"
+          ]
+        }
+      ]
+    },
+    "Hysteria2Quic": {
+      "description": "Hysteria 2's QUIC tuning (ADR-0029).\n\nEvery field maps onto a `quinn::TransportConfig`/`EndpointConfig` knob, so a value\nhere either changes the connection or is not in the model. The defaults are quinn's\nown, not the reference's, because a daer deployment shares one daemon across many\nnodes and a buffer sized for one node's 500 Mbit link would be wrong everywhere else.",
+      "type": "object",
+      "properties": {
+        "disable-path-mtu-discovery": {
+          "description": "Send at the largest size the path allows even when it wastes a little\nbandwidth, instead of coalescing: what Hysteria 2 does, and what makes a\nfixed-size packet pattern less visible.",
+          "type": "boolean"
+        },
+        "disable-segmentation-offload": {
+          "description": "Skip GSO. Off by default because segmentation offload is the difference\nbetween one `sendmsg` and thirty.",
+          "type": "boolean"
+        },
+        "init-conn-receive-window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "init-stream-receive-window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "keep-alive-period-ms": {
+          "description": "Keep-alive period in milliseconds. `0` disables keep-alives.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-conn-receive-window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-idle-timeout-ms": {
+          "description": "Connection idle timeout in milliseconds. `0` keeps quinn's default.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-stream-receive-window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "Node": {
       "description": "One `[[node]]` entry.",
@@ -736,25 +881,40 @@
             "allow-insecure": {
               "type": "boolean"
             },
+            "congestion": {
+              "$ref": "#/$defs/Hysteria2Congestion"
+            },
             "down-mbps": {
               "type": "integer",
               "format": "uint64",
               "minimum": 0
             },
             "obfs": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Hysteria2Obfs"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "password": {
               "type": "string"
             },
-            "port": {
-              "type": "integer",
-              "format": "uint16",
-              "maximum": 65535,
-              "minimum": 0
+            "pin-sha256": {
+              "description": "Certificate digest pin: the SHA-256 of the server's leaf certificate, hex.\nCompared after the handshake, so it is a second factor rather than a\nreplacement for the chain.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ports": {
+              "description": "One port, a list, or a range (ADR-0029).",
+              "$ref": "#/$defs/PortSet"
+            },
+            "quic": {
+              "$ref": "#/$defs/Hysteria2Quic"
             },
             "server": {
               "type": "string"
@@ -784,18 +944,16 @@
           "required": [
             "type",
             "server",
-            "port",
+            "ports",
             "password"
           ]
         },
         {
+          "description": "VLESS: a UUID-authenticated session with an optional Vision flow.",
           "type": "object",
           "properties": {
             "flow": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "$ref": "#/$defs/Flow"
             },
             "port": {
               "type": "integer",
@@ -803,15 +961,8 @@
               "maximum": 65535,
               "minimum": 0
             },
-            "reality": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RealityConfig"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+            "security": {
+              "$ref": "#/$defs/SecurityConfig"
             },
             "server": {
               "type": "string"
@@ -821,6 +972,9 @@
                 "string",
                 "null"
               ]
+            },
+            "transport": {
+              "$ref": "#/$defs/TransportConfig"
             },
             "type": {
               "type": "string",
@@ -836,9 +990,111 @@
             "port",
             "uuid"
           ]
+        },
+        {
+          "description": "VMess AEAD (ADR-0030). The legacy handshake is not expressible.",
+          "type": "object",
+          "properties": {
+            "authenticated-length": {
+              "description": "Authenticate each chunk's length, not only its body. A wire change the server\nmust also have enabled, so it is explicit rather than defaulted (ADR-0030).",
+              "type": "boolean"
+            },
+            "cipher": {
+              "$ref": "#/$defs/VmessCipher"
+            },
+            "no-termination-signal": {
+              "description": "Omit the terminating signal on shutdown.",
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "security": {
+              "$ref": "#/$defs/SecurityConfig"
+            },
+            "server": {
+              "type": "string"
+            },
+            "tag": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "transport": {
+              "$ref": "#/$defs/TransportConfig"
+            },
+            "type": {
+              "type": "string",
+              "const": "vmess"
+            },
+            "uuid": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "server",
+            "port",
+            "uuid"
+          ]
         }
       ],
       "unevaluatedProperties": false
+    },
+    "PortSet": {
+      "description": "Ports a Hysteria 2 node may be reached on, and the hop schedule (ADR-0029).\n\nA reference `hysteria2://` link names either one port or a set\n(`443`, `443,8443`, `20000-30000`, `all`). The set is kept normalised — sorted,\nmerged, no overlaps — because the hop layer samples uniformly from it and a\nduplicated range would bias the rotation.",
+      "type": "object",
+      "properties": {
+        "hop-max-ms": {
+          "description": "Upper bound of the randomised interval.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "hop-min-ms": {
+          "description": "Lower bound of the randomised interval, when it differs from `hop_ms`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "hop-ms": {
+          "description": "Rotate the source port on this interval. `0` disables hopping.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "ranges": {
+          "description": "`low-high` ranges, inclusive, sorted and non-overlapping.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer",
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0
+              },
+              {
+                "type": "integer",
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ranges"
+      ]
     },
     "ProviderFormat": {
       "type": "string",
@@ -852,40 +1108,6 @@
       "enum": [
         "file",
         "http"
-      ]
-    },
-    "RealityConfig": {
-      "type": "object",
-      "properties": {
-        "alpn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "fingerprint": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "public-key": {
-          "type": "string"
-        },
-        "short-id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sni": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "sni",
-        "public-key"
       ]
     },
     "Routing": {
@@ -942,6 +1164,99 @@
       "additionalProperties": false,
       "required": [
         "tag"
+      ]
+    },
+    "SecurityConfig": {
+      "description": "How a node's byte stream is made opaque.\n\nThis is the *security* layer: it owns a handshake, a certificate policy and an\nALPN offer, and it knows nothing about the protocol above it.",
+      "oneOf": [
+        {
+          "description": "The protocol speaks over the transport directly.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Ordinary TLS to the node, verified against the platform trust store.",
+          "type": "object",
+          "properties": {
+            "allow-insecure": {
+              "description": "Accept any certificate. A node that needs this is a node whose chain cannot\nbe verified, which is a fact the operator should be asserting deliberately.",
+              "type": "boolean"
+            },
+            "alpn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "fingerprint": {
+              "description": "netune TLS preset name for this node's ClientHello. Absent uses\n`global.tls.profile`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sni": {
+              "description": "SNI to present. Absent means the node's own hostname.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "tls"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "REALITY: a tag in `legacy_session_id` authenticates the flow, and the\npresented certificate belongs to an impersonated site rather than to the node.",
+          "type": "object",
+          "properties": {
+            "alpn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "public-key": {
+              "description": "The node's X25519 public key, base64url.",
+              "type": "string"
+            },
+            "short-id": {
+              "description": "Short id, up to 8 bytes, hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sni": {
+              "description": "The impersonated site. Required, and never an address: SNI names a host.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "reality"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "sni",
+            "public-key"
+          ]
+        }
       ]
     },
     "Subscription": {
@@ -1005,6 +1320,74 @@
         }
       },
       "additionalProperties": false
+    },
+    "TransportConfig": {
+      "description": "What wraps the stream below the protocol (ADR-0028).",
+      "oneOf": [
+        {
+          "description": "A raw TCP session.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tcp"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "RFC 6455 over TCP, with the reference's `path`/`Host` framing.",
+          "type": "object",
+          "properties": {
+            "headers": {
+              "description": "Extra request headers, sent verbatim.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "host": {
+              "description": "`Host` header. Absent uses the node's SNI, then its hostname.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Request path, e.g. `/ray`.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "ws"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path"
+          ]
+        }
+      ]
+    },
+    "VmessCipher": {
+      "description": "VMess's body cipher (ADR-0030).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "aes-128-gcm",
+            "chacha20-poly1305"
+          ]
+        },
+        {
+          "description": "AES-GCM when the CPU has AES-NI, ChaCha20-Poly1305 otherwise — the\nreference's `SecurityType_AUTO`.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
     }
   }
 }

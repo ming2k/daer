@@ -229,9 +229,11 @@ async fn an_http_error_does_not_replace_a_good_cache() {
 
 #[tokio::test]
 async fn a_subscription_with_no_usable_node_is_not_a_silent_empty_group() {
-    // Every node is a protocol this build cannot speak: the resolution must report
-    // zero nodes rather than a pool that looks populated.
-    let body = base64(b"vmess://eyJhZGQiOiJ4In0\nvless://uuid@example.com:443");
+    // The subject changed when ADR-0030 landed: `vmess` is spoken now, so the fixture uses a
+    // scheme with no layer behind it. The property under test is unchanged — a pool must not
+    // look populated when every node in it is unselectable — and `vmess` moving out of that set
+    // is exactly what the *control* at the end of this test checks.
+    let body = base64(b"tuic://uuid@example.com:443\nvless://uuid@example.com:443");
     let address = serve_once(body.into_bytes()).await;
     let directory = temp_dir("unusable");
 
@@ -239,21 +241,34 @@ async fn a_subscription_with_no_usable_node_is_not_a_silent_empty_group() {
     let resolution =
         resolve_subscriptions_with(&mut configuration, &directory, Duration::from_secs(5)).await;
 
-    // The links decode (both are well-formed), so they enter the pool; it is the
-    // *generation builder* that refuses them, and `daer config validate` that
-    // reports it. Here the resolution itself must still be honest about what it got.
-    assert_eq!(resolution.from_subscription, 2);
-    assert!(resolution.all_usable());
+    // A link the schema cannot express never becomes a node: `Node::from_link` refuses it and
+    // the resolution logs why. That is the first half of "a pool must not look populated" —
+    // the *second* half is what the loop below checks, because a malformed `vless://` uuid does
+    // parse as a node and only the dialer refuses it.
+    assert_eq!(resolution.from_subscription, 1);
+    assert!(resolution.all_usable(), "vacuous: nothing was refused");
     for node in &configuration.node {
-        assert!(
-            daer_outbound::NodeDialer::from_node(
-                node,
-                daer_outbound::DialerOptions::new(None, Duration::from_secs(1)),
-            )
-            .is_err(),
-            "this build must not claim to speak {:?}",
-            node.endpoint
+        let dialect = daer_outbound::NodeDialer::from_node(
+            node,
+            daer_outbound::DialerOptions::new(None, Duration::from_secs(1)),
         );
+        match &node.endpoint {
+            // `tuic` has no layer: refused, and the reason names the scheme.
+            daer_config::NodeEndpoint::Unsupported { scheme, .. } => {
+                let error = dialect.expect_err("an unsupported scheme must not build a dialer");
+                assert!(
+                    error.to_string().contains(scheme),
+                    "the refusal must name {scheme:?}: {error}"
+                );
+            }
+            // `vless` has one, and a link with a malformed uuid is now refused by name rather
+            // than by "missing [node.reality]".
+            daer_config::NodeEndpoint::Vless(_) => {
+                let error = dialect.expect_err("a uuid-less vless node must not build a dialer");
+                assert!(error.to_string().contains("UUID"), "{error}");
+            }
+            other => panic!("unexpected node in this fixture: {other:?}"),
+        }
     }
     let _ = std::fs::remove_dir_all(&directory);
 }

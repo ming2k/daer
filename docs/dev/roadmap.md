@@ -14,7 +14,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Configuration (TOML schema, expression language, loader, validation) | ✅ |
 | Configuration tooling (JSON Schema + drift check; `fmt`/`example` removed by ADR-0015) | ✅ |
 | Decision tooling (`daer route --why --domain`, `daer check --nodes`, node security identity) | ✅ |
-| Active diagnostics (`daer probe node`, `daer probe url` — L3/L4/L7 tiers, ADR-0016) | ✅ |
+| Active diagnostics (`daer probe node`, `daer probe url` — L3/L4/L7 tiers, ADR-0016) | ✅ links, names, `--all`, and `--file` (subscription bodies) all resolve through one decoder; a live VLESS+REALITY node was verified to carry a real HTTP request and a real inner-TLS request |
 | Routing semantics (lowering, matching, policy identity, geodata) | ✅ reference implementation |
 | Routing matcher performance | ✅ indexed, allocation-free: `suffix` is a label walk over a hash set, `keyword` Aho–Corasick, `regex` a `RegexSet`, `full` a hash set, `dip`/`sip` merged intervals + binary search. Measured on `geosite:cn` (110,249 domains): 368 µs → **89 ns** on a miss, 28.9 µs → **82 ns** on a hit. `tests/hot_path.rs` asserts the cost does not scale with set size and that a decision allocates nothing |
 | Subscriptions (fetch, base64 / SIP008 / plain decoding, `persist` cache) | ✅ `daer-outbound::subscription` + `daer-control::subscription`; resolved before a generation is built, so `Router::new` stays a pure function of its configuration |
@@ -23,7 +23,11 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: shadowsocks AEAD (aes-gcm, chacha20-poly1305) | ✅ |
 | Outbound: trojan (TLS to the node via netune) | ✅ |
 | Outbound: chained links (`a -> b`) | ⬜ rejected loudly at validation rather than silently truncated to the first hop |
-| Outbound: remaining protocols (vmess, plain vless, hysteria2, tuic, anytls) | ⬜ |
+| Outbound: anytls | ✅ multiplexed session, framing, datagrams |
+| Outbound: **vless as orthogonal layers** | ✅ per [ADR-0028](../adr/0028-protocol-layering.md): transport (`tcp`, `ws`) × security (`none`, `tls`, `reality`) × flow (`none`, `xtls-rprx-vision`). `tests/layer_matrix.rs` starts one local `xray` with five inbounds and takes a round trip through each reachable row, plus a negative control (a plaintext listener dialled as `security=tls`). Vision over `ws` is **refused at load**: the reference rejects it on both ends ("XTLS only supports TLS and REALITY directly for now"), and the fixture's configured-but-unused inbound is what makes that a test rather than a claim |
+| Outbound: **vmess AEAD** | ✅ per [ADR-0030](../adr/0030-vmess-aead-only.md): the reference's aliasing-hasher KDF (six vectors taken from `aead.KDF` itself), `AuthID`, the sealed header, the three size modes, both ciphers and both data planes. `tests/vmess_live.rs` takes a round trip through a real `xray` VMess inbound for `auto`/`aes-128-gcm`/`chacha20-poly1305`, with `AuthenticatedLength` on and off, and over `ws`. The legacy handshake is not expressible: a non-zero `aid` is a load error |
+| Outbound: **hysteria2, complete** | ✅ per [ADR-0029](../adr/0029-hysteria2-socket-stack.md): Salamander and Gecko on the datagram path (the `obfs` key used to be parsed and never applied — the defect the ADR exists for), per-flow session ids, fragmentation/reassembly, `Hysteria-UDP`/`Hysteria-CC-RX` honoured, Brutal congestion control, and port hopping via `Endpoint::rebind_abstract`. `tests/hysteria2_live.rs` starts the reference server itself — including one configured **with** Salamander, so the obfuscation is proven on the wire, not in a struct |
+| Outbound: `tuic` | ⬜ the one family left: not implemented, listed and reported as unselectable |
 | Outbound: `[global.tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
 | Health checks: the configured `tcp-url`, `tcp-method` and `udp-dns` are what probes use | ✅ |

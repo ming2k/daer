@@ -9,7 +9,10 @@ supersedes: []
 
 # 0010. REALITY and the minimal TLS 1.3 client belong to daer-outbound
 
-- Status: Accepted (Amended by [ADR-0017](0017-proxy-protocols-crate-boundary.md): migrated to `daer-proxy-protocols`)
+- Status: Accepted (Amended by [ADR-0017](0017-proxy-protocols-crate-boundary.md): migrated to
+  `daer-proxy-protocols`; amended by [ADR-0028](0028-protocol-layering.md): the connector became a
+  *security layer*, and the "only constructor is a `vless://security=reality` link" rule in
+  decision 3 now reads "the only constructor is a node whose `security.type = "reality"`")
 - Date: 2026-10-29
 - Deciders: Ming Li
 - Related: [ADR-0002](0002-netune-boundary.md),
@@ -101,6 +104,13 @@ The only constructor of the REALITY connector is
 `RealityConnector::from_link(&str, DialerOptions)`, which parses a `vless://` link
 with `security=reality`. There is no path from `[global.tls].profile`, from
 `trojan://`, or from any routing decision to the TLS 1.3 client.
+
+> **Amended by ADR-0028.** The rule survives and is now stronger, but its shape
+> changed: there is no `RealityConnector` any more, because REALITY is a *security
+> layer* rather than a kind of VLESS. The single entry point is
+> `security::reality::RealitySecurity::wrap`, reachable only from a node whose
+> `[node.security].type = "reality"`, and `Tls13Connection` is still `pub(crate)` with
+> no public constructor. The prohibition is unchanged; only the name of the door is.
 
 **4. ADR-0002 is amended, narrowly.**
 

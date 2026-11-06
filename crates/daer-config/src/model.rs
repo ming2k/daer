@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserializer;
-use serde::de::Error as _;
+use serde::de::{DeserializeOwned, Error as _};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
@@ -361,7 +361,9 @@ pub struct Global {
 impl Default for Global {
     fn default() -> Self {
         Self {
-            tproxy_port: 12_345,
+            // The one definition (ADR-0023): the schema default and the value published
+            // into the datapath's `PARAM` cannot drift.
+            tproxy_port: daer_common::consts::TPROXY_PORT_DEFAULT,
             tproxy_port_protect: true,
             so_mark: None,
             log_level: "info".to_owned(),
@@ -570,6 +572,7 @@ pub enum NodeEndpoint {
     AnyTls(AnyTlsNode),
     Hysteria2(Hysteria2Node),
     Vless(VlessNode),
+    Vmess(VmessNode),
     #[serde(skip_deserializing)]
     Unsupported {
         scheme: String,
@@ -586,6 +589,7 @@ pub type TrojanEndpoint = TrojanNode;
 pub type AnyTlsEndpoint = AnyTlsNode;
 pub type Hysteria2Endpoint = Hysteria2Node;
 pub type VlessEndpoint = VlessNode;
+pub type VmessEndpoint = VmessNode;
 
 impl NodeEndpoint {
     /// Validates the semantic constraints of the structured node.
@@ -633,6 +637,16 @@ impl NodeEndpoint {
                 if node.password.is_empty() {
                     return Err("trojan: 'password' must not be empty".to_owned());
                 }
+                // A certificate cannot be verified against an address: the TLS client would
+                // present the IP as SNI, and no CA signs an IP for a proxy node.
+                if node.sni.is_none() && node.server.parse::<std::net::IpAddr>().is_ok() {
+                    return Err(format!(
+                        "trojan: the server {:?} is an address, so an explicit `sni` is \
+                         required (write `sni = \"hostname\"` or `?sni=…` in a link); a \
+                         certificate cannot be verified against an address",
+                        node.server
+                    ));
+                }
                 Ok(())
             }
             Self::AnyTls(node) => {
@@ -651,11 +665,98 @@ impl NodeEndpoint {
                 if node.server.trim().is_empty() {
                     return Err("hysteria2: 'server' must not be empty".to_owned());
                 }
-                if node.port == 0 {
-                    return Err("hysteria2: 'port' must not be 0".to_owned());
+                if node.ports.ranges.is_empty() {
+                    return Err("hysteria2: 'ports' must name at least one port".to_owned());
+                }
+                if node
+                    .ports
+                    .ranges
+                    .iter()
+                    .any(|(low, high)| *low == 0 && *high == 0)
+                {
+                    return Err("hysteria2: port 0 is not a dialable port".to_owned());
                 }
                 if node.password.is_empty() {
                     return Err("hysteria2: 'password' must not be empty".to_owned());
+                }
+                if node.ports.hops() {
+                    // The reference's floor: a hop schedule shorter than 5 s would
+                    // exhaust the server's port table faster than it can release it.
+                    let low = if node.ports.hop_min_ms > 0 {
+                        node.ports.hop_min_ms
+                    } else {
+                        node.ports.hop_ms
+                    };
+                    let high = if node.ports.hop_max_ms > 0 {
+                        node.ports.hop_max_ms
+                    } else {
+                        node.ports.hop_ms
+                    };
+                    if low != 0 && high != 0 && low > high {
+                        return Err(format!(
+                            "hysteria2: hop-min-interval ({low}ms) must not exceed \
+                             hop-max-interval ({high}ms)"
+                        ));
+                    }
+                    if low < 5_000 {
+                        return Err(format!(
+                            "hysteria2: the hop interval must be at least 5s, got {low}ms"
+                        ));
+                    }
+                }
+                if let Some(obfs) = &node.obfs {
+                    if obfs.password().len() < 4 {
+                        return Err(format!(
+                            "hysteria2.obfs.{}: the password must be at least 4 bytes; the \
+                             reference refuses a shorter pre-shared key",
+                            obfs.kind()
+                        ));
+                    }
+                    if let Hysteria2Obfs::Gecko {
+                        min_packet_size,
+                        max_packet_size,
+                        ..
+                    } = obfs
+                    {
+                        let low = if *min_packet_size == 0 {
+                            512
+                        } else {
+                            *min_packet_size
+                        };
+                        let high = if *max_packet_size == 0 {
+                            1200
+                        } else {
+                            *max_packet_size
+                        };
+                        if low > high || high > 2048 {
+                            return Err(format!(
+                                "hysteria2.obfs.gecko: min/max packet size {low}/{high} is not a \
+                                 usable range (min <= max <= 2048)"
+                            ));
+                        }
+                    }
+                }
+                if matches!(node.congestion, Hysteria2Congestion::Brutal)
+                    && node.up_mbps == 0
+                    && node.down_mbps == 0
+                {
+                    return Err(
+                        "hysteria2: congestion = \"brutal\" pins the window to a configured \
+                         rate, so at least one of up-mbps/down-mbps must be set"
+                            .to_owned(),
+                    );
+                }
+                if let Some(pin) = &node.pin_sha256 {
+                    let digits: String = pin
+                        .chars()
+                        .filter(|c| *c != ':' && *c != ' ' && *c != '-')
+                        .collect();
+                    if digits.len() != 64 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(format!(
+                            "hysteria2.pin-sha256 = {pin:?} is not a SHA-256 digest; write the \
+                             64 hex digits of the certificate's fingerprint"
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -669,30 +770,53 @@ impl NodeEndpoint {
                 if node.uuid.trim().is_empty() {
                     return Err("vless: 'uuid' must not be empty".to_owned());
                 }
-                let Some(reality) = &node.reality else {
-                    return Err(
-                        "vless: missing [node.reality] configuration; daer only supports VLESS with REALITY"
-                            .to_owned(),
-                    );
-                };
-                if reality.sni.trim().is_empty() {
-                    return Err("vless.reality: 'sni' must not be empty".to_owned());
+                if let Err(reason) = parse_node_uuid(&node.uuid) {
+                    return Err(format!("vless: {reason}"));
                 }
-                if reality.public_key.trim().is_empty() {
-                    return Err("vless.reality: 'public-key' must not be empty".to_owned());
+                validate_security(&node.security, "vless", &node.server)?;
+                validate_transport(&node.transport, "vless")?;
+                // The reference rejects this combination on both ends: `VisionWriter` needs
+                // a record layer to splice, and Xray's inbound refuses a plaintext outer
+                // stream outright ("XTLS only supports TLS and REALITY directly for now").
+                // Accepting it would produce a session that authenticates and then
+                // deadlocks, so it is refused by name.
+                if node.flow.is_vision() && node.security.is_none() {
+                    return Err(format!(
+                        "vless: flow = {:?} needs a security layer that can be spliced; add \
+                         security = \"tls\" or security = \"reality\"",
+                        node.flow.as_str()
+                    ));
                 }
-                if reality
-                    .fingerprint
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-                {
-                    return Err(
-                        "vless.reality: 'fingerprint' is required (e.g. fingerprint = \"chrome\")"
-                            .to_owned(),
-                    );
+                // Vision splices the *record layer*, so it needs TLS or REALITY to be the thing
+                // directly under the protocol. The reference says so on both ends — a
+                // `ws`-wrapped connection is neither `*tls.Conn` nor `*reality.UConn`, so
+                // `inbound.go` answers "XTLS only supports TLS and REALITY directly for now" and
+                // the outbound refuses to build the flow at all. Accepting this combination would
+                // produce a node that authenticates and then never carries a byte.
+                if node.flow.is_vision() && !matches!(node.transport, TransportConfig::Tcp) {
+                    return Err(format!(
+                        "vless: flow = {:?} needs TLS or REALITY directly under the protocol, but \
+                         transport.type = \"{}\" wraps the record layer. The reference refuses \
+                         this on both ends (\"XTLS only supports TLS and REALITY directly for \
+                         now\"); either drop the flow or use transport.type = \"tcp\"",
+                        node.flow.as_str(),
+                        node.transport.kind()
+                    ));
                 }
+                Ok(())
+            }
+            Self::Vmess(node) => {
+                if node.server.trim().is_empty() {
+                    return Err("vmess: 'server' must not be empty".to_owned());
+                }
+                if node.port == 0 {
+                    return Err("vmess: 'port' must not be 0".to_owned());
+                }
+                if let Err(reason) = parse_node_uuid(&node.uuid) {
+                    return Err(format!("vmess: {reason}"));
+                }
+                validate_security(&node.security, "vmess", &node.server)?;
+                validate_transport(&node.transport, "vmess")?;
                 Ok(())
             }
             Self::Unsupported { scheme, .. } => {
@@ -713,6 +837,7 @@ impl NodeEndpoint {
             Self::AnyTls(n) => n.tag.as_deref(),
             Self::Hysteria2(n) => n.tag.as_deref(),
             Self::Vless(n) => n.tag.as_deref(),
+            Self::Vmess(n) => n.tag.as_deref(),
             Self::Unsupported { .. } => None,
         }
     }
@@ -727,9 +852,15 @@ impl NodeEndpoint {
             Self::Shadowsocks(n) => format!("{}:{}", n.server, n.port),
             Self::Trojan(n) => format!("{}:{}", n.server, n.port),
             Self::AnyTls(n) => format!("{}:{}", n.server, n.port),
-            Self::Hysteria2(n) => format!("{}:{}", n.server, n.port),
+            Self::Hysteria2(n) => format!("{}:{}", n.server, n.ports.to_link_port()),
             Self::Vless(n) => format!("{}:{}", n.server, n.port),
-            Self::Unsupported { link, .. } => link.clone(),
+            Self::Vmess(n) => format!("{}:{}", n.server, n.port),
+            // A name is printed, logged and shown in `daer probe`; the link is not. For a
+            // protocol this build cannot speak the link *is* all we have, so it is redacted
+            // rather than shown: `tuic://pw@host:443` carries a credential in its userinfo,
+            // and a diagnostic that echoes it writes a secret to stdout and to any log that
+            // captured it. The scheme is the part an operator needs.
+            Self::Unsupported { scheme, link } => redact_link(scheme, link),
         }
     }
 
@@ -745,6 +876,7 @@ impl NodeEndpoint {
             Self::AnyTls(n) => n.to_link(),
             Self::Hysteria2(n) => n.to_link(),
             Self::Vless(n) => n.to_link(),
+            Self::Vmess(n) => n.to_link(),
             Self::Unsupported { link, .. } => link.clone(),
         }
     }
@@ -979,6 +1111,280 @@ impl AnyTlsNode {
     }
 }
 
+/// Ports a Hysteria 2 node may be reached on, and the hop schedule (ADR-0029).
+///
+/// A reference `hysteria2://` link names either one port or a set
+/// (`443`, `443,8443`, `20000-30000`, `all`). The set is kept normalised — sorted,
+/// merged, no overlaps — because the hop layer samples uniformly from it and a
+/// duplicated range would bias the rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PortSet {
+    /// `low-high` ranges, inclusive, sorted and non-overlapping.
+    pub ranges: Vec<(u16, u16)>,
+    /// Rotate the source port on this interval. `0` disables hopping.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hop_ms: u64,
+    /// Lower bound of the randomised interval, when it differs from `hop_ms`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hop_min_ms: u64,
+    /// Upper bound of the randomised interval.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hop_max_ms: u64,
+}
+
+impl PortSet {
+    /// A single port and no hopping.
+    #[must_use]
+    pub fn single(port: u16) -> Self {
+        Self {
+            ranges: vec![(port, port)],
+            hop_ms: 0,
+            hop_min_ms: 0,
+            hop_max_ms: 0,
+        }
+    }
+
+    /// Parses the reference's port-union syntax: `443`, `443,8443`, `1000-2000,443`,
+    /// `all`.
+    ///
+    /// Ranges are swapped when written backwards (`8443-443`) exactly as
+    /// `portunion.go` does, and `all` is `0-65535`. The result is normalised so two
+    /// spellings of the same set compare equal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending component, because a typo in a port
+    /// list is otherwise a node that dials nothing.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("port list is empty".to_owned());
+        }
+        if text == "all" || text == "*" {
+            return Ok(Self {
+                ranges: vec![(0, 65535)],
+                hop_ms: 0,
+                hop_min_ms: 0,
+                hop_max_ms: 0,
+            });
+        }
+        let mut ranges = Vec::new();
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(format!("port list {text:?} has an empty component"));
+            }
+            let range = match part.split_once('-') {
+                Some((low, high)) => {
+                    let low: u16 = low
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("{part:?} is not a port range"))?;
+                    let high: u16 = high
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("{part:?} is not a port range"))?;
+                    if low <= high {
+                        (low, high)
+                    } else {
+                        (high, low)
+                    }
+                }
+                None => {
+                    let port: u16 = part
+                        .parse()
+                        .map_err(|_| format!("{part:?} is not a port number"))?;
+                    (port, port)
+                }
+            };
+            ranges.push(range);
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+        for (low, high) in ranges {
+            match merged.last_mut() {
+                Some(last) if u32::from(low) <= u32::from(last.1) + 1 => {
+                    if high > last.1 {
+                        last.1 = high;
+                    }
+                }
+                _ => merged.push((low, high)),
+            }
+        }
+        Ok(Self {
+            ranges: merged,
+            hop_ms: 0,
+            hop_min_ms: 0,
+            hop_max_ms: 0,
+        })
+    }
+
+    /// Every port in the set, for the hop layer.
+    #[must_use]
+    pub fn ports(&self) -> Vec<u16> {
+        let mut ports = Vec::new();
+        for (low, high) in &self.ranges {
+            for port in *low..=*high {
+                ports.push(port);
+            }
+        }
+        ports
+    }
+
+    /// Whether hopping is configured.
+    #[must_use]
+    pub const fn hops(&self) -> bool {
+        self.hop_ms > 0 || self.hop_min_ms > 0 || self.hop_max_ms > 0
+    }
+
+    /// The port written as a reference link does.
+    #[must_use]
+    pub fn to_link_port(&self) -> String {
+        self.ranges
+            .iter()
+            .map(|(low, high)| {
+                if low == high {
+                    low.to_string()
+                } else {
+                    format!("{low}-{high}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Hysteria 2's QUIC tuning (ADR-0029).
+///
+/// Every field maps onto a `quinn::TransportConfig`/`EndpointConfig` knob, so a value
+/// here either changes the connection or is not in the model. The defaults are quinn's
+/// own, not the reference's, because a daer deployment shares one daemon across many
+/// nodes and a buffer sized for one node's 500 Mbit link would be wrong everywhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct Hysteria2Quic {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub init_stream_receive_window: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub max_stream_receive_window: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub init_conn_receive_window: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub max_conn_receive_window: u64,
+    /// Connection idle timeout in milliseconds. `0` keeps quinn's default.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub max_idle_timeout_ms: u64,
+    /// Keep-alive period in milliseconds. `0` disables keep-alives.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub keep_alive_period_ms: u64,
+    /// Send at the largest size the path allows even when it wastes a little
+    /// bandwidth, instead of coalescing: what Hysteria 2 does, and what makes a
+    /// fixed-size packet pattern less visible.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_path_mtu_discovery: bool,
+    /// Skip GSO. Off by default because segmentation offload is the difference
+    /// between one `sendmsg` and thirty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_segmentation_offload: bool,
+}
+
+/// Hysteria 2's congestion controller (ADR-0029).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum Hysteria2Congestion {
+    /// quinn's BBRv2 implementation.
+    #[default]
+    Bbr,
+    Cubic,
+    NewReno,
+    /// The reference's throughput-pinning controller; needs `up-mbps`/`down-mbps`.
+    Brutal,
+}
+
+/// Hysteria 2's obfuscation layer (ADR-0029).
+///
+/// Tagged by `type` so a password is required by construction: `type = "salamander"`
+/// without a `password` does not deserialize, rather than connecting in the clear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum Hysteria2Obfs {
+    /// `[salt 8][payload]`, XORed with `BLAKE2b-256(psk ‖ salt)`.
+    Salamander { password: String },
+    /// Salamander plus fragmentation of QUIC long-header packets.
+    Gecko {
+        password: String,
+        #[serde(default, skip_serializing_if = "is_zero_u16")]
+        min_packet_size: u16,
+        #[serde(default, skip_serializing_if = "is_zero_u16")]
+        max_packet_size: u16,
+    },
+}
+
+impl Hysteria2Obfs {
+    /// The pre-shared key.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        match self {
+            Self::Salamander { password } | Self::Gecko { password, .. } => password,
+        }
+    }
+
+    /// The name a link and a log use.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Salamander { .. } => "salamander",
+            Self::Gecko { .. } => "gecko",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hysteria2Obfs {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut table = toml::Table::deserialize(d)?;
+        let kind = take_tag(&mut table, "node.obfs", &["salamander", "gecko"])
+            .map_err(D::Error::custom)?;
+        let obfs = match kind.as_str() {
+            "salamander" => {
+                let salamander: ObfsSalamander =
+                    variant(table, "node.obfs").map_err(D::Error::custom)?;
+                Self::Salamander {
+                    password: salamander.password,
+                }
+            }
+            _ => {
+                let gecko: ObfsGecko = variant(table, "node.obfs").map_err(D::Error::custom)?;
+                Self::Gecko {
+                    password: gecko.password,
+                    min_packet_size: gecko.min_packet_size,
+                    max_packet_size: gecko.max_packet_size,
+                }
+            }
+        };
+        Ok(obfs)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct ObfsSalamander {
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct ObfsGecko {
+    password: String,
+    #[serde(default)]
+    min_packet_size: u16,
+    #[serde(default)]
+    max_packet_size: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -986,25 +1392,380 @@ pub struct Hysteria2Node {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     pub server: String,
-    pub port: u16,
+    /// One port, a list, or a range (ADR-0029).
+    pub ports: PortSet,
     pub password: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_insecure: bool,
+    /// Certificate digest pin: the SHA-256 of the server's leaf certificate, hex.
+    /// Compared after the handshake, so it is a second factor rather than a
+    /// replacement for the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub up_mbps: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub down_mbps: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub obfs: Option<String>,
+    pub obfs: Option<Hysteria2Obfs>,
+    #[serde(default, skip_serializing_if = "is_default_congestion")]
+    pub congestion: Hysteria2Congestion,
+    #[serde(default, skip_serializing_if = "Hysteria2Quic::is_default")]
+    pub quic: Hysteria2Quic,
 }
 
-fn is_zero_u64(v: &u64) -> bool {
+impl Hysteria2Quic {
+    /// Whether this is the default tuning, so the table is omitted on output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+const fn is_default_congestion(congestion: &Hysteria2Congestion) -> bool {
+    matches!(congestion, Hysteria2Congestion::Bbr)
+}
+
+const fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+const fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+// ── The layers every Xray-family node composes (ADR-0028) ────────────────────
+
+/// How a node's byte stream is made opaque.
+///
+/// This is the *security* layer: it owns a handshake, a certificate policy and an
+/// ALPN offer, and it knows nothing about the protocol above it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum SecurityConfig {
+    /// The protocol speaks over the transport directly.
+    None {},
+    /// Ordinary TLS to the node, verified against the platform trust store.
+    Tls(TlsSecurity),
+    /// REALITY: a tag in `legacy_session_id` authenticates the flow, and the
+    /// presented certificate belongs to an impersonated site rather than to the node.
+    Reality(RealitySecurity),
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self::None {}
+    }
+}
+
+impl SecurityConfig {
+    /// The `type` this layer is spelled as in TOML and in a link.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::None {} => "none",
+            Self::Tls(_) => "tls",
+            Self::Reality(_) => "reality",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecurityConfig {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut table = toml::Table::deserialize(d)?;
+        // Absent is `none`: a `vless://` link with no `security=` is a plaintext node,
+        // and a table that says nothing must mean the same thing.
+        if !table.contains_key("type") {
+            return Ok(Self::None {});
+        }
+        let kind = take_tag(&mut table, "node.security", &["none", "tls", "reality"])
+            .map_err(D::Error::custom)?;
+        match kind.as_str() {
+            "none" => reject_extra(table, "node.security", "none")
+                .map(|()| Self::None {})
+                .map_err(D::Error::custom),
+            "tls" => variant(table, "node.security")
+                .map(Self::Tls)
+                .map_err(D::Error::custom),
+            _ => variant(table, "node.security")
+                .map(Self::Reality)
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+/// Ordinary TLS to the node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TlsSecurity {
+    /// SNI to present. Absent means the node's own hostname.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Accept any certificate. A node that needs this is a node whose chain cannot
+    /// be verified, which is a fact the operator should be asserting deliberately.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
+    /// netune TLS preset name for this node's ClientHello. Absent uses
+    /// `global.tls.profile`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+/// REALITY (ADR-0010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RealitySecurity {
+    /// The impersonated site. Required, and never an address: SNI names a host.
+    pub sni: String,
+    /// The node's X25519 public key, base64url.
+    pub public_key: String,
+    /// Short id, up to 8 bytes, hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
+}
+
+/// What wraps the stream below the protocol (ADR-0028).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum TransportConfig {
+    /// A raw TCP session.
+    #[default]
+    Tcp,
+    /// RFC 6455 over TCP, with the reference's `path`/`Host` framing.
+    Ws(WsTransport),
+}
+
+impl TransportConfig {
+    /// The `type` this layer is spelled as.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Ws(_) => "ws",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportConfig {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut table = toml::Table::deserialize(d)?;
+        if !table.contains_key("type") {
+            return reject_extra(table, "node.transport", "tcp")
+                .map(|()| Self::Tcp)
+                .map_err(D::Error::custom);
+        }
+        let kind =
+            take_tag(&mut table, "node.transport", &["tcp", "ws"]).map_err(D::Error::custom)?;
+        match kind.as_str() {
+            "tcp" => reject_extra(table, "node.transport", "tcp")
+                .map(|()| Self::Tcp)
+                .map_err(D::Error::custom),
+            _ => variant(table, "node.transport")
+                .map(Self::Ws)
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+/// WebSocket framing below the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WsTransport {
+    /// Request path, e.g. `/ray`.
+    pub path: String,
+    /// `Host` header. Absent uses the node's SNI, then its hostname.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Extra request headers, sent verbatim.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// How a protocol's payload is framed (ADR-0028).
+///
+/// Vision is a VLESS flow, not a REALITY feature: the reference applies it from
+/// `flow`, and a node whose user is configured for it **rejects** a client that omits
+/// it, so this is not a tuning knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum Flow {
+    #[default]
+    #[serde(rename = "none", alias = "", alias = "xtls-rprx-direct")]
+    None,
+    #[serde(rename = "xtls-rprx-vision", alias = "vision")]
+    Vision,
+    /// Vision with UDP/443 allowed through the tunnel. The reference refuses UDP/443
+    /// under plain Vision because a QUIC flow inside XTLS double-encrypts; this is the
+    /// opt-out.
+    #[serde(rename = "xtls-rprx-vision-udp443", alias = "vision-udp443")]
+    VisionUdp443,
+}
+
+impl Flow {
+    /// Whether the flow frames the payload at all.
+    #[must_use]
+    pub const fn is_vision(self) -> bool {
+        matches!(self, Self::Vision | Self::VisionUdp443)
+    }
+
+    /// Whether UDP/443 may use the flow.
+    #[must_use]
+    pub const fn allows_udp443(self) -> bool {
+        matches!(self, Self::VisionUdp443)
+    }
+
+    /// The reference's spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Vision => "xtls-rprx-vision",
+            Self::VisionUdp443 => "xtls-rprx-vision-udp443",
+        }
+    }
+}
+
+/// VLESS: a UUID-authenticated session with an optional Vision flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct VlessNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub uuid: String,
+    #[serde(default, skip_serializing_if = "Flow::is_none")]
+    pub flow: Flow,
+    #[serde(default, skip_serializing_if = "SecurityConfig::is_none")]
+    pub security: SecurityConfig,
+    #[serde(default, skip_serializing_if = "TransportConfig::is_tcp")]
+    pub transport: TransportConfig,
+}
+
+impl SecurityConfig {
+    /// Whether this is the absent layer, so it is omitted on output.
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None {})
+    }
+}
+
+impl TransportConfig {
+    /// Whether this is a raw TCP session, so it is omitted on output.
+    #[must_use]
+    pub const fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+}
+
+impl Flow {
+    /// Whether the flow is absent, so it is omitted on output.
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// VMess's body cipher (ADR-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum VmessCipher {
+    /// AES-GCM when the CPU has AES-NI, ChaCha20-Poly1305 otherwise — the
+    /// reference's `SecurityType_AUTO`.
+    #[default]
+    Auto,
+    #[serde(rename = "aes-128-gcm", alias = "aes-128-gcm")]
+    Aes128Gcm,
+    #[serde(rename = "chacha20-poly1305")]
+    Chacha20Poly1305,
+}
+
+/// VMess AEAD (ADR-0030). The legacy handshake is not expressible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct VmessNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub server: String,
+    pub port: u16,
+    pub uuid: String,
+    #[serde(default, skip_serializing_if = "is_default_cipher")]
+    pub cipher: VmessCipher,
+    /// Authenticate each chunk's length, not only its body. A wire change the server
+    /// must also have enabled, so it is explicit rather than defaulted (ADR-0030).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub authenticated_length: bool,
+    /// Omit the terminating signal on shutdown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_termination_signal: bool,
+    #[serde(default, skip_serializing_if = "SecurityConfig::is_none")]
+    pub security: SecurityConfig,
+    #[serde(default, skip_serializing_if = "TransportConfig::is_tcp")]
+    pub transport: TransportConfig,
+}
+
+const fn is_default_cipher(cipher: &VmessCipher) -> bool {
+    matches!(cipher, VmessCipher::Auto)
+}
+
+/// Reads and removes the `type` discriminant of a layer table.
+///
+/// `serde` does not support `deny_unknown_fields` on an internally tagged enum, and a
+/// typo inside `[node.security]` would silently keep a default — the failure
+/// [ADR-0006](../../../docs/adr/0006-wiring-ownership.md) forbids. Reading the table by
+/// hand lets the *variant* own `deny_unknown_fields`, so the check survives.
+fn take_tag(table: &mut toml::Table, what: &str, expected: &[&str]) -> Result<String, String> {
+    let value = table.remove("type").ok_or_else(|| {
+        format!("{what} must declare `type`; the implemented layers are {expected:?}")
+    })?;
+    let kind = value
+        .as_str()
+        .ok_or_else(|| format!("{what}.type must be one of {expected:?}, got {value:?}"))?
+        .to_owned();
+    if !expected.contains(&kind.as_str()) {
+        return Err(format!(
+            "{what}.type = {kind:?} is not implemented; the implemented layers are {expected:?}"
+        ));
+    }
+    Ok(kind)
+}
+
+/// Rejects any key left in an unparameterised layer table.
+fn reject_extra(table: toml::Table, what: &str, kind: &str) -> Result<(), String> {
+    if let Some(key) = table.keys().next() {
+        return Err(format!(
+            "{what}.{key} is not a key of the `{kind}` layer; it takes no parameters"
+        ));
+    }
+    Ok(())
+}
+
+/// Deserializes a layer's own keys into its variant struct.
+fn variant<T: DeserializeOwned>(table: toml::Table, what: &str) -> Result<T, String> {
+    T::deserialize(toml::Value::Table(table)).map_err(|error| format!("{what}: {error}"))
+}
+
 impl Hysteria2Node {
+    /// The first port, for a diagnostic that names one address.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.ports.ranges.first().map(|(low, _)| *low).unwrap_or(0)
+    }
+
     #[must_use]
     pub fn to_link(&self) -> String {
         let server = format_host(&self.server);
@@ -1017,6 +1778,11 @@ impl Hysteria2Node {
         if self.allow_insecure {
             query.push("insecure=1".to_owned());
         }
+        if let Some(pin) = &self.pin_sha256
+            && !pin.is_empty()
+        {
+            query.push(format!("pinSHA256={}", percent_encode(pin)));
+        }
         if self.up_mbps > 0 {
             query.push(format!("upmbps={}", self.up_mbps));
         }
@@ -1024,7 +1790,17 @@ impl Hysteria2Node {
             query.push(format!("downmbps={}", self.down_mbps));
         }
         if let Some(obfs) = &self.obfs {
-            query.push(format!("obfs={}", percent_encode(obfs)));
+            query.push(format!("obfs={}", percent_encode(obfs.kind())));
+            query.push(format!("obfs-password={}", percent_encode(obfs.password())));
+        }
+        if self.ports.hop_ms > 0 {
+            query.push(format!("hop-interval={}", self.ports.hop_ms));
+        }
+        if self.ports.hop_min_ms > 0 {
+            query.push(format!("hop-min-interval={}", self.ports.hop_min_ms));
+        }
+        if self.ports.hop_max_ms > 0 {
+            query.push(format!("hop-max-interval={}", self.ports.hop_max_ms));
         }
         let query_str = if query.is_empty() {
             String::new()
@@ -1034,72 +1810,137 @@ impl Hysteria2Node {
         format!(
             "hysteria2://{}@{server}:{}{query_str}",
             percent_encode(&self.password),
-            self.port
+            self.ports.to_link_port()
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct VlessNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
-    pub server: String,
-    pub port: u16,
-    pub uuid: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flow: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reality: Option<RealityConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct RealityConfig {
-    pub sni: String,
-    pub public_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub short_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub alpn: Vec<String>,
-}
-
 impl VlessNode {
+    /// The layers this node composes, as `(security, transport, flow)` names.
+    #[must_use]
+    pub fn layers(&self) -> (&'static str, &'static str, &'static str) {
+        (
+            self.security.kind(),
+            self.transport.kind(),
+            self.flow.as_str(),
+        )
+    }
+
     #[must_use]
     pub fn to_link(&self) -> String {
         let server = format_host(&self.server);
-        let mut query = vec!["encryption=none".to_owned(), "security=reality".to_owned()];
-        if let Some(reality) = &self.reality {
-            query.push(format!("sni={}", percent_encode(&reality.sni)));
-            query.push(format!("pbk={}", percent_encode(&reality.public_key)));
-            if let Some(sid) = &reality.short_id
-                && !sid.is_empty()
-            {
-                query.push(format!("sid={}", percent_encode(sid)));
+        let mut query = vec!["encryption=none".to_owned()];
+        query.push(format!("security={}", self.security.kind()));
+        match &self.security {
+            SecurityConfig::None {} => {}
+            SecurityConfig::Tls(tls) => {
+                if let Some(sni) = &tls.sni
+                    && !sni.is_empty()
+                {
+                    query.push(format!("sni={}", percent_encode(sni)));
+                }
+                if tls.allow_insecure {
+                    query.push("allowInsecure=1".to_owned());
+                }
+                if let Some(fp) = &tls.fingerprint
+                    && !fp.is_empty()
+                {
+                    query.push(format!("fp={}", percent_encode(fp)));
+                }
+                if !tls.alpn.is_empty() {
+                    query.push(format!("alpn={}", tls.alpn.join(",")));
+                }
             }
-            if let Some(fp) = &reality.fingerprint
-                && !fp.is_empty()
-            {
-                query.push(format!("fp={}", percent_encode(fp)));
-            }
-            if !reality.alpn.is_empty() {
-                query.push(format!("alpn={}", reality.alpn.join(",")));
+            SecurityConfig::Reality(reality) => {
+                query.push(format!("sni={}", percent_encode(&reality.sni)));
+                query.push(format!("pbk={}", percent_encode(&reality.public_key)));
+                if let Some(sid) = &reality.short_id
+                    && !sid.is_empty()
+                {
+                    query.push(format!("sid={}", percent_encode(sid)));
+                }
+                if !reality.alpn.is_empty() {
+                    query.push(format!("alpn={}", reality.alpn.join(",")));
+                }
             }
         }
-        if let Some(flow) = &self.flow
-            && !flow.is_empty()
-        {
-            query.push(format!("flow={}", percent_encode(flow)));
+        query.push(format!("type={}", self.transport.kind()));
+        if let TransportConfig::Ws(ws) = &self.transport {
+            if !ws.path.is_empty() {
+                query.push(format!("path={}", percent_encode(&ws.path)));
+            }
+            if let Some(host) = &ws.host
+                && !host.is_empty()
+            {
+                query.push(format!("host={}", percent_encode(host)));
+            }
+        }
+        if !self.flow.is_none() {
+            query.push(format!("flow={}", percent_encode(self.flow.as_str())));
         }
         format!(
             "vless://{}@{server}:{}?{}",
             self.uuid,
             self.port,
             query.join("&")
+        )
+    }
+}
+
+impl VmessNode {
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        // The reference's own share format: base64url of a JSON object, not a query
+        // string. `ps` is the tag, and `scy` is the cipher — both are read back by
+        // `from_link`, so the two directions stay inverse.
+        let mut fields: Vec<String> = vec![
+            "\"v\":\"2\"".to_owned(),
+            format!("\"add\":\"{}\"", json_escape(&self.server)),
+            format!("\"port\":\"{}\"", self.port),
+            format!("\"id\":\"{}\"", json_escape(&self.uuid)),
+            "\"aid\":\"0\"".to_owned(),
+            format!("\"scy\":\"{}\"", vmess_cipher_name(self.cipher)),
+            format!("\"net\":\"{}\"", self.transport.kind()),
+            format!(
+                "\"tls\":\"{}\"",
+                if self.security.is_none() { "" } else { "tls" }
+            ),
+            // `type` is the header-obfuscation type, which is independent of the
+            // transport: this model carries none, so it is always "none". The previous
+            // form branched on `is_tcp()` and returned "none" either way.
+            "\"type\":\"none\"".to_owned(),
+        ];
+        if let Some(tag) = &self.tag {
+            fields.push(format!("\"ps\":\"{}\"", json_escape(tag)));
+        }
+        match &self.security {
+            SecurityConfig::Tls(tls) => {
+                if let Some(sni) = &tls.sni {
+                    fields.push(format!("\"sni\":\"{}\"", json_escape(sni)));
+                }
+                if let Some(fp) = &tls.fingerprint {
+                    fields.push(format!("\"fp\":\"{}\"", json_escape(fp)));
+                }
+                if !tls.alpn.is_empty() {
+                    fields.push(format!("\"alpn\":\"{}\"", json_escape(&tls.alpn.join(","))));
+                }
+            }
+            SecurityConfig::Reality(_) => {
+                // VMess has no REALITY client in the reference either: REALITY
+                // authenticates a VLESS flow. Validation refuses this combination;
+                // the arm exists so the match is exhaustive.
+            }
+            SecurityConfig::None {} => {}
+        }
+        if let TransportConfig::Ws(ws) = &self.transport {
+            fields.push(format!("\"path\":\"{}\"", json_escape(&ws.path)));
+            if let Some(host) = &ws.host {
+                fields.push(format!("\"host\":\"{}\"", json_escape(host)));
+            }
+        }
+        format!(
+            "vmess://{}",
+            encode_base64(format!("{{{}}}", fields.join(",")).as_bytes())
         )
     }
 }
@@ -1163,6 +2004,201 @@ fn validate_ss_method(method: &str) -> Result<(), String> {
             "shadowsocks: unknown method '{other}'; supported AEAD ciphers are chacha20-ietf-poly1305, aes-128-gcm, aes-256-gcm, xchacha20-ietf-poly1305"
         )),
     }
+}
+
+/// Parses a UUID the way both VLESS and VMess need it: 32 hex digits in the canonical
+/// 8-4-4-4-12 layout.
+///
+/// Validated at load rather than at connect because a malformed id produces a session
+/// that authenticates to nobody and fails with the node's generic rejection — the one
+/// error an operator cannot attribute.
+fn parse_node_uuid(text: &str) -> Result<[u8; 16], String> {
+    let mut digits = [0u8; 32];
+    let mut count = 0;
+    for byte in text.trim().bytes() {
+        if byte == b'-' {
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return Err(format!(
+                "'{text}' is not a UUID: {:?} is not a hex digit",
+                byte as char
+            ));
+        }
+        if count == 32 {
+            return Err(format!("'{text}' is not a UUID: more than 32 hex digits"));
+        }
+        digits[count] = byte;
+        count += 1;
+    }
+    if count != 32 {
+        return Err(format!(
+            "'{text}' is not a UUID: expected 32 hex digits, got {count}"
+        ));
+    }
+    let mut uuid = [0u8; 16];
+    for (index, pair) in digits.chunks(2).enumerate() {
+        let hex = std::str::from_utf8(pair).map_err(|_| "uuid is not UTF-8".to_owned())?;
+        uuid[index] = u8::from_str_radix(hex, 16).map_err(|_| format!("'{text}' is not a UUID"))?;
+    }
+    Ok(uuid)
+}
+
+/// Checks the security layer's own invariants.
+fn validate_security(
+    security: &SecurityConfig,
+    protocol: &str,
+    server: &str,
+) -> Result<(), String> {
+    match security {
+        SecurityConfig::None {} => Ok(()),
+        SecurityConfig::Tls(tls) => {
+            // A certificate cannot be verified against an address: the TLS client would present
+            // the IP as SNI, and no CA signs an IP for a proxy node. Failing here gives the
+            // operator a message instead of an opaque handshake error.
+            if tls.sni.is_none() && server.parse::<std::net::IpAddr>().is_ok() {
+                return Err(format!(
+                    "{protocol}: a TLS node whose server is an address needs an explicit SNI; \
+                     write `[node.security] sni = \"…\"` (or `?sni=…` in a link), because a \
+                     certificate cannot be verified against an address"
+                ));
+            }
+            if let Some(sni) = &tls.sni {
+                if sni.trim().is_empty() {
+                    return Err(format!("{protocol}.security.sni must not be empty"));
+                }
+                if sni.parse::<std::net::IpAddr>().is_ok() {
+                    return Err(format!(
+                        "{protocol}.security.sni = {sni:?} is an address; SNI names the host \
+                         whose certificate the node presents"
+                    ));
+                }
+            }
+            if let Some(fingerprint) = &tls.fingerprint
+                && fingerprint.trim().is_empty()
+            {
+                return Err(format!("{protocol}.security.fingerprint must not be empty"));
+            }
+            for protocol_name in &tls.alpn {
+                if protocol_name.is_empty() || protocol_name.len() > 255 {
+                    return Err(format!(
+                        "{protocol}.security.alpn entry {protocol_name:?} is not a protocol name"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SecurityConfig::Reality(reality) => {
+            if reality.sni.trim().is_empty() {
+                return Err(format!("{protocol}.security.sni must not be empty"));
+            }
+            if reality.sni.parse::<std::net::IpAddr>().is_ok() {
+                return Err(format!(
+                    "{protocol}.security.sni = {:?} is an address; REALITY impersonates a site, \
+                     and a site is named, not addressed",
+                    reality.sni
+                ));
+            }
+            if reality.public_key.trim().is_empty() {
+                return Err(format!("{protocol}.security.public-key must not be empty"));
+            }
+            if let Some(short_id) = &reality.short_id {
+                let digits = short_id.trim();
+                if digits.len() > 16 || (digits.len() % 2 != 0) {
+                    return Err(format!(
+                        "{protocol}.security.short-id = {short_id:?} must be an even number of \
+                         hex digits (at most 16, i.e. 8 bytes)"
+                    ));
+                }
+                if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "{protocol}.security.short-id = {short_id:?} is not hex"
+                    ));
+                }
+            }
+            // VMess has no REALITY client: REALITY authenticates a VLESS flow, and the
+            // reference's VMess outbound has no branch for it at all.
+            if protocol == "vmess" {
+                return Err(
+                    "vmess.security.type = \"reality\" is not a combination the reference \
+                     implements; REALITY authenticates a vless flow"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Checks the transport layer's own invariants.
+fn validate_transport(transport: &TransportConfig, protocol: &str) -> Result<(), String> {
+    match transport {
+        TransportConfig::Tcp => Ok(()),
+        TransportConfig::Ws(ws) => {
+            if !ws.path.starts_with('/') {
+                return Err(format!(
+                    "{protocol}.transport.path = {:?} must start with '/', because a WebSocket \
+                     upgrade targets a path",
+                    ws.path
+                ));
+            }
+            if let Some(host) = &ws.host
+                && host.trim().is_empty()
+            {
+                return Err(format!("{protocol}.transport.host must not be empty"));
+            }
+            for (name, value) in &ws.headers {
+                if name.is_empty() || name.chars().any(|c| c.is_ascii_control() || c == ':') {
+                    return Err(format!(
+                        "{protocol}.transport.headers: {name:?} is not a header name"
+                    ));
+                }
+                if value.chars().any(|c| c.is_ascii_control()) {
+                    return Err(format!(
+                        "{protocol}.transport.headers.{name} contains a control character"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The `scy` spelling a VMess link uses.
+const fn vmess_cipher_name(cipher: VmessCipher) -> &'static str {
+    match cipher {
+        VmessCipher::Auto => "auto",
+        VmessCipher::Aes128Gcm => "aes-128-gcm",
+        VmessCipher::Chacha20Poly1305 => "chacha20-poly1305",
+    }
+}
+
+/// Escapes the characters a JSON string literal cannot carry bare.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A display-only name for a link this build cannot parse.
+///
+/// `scheme://user:secret@host:443#name` is a link, and the part before `@` is a credential.
+/// A node's `default_name` is printed by `daer probe`, `daer check --nodes` and the daemon's
+/// own logs, so returning the raw link writes a secret wherever a node name goes. Only the
+/// scheme is kept: it is what tells an operator *why* the node was skipped, and it is the
+/// one part of the link that cannot be a credential.
+fn redact_link(scheme: &str, _link: &str) -> String {
+    format!("{scheme}://<redacted>")
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1254,6 +2290,433 @@ fn parse_host_port(authority: &str) -> Result<(String, u16), String> {
         .parse()
         .map_err(|_| format!("{authority:?} has an invalid port"))?;
     Ok((host.to_owned(), port))
+}
+
+/// Splits `host:ports` where `ports` may be a set (`443,8443`, `1-100`, `all`).
+///
+/// Distinct from [`parse_host_port`] because the port field is the only one that can
+/// carry a list, and a list is what port hopping needs (ADR-0029). The split is on the
+/// last colon so an IPv6 literal survives, and bracketed literals are handled first.
+fn split_host_ports(authority: &str) -> Result<(String, String), String> {
+    let authority = authority.trim();
+    let authority = match authority.split_once('?') {
+        Some((auth, _query)) => auth,
+        None => authority,
+    };
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{authority:?} has an unclosed '['"))?;
+        let ports = tail
+            .strip_prefix(':')
+            .ok_or_else(|| format!("{authority:?} has no port"))?;
+        return Ok((host.to_owned(), ports.to_owned()));
+    }
+    let (host, ports) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{authority:?} has no port"))?;
+    Ok((host.to_owned(), ports.to_owned()))
+}
+
+/// Whether a query value means "on": `1`, `true`, `yes`.
+fn truthy(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+}
+
+/// A hop interval: bare milliseconds, or a Go duration (`30s`, `1m`).
+fn parse_interval_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(millis) = value.parse::<u64>() {
+        return Some(millis);
+    }
+    parse_duration(value).and_then(|span| u64::try_from(span.as_nanos() / 1_000_000).ok())
+}
+
+/// Builds a VLESS node from a link's query, splitting the security and transport layers
+/// out of the flat parameter list the link format uses (ADR-0028).
+fn parse_vless_layers(
+    tag: Option<String>,
+    user_part: &str,
+    server: String,
+    port: u16,
+    query: &str,
+) -> Result<VlessNode, String> {
+    let mut security_kind = None;
+    let mut public_key = None;
+    let mut short_id = None;
+    let mut fingerprint = None;
+    let mut flow_text = None;
+    let mut kind = None;
+    let mut sni = None;
+    let mut alpn: Vec<String> = Vec::new();
+    let mut allow_insecure = false;
+    let mut path = None;
+    let mut host = None;
+
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        // Xray's own spelling for "no encryption" is mandatory in a link and carries no
+        // information daer does not already know; anything else is a real request.
+        if key == "encryption" && !value.eq_ignore_ascii_case("none") {
+            return Err(format!(
+                "vless link asks for encryption={value}; VLESS carries no inner encryption, and \
+                 only `none` is a valid value"
+            ));
+        }
+        let decoded = percent_decode(value);
+        match key {
+            "security" => security_kind = Some(decoded),
+            "pbk" if !decoded.is_empty() => public_key = Some(decoded),
+            "sid" if !decoded.is_empty() => short_id = Some(decoded),
+            "fp" if !decoded.is_empty() => fingerprint = Some(decoded),
+            "flow" if !decoded.is_empty() => flow_text = Some(decoded),
+            "type" if !decoded.is_empty() => kind = Some(decoded),
+            "sni" | "peer" if !decoded.is_empty() => sni = Some(decoded),
+            "alpn" if !decoded.is_empty() => {
+                alpn = decoded.split(',').map(str::to_owned).collect();
+            }
+            "allowInsecure" | "allow_insecure" | "insecure" => allow_insecure = truthy(value),
+            "path" if !decoded.is_empty() => path = Some(decoded),
+            "host" if !decoded.is_empty() => host = Some(decoded),
+            "headerType" | "serviceName" | "mode" | "extra" => {}
+            // Unknown parameters are not an error: panels add them freely and a strict
+            // parser would lock an operator out of their own subscription.
+            _ => {}
+        }
+    }
+
+    let flow = match flow_text.as_deref() {
+        None | Some("") | Some("none") => Flow::None,
+        Some("xtls-rprx-vision") | Some("vision") => Flow::Vision,
+        Some("xtls-rprx-vision-udp443") | Some("vision-udp443") => Flow::VisionUdp443,
+        Some(other) => {
+            return Err(format!(
+                "vless link asks for flow={other}; the implemented flows are none, \
+                 xtls-rprx-vision and xtls-rprx-vision-udp443"
+            ));
+        }
+    };
+
+    let transport = match kind.as_deref() {
+        None | Some("") | Some("tcp") | Some("raw") | Some("none") => TransportConfig::Tcp,
+        Some("ws") | Some("websocket") => TransportConfig::Ws(WsTransport {
+            path: path.unwrap_or_else(|| "/".to_owned()),
+            host,
+            headers: BTreeMap::new(),
+        }),
+        Some(other) => {
+            return Err(format!(
+                "vless link asks for type={other}; the implemented transports are tcp and ws. \
+                 A {other} session is a framing layer daer does not have, so it is refused \
+                 rather than silently downgraded to tcp"
+            ));
+        }
+    };
+
+    let security = match security_kind.as_deref() {
+        None | Some("") | Some("none") => SecurityConfig::None {},
+        Some("tls") => SecurityConfig::Tls(TlsSecurity {
+            sni,
+            allow_insecure,
+            alpn,
+            fingerprint,
+        }),
+        Some("reality") => SecurityConfig::Reality(RealitySecurity {
+            sni: sni.ok_or_else(|| {
+                "vless:// REALITY link has no `sni`; REALITY impersonates a named site, and the \
+                 node's address cannot be one"
+                    .to_owned()
+            })?,
+            public_key: public_key.ok_or_else(|| {
+                "vless:// REALITY link has no `pbk`; the server's public key is what the tag is \
+                 derived from, and without it no handshake can be attempted"
+                    .to_owned()
+            })?,
+            short_id,
+            alpn,
+        }),
+        Some("xtls") => {
+            return Err(
+                "vless link asks for security=xtls; that is the retired pre-Vision XTLS, which \
+                 the reference removed. Use security=reality with flow=xtls-rprx-vision"
+                    .to_owned(),
+            );
+        }
+        Some(other) => {
+            return Err(format!(
+                "vless link asks for security={other}; the implemented security layers are none, \
+                 tls and reality"
+            ));
+        }
+    };
+
+    let vless = VlessNode {
+        tag,
+        server,
+        port,
+        uuid: user_part.to_owned(),
+        flow,
+        security,
+        transport,
+    };
+    vless
+        .validate_self()
+        .map_err(|reason| format!("vless link is not usable: {reason}"))?;
+    Ok(vless)
+}
+
+impl VlessNode {
+    /// Validates this node, for the link path where the caller wants a usable node.
+    fn validate_self(&self) -> Result<(), String> {
+        NodeEndpoint::Vless(self.clone()).validate()
+    }
+}
+
+impl VmessNode {
+    /// Validates this node, for the link path where the caller wants a usable node.
+    fn validate_self(&self) -> Result<(), String> {
+        NodeEndpoint::Vmess(self.clone()).validate()
+    }
+}
+
+/// Parses `vmess://<base64(json)>` (ADR-0030).
+///
+/// The reference's share format is a base64url JSON object rather than a query string, so
+/// there is no shared query parser to reuse. Unknown fields are ignored — panels add
+/// them — but a field naming a layer daer does not implement is refused, because silently
+/// dialling `net = "kcp"` as TCP produces a session that never authenticates.
+fn parse_vmess_link(
+    tag: Option<String>,
+    body: &str,
+    whole_link: &str,
+) -> Result<VmessNode, String> {
+    let json = decode_base64(body.trim())
+        .map_err(|reason| format!("vmess link payload is not base64 JSON: {reason}"))?;
+    let fields = parse_json_object(&json)?;
+
+    let get = |key: &str| fields.get(key).map(String::as_str).unwrap_or("");
+    let server = get("add");
+    if server.is_empty() {
+        return Err("vmess link has no `add` (server)".to_owned());
+    }
+    let port: u16 = get("port")
+        .parse()
+        .map_err(|_| format!("vmess link port {:?} is not a number", get("port")))?;
+    let uuid = get("id");
+    if uuid.is_empty() {
+        return Err("vmess link has no `id` (uuid)".to_owned());
+    }
+    // `aid` is the legacy handshake's parameter. Accepting a non-zero value while
+    // speaking AEAD would be a lie about which handshake is on the wire.
+    match get("aid") {
+        "" | "0" => {}
+        other => {
+            return Err(format!(
+                "vmess link has aid={other}; a non-zero alterId selects the legacy handshake, \
+                 which daer does not implement (ADR-0030). Only VMess AEAD is spoken"
+            ));
+        }
+    }
+
+    let cipher = match get("scy").to_ascii_lowercase().as_str() {
+        "" | "auto" => VmessCipher::Auto,
+        "aes-128-gcm" => VmessCipher::Aes128Gcm,
+        "chacha20-poly1305" => VmessCipher::Chacha20Poly1305,
+        other => {
+            return Err(format!(
+                "vmess link asks for scy={other}; the implemented ciphers are auto, \
+                 aes-128-gcm and chacha20-poly1305"
+            ));
+        }
+    };
+
+    let tls_field = get("tls").to_ascii_lowercase();
+    let alpn: Vec<String> = if get("alpn").is_empty() {
+        Vec::new()
+    } else {
+        get("alpn").split(',').map(str::to_owned).collect()
+    };
+    let security = match tls_field.as_str() {
+        "" | "none" => SecurityConfig::None {},
+        "tls" => SecurityConfig::Tls(TlsSecurity {
+            sni: (!get("sni").is_empty()).then(|| get("sni").to_owned()),
+            allow_insecure: truthy(get("allowinsecure")) || truthy(get("allow_insecure")),
+            alpn,
+            fingerprint: (!get("fp").is_empty()).then(|| get("fp").to_owned()),
+        }),
+        "reality" => {
+            return Err(
+                "vmess link asks for tls=reality; REALITY authenticates a vless flow, and the \
+                 reference implements no VMess REALITY client"
+                    .to_owned(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "vmess link asks for tls={other}; the implemented security layers are none and \
+                 tls"
+            ));
+        }
+    };
+
+    let transport = match get("net").to_ascii_lowercase().as_str() {
+        "" | "tcp" | "raw" => TransportConfig::Tcp,
+        "ws" | "websocket" => {
+            let path = get("path");
+            TransportConfig::Ws(WsTransport {
+                path: if path.is_empty() {
+                    "/".to_owned()
+                } else {
+                    path.to_owned()
+                },
+                host: (!get("host").is_empty()).then(|| get("host").to_owned()),
+                headers: BTreeMap::new(),
+            })
+        }
+        other => {
+            return Err(format!(
+                "vmess link asks for net={other}; the implemented transports are tcp and ws \
+                 (in {whole_link:?})"
+            ));
+        }
+    };
+
+    let tag = tag.or_else(|| (!get("ps").is_empty()).then(|| get("ps").to_owned()));
+    let vmess = VmessNode {
+        tag,
+        server: server.to_owned(),
+        port,
+        uuid: uuid.to_owned(),
+        cipher,
+        authenticated_length: get("authenticatedLength").eq_ignore_ascii_case("true"),
+        no_termination_signal: get("noTerminationSignal").eq_ignore_ascii_case("true"),
+        security,
+        transport,
+    };
+    vmess
+        .validate_self()
+        .map_err(|reason| format!("vmess link is not usable: {reason}"))?;
+    Ok(vmess)
+}
+
+/// A flat JSON object of string values, which is all a `vmess://` payload is.
+///
+/// Hand-rolled rather than a `serde_json` dependency in `daer-config`: the payload is a
+/// dozen string fields, `serde_json` is already a workspace dependency but pulling a JSON
+/// parser into the configuration crate for one link format would put a second
+/// deserializer on the load path. Escapes are decoded; nested values are refused because
+/// a `vmess://` payload has none and accepting one would silently drop it.
+fn parse_json_object(json: &str) -> Result<BTreeMap<String, String>, String> {
+    let bytes: Vec<char> = json.trim().chars().collect();
+    let mut index = 0;
+    let mut fields = BTreeMap::new();
+
+    let skip_ws = |index: &mut usize| {
+        while *index < bytes.len() && bytes[*index].is_whitespace() {
+            *index += 1;
+        }
+    };
+    let parse_string = |index: &mut usize| -> Result<String, String> {
+        skip_ws(index);
+        if bytes.get(*index) != Some(&'"') {
+            return Err(format!("expected a string at offset {index}"));
+        }
+        *index += 1;
+        let mut out = String::new();
+        loop {
+            let c = *bytes.get(*index).ok_or("unterminated string")?;
+            *index += 1;
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let escape = *bytes.get(*index).ok_or("unterminated escape")?;
+                    *index += 1;
+                    match escape {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'b' => out.push('\u{8}'),
+                        'f' => out.push('\u{c}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let hex: String = bytes
+                                .get(*index..*index + 4)
+                                .ok_or("truncated \\u escape")?
+                                .iter()
+                                .collect();
+                            *index += 4;
+                            let code = u32::from_str_radix(&hex, 16)
+                                .map_err(|_| format!("{hex:?} is not a code point"))?;
+                            out.push(char::from_u32(code).ok_or("invalid code point")?);
+                        }
+                        other => return Err(format!("unknown escape \\{other}")),
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+    };
+
+    skip_ws(&mut index);
+    if bytes.get(index) != Some(&'{') {
+        return Err("payload is not a JSON object".to_owned());
+    }
+    index += 1;
+    loop {
+        skip_ws(&mut index);
+        match bytes.get(index) {
+            Some('}') => break,
+            Some('"') => {}
+            Some(other) => return Err(format!("expected a key or '}}', got {other:?}")),
+            None => return Err("unterminated object".to_owned()),
+        }
+        let key = parse_string(&mut index)?;
+        skip_ws(&mut index);
+        if bytes.get(index) != Some(&':') {
+            return Err(format!("expected ':' after key {key:?}"));
+        }
+        index += 1;
+        skip_ws(&mut index);
+        match bytes.get(index) {
+            Some('"') => {
+                let value = parse_string(&mut index)?;
+                fields.insert(key, value);
+            }
+            Some('{') | Some('[') => {
+                return Err(format!(
+                    "vmess link field {key:?} holds a nested value; a `vmess://` payload is a \
+                     flat object of strings"
+                ));
+            }
+            Some(_) => {
+                // Numbers and booleans are written bare by some panels. Reading the token
+                // as text is what the reference does, and it keeps `"port": 443` working.
+                let start = index;
+                while index < bytes.len() && !matches!(bytes[index], ',' | '}') {
+                    index += 1;
+                }
+                let token: String = bytes[start..index].iter().collect();
+                fields.insert(key, token.trim().to_owned());
+            }
+            None => return Err("unterminated object".to_owned()),
+        }
+        skip_ws(&mut index);
+        match bytes.get(index) {
+            Some(',') => index += 1,
+            Some('}') => {}
+            Some(other) => return Err(format!("expected ',' or '}}', got {other:?}")),
+            None => return Err("unterminated object".to_owned()),
+        }
+    }
+    Ok(fields)
 }
 
 impl StructuredNode {
@@ -1458,13 +2921,22 @@ impl StructuredNode {
                 let (password, hostport) = authority
                     .rsplit_once('@')
                     .ok_or_else(|| "hysteria2 link has no 'password@server:port'".to_owned())?;
-                let (server, port) = parse_host_port(hostport)?;
+                // The port field may be a set (`443,8443`, `20000-30000`, `all`), which is
+                // what the reference's port hopping needs. Splitting on the *last* colon
+                // keeps an IPv6 literal intact.
+                let (server, port_text) = split_host_ports(hostport)?;
+                let mut ports = PortSet::parse(&port_text)?;
 
                 let mut sni = None;
                 let mut allow_insecure = false;
+                let mut pin_sha256 = None;
                 let mut up_mbps = 0;
                 let mut down_mbps = 0;
-                let mut obfs = None;
+                let mut obfs_kind = None;
+                let mut obfs_password = None;
+                let mut congestion = Hysteria2Congestion::Bbr;
+                let mut gecko_min = 0u16;
+                let mut gecko_max = 0u16;
 
                 for pair in query.split('&').filter(|p| !p.is_empty()) {
                     let (k, v) = match pair.split_once('=') {
@@ -1472,38 +2944,93 @@ impl StructuredNode {
                         None => (pair, ""),
                     };
                     match k {
-                        "sni" | "peer" if !v.is_empty() => {
-                            sni = Some(percent_decode(v));
-                        }
+                        "sni" | "peer" if !v.is_empty() => sni = Some(percent_decode(v)),
                         "insecure" | "allowInsecure" | "allow_insecure" => {
-                            allow_insecure = v == "1" || v.eq_ignore_ascii_case("true");
+                            allow_insecure = truthy(v);
                         }
-                        "upmbps" | "up_mbps" => {
-                            if let Ok(n) = v.parse::<u64>() {
-                                up_mbps = n;
-                            }
+                        "pinSHA256" | "pin-sha256" if !v.is_empty() => {
+                            pin_sha256 = Some(percent_decode(v));
                         }
-                        "downmbps" | "down_mbps" => {
-                            if let Ok(n) = v.parse::<u64>() {
-                                down_mbps = n;
-                            }
+                        "upmbps" | "up_mbps" => up_mbps = v.parse().unwrap_or(0),
+                        "downmbps" | "down_mbps" => down_mbps = v.parse().unwrap_or(0),
+                        "obfs" if !v.is_empty() => obfs_kind = Some(percent_decode(v)),
+                        "obfs-password" if !v.is_empty() => {
+                            obfs_password = Some(percent_decode(v));
                         }
-                        "obfs" | "obfs-password" if !v.is_empty() => {
-                            obfs = Some(percent_decode(v));
+                        "hop-interval" | "hop_interval" => {
+                            ports.hop_ms = parse_interval_ms(v).unwrap_or(0);
                         }
+                        "hop-min-interval" | "hop_min_interval" => {
+                            ports.hop_min_ms = parse_interval_ms(v).unwrap_or(0);
+                        }
+                        "hop-max-interval" | "hop_max_interval" => {
+                            ports.hop_max_ms = parse_interval_ms(v).unwrap_or(0);
+                        }
+                        "congestion" if !v.is_empty() => {
+                            congestion = match percent_decode(v).to_ascii_lowercase().as_str() {
+                                "bbr" => Hysteria2Congestion::Bbr,
+                                "cubic" => Hysteria2Congestion::Cubic,
+                                "new_reno" | "newreno" | "reno" => Hysteria2Congestion::NewReno,
+                                "brutal" => Hysteria2Congestion::Brutal,
+                                other => {
+                                    return Err(format!(
+                                        "hysteria2 link asks for congestion={other}; the \
+                                         implemented controllers are bbr, cubic, new-reno and \
+                                         brutal"
+                                    ));
+                                }
+                            };
+                        }
+                        "gecko-min-packet-size" => gecko_min = v.parse().unwrap_or(0),
+                        "gecko-max-packet-size" => gecko_max = v.parse().unwrap_or(0),
                         _ => {}
                     }
                 }
+
+                let obfs = match (obfs_kind.as_deref(), obfs_password) {
+                    (None, None) | (Some(""), None) => None,
+                    (Some(kind), Some(password)) => match kind.to_ascii_lowercase().as_str() {
+                        "salamander" => Some(Hysteria2Obfs::Salamander { password }),
+                        "gecko" => Some(Hysteria2Obfs::Gecko {
+                            password,
+                            min_packet_size: gecko_min,
+                            max_packet_size: gecko_max,
+                        }),
+                        other => {
+                            return Err(format!(
+                                "hysteria2 link asks for obfs={other}; the implemented \
+                                 obfuscations are salamander and gecko (and omitting obfs)"
+                            ));
+                        }
+                    },
+                    (Some(kind), None) => {
+                        return Err(format!(
+                            "hysteria2 link names obfs={kind} without obfs-password; the \
+                             obfuscation is a pre-shared key"
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(
+                            "hysteria2 link names obfs-password without obfs; the password has \
+                             no meaning on its own"
+                                .to_owned(),
+                        );
+                    }
+                };
+
                 Ok(Self::Hysteria2(Hysteria2Node {
                     tag,
                     server,
-                    port,
+                    ports,
                     password: percent_decode(password),
                     sni,
                     allow_insecure,
+                    pin_sha256,
                     up_mbps,
                     down_mbps,
                     obfs,
+                    congestion,
+                    quic: Hysteria2Quic::default(),
                 }))
             }
             "vless" => {
@@ -1515,53 +3042,9 @@ impl StructuredNode {
                     None => (rest, ""),
                 };
                 let (server, port) = parse_host_port(authority)?;
-
-                let mut sni = None;
-                let mut public_key = None;
-                let mut short_id = None;
-                let mut fingerprint = None;
-                let mut flow = None;
-                let mut alpn = Vec::new();
-
-                for pair in query.split('&').filter(|p| !p.is_empty()) {
-                    let (k, v) = match pair.split_once('=') {
-                        Some((k, v)) => (k, v),
-                        None => (pair, ""),
-                    };
-                    let decoded_v = percent_decode(v);
-                    match k {
-                        "sni" | "peer" if !decoded_v.is_empty() => sni = Some(decoded_v),
-                        "pbk" if !decoded_v.is_empty() => public_key = Some(decoded_v),
-                        "sid" if !decoded_v.is_empty() => short_id = Some(decoded_v),
-                        "fp" if !decoded_v.is_empty() => fingerprint = Some(decoded_v),
-                        "flow" if !decoded_v.is_empty() => flow = Some(decoded_v),
-                        "alpn" if !decoded_v.is_empty() => {
-                            alpn = decoded_v.split(',').map(str::to_owned).collect();
-                        }
-                        _ => {}
-                    }
-                }
-
-                let reality = match (sni, public_key) {
-                    (Some(sni), Some(public_key)) => Some(RealityConfig {
-                        sni,
-                        public_key,
-                        short_id,
-                        fingerprint: Some(fingerprint.unwrap_or_else(|| "chrome".to_owned())),
-                        alpn,
-                    }),
-                    _ => None,
-                };
-
-                Ok(Self::Vless(VlessNode {
-                    tag,
-                    server,
-                    port,
-                    uuid: user_part.to_owned(),
-                    flow,
-                    reality,
-                }))
+                parse_vless_layers(tag, user_part, server, port, query).map(Self::Vless)
             }
+            "vmess" => parse_vmess_link(tag, before_fragment, link).map(Self::Vmess),
             other => Ok(Self::Unsupported {
                 scheme: other.to_owned(),
                 link: link.to_owned(),
@@ -1979,15 +3462,22 @@ mod tests {
                 assert_eq!(vless.server, "fkus1keria.itknowledgeblog.com");
                 assert_eq!(vless.port, 443);
                 assert_eq!(vless.uuid, "df4af3d0-030e-4062-baa6-eb9dd45298ef");
-                assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
-                let reality = vless.reality.expect("reality config");
+                assert_eq!(vless.flow, Flow::Vision);
+                let SecurityConfig::Reality(reality) = &vless.security else {
+                    panic!(
+                        "expected a REALITY security layer, got {:?}",
+                        vless.security
+                    );
+                };
                 assert_eq!(reality.sni, "portal.citygrainla.com");
                 assert_eq!(
                     reality.public_key,
                     "9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E"
                 );
                 assert_eq!(reality.short_id.as_deref(), Some("672f"));
-                assert_eq!(reality.fingerprint.as_deref(), Some("chrome"));
+                // The transport layer is its own axis now (ADR-0028): `type=tcp` in the
+                // link is `TransportConfig::Tcp`, not a field on the REALITY layer.
+                assert_eq!(vless.transport, TransportConfig::Tcp);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -2034,19 +3524,26 @@ mod tests {
             other => panic!("unexpected variant: {other:?}"),
         }
 
-        let hy2_link = "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com&insecure=1&upmbps=50&downmbps=100&obfs=salamander#my-hy2";
+        let hy2_link = "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com&insecure=1&upmbps=50&downmbps=100&obfs=salamander&obfs-password=cry_me_a_r1ver#my-hy2";
         let structured = StructuredNode::from_link(hy2_link).expect("converts hysteria2 link");
         match structured {
             StructuredNode::Hysteria2(hy2) => {
                 assert_eq!(hy2.tag.as_deref(), Some("my-hy2"));
                 assert_eq!(hy2.server, "hy2.example.com");
-                assert_eq!(hy2.port, 443);
+                assert_eq!(hy2.ports.ranges, vec![(443, 443)]);
                 assert_eq!(hy2.password, "secret-hy2");
                 assert_eq!(hy2.sni.as_deref(), Some("sni.example.com"));
                 assert!(hy2.allow_insecure);
                 assert_eq!(hy2.up_mbps, 50);
                 assert_eq!(hy2.down_mbps, 100);
-                assert_eq!(hy2.obfs.as_deref(), Some("salamander"));
+                // `obfs=salamander` with no password is refused at link-parse time, so the
+                // fixture carries one and the layer survives with its key.
+                assert_eq!(
+                    hy2.obfs,
+                    Some(Hysteria2Obfs::Salamander {
+                        password: "cry_me_a_r1ver".to_owned()
+                    })
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -2073,11 +3570,11 @@ server = "198.51.100.1"
 port = 443
 uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 flow = "xtls-rprx-vision"
-[node.reality]
+[node.security]
+type = "reality"
 sni = "example.com"
 public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
 short-id = "ab01cd02"
-fingerprint = "chrome"
 
 [[node]]
 tag = "us-ss"
@@ -2131,7 +3628,6 @@ type = "direct"
         assert!(link0.contains("sni=example.com"));
         assert!(link0.contains("pbk=f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"));
         assert!(link0.contains("sid=ab01cd02"));
-        assert!(link0.contains("fp=chrome"));
         assert!(link0.contains("flow=xtls-rprx-vision"));
 
         // us-ss
@@ -2235,6 +3731,7 @@ type = "direct"
                 NodeEndpoint::AnyTls(n) => n.tag = None,
                 NodeEndpoint::Hysteria2(n) => n.tag = None,
                 NodeEndpoint::Vless(n) => n.tag = None,
+                NodeEndpoint::Vmess(n) => n.tag = None,
                 NodeEndpoint::Unsupported { .. } => {}
             }
             assert_eq!(parsed.node[0].endpoint, expected, "\n{rendered}");
@@ -2256,12 +3753,23 @@ type = "direct"
         .expect_err("unknown field must fail");
         assert!(err.to_string().contains("unknown_field"), "{err}");
 
-        // Unknown field inside [node.reality] fails
+        // Unknown field inside a layer table fails. `deny_unknown_fields` on an internally
+        // tagged enum is not something serde provides, so `SecurityConfig::deserialize`
+        // reads the table itself; this is the test that keeps that hand-written check
+        // honest.
         let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"u\"\n[node.reality]\nsni = \"s\"\npublic-key = \"k\"\nextra = \"bad\"\n",
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.security]\ntype = \"reality\"\nsni = \"s\"\npublic-key = \"k\"\nextra = \"bad\"\n",
         )
-        .expect_err("unknown field in reality must fail");
+        .expect_err("unknown field in the security layer must fail");
         assert!(err.to_string().contains("extra"), "{err}");
+
+        // The retired `[node.reality]` table is gone (ADR-0028 moved it under
+        // `[node.security]`), and the error is a plain unknown-field error naming the key.
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.reality]\nsni = \"s\"\npublic-key = \"k\"\n",
+        )
+        .expect_err("the retired [node.reality] table must fail");
+        assert!(err.to_string().contains("reality"), "{err}");
 
         // Having 'url' fails with retirement explanation
         let err = toml::from_str::<Config>("[[node]]\nurl = \"socks5://1.1.1.1:1080\"\n")
@@ -2294,12 +3802,30 @@ type = "direct"
         .expect_err("empty server must fail");
         assert!(err.to_string().contains("server"), "{err}");
 
-        // Vless without reality fails
+        // A VLESS node needs no security layer at all now (ADR-0028), but it does need a
+        // UUID: the id is what authenticates the session, and a malformed one produces a
+        // generic node rejection with nothing to attribute it to.
         let err = toml::from_str::<Config>(
             "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"u\"\n",
         )
-        .expect_err("vless without reality must fail");
-        assert!(err.to_string().contains("reality"), "{err}");
+        .expect_err("a malformed vless uuid must fail");
+        assert!(err.to_string().contains("UUID"), "{err}");
+
+        // A malformed REALITY public key is refused only at dial time today, but the
+        // missing `sni` is a load-time error because REALITY impersonates a named site.
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.security]\ntype = \"reality\"\npublic-key = \"k\"\n",
+        )
+        .expect_err("reality without sni must fail");
+        assert!(err.to_string().contains("sni"), "{err}");
+
+        // Vision needs a record layer it can splice. The reference rejects this on both
+        // ends; accepting it would produce a session that authenticates and deadlocks.
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\nflow = \"xtls-rprx-vision\"\n",
+        )
+        .expect_err("vision without a security layer must fail");
+        assert!(err.to_string().contains("security layer"), "{err}");
 
         // Shadowsocks with legacy cipher fails with clear explanation
         let err = toml::from_str::<Config>(

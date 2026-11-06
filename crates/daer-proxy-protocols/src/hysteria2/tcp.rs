@@ -16,10 +16,12 @@ pub async fn open_tcp_stream(
     conn: &quinn::Connection,
     authority: &str,
 ) -> Result<QuicBiStream, ProxyProtocolError> {
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| ProxyProtocolError::Connect(format!("quic open bi stream: {e}")))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| {
+        ProxyProtocolError::Connect(format!(
+            "quic open bi stream: {e} (close reason: {:?})",
+            conn.close_reason()
+        ))
+    })?;
 
     // Frame type 0x401
     let mut req = Vec::with_capacity(64);
@@ -35,9 +37,12 @@ pub async fn open_tcp_stream(
     encode_varint(pad_len as u64, &mut req);
     req.resize(req.len() + pad_len, 0);
 
-    send.write_all(&req)
-        .await
-        .map_err(|e| ProxyProtocolError::Connect(format!("write hysteria2 tcp req: {e}")))?;
+    send.write_all(&req).await.map_err(|e| {
+        ProxyProtocolError::Connect(format!(
+            "write hysteria2 tcp req: {e} (close reason: {:?})",
+            conn.close_reason()
+        ))
+    })?;
     send.flush()
         .await
         .map_err(|e| ProxyProtocolError::Connect(format!("flush hysteria2 tcp req: {e}")))?;

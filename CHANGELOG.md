@@ -31,6 +31,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the relay asking twice (`dial_target` then `open_datagram`). The two calls could straddle a
   reload, so a datagram flow could be dialed to a target the rule that opened its leg had never
   chosen.
+- **The kernel ABI and the checks that guard it are now a build artifact, not a convention.**
+  `ebpf/abi.toml` is the only place a map name, program name, discriminant or struct layout is
+  declared, and `cargo xtask abi` writes both `ebpf/kern/daer_abi.h` and
+  `crates/daer-ebpf/src/generated.rs` from it (ADR-0021, `[INV-ABI-01]`). Three things make
+  that hold rather than read well:
+  - **The generated files are tracked.** `generated.rs` is a `pub mod` of a crate
+    `cargo test --workspace` compiles, and the generator lives in `xtask`, not in a `build.rs`.
+    Untracked — which is what ADR-0021 originally said, on reasoning that holds for the C
+    header and not for the Rust module — a fresh clone, a `git archive` tarball and the CI
+    `test` job all fail with `E0583: file not found for module 'generated'`, and the tree
+    builds only where a previous run happened to leave the file.
+  - **The drift gate runs on pull requests.** `cargo xtask abi --check` compares
+    `abi.toml`, the header and the module byte for byte, and is now a step in the `test` job.
+    Its only caller used to be `cargo xtask ci`, which CI does not run, so the invariant was
+    enforced on a developer's machine and nowhere else.
+  - **The privileged CI gates can no longer skip silently.** `kernel-datapath` set
+    `DAER_REQUIRE: "7-tcp,8"` and `scripts/kernel-check.sh` emits neither key — an entry that
+    matches no skip is inert, so every check in that job could skip while it stayed green. The
+    keys are now the script's own (`kernel-binary,7`), the job builds the test object only
+    `cargo xtask ebpf --tests` produces (absent, section 7 skipped for a second reason), and
+    `3-tcp,4` — the transparent data path and the `SIGHUP` reload — get the `e2e-ingress` job
+    they never had, because `scripts/e2e-check.sh` existed with no caller.
 
 ### Fixed
 
@@ -104,7 +126,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did another. `direct`, `block`, `must_rules`, `<OR>`, `<AND>` and `<Control Plane Routing>` are
   now rejected as group names at load time, from one list in `daer-common` that the rule lowering
   also uses, so the two cannot drift apart.
-
 ### Removed
 
 - **`dial-mode` from the configuration reference.** It was documented (and in an ADR's key list)

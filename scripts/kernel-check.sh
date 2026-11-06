@@ -117,8 +117,12 @@ if command -v capsh >/dev/null 2>&1; then
         bad "CAP_BPF / CAP_NET_ADMIN are not effective; bpf() will refuse map creation"
     fi
 fi
+# This is a property of the machine, not a check that was skipped: with the sysctl set,
+# unprivileged `bpf()` is refused, and that is the *correct* configuration for a box that
+# runs the datapath as a service. Saying "skip" here counted it against the run and made a
+# fully-proving green summary read as "3 skipped".
 if [[ "$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo 0)" != "0" ]]; then
-    skip "env-bpf" "unprivileged_bpf_disabled is set; only real capabilities work (this is fine as root)"
+    ok "unprivileged bpf() is disabled (expected; this script runs with real capabilities)"
 fi
 
 section "2. datapath object"
@@ -144,35 +148,20 @@ else
     ok "binary: $binary"
 fi
 
-# The transparent-path binary is built here too: section 7 runs it, and a binary that was never
-# built would silently turn that section into a skip.
-if ! as_builder env -u SUDO_USER cargo test -p daer-control --test transparent --no-run \
-        >"$logs/build-transparent.log" 2>&1; then
-    bad "the transparent test binary did not build; see $logs/build-transparent.log"
-    binary_transparent=""
+# The in-kernel datapath cases (ADR-0022) live in their own test target. Building it here
+# is what makes section 9 possible; a binary that was never built would turn the section
+# into a silent skip, which is the failure mode ADR-0007 exists to prevent.
+if ! as_builder env -u SUDO_USER cargo test -p daer-ebpf --test datapath --no-run \
+        >"$logs/build-datapath.log" 2>&1; then
+    bad "the datapath test binary did not build; see $logs/build-datapath.log"
+    binary_datapath=""
 else
-    binary_transparent="$(ls -t target/debug/deps/transparent-* 2>/dev/null \
+    binary_datapath="$(ls -t target/debug/deps/datapath-* 2>/dev/null \
         | grep -v '\.d$' | head -n 1)"
-    if [[ -z "$binary_transparent" ]]; then
-        bad "no transparent test binary under target/debug/deps"
+    if [[ -z "$binary_datapath" ]]; then
+        bad "no datapath test binary under target/debug/deps"
     else
-        ok "binary: $binary_transparent"
-    fi
-fi
-
-# Section 8 sends `SIGHUP` to a live `daer run`, which needs the transparent port — so the binary
-# is built here as well. Its own skip path covers a box where the bind fails anyway.
-if ! as_builder env -u SUDO_USER cargo test -p daer-cli --test reload --no-run \
-        >"$logs/build-reload.log" 2>&1; then
-    bad "the reload test binary did not build; see $logs/build-reload.log"
-    binary_reload=""
-else
-    binary_reload="$(ls -t target/debug/deps/reload-* 2>/dev/null \
-        | grep -v '\.d$' | head -n 1)"
-    if [[ -z "$binary_reload" ]]; then
-        bad "no reload test binary under target/debug/deps"
-    else
-        ok "binary: $binary_reload"
+        ok "binary: $binary_datapath"
     fi
 fi
 
@@ -201,10 +190,10 @@ run_one() {
     # the test harness emit ANSI even into a file, and grepping those raw yields fragments.
     if command -v perl >/dev/null 2>&1; then
         perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$log" 2>/dev/null \
-            | awk '/must load:|PermissionDenied|verifier|LoadError|panicked|attach|InvalidProgram/ \
+            | awk '/must load:|PermissionDenied|verifier|LoadError|panicked|attach|InvalidProgram|insn_off/ \
                    { print "       " $0; if (++n == 3) exit }'
     else
-        awk '/must load:|PermissionDenied|verifier|LoadError|panicked|attach|InvalidProgram/ \
+        awk '/must load:|PermissionDenied|verifier|LoadError|panicked|attach|InvalidProgram|insn_off/ \
              { print "       " $0; if (++n == 3) exit }' "$log"
     fi
     return 1
@@ -240,76 +229,36 @@ if [[ "$created_pair" == 1 ]]; then
     ip link del daer0 2>/dev/null && ok "removed the test pair"
 fi
 
-# ── 7. the transparent data path ────────────────────────────────────────────────
-#
-# `tests/transparent.rs` is the only proof that a redirected flow is actually proxied, and it
-# installs its own `nftables tproxy` rule — which needs `CAP_NET_ADMIN` *and* `nft`. This script
-# already runs with those, so the test that would otherwise be an ignored debt is run here
-# (ADR-0007: "an ignored test that no script runs is how a vacuous test survives").
-section "7. the transparent data path (a real tproxy redirect into a real origin)"
-if ! command -v nft >/dev/null 2>&1; then
-    skip "7-tcp" "nft is not installed; the transparent-path test cannot install its redirect"
-elif [[ -z "$binary_transparent" ]]; then
-    skip "7-tcp" "no transparent test binary (run \`cargo test --no-run\`)"
+section "7. the in-kernel datapath cases (BPF_PROG_TEST_RUN)"
+# Every case is a pktgen/setup/check triple in `ebpf/kern/tests/bpf_test.c`, compiled into
+# `target/ebpf/datapath-test.o` and driven by `crates/daer-ebpf/tests/datapath.rs`. This is
+# the only part of the suite that executes the datapath's own logic in the kernel.
+if [[ -z "$binary_datapath" ]]; then
+    skip "7" "no datapath test binary (run \`cargo xtask ebpf --tests\`)"
+elif [[ ! -f target/ebpf/datapath-test.o ]]; then
+    skip "7" "target/ebpf/datapath-test.o is missing (run \`cargo xtask ebpf --tests\`)"
 else
-    # The test needs a working loopback address and the daemon's transparent port; a fresh
-    # namespace is not required, and this script must not disturb the operator's rules — the
-    # test creates and removes its own `ip daer-test` table.
-    if "$binary_transparent" --nocapture --test-threads=1 >"$logs/transparent.log" 2>&1 \
-            && grep -q "test result: ok" "$logs/transparent.log"; then
-        # Report each data path separately. Grepping for *any* `skipped:` line and calling the
-        # whole section a skip was wrong: the datagram test skips itself on a box that cannot
-        # create a second network namespace while the TCP path — the one that matters — passes,
-        # and the operator read "skip" as "nothing was proven".
-        if grep -q "a_redirected_flow_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
-            ok "a redirected flow reached the daemon, was proxied, and the origin's nonce came back"
-        else
-            bad "the TCP data path did not report a pass; see $logs/transparent.log"
-        fi
-        if grep -q "a_redirected_datagram_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
-            ok "a redirected datagram reached the daemon and the reply came back to the client port"
-        else
-            skip "7-udp" "the UDP path skipped itself (a second network namespace is needed); see $logs/transparent.log"
-        fi
-        grep -E "^test " "$logs/transparent.log" | sed 's/^/       /'
-    else
-        bad "the transparent data path failed; see $logs/transparent.log"
-        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent.log" 2>/dev/null \
-            | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
-    fi
-fi
-
-section "8. reload: a SIGHUP must not abort the daemon"
-#
-# `daer run` used to panic on its *first* `SIGHUP` — `reload` called `block_on` from inside the
-# multi-threaded runtime ("Cannot start a runtime from within a runtime"), so the main task died
-# and every in-flight flow with it. No unit test could have caught it: the defect is in the
-# interaction between the signal loop and the runtime, so it needs a real process and a real
-# signal. Section 7 is the detour that made it look like a configuration problem.
-if [[ -z "$binary_reload" ]]; then
-    skip "8" "no reload test binary (run \`cargo test --no-run\`)"
-elif [[ ! -x "$binary_reload" ]]; then
-    bad "reload test binary is not executable: $binary_reload"
-else
-    if "$binary_reload" --nocapture --test-threads=1 >"$logs/reload.log" 2>&1 \
-            && grep -q "test result: ok" "$logs/reload.log"; then
-        if grep -q "skipped: the daemon could not start here" "$logs/reload.log"; then
-            skip "8" "the reload test skipped itself; see $logs/reload.log"
-        else
-            ok "the daemon survived SIGHUP and published generation 2"
-        fi
-    else
-        bad "reload failed; see $logs/reload.log"
-        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/reload.log" 2>/dev/null \
-            | awk '/panicked|Cannot start a runtime|did not publish|must not abort/\
-                   {print "       " $0; if (++n == 3) exit}'
-    fi
+    run_one every_datapath_case_passes "$logs/datapath.log" \
+        "every in-kernel datapath case passed"
 fi
 
 section "summary"
 if [[ "$failures" -eq 0 ]]; then
     printf '%s%sAll checks passed. The kernel datapath works on this machine.%s\n' \
         "$GREEN" "$BOLD" "$OFF"
+    # A skip is still reported on the green path. Omitting it here would let a run that
+    # proved nothing print the same line as one that proved everything (ADR-0007).
+    if [[ "$skips" -gt 0 ]]; then
+        printf '%s%d check(s) skipped — read the reasons above before treating this as full coverage.%s\n' \
+            "$YELLOW" "$skips" "$OFF"
+        if [[ -n "${DAER_REQUIRE:-}" ]]; then
+            printf 'DAER_REQUIRE=%s was satisfied; raise it to make more skips fatal.\n' "$DAER_REQUIRE"
+        else
+            printf 'Set DAER_REQUIRE=<key,...> to make a skip fatal in CI.\n'
+        fi
+    else
+        printf 'No check was skipped: every gate above ran and passed.\n'
+    fi
     printf 'Logs: %s\n' "$logs"
     printf 'Next: %ssudo %s run -c /etc/daer/config.toml%s\n' "$BOLD" "$root/target/release/daer" "$OFF"
     exit 0

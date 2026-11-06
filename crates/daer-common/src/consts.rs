@@ -1,46 +1,31 @@
 //! Shared constants for the daer workspace.
 //!
-//! Replaces the Go package `common/consts`. Values are kept identical to the Go
-//! implementation, so a daer binary keeps the same kernel contract without changing
-//! kernel-side behaviour.
+//! Every constant here has at least one reader in another crate; ADR-0023 makes that a
+//! tested property rather than a convention. Values that describe a behaviour owned by a
+//! single crate live in that crate: the `daer0`/`daer0peer` device names are
+//! `daer_control::datapath::{DEVICE, PEER}`, because that is what creates the devices.
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 /// Binary name used by daer's own artifacts.
 pub const APP_NAME: &str = "daer";
 
 /// Default tproxy listen port. It is not an HTTP/SOCKS port; only eBPF uses it.
+///
+/// This is the single definition: `daer-config`'s schema default references it, so the
+/// documented default and the value published into `PARAM` cannot disagree.
 pub const TPROXY_PORT_DEFAULT: u16 = 12345;
 
 /// skb mark used to identify daer-originated traffic (`TPROXY_MARK` in
-/// `control/kern/tproxy.c`).
+/// `ebpf/kern/tproxy.c`). This is the one definition of the mark; the `ip rule`
+/// selector the control plane installs is formatted from it (ADR-0023).
 pub const TPROXY_MARK: u32 = 0x0800_0000;
 
-/// Network namespace that hosts the tproxy listener.
-pub const DAENS_NETNS: &str = "daens";
-
-/// Virtual interface paired with `DAE0_IFNAME` (netkit/netdev pair).
-pub const DAE0_IFNAME: &str = "dae0";
-
-/// Peer of [`DAE0_IFNAME`] used as the redirect target.
-pub const DAEPEER_IFNAME: &str = "dae0peer";
-
-/// Ethernet MTU assumed while rewriting L2 headers.
-pub const ETHERNET_MTU: usize = 1500;
-
 /// Default bound for `MAX_MATCH_SET_LEN`, the number of 32-bit match words the
-/// kernel routing program evaluates per packet. Overridable at build time in
-/// the Go implementation via `make`, or in daer via `MAX_MATCH_SET_LEN=... cargo xtask ebpf`.
+/// kernel routing program evaluates per packet. Overridable at build time with
+/// `MAX_MATCH_SET_LEN=... cargo xtask ebpf`.
 pub const MAX_MATCH_SET_LEN: usize = 1024;
-
-/// Minimum supported kernel version; `bpf_loop` and the cgroup hooks daer relies
-/// on require 5.17 or later.
-pub const MIN_KERNEL_VERSION: (u16, u16) = (5, 17);
-
-/// Backstop lifetime for UDP connection state entries.
-pub const UDP_CONN_STATE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How the dial target is chosen for a matched flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,3 +239,79 @@ impl fmt::Display for UnsupportedSelectionPolicy {
 }
 
 impl std::error::Error for UnsupportedSelectionPolicy {}
+
+#[cfg(test)]
+mod tests {
+    /// Every exported constant has a reader outside this crate (ADR-0023).
+    ///
+    /// `rustc`'s dead-code lint does not fire on `pub` items, so a constant transcribed
+    /// "for compatibility" can sit here unused for months — which is exactly how the
+    /// `dae0`/`dae0peer` names contradicted the `daer0`/`daer0peer` devices the daemon
+    /// actually creates. This test walks the crate sources of the workspace and fails
+    /// when a constant in this file is not named anywhere else.
+    ///
+    /// The list is explicit rather than reflective because Rust has no runtime
+    /// reflection: a new constant is added here with its reader, in the same change.
+    #[test]
+    fn every_constant_has_a_reader() {
+        // (name, is this constant still expected to exist?)
+        let constants = [
+            ("APP_NAME", true),
+            ("TPROXY_PORT_DEFAULT", true),
+            ("TPROXY_MARK", true),
+            ("MAX_MATCH_SET_LEN", true),
+        ];
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let crates = workspace.join("crates");
+
+        let mut sources = String::new();
+        collect_rs(&crates, &mut sources);
+
+        for (name, expected) in constants {
+            // Count occurrences as a bare identifier, excluding this file's own
+            // declaration and its doc comments.
+            let needle = name;
+            let hits: usize = sources
+                .lines()
+                .filter(|line| {
+                    !line.trim_start().starts_with("///")
+                        && !line.trim_start().starts_with("//!")
+                        && !line.contains("pub const ")
+                        && line.contains(needle)
+                })
+                .count();
+            assert_eq!(
+                hits > 0,
+                expected,
+                "constant {name}: expected a reader outside consts.rs, found {hits} mention(s). \
+                 A constant with no reader is deleted, not kept (ADR-0023)."
+            );
+        }
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // This crate's own tests are not readers.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != "consts.rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
+    }
+}

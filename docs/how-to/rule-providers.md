@@ -35,16 +35,19 @@ ip: 10.0.0.0/8
 suffix: internal.company.com
 .corp.company.com
 full: vpn.company.com
-keyword: gitlab-internal
-regex: ^.*\.dev\.local$
 ```
+
+A `.rules` file accepts exactly two domain kinds — `full:` and `suffix:` — plus a bare name as a
+suffix (ADR-0033). `keyword:` and `regex:` are refused with a message: they were V2Ray geodata
+codes that each needed its own engine on the matching path, and the published corpus never used
+them. Expand such a pattern into the concrete names it was standing in for.
 
 ### Compiling to DRB
 
 Compile the text rules into a `.drb` binary:
 
 ```bash
-geodrb compile company-direct.rules -o company-direct.drb
+daer-drb compile company-direct.rules -o company-direct.drb
 ```
 
 Output:
@@ -52,16 +55,11 @@ Output:
 ```text
 company-direct.drb: ok
   name:             company-direct
-  version:          1
+  version:          2
   v4 intervals:     3
   v6 intervals:     0
-  ip prefixes:      3
-  domain suffix:    2
-  domain full:      1
-  domain keyword:   1
-  domain regex:     1
-  total domains:    5
-  binary size:      196 bytes
+  domain patterns:  2
+  binary size:      191 bytes
   sha256:           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 ```
 
@@ -70,21 +68,24 @@ company-direct.drb: ok
 Verify the integrity and view the contents of any `.drb` file:
 
 ```bash
-geodrb inspect company-direct.drb
+daer-drb inspect company-direct.drb
 ```
 
 ---
 
 ## 3. Converting Legacy `geoip.dat` and `geosite.dat`
 
-To migrate from legacy Protobuf `.dat` rule sets to `.drb`:
+`daer-drb` has no `.dat` reader: Protobuf geodata is retired and the workspace links no decoder
+(ADR-0031). Unpack the entry to Canonical Rule Source first, then compile:
 
 ```bash
-# Convert geosite category "cn" to DRB
-geodrb convert geosite.dat --code cn -o geosite-cn.drb
+# geosite category "cn"
+python3 scripts/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
+daer-drb compile cn.rules -o geosite-cn.drb
 
-# Convert geoip country "cn" to DRB
-geodrb convert geoip.dat --code cn -o geoip-cn.drb --type geoip
+# geoip country "cn"
+python3 scripts/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
+daer-drb compile cn-ip.rules -o geoip-cn.drb
 ```
 
 ---
@@ -107,14 +108,14 @@ format = "drb"
 [[rule-provider]]
 tag = "geosite-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daeuniverse/geodrb/release/geosite-cn.drb"
+url = "https://raw.githubusercontent.com/daer-proxy/rules/release/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "geoip-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daeuniverse/geodrb/release/geoip-cn.drb"
+url = "https://raw.githubusercontent.com/daer-proxy/rules/release/geoip-cn.drb"
 format = "drb"
 interval = "24h"
 
@@ -132,15 +133,17 @@ fallback = "proxy"
 
 ---
 
-## 5. Automated CI/CD Publishing with `geodrb`
+## 5. Dedicated Rule Asset Repository: `drb-sets`
 
-For organization-wide or community distribution of pre-compiled `.drb` artifacts:
+The runtime daemon `daer` consumes compiled `.drb` artifacts; it does not host scheduled upstream crawlers or data releases. Production rule distributions are maintained in a dedicated rule asset repository, typically named **`drb-sets`** (analogous to `v2fly/domain-list-community` or `Loyalsoldier/v2ray-rules-dat`).
 
-1. Maintain a dedicated repository (such as `geodrb`) to host scheduled GitHub Actions workflows.
-2. In the workflow, fetch upstream sources (e.g. `v2fly/domain-list-community`, `Loyalsoldier/v2ray-rules-dat`, or MaxMind).
-3. Run `geodrb convert` for each target category (`cn`, `google`, `apple`, `openai`, `telegram`, `category-ads-all`, etc.).
-4. Publish the output `.drb` artifacts to a `release` branch or GitHub Releases.
-5. End users reference the raw URLs in `[[rule-provider]]`, receiving automated daily updates without manual maintenance or root privileges.
+In the `drb-sets` repository, a lightweight GitHub Actions workflow runs daily:
+1. Downloads upstream `.dat` or plaintext rules (e.g. from Loyalsoldier).
+2. Unpacks each entry to `.rules`, then invokes `daer-drb compile` to build `.drb` artifacts.
+3. Tests generated outputs with `daer-drb test`.
+4. Computes `sha256sum.txt` and publishes artifacts to the `release` branch or GitHub Releases.
+
+End users reference the public URLs in `[[rule-provider]]`, receiving automated background updates without manual maintenance or root privileges.
 
 ---
 
@@ -188,3 +191,137 @@ fallback = "proxy"
 - **Format Selection**:
   - Use `format = "drb"` for external subscriptions, production workloads, and large rule sets ($> 1,000$ entries) for instant sub-millisecond cold start.
   - Use `format = "text"` only for small, human-edited local override files during active prototyping.
+
+---
+
+## 7. Production-Grade Deployment with Loyalsoldier Datasets
+
+The widely trusted [`Loyalsoldier/v2ray-rules-dat`](https://github.com/Loyalsoldier/v2ray-rules-dat) repository maintains canonical community categories (China direct domains, GFW proxy domains, ad tracking, and APNIC IP CIDRs). In production, these are converted and hosted via `drb-sets` into verified `.drb` artifacts:
+- `geosite-cn.drb` (Domestic domains for direct routing)
+- `geoip-cn.drb` (Domestic IP prefixes for direct routing)
+- `geosite-ads.drb` (Ad blocking and privacy tracking domains from `category-ads-all`)
+- `geosite-gfw.drb` (Blocked domains requiring proxy egress from `gfw`)
+- `geoip-private.drb` (RFC1918 and loopback subnets for bypass)
+- `geosite-apple-cn.drb` (Apple mainland CDN endpoints)
+- `geosite-google-cn.drb` (Google mainland localized endpoints)
+- `geosite-tld-cn.drb` (`.cn` top-level domains)
+
+### Compiling Locally with `daer-drb`
+
+`daer-drb` reads and writes exactly one pair of formats: Canonical Rule Source (`.rules`) in,
+DRB v2 (`.drb`) out. There is no `.dat` reader inside it — that format is retired, and the
+workspace links no Protobuf at all (ADR-0031).
+
+To convert legacy geodata, unpack it to `.rules` first. `drb-sets` ships the reference
+unpacker; the shape is one small script per upstream format:
+
+```bash
+# 1. Unpack the upstream .dat entry into Canonical Rule Source.
+python3 scripts/dat_to_rules.py --kind geosite \
+    --dat geosite.dat --code cn --output geosite-cn.rules
+
+# 2. Review it. This step is the point: the file is plain text, diffable, and committable.
+$EDITOR geosite-cn.rules      # ip: …  suffix: …  suffix: .…  full: …  @cn / @ads markers
+
+# 3. Encode it.
+daer-drb compile geosite-cn.rules -o geosite-cn.drb
+```
+
+Because geosite entries carry attributes (`@cn`, `@ads`, `@telemetry`, `@!cn`), a category that
+contains its own counter-examples can be filtered while it is still text:
+
+```bash
+# `google` tags 54 of its own domains @ads; publishing the whole category advertises them.
+grep -v '@ads' geosite-google.rules > geosite-google-clean.rules
+daer-drb compile geosite-google-clean.rules -o geosite-google.drb
+```
+
+Any published artifact can be read back, which is how you audit a release rather than trusting
+the file it came from:
+
+```bash
+daer-drb decompile geosite-cn.drb -o /tmp/check.rules
+daer-drb compile /tmp/check.rules -o /tmp/check.drb   # byte-identical to geosite-cn.drb
+```
+
+Attributes are not stored in DRB — the format holds patterns, not provenance — so a round trip
+through an artifact shows the same rules without their `@` markers.
+
+### Ready-to-Use Production `daer.toml`
+
+The following configuration deploys the compiled Loyalsoldier rule sets with automated 24-hour background synchronization and line-rate eBPF kernel offload:
+
+```toml
+schema = 1
+
+[global]
+tproxy-port = 12345
+dial-mode = "domain"
+wan-interface = ["eth0"]
+lan-interface = ["lan0"]
+
+# ── 1. Declare Rule Providers ──────────────────────────────────────────────
+
+# Ad & tracking rejection (daily update)
+[[rule-provider]]
+tag = "ads"
+type = "http"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-ads.drb"
+format = "drb"
+interval = "24h"
+
+# Private subnets (RFC1918 / Loopback)
+[[rule-provider]]
+tag = "private-ips"
+type = "http"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-private.drb"
+format = "drb"
+interval = "168h"
+
+# Mainland China Domains (daily update)
+[[rule-provider]]
+tag = "geosite-cn"
+type = "http"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-cn.drb"
+format = "drb"
+interval = "24h"
+
+# Mainland China IP CIDRs (weekly update)
+[[rule-provider]]
+tag = "geoip-cn"
+type = "http"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-cn.drb"
+format = "drb"
+interval = "168h"
+
+# Designated GFW Proxy Domains (daily update)
+[[rule-provider]]
+tag = "geosite-gfw"
+type = "http"
+url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-gfw.drb"
+format = "drb"
+interval = "24h"
+
+# ── 2. Evaluation Order (Coarse-Grained Pipeline) ──────────────────────────
+
+[routing]
+rules = [
+    # 1. Block ads and analytics trackers
+    "provider(ads) -> block",
+
+    # 2. Bypass private LAN subnets
+    "provider(private-ips) -> direct",
+
+    # 3. Direct route domestic domains & IPs
+    "provider(geosite-cn) -> direct",
+    "provider(geoip-cn) -> direct",
+
+    # 4. Explicit proxy for known GFW domains
+    "provider(geosite-gfw) -> proxy",
+]
+
+# 5. Default fallback for unmatched traffic
+fallback = "proxy"
+```
+
+This configuration lowers to fewer than **10 match sets** in the kernel, ensuring full eBPF line-rate offload with zero userspace deferrals for un-sniffed or IP-forwarded packets.

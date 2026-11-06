@@ -63,6 +63,7 @@
 //! ```
 
 pub mod cache;
+pub mod exclusions;
 pub mod fake_ip;
 pub mod resolver;
 pub mod routing;

@@ -1,0 +1,549 @@
+# The kernel/userspace ABI, declared once (ADR-0021).
+#
+# `cargo xtask abi` generates both sides from this file:
+#   ebpf/kern/daer_abi.h                 the C header
+#   crates/daer-ebpf/src/generated.rs    the Rust constants and layout assertions
+#
+# `cargo xtask abi --check` regenerates into a temporary directory and diffs, so a hand
+# edit to either generated file — or a change here without regenerating — is a red build.
+#
+# Sizes are in bytes. Field offsets are derived by the generator from the declared field
+# order and type sizes, and emitted as assertions on the Rust side.
+
+schema = 1
+
+# The `const volatile` global the loader overrides before `BPF_PROG_LOAD`.
+[params]
+global = "PARAM"
+c_struct = "daer_param"
+
+[[params.fields]]
+name = "tproxy_port"
+c_type = "u32"
+
+[[params.fields]]
+name = "control_plane_pid"
+c_type = "u32"
+
+[[params.fields]]
+name = "device_ifindex"
+c_type = "u32"
+
+[[params.fields]]
+name = "netns_id"
+c_type = "u32"
+
+[[params.fields]]
+name = "peer_mac"
+c_type = "[u8; 6]"
+
+[[params.fields]]
+name = "padding_after_mac"
+c_type = "[u8; 2]"
+
+[[params.fields]]
+name = "use_redirect_peer"
+c_type = "u8"
+
+[[params.fields]]
+name = "has_bpf_get_current_task"
+c_type = "u8"
+
+[[params.fields]]
+name = "datapath_generation"
+c_type = "u16"
+
+[[params.fields]]
+name = "socket_mark"
+c_type = "u32"
+
+# Every map the object declares, with the ADR-0004 classification the epoch code needs.
+[[maps]]
+name = "outbound_connectivity_map"
+rust_const = "OUTBOUND_CONNECTIVITY"
+generationality = "per-generation"
+
+[[maps]]
+name = "listen_socket_map"
+rust_const = "LISTEN_SOCKET"
+generationality = "shared"
+
+[[maps]]
+name = "redirect_track"
+rust_const = "REDIRECT_TRACK"
+generationality = "shared"
+
+[[maps]]
+name = "daer_ifindex_map"
+rust_const = "DEVICE_IFINDEX"
+generationality = "shared"
+
+[[maps]]
+name = "fast_sock"
+rust_const = "FAST_SOCK"
+generationality = "shared"
+
+[[maps]]
+name = "tcp_offload_pause"
+rust_const = "TCP_OFFLOAD_PAUSE"
+generationality = "shared"
+
+[[maps]]
+name = "tcp_offload_sent"
+rust_const = "TCP_OFFLOAD_SENT"
+generationality = "shared"
+
+[[maps]]
+name = "routing_handoff_map"
+rust_const = "ROUTING_HANDOFF"
+generationality = "per-generation"
+
+[[maps]]
+name = "unused_lpm_type"
+rust_const = "UNUSED_LPM_TYPE"
+generationality = "per-generation"
+
+[[maps]]
+name = "lpm_array_map"
+rust_const = "LPM_ARRAY"
+generationality = "per-generation"
+
+[[maps]]
+name = "routing_map"
+rust_const = "ROUTING"
+generationality = "per-generation"
+
+[[maps]]
+name = "routing_meta_map"
+rust_const = "ROUTING_META"
+generationality = "per-generation"
+
+[[maps]]
+name = "active_routing_epoch_map"
+rust_const = "ACTIVE_ROUTING_EPOCH"
+generationality = "per-generation"
+
+[[maps]]
+name = "domain_routing_map"
+rust_const = "DOMAIN_ROUTING"
+generationality = "per-generation"
+
+[[maps]]
+name = "cookie_pid_map"
+rust_const = "COOKIE_PID"
+generationality = "shared"
+
+[[maps]]
+name = "conn_state_map"
+rust_const = "CONN_STATE"
+generationality = "shared"
+
+[[maps]]
+name = "bpf_stats_map"
+rust_const = "BPF_STATS"
+generationality = "shared"
+
+[[maps]]
+name = "alive_block_rate_map"
+rust_const = "ALIVE_BLOCK_RATE"
+generationality = "shared"
+
+[[maps]]
+name = "event_ringbuf"
+rust_const = "EVENT_RINGBUF"
+generationality = "shared"
+
+[[maps]]
+name = "parse_ctx_scratch_map"
+rust_const = "PARSE_CTX_SCRATCH"
+generationality = "shared"
+
+[[maps]]
+name = "pkt_scratch_map"
+rust_const = "PKT_SCRATCH"
+generationality = "shared"
+
+[[maps]]
+name = "route_ctx_scratch_map"
+rust_const = "ROUTE_CTX_SCRATCH"
+generationality = "shared"
+
+[[maps]]
+name = "wan_egress_route_scratch_map"
+rust_const = "WAN_EGRESS_ROUTE_SCRATCH"
+generationality = "shared"
+
+[[maps]]
+name = "conntrack_args_map"
+rust_const = "CONNTRACK_ARGS"
+generationality = "shared"
+
+# Every program, with the section it attaches through. The section is what `aya` parses
+# and what the loader attaches by, so the two cannot be allowed to drift (ADR-0020).
+[[programs]]
+name = "tproxy_daer0_ingress"
+rust_const = "DEVICE_INGRESS"
+section = "classifier/daer0_ingress"
+
+[[programs]]
+name = "tproxy_daer0peer_ingress"
+rust_const = "PEER_INGRESS"
+section = "classifier/daer0peer_ingress"
+
+[[programs]]
+name = "tproxy_lan_ingress_l2"
+rust_const = "LAN_INGRESS_L2"
+section = "classifier/lan_ingress_l2"
+
+[[programs]]
+name = "tproxy_lan_ingress_l3"
+rust_const = "LAN_INGRESS_L3"
+section = "classifier/lan_ingress_l3"
+
+[[programs]]
+name = "tproxy_lan_egress_l2"
+rust_const = "LAN_EGRESS_L2"
+section = "classifier/lan_egress_l2"
+
+[[programs]]
+name = "tproxy_lan_egress_l3"
+rust_const = "LAN_EGRESS_L3"
+section = "classifier/lan_egress_l3"
+
+[[programs]]
+name = "tproxy_lan_wan_egress_l2"
+rust_const = "LAN_WAN_EGRESS_L2"
+section = "classifier/lan_wan_egress_l2"
+
+[[programs]]
+name = "tproxy_lan_wan_egress_l3"
+rust_const = "LAN_WAN_EGRESS_L3"
+section = "classifier/lan_wan_egress_l3"
+
+[[programs]]
+name = "tproxy_wan_ingress_l2"
+rust_const = "WAN_INGRESS_L2"
+section = "classifier/wan_ingress_l2"
+
+[[programs]]
+name = "tproxy_wan_ingress_l3"
+rust_const = "WAN_INGRESS_L3"
+section = "classifier/wan_ingress_l3"
+
+[[programs]]
+name = "tproxy_wan_egress_l2"
+rust_const = "WAN_EGRESS_L2"
+section = "classifier/wan_egress_l2"
+
+[[programs]]
+name = "tproxy_wan_egress_l3"
+rust_const = "WAN_EGRESS_L3"
+section = "classifier/wan_egress_l3"
+
+[[programs]]
+name = "tproxy_wan_lan_ingress_l2"
+rust_const = "WAN_LAN_INGRESS_L2"
+section = "classifier/wan_lan_ingress_l2"
+
+[[programs]]
+name = "tproxy_wan_lan_ingress_l3"
+rust_const = "WAN_LAN_INGRESS_L3"
+section = "classifier/wan_lan_ingress_l3"
+
+[[programs]]
+name = "tproxy_wan_cg_connect4"
+rust_const = "WAN_CG_CONNECT4"
+section = "cgroup/connect4"
+
+[[programs]]
+name = "tproxy_wan_cg_connect6"
+rust_const = "WAN_CG_CONNECT6"
+section = "cgroup/connect6"
+
+[[programs]]
+name = "tproxy_wan_cg_sendmsg4"
+rust_const = "WAN_CG_SENDMSG4"
+section = "cgroup/sendmsg4"
+
+[[programs]]
+name = "tproxy_wan_cg_sendmsg6"
+rust_const = "WAN_CG_SENDMSG6"
+section = "cgroup/sendmsg6"
+
+[[programs]]
+name = "tproxy_wan_cg_sock_create"
+rust_const = "WAN_CG_SOCK_CREATE"
+section = "cgroup/sock_create"
+
+[[programs]]
+name = "tproxy_wan_cg_sock_release"
+rust_const = "WAN_CG_SOCK_RELEASE"
+section = "cgroup/sock_release"
+
+[[programs]]
+name = "tcp_offload_redirect"
+rust_const = "TCP_OFFLOAD_REDIRECT"
+section = "sk_skb/stream_verdict"
+
+[[programs]]
+name = "tcp_offload_sent_account"
+rust_const = "TCP_OFFLOAD_SENT_ACCOUNT"
+section = "fentry/skb_send_sock"
+
+[[programs]]
+name = "tcp_offload_sent_account_kprobe"
+rust_const = "TCP_OFFLOAD_SENT_ACCOUNT_KPROBE"
+section = "kprobe/skb_send_sock"
+
+# `enum MatchType`, packed, so one byte inside `match_set`.
+[[match_types]]
+name = "DomainSet"
+rust_const = "DOMAIN_SET"
+value = 0
+
+[[match_types]]
+name = "IpSet"
+rust_const = "IP_SET"
+value = 1
+
+[[match_types]]
+name = "SourceIpSet"
+rust_const = "SOURCE_IP_SET"
+value = 2
+
+[[match_types]]
+name = "Port"
+rust_const = "PORT"
+value = 3
+
+[[match_types]]
+name = "SourcePort"
+rust_const = "SOURCE_PORT"
+value = 4
+
+[[match_types]]
+name = "L4Proto"
+rust_const = "L4_PROTO"
+value = 5
+
+[[match_types]]
+name = "IpVersion"
+rust_const = "IP_VERSION"
+value = 6
+
+[[match_types]]
+name = "Mac"
+rust_const = "MAC"
+value = 7
+
+[[match_types]]
+name = "ProcessName"
+rust_const = "PROCESS_NAME"
+value = 8
+
+[[match_types]]
+name = "Dscp"
+rust_const = "DSCP"
+value = 9
+
+[[match_types]]
+name = "Fallback"
+rust_const = "FALLBACK"
+value = 10
+
+[[match_types]]
+name = "MustRules"
+rust_const = "MUST_RULES"
+value = 11
+
+[[match_types]]
+name = "Upstream"
+rust_const = "UPSTREAM"
+value = 12
+
+[[match_types]]
+name = "QType"
+rust_const = "QTYPE"
+value = 13
+
+# The reserved outbound ids the datapath interprets itself.
+[[outbounds]]
+name = "DIRECT"
+value = 0
+
+[[outbounds]]
+name = "BLOCK"
+value = 1
+
+[[outbounds]]
+name = "FIRST_GROUP"
+value = 2
+
+[[outbounds]]
+name = "LAST_GROUP"
+value = 251
+
+[[outbounds]]
+name = "MUST_RULES"
+value = 252
+
+[[outbounds]]
+name = "CONTROL_PLANE_ROUTING"
+value = 253
+
+[[outbounds]]
+name = "LOGICAL_OR"
+value = 254
+
+[[outbounds]]
+name = "LOGICAL_AND"
+value = 255
+
+# The mask that isolates the logical marker bits: `OR` and `AND` share their high bits.
+[[outbounds]]
+name = "LOGICAL_MASK"
+value = 254
+
+[[l4_protos]]
+name = "TCP"
+value = 1
+
+[[l4_protos]]
+name = "UDP"
+value = 2
+
+[[l4_protos]]
+name = "X"
+value = 3
+
+[[ip_versions]]
+name = "4"
+rust_const = "V4"
+value = 1
+
+[[ip_versions]]
+name = "6"
+rust_const = "V6"
+value = 2
+
+[[ip_versions]]
+name = "X"
+rust_const = "X"
+value = 3
+
+# `struct match_set`: one union operand, the packed tag, and the decision.
+[structs.match_set]
+size = 24
+align = 4
+
+[[structs.match_set.fields]]
+name = "not"
+offset = 16
+
+[[structs.match_set.fields]]
+name = "type"
+offset = 17
+
+[[structs.match_set.fields]]
+name = "outbound"
+offset = 18
+
+[[structs.match_set.fields]]
+name = "must"
+offset = 19
+
+[[structs.match_set.fields]]
+name = "mark"
+offset = 20
+
+# `struct routing_result`, read out of `routing_handoff_map` (ADR-0013).
+[structs.routing_result]
+size = 36
+align = 4
+
+[[structs.routing_result.fields]]
+name = "mark"
+offset = 0
+
+[[structs.routing_result.fields]]
+name = "must"
+offset = 4
+
+[[structs.routing_result.fields]]
+name = "mac"
+offset = 5
+
+[[structs.routing_result.fields]]
+name = "outbound"
+offset = 11
+
+[[structs.routing_result.fields]]
+name = "pname"
+offset = 12
+
+[[structs.routing_result.fields]]
+name = "pid"
+offset = 28
+
+[[structs.routing_result.fields]]
+name = "dscp"
+offset = 32
+
+[[structs.routing_result.fields]]
+name = "routing_epoch_slot"
+offset = 33
+
+[[structs.routing_result.fields]]
+name = "datapath_generation"
+offset = 34
+
+# `struct routing_handoff_entry`: the timestamp plus the decision.
+[structs.routing_handoff_entry]
+size = 48
+align = 8
+
+[[structs.routing_handoff_entry.fields]]
+name = "last_seen_ns"
+offset = 0
+
+[[structs.routing_handoff_entry.fields]]
+name = "result"
+offset = 8
+
+# `struct tuples_key`: the connection-tracking key.
+[structs.tuples_key]
+size = 40
+align = 8
+
+[[structs.tuples_key.fields]]
+name = "sip"
+offset = 0
+
+[[structs.tuples_key.fields]]
+name = "dip"
+offset = 16
+
+[[structs.tuples_key.fields]]
+name = "sport"
+offset = 32
+
+[[structs.tuples_key.fields]]
+name = "dport"
+offset = 34
+
+[[structs.tuples_key.fields]]
+name = "l4proto"
+offset = 36
+
+# `struct lpm_key`: the LPM trie key for `lpm_array_map`.
+[structs.lpm_key]
+size = 20
+align = 4
+
+[[structs.lpm_key.fields]]
+name = "prefixlen"
+offset = 0
+
+[[structs.lpm_key.fields]]
+name = "data"
+offset = 4
