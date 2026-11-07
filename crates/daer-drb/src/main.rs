@@ -42,6 +42,9 @@ enum Command {
         /// Rule set name. Defaults to file stem or name specified inside the rule file.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Drop domain rules carrying this attribute tag (repeatable, e.g. `--without ads`).
+        #[arg(long = "without", value_name = "TAG")]
+        without: Vec<String>,
     },
     /// Decompiles an existing .drb binary artifact back into Canonical Rule Source (.rules) text.
     Decompile {
@@ -87,7 +90,8 @@ fn run(command: Command) -> anyhow::Result<()> {
             input,
             output,
             name,
-        } => compile(&input, &output, name.as_deref()),
+            without,
+        } => compile(&input, &output, name.as_deref(), &without),
         Command::Decompile { input, output } => decompile(&input, &output),
         Command::Inspect { input } => inspect(&input),
         Command::Test { input, target } => test(&input, &target),
@@ -113,10 +117,26 @@ fn read_input_text(path: &Path) -> anyhow::Result<(String, String)> {
     }
 }
 
-fn compile(input: &Path, output: &Path, explicit_name: Option<&str>) -> anyhow::Result<()> {
+fn compile(
+    input: &Path,
+    output: &Path,
+    explicit_name: Option<&str>,
+    without: &[String],
+) -> anyhow::Result<()> {
     let (stem, text) = read_input_text(input)?;
     let mut rules = RuleSet::parse(&text)
         .with_context(|| format!("cannot parse rules from {}", input.display()))?;
+
+    for raw_tag in without {
+        let tag = raw_tag.trim().strip_prefix('@').unwrap_or(raw_tag.trim());
+        if tag.is_empty() {
+            continue;
+        }
+        let dropped = rules.drop_attribute(tag);
+        if dropped > 0 {
+            eprintln!("filtered out {dropped} domain rule(s) carrying attribute '@{tag}'");
+        }
+    }
 
     if let Some(name) = explicit_name {
         rules.set_name(name);
@@ -229,7 +249,7 @@ mod tests {
         .unwrap();
 
         let drb_file = dir.join("test.drb");
-        compile(&rules_file, &drb_file, None).unwrap();
+        compile(&rules_file, &drb_file, None, &[]).unwrap();
 
         let summary = DrbSet::inspect_bytes(&fs::read(&drb_file).unwrap()).unwrap();
         assert_eq!(summary.name, "my-rules");
@@ -244,6 +264,32 @@ mod tests {
 
         assert!(test(&drb_file, "10.0.0.1").is_err());
         assert!(test(&drb_file, "corp.internal").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_with_without_attribute_filtering() {
+        let dir = std::env::temp_dir().join(format!("daer-drb-test-filter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rules_file = dir.join("test.rules");
+        fs::write(
+            &rules_file,
+            "name: filter-rules\nsuffix: allowed.com @cn\nsuffix: tracking.com @ads\n",
+        )
+        .unwrap();
+
+        let drb_file = dir.join("test.drb");
+        // Test with leading '@' in --without tag to verify it is stripped and matched
+        compile(&rules_file, &drb_file, None, &["@ads".to_string()]).unwrap();
+
+        let summary = DrbSet::inspect_bytes(&fs::read(&drb_file).unwrap()).unwrap();
+        assert_eq!(summary.domain_patterns, 1);
+
+        test(&drb_file, "allowed.com").unwrap();
+        assert!(test(&drb_file, "tracking.com").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

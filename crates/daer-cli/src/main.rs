@@ -24,7 +24,7 @@
 //! | `config fmt`, `config example` | a configuration is hand-written TOML; a formatter and a sample belong in an editor and in the docs. |
 //! | `explain` | replaced by `daer route <TARGET>`: natural routing lookup mental model. |
 //! | `node convert` | [ADR-0014] put subscription parsing in the runtime, so a URI no longer needs hand-converting. A text transformer is a third-party tool. |
-//! | `rule compile` / `inspect` / `convert` | the rule compiler is a **producer**. It lives in `daer-drb`, so the daemon links no `daer-geodata` and can never be the thing that speaks Protobuf. |
+//! | `rule compile` / `decompile` / `inspect` | the rule compiler is a **producer**. It lives in `daer-drb`, so the daemon links no Protobuf reader. |
 //! | `dns serve` / `dns check` | the resolver is part of `daer run` (Fake-IP has no meaning without it) and upstream usability is part of `daer check`. A standalone DNS server is a different product. |
 //!
 //! [ADR-0014]: ../docs/adr/0014-drb-rule-binary-and-providers.md
@@ -437,7 +437,7 @@ fn main() -> ExitCode {
         )),
         Command::Rule { .. } => Err(removed_verb(
             "rule",
-            "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb convert`, `daer-drb inspect`",
+            "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb decompile`, `daer-drb inspect`, `daer-drb test`",
         )),
     };
 
@@ -1741,8 +1741,8 @@ fallback = "direct"
             )),
             Command::Rule { .. } => Err(removed_verb(
                 "rule",
-                "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb convert`, \
-                 `daer-drb inspect`",
+                "the DRB producer is `daer-drb`: `daer-drb compile`, `daer-drb decompile`, \
+                 `daer-drb inspect`, `daer-drb test`",
             )),
             other => panic!("{other:?} is not a removed verb"),
         };

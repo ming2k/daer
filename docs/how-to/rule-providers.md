@@ -232,8 +232,8 @@ contains its own counter-examples can be filtered while it is still text:
 
 ```bash
 # `google` tags 54 of its own domains @ads; publishing the whole category advertises them.
-grep -v '@ads' geosite-google.rules > geosite-google-clean.rules
-daer-drb compile geosite-google-clean.rules -o geosite-google.drb
+# Filter them out directly during compilation with `--without` (or filter the text beforehand):
+daer-drb compile geosite-google.rules --without ads -o geosite-google.drb
 ```
 
 Any published artifact can be read back, which is how you audit a release rather than trusting

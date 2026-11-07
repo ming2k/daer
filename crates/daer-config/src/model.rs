@@ -625,6 +625,20 @@ impl NodeEndpoint {
                     return Err("shadowsocks: 'password' must not be empty".to_owned());
                 }
                 validate_ss_method(&node.method)?;
+                if let Some(expected) = ss_2022_key_len(&node.method) {
+                    let decoded_len = validate_base64_len(&node.password).map_err(|e| {
+                        format!(
+                            "shadowsocks 2022: method '{}' password must be valid base64: {e}",
+                            node.method
+                        )
+                    })?;
+                    if decoded_len != expected {
+                        return Err(format!(
+                            "shadowsocks 2022: method '{}' requires a {expected}-byte base64-encoded key, but decoded length is {decoded_len}",
+                            node.method
+                        ));
+                    }
+                }
                 Ok(())
             }
             Self::Trojan(node) => {
@@ -1991,9 +2005,13 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 fn validate_ss_method(method: &str) -> Result<(), String> {
     match method.trim().to_ascii_lowercase().as_str() {
-        "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305" | "xchacha20-ietf-poly1305" => {
-            Ok(())
-        }
+        "aes-128-gcm"
+        | "aes-256-gcm"
+        | "chacha20-ietf-poly1305"
+        | "xchacha20-ietf-poly1305"
+        | "2022-blake3-aes-128-gcm"
+        | "2022-blake3-aes-256-gcm"
+        | "2022-blake3-chacha20-poly1305" => Ok(()),
         legacy @ ("aes-128-cfb" | "aes-192-cfb" | "aes-256-cfb" | "aes-128-ctr" | "aes-192-ctr"
         | "aes-256-ctr" | "rc4-md5" | "chacha20" | "chacha20-ietf" | "salsa20"
         | "bf-cfb" | "camellia-128-cfb" | "camellia-192-cfb" | "camellia-256-cfb"
@@ -2001,9 +2019,53 @@ fn validate_ss_method(method: &str) -> Result<(), String> {
             "shadowsocks: method '{legacy}' is an insecure legacy cipher and is not supported (use an AEAD cipher like chacha20-ietf-poly1305 or aes-256-gcm)"
         )),
         other => Err(format!(
-            "shadowsocks: unknown method '{other}'; supported AEAD ciphers are chacha20-ietf-poly1305, aes-128-gcm, aes-256-gcm, xchacha20-ietf-poly1305"
+            "shadowsocks: unknown method '{other}'; supported ciphers are chacha20-ietf-poly1305, aes-128-gcm, aes-256-gcm, xchacha20-ietf-poly1305, 2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm, 2022-blake3-chacha20-poly1305"
         )),
     }
+}
+
+fn ss_2022_key_len(method: &str) -> Option<usize> {
+    match method.trim().to_ascii_lowercase().as_str() {
+        "2022-blake3-aes-128-gcm" => Some(16),
+        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
+        _ => None,
+    }
+}
+
+fn validate_base64_len(text: &str) -> Result<usize, String> {
+    fn value(byte: u8) -> Option<u8> {
+        Some(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        })
+    }
+
+    let text: Vec<u8> = text.trim().bytes().filter(|byte| *byte != b'=').collect();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let mut out_len = 0;
+    for chunk in text.chunks(4) {
+        if chunk.len() == 1 {
+            return Err("a single trailing character is not a valid group".to_owned());
+        }
+        for byte in chunk {
+            if value(*byte).is_none() {
+                return Err(format!("{:?} is not in the base64 alphabet", *byte as char));
+            }
+        }
+        out_len += match chunk.len() {
+            2 => 1,
+            3 => 2,
+            4 => 3,
+            _ => unreachable!(),
+        };
+    }
+    Ok(out_len)
 }
 
 /// Parses a UUID the way both VLESS and VMess need it: 32 hex digits in the canonical
@@ -2813,7 +2875,21 @@ impl StructuredNode {
             }
             "ss" | "shadowsocks" => {
                 let (creds, authority) = match before_fragment.rsplit_once('@') {
-                    Some((userinfo, hostport)) => (decode_base64(userinfo)?, hostport.to_owned()),
+                    Some((userinfo, hostport)) => {
+                        if userinfo.contains(':')
+                            && validate_ss_method(userinfo.split_once(':').unwrap().0).is_ok()
+                        {
+                            (userinfo.to_owned(), hostport.to_owned())
+                        } else {
+                            match decode_base64(userinfo) {
+                                Ok(decoded) => (decoded, hostport.to_owned()),
+                                Err(_) if userinfo.contains(':') => {
+                                    (userinfo.to_owned(), hostport.to_owned())
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
                     None => {
                         let decoded = decode_base64(before_fragment)?;
                         let (creds, hostport) = decoded.rsplit_once('@').ok_or_else(|| {
@@ -3833,6 +3909,26 @@ type = "direct"
         )
         .expect_err("legacy cipher must fail");
         assert!(err.to_string().contains("insecure legacy cipher"), "{err}");
+
+        // Shadowsocks 2022 with valid 16-byte base64 key succeeds
+        let valid_2022 = toml::from_str::<Config>(
+            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"3L69X4PF2eSL/JSLkoWnXg==\"\n",
+        );
+        assert!(valid_2022.is_ok(), "{valid_2022:?}");
+
+        // Shadowsocks 2022 with wrong key length fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"bm90MTZieXRlcw==\"\n",
+        )
+        .expect_err("wrong key length must fail");
+        assert!(err.to_string().contains("requires a 16-byte"), "{err}");
+
+        // Shadowsocks 2022 with invalid base64 fails
+        let err = toml::from_str::<Config>(
+            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"not-valid-base64!\"\n",
+        )
+        .expect_err("invalid base64 must fail");
+        assert!(err.to_string().contains("valid base64"), "{err}");
     }
 
     #[test]

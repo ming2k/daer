@@ -56,8 +56,8 @@ the two are evaluated over one table.
 
 - **Magic**: `b"DAERDRB2"` (8 bytes).
 - **Version**: `2` (u32).
-- **Header**: Fixed 64 bytes (`#[repr(C, align(64))]`).
-- **Payload-Only Checksum**: SHA-256 is computed strictly over `[0x40..EOF]`. Dynamic timestamps (`created_at`) are deleted from the file format, guaranteeing byte-for-byte deterministic, reproducible builds across machines and dates.
+- **Header**: Fixed 128 bytes (two 64-byte cache lines; SHA-256 checksum at `[0x40..0x60]`, fields padded to 128 bytes).
+- **Payload-Only Checksum**: SHA-256 is computed strictly over `[0x80..EOF]`. Dynamic timestamps (`created_at`) are deleted from the file format, guaranteeing byte-for-byte deterministic, reproducible builds across machines and dates.
 
 ### 5. Two-Way Reversible Toolchain
 

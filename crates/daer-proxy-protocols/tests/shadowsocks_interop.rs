@@ -9,6 +9,9 @@
 #[path = "shadowsocks_server.rs"]
 mod server;
 
+#[path = "shadowsocks_2022_server.rs"]
+mod server2022;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -188,5 +191,206 @@ async fn several_payloads_in_sequence_stay_in_sync() {
             .await
             .unwrap_or_else(|error| panic!("echo of {payload:?}: {error}"));
         assert_eq!(echoed, payload);
+    }
+}
+
+#[tokio::test]
+async fn ss2022_all_ciphers_interoperate_with_echo() {
+    let key16 = "3L69X4PF2eSL/JSLkoWnXg=="; // 16 bytes base64
+    let key32 = "4wYfDniq4N6kMqFajRO03PPZLfPkl469eNYY9Wz0E78="; // 32 bytes base64
+
+    for (method, method_name, b64_key) in [
+        (
+            server2022::Method2022::Aes128Gcm,
+            "2022-blake3-aes-128-gcm",
+            key16,
+        ),
+        (
+            server2022::Method2022::Aes256Gcm,
+            "2022-blake3-aes-256-gcm",
+            key32,
+        ),
+        (
+            server2022::Method2022::ChaCha20Poly1305,
+            "2022-blake3-chacha20-poly1305",
+            key32,
+        ),
+    ] {
+        let psk = daer_proxy_protocols::shadowsocks::decode_base64_bytes(b64_key).unwrap();
+        let (server_addr, observed) =
+            server2022::serve_2022(method, psk, server2022::ServerBehavior::default()).await;
+
+        let link = format!("ss://{method_name}:{b64_key}@{server_addr}#test22");
+        let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
+        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+
+        let established = connector
+            .connect("example.com:443", &recorder)
+            .await
+            .unwrap_or_else(|e| panic!("{method_name} connect failed: {e}"));
+
+        let seen = observed.await.expect("server recorded handshake");
+        assert_eq!(seen.target, "example.com:443", "{method_name}");
+        assert!(seen.payload.is_empty(), "{method_name}");
+        assert!(
+            (1..=900).contains(&seen.padding_len),
+            "{method_name}: SIP022 mandatory padding check failed (got {})",
+            seen.padding_len
+        );
+
+        let mut stream = established.stream;
+        let mut greeting = vec![0u8; 5];
+        stream
+            .read_exact(&mut greeting)
+            .await
+            .expect("reads server greeting");
+        assert_eq!(&greeting, b"hello", "{method_name}");
+
+        // Multi-chunk round trip echo test
+        for msg in [
+            b"message_one".as_slice(),
+            b"message_two",
+            b"final_round_trip",
+        ] {
+            stream.write_all(msg).await.expect("writes message");
+            let mut echo = vec![0u8; msg.len()];
+            stream.read_exact(&mut echo).await.expect("reads echo");
+            assert_eq!(&echo, msg, "{method_name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ss2022_clock_skew_is_rejected() {
+    let key16 = "3L69X4PF2eSL/JSLkoWnXg==";
+    let psk = daer_proxy_protocols::shadowsocks::decode_base64_bytes(key16).unwrap();
+    let (server_addr, _observed) = server2022::serve_2022(
+        server2022::Method2022::Aes128Gcm,
+        psk,
+        server2022::ServerBehavior {
+            clock_skew_secs: 100, // 100s skew exceeds 30s threshold
+            tamper_request_salt: false,
+        },
+    )
+    .await;
+
+    let link = format!("ss://2022-blake3-aes-128-gcm:{key16}@{server_addr}");
+    let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
+    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+
+    let mut established = connector
+        .connect("example.com:443", &recorder)
+        .await
+        .expect("initial send succeeds");
+    let mut buf = [0u8; 10];
+    let err = established
+        .stream
+        .read(&mut buf)
+        .await
+        .expect_err("must reject large clock skew on receive");
+    let err_str = err.to_string();
+    assert!(err_str.contains("clock skew"), "{err_str}");
+}
+
+#[tokio::test]
+async fn ss2022_salt_mismatch_is_rejected() {
+    let key16 = "3L69X4PF2eSL/JSLkoWnXg==";
+    let psk = daer_proxy_protocols::shadowsocks::decode_base64_bytes(key16).unwrap();
+    let (server_addr, _observed) = server2022::serve_2022(
+        server2022::Method2022::Aes128Gcm,
+        psk,
+        server2022::ServerBehavior {
+            clock_skew_secs: 0,
+            tamper_request_salt: true, // Tampered Request Salt
+        },
+    )
+    .await;
+
+    let link = format!("ss://2022-blake3-aes-128-gcm:{key16}@{server_addr}");
+    let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
+    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+
+    let mut established = connector
+        .connect("example.com:443", &recorder)
+        .await
+        .expect("initial send succeeds");
+    let mut buf = [0u8; 10];
+    let err = established
+        .stream
+        .read(&mut buf)
+        .await
+        .expect_err("must reject request salt mismatch on receive");
+    let err_str = err.to_string();
+    assert!(err_str.contains("salt"), "{err_str}");
+}
+
+#[tokio::test]
+async fn ss2022_node_dialer_speaks_shadowsocks_2022() {
+    let key16 = "3L69X4PF2eSL/JSLkoWnXg==";
+    let psk = daer_proxy_protocols::shadowsocks::decode_base64_bytes(key16).unwrap();
+    let (server_addr, _observed) = server2022::serve_2022(
+        server2022::Method2022::Aes128Gcm,
+        psk,
+        server2022::ServerBehavior::default(),
+    )
+    .await;
+
+    let link = format!("ss://2022-blake3-aes-128-gcm:{key16}@{server_addr}#ss22");
+    let dialer = ProxyDialer::from_link(&link, options()).expect("the link is accepted");
+    assert_eq!(dialer.protocol(), ProxyProtocol::ShadowSocks);
+
+    let established = dialer
+        .connect("example.com:80")
+        .await
+        .expect("connects through the 2022 node");
+    let mut stream = established.stream;
+    let mut buffer = vec![0u8; 5];
+    stream
+        .read_exact(&mut buffer)
+        .await
+        .expect("reads the echo");
+    assert_eq!(&buffer, b"hello");
+}
+
+#[tokio::test]
+async fn ss2022_udp_datagram_echo_round_trip() {
+    let key16 = "3L69X4PF2eSL/JSLkoWnXg==";
+    let key32 = "4wYfDniq4N6kMqFajRO03PPZLfPkl469eNYY9Wz0E78=";
+
+    for (method, method_name, b64_key) in [
+        (
+            server2022::Method2022::Aes128Gcm,
+            "2022-blake3-aes-128-gcm",
+            key16,
+        ),
+        (
+            server2022::Method2022::ChaCha20Poly1305,
+            "2022-blake3-chacha20-poly1305",
+            key32,
+        ),
+    ] {
+        let psk = daer_proxy_protocols::shadowsocks::decode_base64_bytes(b64_key).unwrap();
+        let (server_addr, mut rx) = server2022::serve_2022_udp(method, psk).await;
+
+        let link = format!("ss://{method_name}:{b64_key}@{server_addr}");
+        let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
+        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+
+        let established = connector
+            .connect_datagram("1.2.3.4:443", &recorder)
+            .await
+            .expect("datagram connects");
+
+        let session = established.datagrams;
+        let test_payload = b"ping_2022_udp";
+        let sent = session.send(test_payload).await.expect("sends datagram");
+        assert_eq!(sent, test_payload.len());
+
+        let server_received = rx.recv().await.expect("server received packet");
+        assert_eq!(&server_received, test_payload);
+
+        let mut recv_buf = vec![0u8; 1024];
+        let n = session.recv(&mut recv_buf).await.expect("receives echo");
+        assert_eq!(&recv_buf[..n], test_payload);
     }
 }

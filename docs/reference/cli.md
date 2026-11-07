@@ -1,7 +1,7 @@
 # Command Line Interface (CLI) Reference
 
 The `daer` CLI provides the runtime daemon, deployment gates, and diagnostics for the
-transparent proxy. Build-time producers and converter toolchains live in the companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb).
+transparent proxy. Build-time rule producers live in the companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb).
 
 ---
 
@@ -153,7 +153,7 @@ daer version
 
 | Not in `daer` | Use instead |
 | :--- | :--- |
-| Compiling rules to `.drb`, converting `geoip.dat` / `geosite.dat`, inspecting or unit-testing `.drb` | Companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb). |
+| Compiling rules to `.drb`, decompiling, inspecting or unit-testing `.drb` | Companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb); unpack legacy `.dat` with `scripts/dat_to_rules.py`. |
 | Converting a `vless://` / `ss://` link into a `[[node]]` table | Any subscription converter, or declare a `[[subscription]]`: `daer` parses links at runtime. |
 | Running a standalone DNS server | `daer run` serves DNS; `daer check` reports unusable upstreams. |
 | Formatting a configuration | An editor plus `daer.example.toml`. |
@@ -167,8 +167,9 @@ daer version
 It links no Protobuf reader and no `.dat` converter (ADR-0031).
 
 ```bash
-# Compile plain-text rules to .drb
+# Compile plain-text rules to .drb (with optional attribute filtering)
 daer-drb compile company-direct.rules -o company-direct.drb
+daer-drb compile geosite-google.rules --without ads -o geosite-google.drb
 
 # Inspect metadata and counts of a .drb file
 daer-drb inspect company-direct.drb
