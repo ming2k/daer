@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-11-07
+
+Release 0.0.8 introduces Shadowsocks 2022 (SIP022) with a dual-stack modular architecture,
+rule attribute filtering in `daer-drb compile`, and an unpacker tool for legacy `.dat` rule sets.
+
+### Added
+
+- **Shadowsocks 2022 and AEAD dual-stack ([ADR-0034](docs/adr/0034-shadowsocks-2022-and-aead-dual-stack.md)).**
+  `daer-proxy-protocols` implements both classic 2017 AEAD and Shadowsocks 2022 side-by-side with
+  strict physical modularity in `v1/` and `v2/`:
+  - Shadowsocks 2022 (`v2/`): `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, and
+    `2022-blake3-chacha20-poly1305` ciphers.
+  - BLAKE3 key derivation with SIP022 subkey context; base64 pre-shared key (16 or 32 bytes)
+    validation at load time.
+  - Mandatory randomized padding (1..=900 bytes) on empty-payload initial requests.
+  - Bidirectional ±30s timestamp validation and server-echoed request salt verification to
+    prevent replay and active probing attacks.
+  - Structured UDP datagrams with per-session client IDs, packet IDs, and AES-ECB header
+    obfuscation.
+  - Classic AEAD (`v1/`): `chacha20-ietf-poly1305`, `aes-128-gcm`, `aes-256-gcm`, and
+    `xchacha20-ietf-poly1305` retained for full compatibility.
+  - Unified SIP002 link parser supporting both legacy base64 userinfo and standard
+    `method:password` authority.
+- **Rule attribute filtering in `daer-drb compile`.** Added `--without <TAG>` flag to drop domain
+  rules carrying specific attributes (e.g. `--without ads`) during binary artifact compilation.
+- **Legacy GeoData `.dat` unpacker.** Added `scripts/dat_to_rules.py` to unpack legacy `geosite.dat`
+  and `geoip.dat` files into Canonical Rule Source format without linking Protobuf into the runtime.
+- **Architectural Decision Record ([ADR-0035](docs/adr/0035-quic-and-http3-in-netune.md)).**
+  Ratified migration plan for QUIC and HTTP/3 client transports to `netune-quic` and `netune-http3`,
+  consolidating crypto under `aws-lc-rs` and restoring [INV-NETUNE-01].
+
 ## [0.0.7] - 2026-11-06
 
 Three subsystems were reworked around one theme: a single declaration, and a gate that proves

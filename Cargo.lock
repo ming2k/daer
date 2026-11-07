@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "aya",
@@ -591,11 +591,11 @@ dependencies = [
 
 [[package]]
 name = "daer-common"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "daer-config"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "daer-common",
  "glob",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytes",
  "daer-common",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "daer-drb"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aya",
  "aya-obj",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "daer-outbound"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "daer-common",
  "daer-config",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "daer-relay"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "daer-sniff",
  "libc",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "daer-routing"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aya-obj",
  "daer-common",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2682,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "serde",
  "toml",
