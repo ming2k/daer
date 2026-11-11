@@ -13,9 +13,31 @@
 //!
 //! The falsifiers are concrete: a namespace that is not created, a peer still visible in the
 //! host, a policy rule keyed by mark instead of ingress, a missing return route, a namespace
-//! that survives drop, or a host veth end that is not freed with its peer.
+//! that survives drop, a host veth end that is not freed with its peer, or a namespace mount
+//! that is visible in the host's mount namespace instead of being private to the daemon.
 
 use std::time::{Duration, Instant};
+
+/// Sets the host-global prerequisites the daemon requires in this test's network namespace.
+///
+/// The test runs in a disposable netns, so this does not touch the host. It mirrors what an
+/// operator installs in `/etc/sysctl.d/99-daer.conf`; the daemon checks these and refuses to
+/// change them itself.
+fn set_host_prerequisites() {
+    for (path, value) in [
+        ("ipv4/ip_forward", "1"),
+        ("ipv4/conf/all/forwarding", "1"),
+        ("ipv4/conf/all/rp_filter", "0"),
+        ("ipv4/conf/all/arp_filter", "0"),
+    ] {
+        std::fs::write(format!("/proc/sys/net/{path}"), value)
+            .unwrap_or_else(|error| panic!("set net/{path} = {value}: {error}"));
+    }
+    let ipv6 = "/proc/sys/net/ipv6/conf/all/forwarding";
+    if std::path::Path::new(ipv6).exists() {
+        std::fs::write(ipv6, "1").expect("set IPv6 forwarding");
+    }
+}
 
 #[test]
 fn prepare_and_drop_the_private_ingress() {
@@ -26,12 +48,28 @@ fn prepare_and_drop_the_private_ingress() {
         );
         return;
     }
+    set_host_prerequisites();
+
+    // Started before `prepare` unshares the mount namespace, so this process stays in the
+    // host mount namespace. `/proc/<pid>/root/run/netns` is therefore the host view: it must
+    // never see the private mount, even while the ingress is alive.
+    let mut host_view = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the host-view process");
+    let host_namespace = format!("/proc/{}/root/run/netns/daer0ns", host_view.id());
 
     let ingress = daer_control::PreparedIngress::prepare().expect("prepare the ingress");
     assert!(
         std::path::Path::new("/run/netns/daer0ns").exists(),
-        "the named namespace mount must exist"
+        "the named namespace mount must exist inside the daemon's mount namespace"
     );
+    assert!(
+        !std::path::Path::new(&host_namespace).exists(),
+        "the namespace mount must be private to the daemon, but the host sees {host_namespace}"
+    );
+    let _ = host_view.kill();
+    let _ = host_view.wait();
     assert!(
         !daer_control::datapath::interface_exists("daer0peer"),
         "the peer must have moved out of the host namespace"
@@ -117,6 +155,7 @@ async fn the_transparent_listener_binds_inside_the_namespace() {
         eprintln!("skipping: set DAER_NETNS_TEST=1 in a disposable namespace");
         return;
     }
+    set_host_prerequisites();
 
     let ingress = daer_control::PreparedIngress::prepare().expect("prepare the ingress");
     let port = 30_000 + (std::process::id() % 20_000) as u16;
@@ -144,5 +183,14 @@ async fn the_transparent_listener_binds_inside_the_namespace() {
         .expect("enter the namespace")
         .expect("connect to the listener from inside daer0ns");
     drop(connected);
+    // The v6 listener is a separate fd, because a transparent v4 socket cannot serve a v6
+    // flow. Reachability from inside the namespace proves it was bound there too, not in the
+    // host namespace where `bpf_sk_assign` could not deliver to it.
+    let connected6 = ingress
+        .namespace
+        .with(|| std::net::TcpStream::connect(("::1", port)))
+        .expect("enter the namespace")
+        .expect("connect to the IPv6 listener from inside daer0ns");
+    drop(connected6);
     drop(daemon);
 }

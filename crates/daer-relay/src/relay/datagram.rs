@@ -252,6 +252,8 @@ struct SessionKey {
 
 /// One peer's established outbound session.
 struct Peer {
+    /// The session correlation ID, taken from the first datagram that opened it.
+    flow_id: daer_observe::FlowId,
     /// The outbound leg, shared with the reply pump that was spawned for it.
     datagrams: Arc<dyn DatagramTransport>,
     /// Last time this peer was heard from, for idle reaping.
@@ -316,7 +318,7 @@ pub async fn serve_datagrams(
                 // Counted before the event, not inside it: a tracing field borrow held
                 // across an await makes the whole relay future non-`Send`.
                 let live = peers.lock().await.len();
-                tracing::info!(
+                daer_observe::info!(daer_observe::EventCode::DatagramIngressStopped,
                     sessions = live,
                     "datagram ingress stopped; live sessions keep replying"
                 );
@@ -325,7 +327,7 @@ pub async fn serve_datagrams(
             _ = reaper.tick() => {
                 let reaped = reap_idle(&peers, &options).await;
                 if reaped > 0 {
-                    tracing::debug!(reaped, "reaped idle datagram sessions");
+                    daer_observe::debug!(daer_observe::EventCode::DatagramReaped,reaped, "reaped idle datagram sessions");
                 }
                 continue;
             }
@@ -338,12 +340,12 @@ pub async fn serve_datagrams(
             // provoked an ICMP error that surfaces on the next receive, and killing
             // the relay for that would take down every peer on the socket.
             Err(error) if is_per_datagram_error(&error) => {
-                tracing::trace!(%error, "ingress datagram failed; continuing");
+                daer_observe::trace!(daer_observe::EventCode::DatagramIngressFailed,%error, "ingress datagram failed; continuing");
                 continue;
             }
             Err(RelayError::Rejected(reject)) => {
                 stats.dropped_failed.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%reject, "dropped a datagram that was not redirected");
+                daer_observe::debug!(daer_observe::EventCode::DatagramRejected,%reject, "dropped a datagram that was not redirected");
                 continue;
             }
             Err(error) => return Err(error),
@@ -356,19 +358,20 @@ pub async fn serve_datagrams(
             destination: original_destination,
         };
 
-        let peer = match peer_for(&peers, key, &buffer[..received], &service).await {
-            Some(peer) => peer,
-            None => {
-                // Opening failed or the table was full: distinguish the two, because
-                // one is a capacity signal and the other a policy or transport one.
-                if peers.lock().await.len() >= service.options.max_sessions {
-                    service.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    service.stats.dropped_failed.fetch_add(1, Ordering::Relaxed);
+        let peer =
+            match peer_for(&peers, key, datagram.flow_id, &buffer[..received], &service).await {
+                Some(peer) => peer,
+                None => {
+                    // Opening failed or the table was full: distinguish the two, because
+                    // one is a capacity signal and the other a policy or transport one.
+                    if peers.lock().await.len() >= service.options.max_sessions {
+                        service.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        service.stats.dropped_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         // Liveness is "sent recently", so it is refreshed on every datagram, not only
         // when the session opened.
@@ -383,9 +386,15 @@ pub async fn serve_datagrams(
         // Send on a task, not inline: a tunnel's `send` can await (a record write),
         // and blocking the receive loop on it would stall every other peer.
         let datagrams = Arc::clone(&peer.datagrams);
+        let flow_id = peer.flow_id;
         tokio::spawn(async move {
             if let Err(error) = datagrams.send(&payload).await {
-                tracing::debug!(%error, "datagram forward failed");
+                daer_observe::warn!(
+                    daer_observe::EventCode::DatagramForwardFailed,
+                    flow_id = %flow_id,
+                    %error,
+                    "datagram forward failed"
+                );
             }
         });
     }
@@ -399,6 +408,7 @@ pub async fn serve_datagrams(
 async fn peer_for(
     peers: &Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>>,
     key: SessionKey,
+    flow_id: daer_observe::FlowId,
     initial_payload: &[u8],
     service: &DatagramService,
 ) -> Option<Arc<Peer>> {
@@ -438,6 +448,7 @@ async fn peer_for(
     });
 
     let facts = FlowFacts {
+        flow_id,
         source: address,
         destination: original_destination,
     };
@@ -452,7 +463,13 @@ async fn peer_for(
     {
         Ok(leg) => leg,
         Err(error) => {
-            tracing::debug!(%error, %address, "datagram flow refused");
+            daer_observe::warn!(
+                daer_observe::EventCode::DatagramFlowRefused,
+                flow_id = %flow_id,
+                %error,
+                %address,
+                "datagram flow refused"
+            );
             return None;
         }
     };
@@ -461,13 +478,20 @@ async fn peer_for(
     let established = match leg.connector.connect(&leg.target, &recorder).await {
         Ok(established) => established,
         Err(error) => {
-            tracing::debug!(%error, %address, "datagram session failed");
+            daer_observe::warn!(
+                daer_observe::EventCode::DatagramSessionFailed,
+                flow_id = %flow_id,
+                %error,
+                %address,
+                "datagram session failed"
+            );
             return None;
         }
     };
 
     let datagrams: Arc<dyn DatagramTransport> = Arc::from(established.datagrams);
     let peer = Arc::new(Peer {
+        flow_id,
         datagrams: Arc::clone(&datagrams),
         last_seen_ms: AtomicU64::new(0),
         opened_at: Instant::now(),
@@ -502,7 +526,13 @@ async fn peer_for(
             let received = match datagrams.recv(&mut buffer).await {
                 Ok(received) => received,
                 Err(error) => {
-                    tracing::debug!(%error, %address, "datagram session closed");
+                    daer_observe::debug!(
+                        daer_observe::EventCode::DatagramSessionClosed,
+                        flow_id = %flow_id,
+                        %error,
+                        %address,
+                        "datagram session closed"
+                    );
                     return;
                 }
             };
@@ -516,7 +546,13 @@ async fn peer_for(
                 .send_from(&buffer[..received], original_destination, address)
                 .await
             {
-                tracing::debug!(%error, %address, "datagram reply failed");
+                daer_observe::warn!(
+                    daer_observe::EventCode::DatagramReplyFailed,
+                    flow_id = %flow_id,
+                    %error,
+                    %address,
+                    "datagram reply failed"
+                );
                 return;
             }
         }
@@ -621,6 +657,7 @@ mod tests {
     #[test]
     fn a_touch_makes_a_peer_young_again() {
         let peer = Peer {
+            flow_id: daer_observe::FlowId::new(1),
             datagrams: Arc::new(StubDatagrams),
             last_seen_ms: AtomicU64::new(0),
             opened_at: Instant::now() - Duration::from_secs(3600),
@@ -650,6 +687,7 @@ mod tests {
         peers.lock().await.insert(
             old,
             Arc::new(Peer {
+                flow_id: daer_observe::FlowId::new(1),
                 datagrams: Arc::new(StubDatagrams),
                 last_seen_ms: AtomicU64::new(0),
                 opened_at: Instant::now() - Duration::from_secs(600),
@@ -658,6 +696,7 @@ mod tests {
         peers.lock().await.insert(
             fresh,
             Arc::new(Peer {
+                flow_id: daer_observe::FlowId::new(1),
                 datagrams: Arc::new(StubDatagrams),
                 last_seen_ms: AtomicU64::new(0),
                 opened_at: Instant::now(),
@@ -770,6 +809,7 @@ mod tests {
                     .await
                     .map_err(RelayError::Socket)?;
                 Ok(crate::inbound::Datagram {
+                    flow_id: daer_observe::FlowId::new(1),
                     source,
                     destination: self.next_destination(),
                     len,
@@ -814,6 +854,7 @@ mod tests {
                     .await
                     .map_err(RelayError::Socket)?;
                 Ok(crate::inbound::Datagram {
+                    flow_id: daer_observe::FlowId::new(1),
                     source,
                     destination: self.destination,
                     len,
@@ -894,7 +935,7 @@ mod tests {
                 client: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
                 destination,
             };
-            let peer = peer_for(&peers, key, &[], &service)
+            let peer = peer_for(&peers, key, daer_observe::FlowId::new(1), &[], &service)
                 .await
                 .expect("a direct session opens");
             assert!(Arc::ptr_eq(&peer, &peers.lock().await[&key]));
@@ -907,7 +948,9 @@ mod tests {
             destination,
         };
         assert!(
-            peer_for(&peers, third, &[], &service).await.is_none(),
+            peer_for(&peers, third, daer_observe::FlowId::new(1), &[], &service)
+                .await
+                .is_none(),
             "a full table must refuse, not evict"
         );
         assert_eq!(peers.lock().await.len(), 2);
@@ -938,7 +981,7 @@ mod tests {
                 client: address,
                 destination,
             };
-            peer_for(&peers, key, &[], &service)
+            peer_for(&peers, key, daer_observe::FlowId::new(1), &[], &service)
                 .await
                 .expect("direct session opens");
         }

@@ -331,6 +331,36 @@ fallback = "origin"
     (address, resolver)
 }
 
+/// Builds a dual-stack Fake-IP resolver, served on a fresh UDP port.
+async fn dual_stack_fake_ip_server(origin: SocketAddr) -> (SocketAddr, Arc<Resolver>) {
+    let config = daer_config::toml_config::load_str(&format!(
+        r#"
+[dns]
+upstream = ["origin:tcp://{origin}"]
+
+[dns.fake-ip]
+enabled = true
+inet = "198.18.0.0/15"
+inet6 = "fdfe:dcba:9876::/64"
+pool-size = 256
+
+[dns.request]
+fallback = "origin"
+"#
+    ))
+    .expect("config loads");
+    let resolver = Arc::new(Resolver::from_config(&config).expect("resolver builds"));
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("binds");
+    let address = socket.local_addr().expect("addr");
+    let served = Arc::clone(&resolver);
+    tokio::spawn(async move {
+        let _ = serve_udp_on(socket, served, std::future::pending()).await;
+    });
+    (address, resolver)
+}
+
 fn typed_query(id: u16, name: &str, rtype: RecordType) -> Message {
     Message {
         id,
@@ -399,6 +429,42 @@ async fn fake_ip_suppresses_aaaa_so_a_dual_stack_client_cannot_bypass_the_pool()
         0,
         "the suppressed AAAA must not reach the upstream either"
     );
+}
+
+#[tokio::test]
+async fn dual_stack_fake_ip_synthesises_an_aaaa_record() {
+    // With `inet6` configured, the client must not be pushed to real IPv6 to bypass the
+    // pool. The synthetic address is inside the configured prefix and has a reverse mapping
+    // that the transparent data path can use.
+    let (origin_address, origin_calls) = origin().await;
+    let (address, resolver) = dual_stack_fake_ip_server(origin_address).await;
+
+    let reply = ask(
+        address,
+        &typed_query(33, "site.example.com", RecordType::AAAA),
+    )
+    .await
+    .expect("a reply");
+    let answer = reply.answers.first().expect("an AAAA answer");
+    assert_eq!(answer.rtype, RecordType::AAAA);
+    assert_eq!(
+        origin_calls.load(Ordering::Relaxed),
+        0,
+        "a synthetic AAAA must not reach the upstream"
+    );
+    let octets: [u8; 16] = answer.rdata.as_slice().try_into().expect("sixteen octets");
+    let synthetic = std::net::Ipv6Addr::from(octets);
+    assert!(
+        resolver
+            .fake_ip()
+            .contains_ip(std::net::IpAddr::V6(synthetic)),
+        "{synthetic} must be inside the configured IPv6 pool"
+    );
+    let domain = resolver
+        .fake_ip()
+        .reverse_lookup_v6(synthetic)
+        .expect("reverse lookup");
+    assert_eq!(&*domain, "site.example.com");
 }
 
 #[tokio::test]

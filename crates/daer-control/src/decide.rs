@@ -359,6 +359,8 @@ pub struct Router {
     dial_observer: daer_outbound::ObserverSlot,
     /// The mark every socket daer creates carries, including health probes.
     so_mark: Option<u32>,
+    /// Non-fatal compile warnings, so a reload report and a snapshot can carry them.
+    warnings: Vec<String>,
 }
 
 impl Router {
@@ -445,7 +447,7 @@ impl Router {
         }
         let fallback = fallback.ok_or_else(|| RoutingError::new("no routing fallback"))?;
         for warning in &sink.warnings {
-            tracing::warn!(%warning, "routing rule compiled with a warning");
+            daer_observe::warn!(daer_observe::EventCode::GenerationRuleWarning,%warning, "routing rule compiled with a warning");
         }
 
         // Every rule target must resolve too, not just the fallback.
@@ -493,6 +495,7 @@ impl Router {
             kernel_observer: options.kernel_observer.clone(),
             dial_observer: options.dial_observer.clone(),
             so_mark,
+            warnings: sink.warnings.clone(),
         })
     }
 
@@ -512,6 +515,12 @@ impl Router {
     #[must_use]
     pub const fn program(&self) -> &NormalizedProgram {
         &self.program
+    }
+
+    /// Non-fatal compile warnings from this generation.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Compiles this generation's policy into the datapath's table (ADR-0005).
@@ -569,7 +578,8 @@ impl Router {
         let known_domain = self.known_domain(flow.destination);
 
         if let Some(domain) = known_domain {
-            tracing::debug!(
+            daer_observe::debug!(daer_observe::EventCode::FlowDnsMapping,
+                flow_id = %flow.flow_id,
                 generation = %self.generation,
                 destination = %flow.destination,
                 domain = %domain,
@@ -584,14 +594,16 @@ impl Router {
         if !self.sniffing_timeout.is_zero() {
             let outcome = crate::sniff::sniff_stream(&flow.stream, self.sniffing_timeout).await;
             if outcome.is_named() {
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::FlowSniffed,
+                    flow_id = %flow.flow_id,
                     generation = %self.generation,
                     destination = %flow.destination,
                     sniffed = %outcome.describe(),
                     "flow sniffed"
                 );
             } else {
-                tracing::trace!(
+                daer_observe::trace!(daer_observe::EventCode::FlowNotSniffed,
+                    flow_id = %flow.flow_id,
                     generation = %self.generation,
                     destination = %flow.destination,
                     reason = %outcome.describe(),
@@ -624,7 +636,8 @@ impl Router {
         let outbound = &verdict.outbound;
         // One structured event per decision: the first thing anyone needs when
         // asking "why did *this* connection go there?".
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::FlowDecided,
+            flow_id = %flow.flow_id,
             generation = %self.generation,
             source = %flow.source,
             destination = %flow.destination,
@@ -647,9 +660,21 @@ impl Router {
                 .direct
                 .connect(&direct_authority)
                 .await
-                .map_err(|error| RelayError::Dial {
-                    destination: flow.destination,
-                    reason: error.to_string(),
+                .map_err(|error| {
+                    let failure: daer_observe::DialFailure = error.into();
+                    daer_observe::warn!(
+                        daer_observe::EventCode::FlowDialFailed,
+                        flow_id = %flow.flow_id,
+                        destination = %flow.destination,
+                        group = "direct",
+                        stage = %failure.stage,
+                        error_code = %failure.code,
+                        "flow dial failed"
+                    );
+                    RelayError::Dial {
+                        destination: flow.destination,
+                        failure,
+                    }
                 })?;
             return Ok(established.stream);
         }
@@ -661,7 +686,7 @@ impl Router {
         };
 
         let established = self
-            .connect_through_group(flow.destination, &outbound.name, &authority)
+            .connect_through_group(flow.flow_id, flow.destination, &outbound.name, &authority)
             .await?;
         Ok(established.stream)
     }
@@ -669,17 +694,19 @@ impl Router {
     /// Opens a TCP leg through `group`, holding the group lock only for the selection.
     async fn connect_through_group(
         &self,
+        flow_id: daer_observe::FlowId,
         destination: SocketAddr,
         group: &str,
         authority: &str,
     ) -> Result<daer_outbound::Established, RelayError> {
-        let node = self.select_node(destination, group)?;
+        let node = self.select_node(flow_id, destination, group)?;
         // The dial is wrapped so its span reaches the observer when one is installed. A group
         // whose dials are never measured is a group whose slowness has no explanation in any
         // log: the transport's recorder is filled by netune and then dropped.
         let observed = daer_outbound::ObservedDialer::new(
             Arc::clone(&node),
             self.dial_observer.clone(),
+            flow_id,
             group,
         );
         observed
@@ -687,7 +714,7 @@ impl Router {
             .await
             .map_err(|error| RelayError::Dial {
                 destination,
-                reason: error.to_string(),
+                failure: error.into(),
             })
     }
 
@@ -699,27 +726,47 @@ impl Router {
     /// dial behind the health checker's writes.
     fn select_node(
         &self,
+        flow_id: daer_observe::FlowId,
         destination: SocketAddr,
         group: &str,
     ) -> Result<Arc<NodeDialer>, RelayError> {
         let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
         let Some(route) = groups.get(group) else {
-            return Err(RelayError::Dial {
+            return Err(dial_error(
+                flow_id,
                 destination,
-                reason: OutboundError::UnknownGroup(group.to_owned()).to_string(),
-            });
+                group,
+                OutboundError::UnknownGroup(group.to_owned()),
+            ));
         };
-        let dialer = route.group.select(None).ok_or_else(|| RelayError::Dial {
-            destination,
-            reason: OutboundError::NoAliveNode(group.to_owned()).to_string(),
-        })?;
-        route
-            .node(dialer.id())
-            .map(Arc::clone)
-            .ok_or_else(|| RelayError::Dial {
+        let dialer = route.group.select(None).ok_or_else(|| {
+            dial_error(
+                flow_id,
                 destination,
-                reason: OutboundError::NoAliveNode(group.to_owned()).to_string(),
-            })
+                group,
+                OutboundError::NoAliveNode(group.to_owned()),
+            )
+        })?;
+        let node = route.node(dialer.id()).map(Arc::clone).ok_or_else(|| {
+            dial_error(
+                flow_id,
+                destination,
+                group,
+                OutboundError::NoAliveNode(group.to_owned()),
+            )
+        })?;
+        let property = dialer.property();
+        daer_observe::trace!(
+            daer_observe::EventCode::FlowNodeSelected,
+            flow_id = %flow_id,
+            group = %group,
+            node = %property.name,
+            protocol = %property.protocol.as_str(),
+            policy = ?route.group.policy(),
+            latency_us = ?dialer.last_latency().map(|latency| latency.as_nanos() / 1_000),
+            "node selected"
+        );
+        Ok(node)
     }
 
     /// The routing verdict for a datagram flow, without dialing.
@@ -772,13 +819,10 @@ impl Router {
     /// which source of truth wins.
     #[must_use]
     pub fn known_domain(&self, destination: SocketAddr) -> Option<String> {
-        let from_fake_ip = self.fake_ip.as_ref().and_then(|fake_ip| {
-            if let std::net::IpAddr::V4(v4) = destination.ip() {
-                fake_ip.reverse_lookup(v4)
-            } else {
-                None
-            }
-        });
+        let from_fake_ip = self
+            .fake_ip
+            .as_ref()
+            .and_then(|fake_ip| fake_ip.reverse_lookup_ip(destination.ip()));
         from_fake_ip
             .or_else(|| {
                 self.dns_snooper
@@ -807,7 +851,8 @@ impl Router {
         domain: Option<&str>,
     ) -> Result<DatagramLeg, RelayError> {
         let outbound = &verdict.outbound;
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::FlowDatagramDecided,
+            flow_id = %facts.flow_id,
             generation = %self.generation,
             source = %facts.source,
             destination = %facts.destination,
@@ -839,11 +884,15 @@ impl Router {
         }
 
         let group_name = outbound.name.clone();
-        let node = self.select_node(facts.destination, &group_name)?;
+        let node = self.select_node(facts.flow_id, facts.destination, &group_name)?;
 
-        let connector = node.datagram().ok_or(RelayError::Dial {
-            destination: facts.destination,
-            reason: OutboundError::NoDatagramSupport(group_name.to_string()).to_string(),
+        let connector = node.datagram().ok_or_else(|| {
+            dial_error(
+                facts.flow_id,
+                facts.destination,
+                &group_name,
+                OutboundError::NoDatagramSupport(group_name.to_string()),
+            )
         })?;
         Ok(DatagramLeg { target, connector })
     }
@@ -1398,6 +1447,29 @@ fn check_target(name: &str, groups: &[String]) -> Result<(), RoutingError> {
 /// treating an unknown scheme as `direct` would leak the flow outside the proxy.
 /// That skip is logged at `warn` with the reason, because a group that silently
 /// lost half its nodes is a configuration bug an operator must see.
+/// Builds a relay dial error and emits the one `warn` event that names its stage and code.
+fn dial_error(
+    flow_id: daer_observe::FlowId,
+    destination: SocketAddr,
+    group: &str,
+    error: OutboundError,
+) -> RelayError {
+    let failure: daer_observe::DialFailure = error.into();
+    daer_observe::warn!(
+        daer_observe::EventCode::FlowDialFailed,
+        flow_id = %flow_id,
+        destination = %destination,
+        group = %group,
+        stage = %failure.stage,
+        error_code = %failure.code,
+        "flow dial failed"
+    );
+    RelayError::Dial {
+        destination,
+        failure,
+    }
+}
+
 fn build_groups(
     config: &Config,
     dialer_options: &DialerOptions,
@@ -1434,7 +1506,7 @@ fn build_groups(
             let node_dialer = match NodeDialer::from_node(node, *dialer_options) {
                 Ok(dialer) => dialer,
                 Err(OutboundError::UnsupportedLink(message)) => {
-                    tracing::warn!(
+                    daer_observe::warn!(daer_observe::EventCode::GenerationNodeUnselectable,
                         node = %property.name,
                         protocol = %property.protocol.as_str(),
                         %message,

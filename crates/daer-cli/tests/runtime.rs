@@ -94,14 +94,33 @@ fn the_daemon_entry_point_uses_the_multi_threaded_runtime() {
     let arm_start = source
         .find("Command::Run {")
         .expect("`main` has a `Command::Run` arm");
-    // The arm's own body: far enough to include the runtime call, short enough that a match in
-    // a later arm cannot satisfy it.
-    let window = &source[arm_start..(arm_start + 900).min(source.len())];
+    // The arm's own body: everything up to the next `Command::` arm, so a match in a later
+    // arm cannot satisfy it and a call added inside this arm does not need a magic window.
+    let arm_end = source[arm_start..]
+        .find("Command::Check {")
+        .map(|offset| arm_start + offset)
+        .unwrap_or(source.len());
+    let window = &source[arm_start..arm_end];
     // Match the *call*, not the word: the comment next to it names the function too, and an
     // assertion that a comment can satisfy is exactly the vacuity ADR-0007 is about.
     assert!(
         window.contains("block_on_daemon(async move"),
         "the `run` subcommand must be driven by `block_on_daemon`: a current-thread runtime \
          starves the relays and datagram sessions the daemon spawns. Saw:\n{window}"
+    );
+
+    // Worker threads inherit the mount namespace of the thread that creates them. Unsharing
+    // after `block_on_daemon` would leave the runtime in the host namespace, where the private
+    // `/run/netns` tmpfs does not exist.
+    let isolation = window
+        .find("isolate_ingress_mounts")
+        .expect("the `run` arm isolates the ingress mounts before starting the runtime");
+    let runtime = window
+        .find("block_on_daemon(async move")
+        .expect("the `run` arm starts the daemon runtime");
+    assert!(
+        isolation < runtime,
+        "the ingress mount namespace must be unshared before `block_on_daemon`: a worker \
+         thread created first keeps the host mount namespace. Saw:\n{window}"
     );
 }

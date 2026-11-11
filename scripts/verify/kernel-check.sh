@@ -140,7 +140,10 @@ if ! as_builder env -u SUDO_USER cargo test -p daer-ebpf --test kernel --no-run 
     bad "the kernel test binary did not build; see $logs/build.log"
     sed -n '$p' "$logs/build.log" | sed 's/^/       /'
 fi
-binary="$(ls -t target/debug/deps/kernel-* 2>/dev/null | grep -v '\.d$' | head -n 1)"
+# Keep the glob out of `ls`: a long-lived target directory can hold enough incremental
+# objects that `ls` exits with E2BIG before selecting the newest executable.
+binary="$(find target/debug/deps -maxdepth 1 -type f -name 'kernel-*' -perm -u+x \
+    -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
 if [[ -z "$binary" ]]; then
     bad "no kernel test binary under target/debug/deps"
     binary=""
@@ -156,8 +159,8 @@ if ! as_builder env -u SUDO_USER cargo test -p daer-ebpf --test datapath --no-ru
     bad "the datapath test binary did not build; see $logs/build-datapath.log"
     binary_datapath=""
 else
-    binary_datapath="$(ls -t target/debug/deps/datapath-* 2>/dev/null \
-        | grep -v '\.d$' | head -n 1)"
+    binary_datapath="$(find target/debug/deps -maxdepth 1 -type f -name 'datapath-*' -perm -u+x \
+        -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
     if [[ -z "$binary_datapath" ]]; then
         bad "no datapath test binary under target/debug/deps"
     else

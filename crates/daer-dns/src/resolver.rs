@@ -42,6 +42,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -197,6 +198,15 @@ impl StatsSnapshot {
     }
 }
 
+/// One DNS query's correlation context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryContext {
+    /// The query's ID, allocated at the server boundary.
+    pub id: daer_observe::QueryId,
+    /// The client that sent it.
+    pub peer: SocketAddr,
+}
+
 /// Query in, answer out.
 #[derive(Debug)]
 pub struct Resolver {
@@ -205,6 +215,8 @@ pub struct Resolver {
     upstreams: BTreeMap<String, Arc<dyn Upstream>>,
     cache: Mutex<Cache>,
     stats: Stats,
+    /// Correlation IDs for DNS queries.
+    ids: Arc<daer_observe::Ids>,
     /// `dns.ipversion-prefer`: `4`, `6`, or `0` for no preference.
     ///
     /// Applied to the answer set, not to the upstream choice: a query for `AAAA` against a
@@ -255,7 +267,7 @@ impl IpVersionPreference {
     /// The rule is "prefer", not "only": if the answer has no record of the preferred family the
     /// other family is kept, because an empty answer to a client that can use the other family is
     /// strictly worse than a slower one.
-    fn apply(self, message: &mut Message) {
+    fn apply(self, message: &mut Message, query_id: daer_observe::QueryId) {
         let (keep, drop) = match self {
             Self::None => return,
             Self::V4 => (RecordType::A, RecordType::AAAA),
@@ -267,7 +279,8 @@ impl IpVersionPreference {
         let before = message.answers.len();
         message.answers.retain(|record| record.rtype != drop);
         if message.answers.len() != before {
-            tracing::trace!(
+            daer_observe::trace!(daer_observe::EventCode::DnsFamilyFiltered,
+                query_id = %query_id,
                 dropped = before - message.answers.len(),
                 preference = ?self,
                 "dns: dropped the dispreferred address family from a mixed answer"
@@ -350,6 +363,7 @@ impl Resolver {
             upstreams,
             cache: Mutex::new(Cache::new(cache_config)),
             stats: Stats::default(),
+            ids: Arc::new(daer_observe::Ids::new()),
             ipversion_prefer,
             fake_ip,
             snooper,
@@ -385,6 +399,25 @@ impl Resolver {
         &self.stats
     }
 
+    /// Starts one query, allocating its correlation ID.
+    ///
+    /// The server calls this once per received message, before parsing or routing. Every
+    /// event about the query then carries the same `QueryId`, and the response log can be
+    /// joined to the cache/upstream log without matching the question text.
+    #[must_use]
+    pub fn begin_query(&self, peer: SocketAddr) -> QueryContext {
+        QueryContext {
+            id: self.ids.query(),
+            peer,
+        }
+    }
+
+    /// The run ID every event from this resolver carries.
+    #[must_use]
+    pub fn run_id(&self) -> daer_observe::RunId {
+        self.ids.run_id()
+    }
+
     /// The Fake-IP pool (ADR-0012).
     #[must_use]
     pub fn fake_ip(&self) -> &Arc<crate::fake_ip::FakeIpPool> {
@@ -405,14 +438,20 @@ impl Resolver {
     /// (the query is itself a response, or has no question to echo). Every other failure
     /// becomes an answer with a response code, because a client that gets nothing retries
     /// and holds its slot.
-    pub async fn resolve(&self, query: &Message) -> Result<Resolution, ResolverError> {
+    pub async fn resolve(
+        &self,
+        query: &Message,
+        context: QueryContext,
+    ) -> Result<Resolution, ResolverError> {
         let started = Instant::now();
         if query.is_response() {
             return Err(ResolverError::Unserviceable(ResponseCode::FORMERR));
         }
 
         let decision = self.request.decide(query);
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::DnsRequestRouted,
+            query_id = %context.id,
+            peer = %context.peer,
             question = %describe_question(query),
             decision = %decision,
             "dns request routed"
@@ -451,10 +490,20 @@ impl Resolver {
                         return Ok(Resolution::Answer(reply));
                     }
                     RecordType::AAAA => {
-                        // An empty NOERROR for `AAAA`, not a pass-through.
+                        if let Some(fake_addr) = self.fake_ip.allocate_v6(&qname) {
+                            let mut reply = Message::reply_to(query, ResponseCode::NOERROR);
+                            reply.answers.push(crate::wire::Record {
+                                name: query.questions[0].name.clone(),
+                                rtype: RecordType::AAAA,
+                                class: query.questions[0].qclass,
+                                ttl: 60,
+                                rdata: fake_addr.octets().to_vec(),
+                            });
+                            return Ok(Resolution::Answer(reply));
+                        }
+                        // No IPv6 pool: an empty NOERROR for `AAAA`, not a pass-through.
                         //
-                        // The pool is IPv4-only, so a synthesised address only exists in
-                        // `A`. Forwarding `AAAA` to the upstream would hand a dual-stack
+                        // Forwarding `AAAA` to the upstream would hand a dual-stack
                         // client the *real* IPv6 address, and the client would prefer it:
                         // the flow then leaves over IPv6, never touches the synthetic
                         // address, and the whole Fake-IP path is bypassed — while the
@@ -473,7 +522,7 @@ impl Resolver {
         if let Some(key) = &key {
             match self.lookup(key) {
                 Some(cached) => {
-                    let message = self.materialise(query, cached);
+                    let message = self.materialise(query, cached, context.id);
                     return Ok(Resolution::Answer(message));
                 }
                 None => {
@@ -488,7 +537,16 @@ impl Resolver {
         let answer = match self.ask(&tag, query).await {
             Ok(answer) => answer,
             Err(error) => {
-                tracing::debug!(%error, upstream = %tag, "dns upstream failed");
+                daer_observe::warn!(
+                    daer_observe::EventCode::DnsUpstreamFailed,
+                    query_id = %context.id,
+                    peer = %context.peer,
+                    question = %describe_question(query),
+                    upstream = %tag,
+                    %error,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "dns upstream failed"
+                );
                 return Ok(Resolution::Answer(Message::reply_to(
                     query,
                     ResponseCode::SERVFAIL,
@@ -497,10 +555,13 @@ impl Resolver {
         };
 
         let action = self.respond(&answer, query, &tag);
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::DnsAnswerRouted,
+            query_id = %context.id,
+            peer = %context.peer,
             question = %describe_question(query),
             upstream = %tag,
             action = %action,
+            rcode = ?answer.response_code(),
             elapsed_ms = started.elapsed().as_millis(),
             "dns answer routed"
         );
@@ -512,7 +573,7 @@ impl Resolver {
                 // see: filtering on the way out of the cache would re-filter the same records on
                 // every hit and, worse, leave a stale cache holding records the configuration
                 // says to drop.
-                self.ipversion_prefer.apply(&mut answer);
+                self.ipversion_prefer.apply(&mut answer, context.id);
                 if !query.questions.is_empty() {
                     let qname = query.questions[0].name.to_string();
                     for record in &answer.answers {
@@ -545,7 +606,9 @@ impl Resolver {
                 if other == tag {
                     // A rule that sends an answer back to the upstream that produced it
                     // would loop; answering what we have is the lesser harm.
-                    tracing::warn!(
+                    daer_observe::warn!(daer_observe::EventCode::DnsFailoverSelf,
+                        query_id = %context.id,
+                        peer = %context.peer,
                         upstream = %tag,
                         "dns.response failover targets the same upstream; ignoring"
                     );
@@ -554,7 +617,14 @@ impl Resolver {
                     match self.ask(&other, query).await {
                         Ok(second) => second,
                         Err(error) => {
-                            tracing::debug!(%error, upstream = %other, "dns failover failed");
+                            daer_observe::warn!(
+                                daer_observe::EventCode::DnsFailoverFailed,
+                                query_id = %context.id,
+                                peer = %context.peer,
+                                %error,
+                                upstream = %other,
+                                "dns failover failed"
+                            );
                             answer
                         }
                     }
@@ -563,10 +633,17 @@ impl Resolver {
         };
 
         if let Some(key) = key {
-            self.store(key, &final_answer);
+            self.store(key, &final_answer, context.id);
         }
 
         Ok(Resolution::Answer(settle(query, final_answer)))
+    }
+
+    /// Test-only wrapper that supplies a synthetic peer and a fresh query ID.
+    #[cfg(test)]
+    async fn resolve_test(&self, query: &Message) -> Result<Resolution, ResolverError> {
+        let peer = "127.0.0.1:0".parse().expect("test peer");
+        self.resolve(query, self.begin_query(peer)).await
     }
 
     /// Drops entries whose stale window has passed. Returns how many went.
@@ -595,23 +672,39 @@ impl Resolver {
         cache.lookup(key, Instant::now())
     }
 
-    fn store(&self, key: Key, answer: &Message) {
+    fn store(&self, key: Key, answer: &Message, query_id: daer_observe::QueryId) {
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         match cache.store(key, Arc::new(answer.clone()), Instant::now()) {
             Ok(ttl) => {
-                tracing::trace!(ttl, "dns answer cached");
+                daer_observe::trace!(
+                    daer_observe::EventCode::DnsCacheStored,
+                    query_id = %query_id,
+                    ttl,
+                    "dns answer cached"
+                );
             }
             Err(skipped) => {
-                tracing::trace!(?skipped, "dns answer not cached");
+                daer_observe::trace!(
+                    daer_observe::EventCode::DnsCacheSkipped,
+                    query_id = %query_id,
+                    ?skipped,
+                    "dns answer not cached"
+                );
             }
         }
     }
 
     /// Turns a cache hit into a client-ready answer, counting it.
-    fn materialise(&self, query: &Message, cached: Cached) -> Message {
+    fn materialise(
+        &self,
+        query: &Message,
+        cached: Cached,
+        query_id: daer_observe::QueryId,
+    ) -> Message {
         if cached.needs_refresh() {
             self.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
+            daer_observe::debug!(daer_observe::EventCode::DnsCacheStale,
+                query_id = %query_id,
                 question = %describe_question(query),
                 expired_for_ms = cached.expired_for().map(|d| d.as_millis()),
                 "dns stale answer served; a refresh is owed"
@@ -814,13 +907,13 @@ fallback = "accept"
         let resolver = resolver(BASE, Arc::clone(&upstream));
         let query = query("example.com", RecordType::A);
 
-        let first = answer_of(resolver.resolve(&query).await.expect("resolves"));
+        let first = answer_of(resolver.resolve_test(&query).await.expect("resolves"));
         assert_eq!(first.id, query.id, "the client's id is echoed");
         assert!(first.is_response());
         assert_eq!(first.answer_addresses().len(), 1);
         assert_eq!(upstream.calls(), 1);
 
-        let second = answer_of(resolver.resolve(&query).await.expect("resolves"));
+        let second = answer_of(resolver.resolve_test(&query).await.expect("resolves"));
         assert_eq!(upstream.calls(), 1, "the second answer came from the cache");
         assert_eq!(second.answer_addresses(), first.answer_addresses());
 
@@ -836,7 +929,7 @@ fallback = "accept"
         let upstream = FakeUpstream::answering(&[[1, 2, 3, 4]], 300);
         let resolver = resolver(BASE, upstream);
         let query = query("ttl.example.com", RecordType::A);
-        let _ = resolver.resolve(&query).await.expect("resolves");
+        let _ = resolver.resolve_test(&query).await.expect("resolves");
 
         // Reach into the cache with a synthetic clock so the assertion is deterministic.
         let key = Key::of(&query).expect("key");
@@ -865,7 +958,7 @@ fallback = "accept"
         let resolver = resolver(BASE, Arc::clone(&upstream));
         let answer = answer_of(
             resolver
-                .resolve(&query("tracker.blocked", RecordType::A))
+                .resolve_test(&query("tracker.blocked", RecordType::A))
                 .await
                 .expect("resolves"),
         );
@@ -880,7 +973,7 @@ fallback = "accept"
         let resolver = resolver(BASE, Arc::clone(&upstream));
         assert!(matches!(
             resolver
-                .resolve(&query("nas.lan", RecordType::A))
+                .resolve_test(&query("nas.lan", RecordType::A))
                 .await
                 .expect("resolves"),
             Resolution::AsIs
@@ -895,12 +988,25 @@ fallback = "accept"
         let resolver = resolver(BASE, FakeUpstream::failing());
         let answer = answer_of(
             resolver
-                .resolve(&query("example.com", RecordType::A))
+                .resolve_test(&query("example.com", RecordType::A))
                 .await
                 .expect("resolves"),
         );
         assert_eq!(answer.response_code(), ResponseCode::SERVFAIL);
         assert_eq!(resolver.stats().snapshot().upstream_errors, 1);
+    }
+
+    #[test]
+    fn a_query_trace_is_joinable_by_id() {
+        // Every event about one query carries this ID. It is created at the server boundary,
+        // not reconstructed from the question text or the peer address.
+        let resolver = resolver(BASE, FakeUpstream::answering(&[[1, 2, 3, 4]], 60));
+        let peer = "127.0.0.1:5353".parse().expect("peer");
+        let first = resolver.begin_query(peer);
+        let second = resolver.begin_query(peer);
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.peer, peer);
+        assert_eq!(second.peer, peer);
     }
 
     #[test]
@@ -950,7 +1056,7 @@ rules = ["ip(10.0.0.0/8) -> second"]
 
         let answer = answer_of(
             resolver
-                .resolve(&query("example.com", RecordType::A))
+                .resolve_test(&query("example.com", RecordType::A))
                 .await
                 .expect("resolves"),
         );
@@ -987,7 +1093,7 @@ rules = ["ip(10.0.0.0/8) -> only"]
 
         let answer = answer_of(
             resolver
-                .resolve(&query("example.com", RecordType::A))
+                .resolve_test(&query("example.com", RecordType::A))
                 .await
                 .expect("resolves"),
         );
@@ -1001,7 +1107,7 @@ rules = ["ip(10.0.0.0/8) -> only"]
         let mut response = query("example.com", RecordType::A);
         response.flags = Flags(0x8180);
         assert!(matches!(
-            resolver.resolve(&response).await,
+            resolver.resolve_test(&response).await,
             Err(ResolverError::Unserviceable(ResponseCode::FORMERR))
         ));
     }
@@ -1122,7 +1228,7 @@ fallback = "local"
             additionals: Vec::new(),
         };
 
-        let answer = match resolver.resolve(&query).await.expect("resolves") {
+        let answer = match resolver.resolve_test(&query).await.expect("resolves") {
             Resolution::Answer(message) => message,
             Resolution::AsIs => panic!("the fallback is an upstream, not asis"),
         };
@@ -1187,7 +1293,7 @@ fallback = "google"
             authorities: Vec::new(),
             additionals: Vec::new(),
         };
-        let answer = match resolver.resolve(&query).await.expect("resolves") {
+        let answer = match resolver.resolve_test(&query).await.expect("resolves") {
             Resolution::Answer(message) => message,
             Resolution::AsIs => panic!("expected SERVFAIL"),
         };

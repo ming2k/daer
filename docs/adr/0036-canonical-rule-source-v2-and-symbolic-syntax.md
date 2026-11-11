@@ -56,7 +56,7 @@ CRS v2 adopts a pure, prefix-free, symbolic domain syntax across `daer-rule-ast`
 - **Decommissioning `full:`**:
   The legacy `full:` keyword is retired in favor of `=`. In `RuleSet::render()` and `daer-drb decompile`, exact matches are canonically emitted with the `=` prefix (`=example.com`).
 - **Network Directives**:
-  IP rules continue to accept CIDRs (`192.168.0.0/16`), ranges (`172.16.1.10 - 172.16.1.50`), and host IPs (`1.1.1.1`). The optional `ip:` prefix is preserved for explicit clarity.
+  IP rules continue to accept CIDRs (`192.168.0.0/16`), ranges (`172.16.1.10-172.16.1.50`), and host IPs (`1.1.1.1`). The optional `ip:` prefix is preserved for explicit clarity.
 - **Bi-directional Round-Trip Invariant (`[INV-DRB-02]`)**:
   `compile(decompile(drb)) == drb` holds strictly under the new symbolic syntax.
 

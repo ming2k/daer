@@ -11,6 +11,7 @@ description = "Outbound dialers, groups and health checks for daer"
 [dependencies]
 daer-common.workspace = true
 daer-config.workspace = true
+daer-observe.workspace = true
 daer-proxy-protocols.workspace = true
 fastrand.workspace = true
 netune.workspace = true
@@ -18,7 +19,6 @@ netune-trace.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

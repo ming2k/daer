@@ -156,41 +156,4 @@ example.com
         !test_sub_bare.status.success(),
         "bare domain should not match SubdomainsOnly suffix"
     );
-
-    // 9. daer-drb compile with --without attribute filtering
-    let filter_rules = temp_dir.path().join("filter.rules");
-    let filter_drb = temp_dir.path().join("filter.drb");
-    fs::write(
-        &filter_rules,
-        "name: filter-test\nallowed.org @ok\nblocked.org @ads\n",
-    )
-    .expect("filter rules written");
-
-    let filter_compile = drb_cmd()
-        .args([
-            "compile",
-            filter_rules.to_str().unwrap(),
-            "-o",
-            filter_drb.to_str().unwrap(),
-            "--without",
-            "ads",
-        ])
-        .status()
-        .expect("compile with --without");
-    assert!(
-        filter_compile.success(),
-        "compile with --without must succeed"
-    );
-
-    let test_allowed = drb_cmd()
-        .args(["test", filter_drb.to_str().unwrap(), "allowed.org"])
-        .status()
-        .expect("runs test allowed");
-    assert!(test_allowed.success(), "allowed.org must match");
-
-    let test_blocked = drb_cmd()
-        .args(["test", filter_drb.to_str().unwrap(), "blocked.org"])
-        .status()
-        .expect("runs test blocked");
-    assert!(!test_blocked.success(), "blocked.org must be filtered out");
 }

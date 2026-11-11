@@ -110,9 +110,29 @@ impl Supervisor {
     where
         F: Future<Output = Relayed> + Send + 'static,
     {
+        self.spawn_inner(None, flow);
+    }
+
+    /// Runs a flow as an independent task and attributes an abnormal end to `flow_id`.
+    ///
+    /// The data path uses this form. A plain [`Self::spawn`] is kept for test doubles that
+    /// deliberately do not have a flow context; it still counts the abnormal end but cannot
+    /// name it.
+    pub fn spawn_tracked<F>(&self, flow_id: daer_observe::FlowId, flow: F)
+    where
+        F: Future<Output = Relayed> + Send + 'static,
+    {
+        self.spawn_inner(Some(flow_id), flow);
+    }
+
+    fn spawn_inner<F>(&self, flow_id: Option<daer_observe::FlowId>, flow: F)
+    where
+        F: Future<Output = Relayed> + Send + 'static,
+    {
         self.inner.flows.fetch_add(1, Ordering::AcqRel);
         let guard = FlowGuard {
             inner: Arc::clone(&self.inner),
+            flow_id,
             completed: false,
         };
         tokio::spawn(async move {
@@ -163,6 +183,7 @@ impl Default for Supervisor {
 #[derive(Debug)]
 struct FlowGuard {
     inner: Arc<Inner>,
+    flow_id: Option<daer_observe::FlowId>,
     completed: bool,
 }
 
@@ -172,6 +193,13 @@ impl Drop for FlowGuard {
             // A join error, a panic, or a cancellation: all of them are "this flow
             // did not finish its work", and all of them are worth counting.
             self.inner.metrics.record_abnormal_end();
+            if let Some(flow_id) = self.flow_id {
+                daer_observe::warn!(
+                    daer_observe::EventCode::FlowAbnormalEnd,
+                    flow_id = %flow_id,
+                    "flow task ended abnormally"
+                );
+            }
         }
         if self.inner.flows.fetch_sub(1, Ordering::AcqRel) == 1 {
             // The last flow: wake every waiter. A single permit would be taken by one

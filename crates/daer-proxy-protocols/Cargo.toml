@@ -17,6 +17,7 @@ ignored = ["md-5"]
 [dependencies]
 bytes.workspace = true
 daer-config.workspace = true
+daer-observe.workspace = true
 libc.workspace = true
 aes.workspace = true
 aes-gcm.workspace = true
@@ -37,7 +38,6 @@ netune-ws.workspace = true
 netune-quic.workspace = true
 netune-http3.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }

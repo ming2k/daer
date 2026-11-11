@@ -75,9 +75,12 @@ const JOURNAL_PATH: &str = "/run/daer/restore";
 /// keep redirecting traffic into a listener that no longer exists, and a sysctl remains at a
 /// daer-chosen value that the next start would mistake for the operator's baseline.
 ///
-/// One record is one tab-separated line:
+/// One record is one tab-separated line. The first line is `version<TAB>2`; a journal without
+/// that header was written by a daemon that could also leave host sysctls and a host
+/// namespace/pair behind, so `cleanup_system_state` gives it the full legacy restore.
 ///
 /// ```text
+/// version<TAB>2
 /// sysctl<TAB>net/ipv4/ip_forward<TAB>1
 /// interface<TAB>eth0<TAB>
 /// qdisc<TAB>eth0<TAB>
@@ -85,6 +88,10 @@ const JOURNAL_PATH: &str = "/run/daer/restore";
 ///
 /// The writer flushes each line before the change it describes, so a crash cannot leave a
 /// change without its undo record. A truncated final line is ignored by the reader.
+///
+/// Per-device knobs under `daer0`/`daer0peer` are deliberately absent: deleting the device
+/// removes the whole `/proc/sys/net/*/conf/<device>` subtree, so there is no surviving value
+/// to restore.
 #[derive(Debug, Clone)]
 struct RestoreJournal(Arc<JournalFile>);
 
@@ -106,7 +113,7 @@ impl RestoreJournal {
             ))
         })?;
         let path = Path::new(JOURNAL_PATH).to_path_buf();
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
@@ -114,6 +121,17 @@ impl RestoreJournal {
             .map_err(|error| {
                 DatapathError::Device(format!(
                     "cannot write the recovery journal {JOURNAL_PATH}: {error}"
+                ))
+            })?;
+        // The header distinguishes a current host-TC-only journal from a pre-v2 journal that
+        // may also carry host sysctls and a host namespace/pair to clean up. It is written
+        // before any undo record, so a crash before the first system change leaves either an
+        // empty file (nothing to do) or a complete header.
+        writeln!(file, "version\t2")
+            .and_then(|()| file.flush())
+            .map_err(|error| {
+                DatapathError::Device(format!(
+                    "cannot write the recovery journal header {JOURNAL_PATH}: {error}"
                 ))
             })?;
         Ok(Self(Arc::new(JournalFile {
@@ -148,7 +166,7 @@ impl RestoreJournal {
 impl Drop for JournalFile {
     fn drop(&mut self) {
         if self.failed.load(Ordering::Acquire) {
-            tracing::warn!(
+            daer_observe::warn!(daer_observe::EventCode::DatapathCleanupFailed,
                 path = %self.path.display(),
                 "a cleanup step failed; keeping the recovery journal for ExecStopPost"
             );
@@ -404,7 +422,7 @@ impl RouteTable {
                     // IPv6 table; failing the whole datapath for it would make the IPv4
                     // proxy unusable. The absence is logged, and IPv6 redirected traffic
                     // cannot be delivered without it.
-                    tracing::warn!(%error, "IPv6 policy routing is unavailable; IPv4 continues");
+                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable,%error, "IPv6 policy routing is unavailable; IPv4 continues");
                     continue;
                 }
                 // Roll back what was installed: a half-configured table would send one
@@ -438,7 +456,7 @@ impl RouteTable {
 impl Drop for RouteTable {
     fn drop(&mut self) {
         if let Err(error) = self.remove() {
-            tracing::debug!(%error, "could not remove the datapath policy routing");
+            daer_observe::warn!(daer_observe::EventCode::DatapathCleanupFailed,%error, "could not remove the datapath policy routing");
         }
     }
 }
@@ -645,9 +663,28 @@ fn link_line(interface: &str) -> Result<String, DatapathError> {
     })
 }
 
+/// Parses the opt-in TC attachment mode.
+///
+/// The default is the classic netlink path. `DAER_TC_ATTACH=tcx` is the privileged gate's
+/// validation knob; an unknown value fails startup rather than silently selecting a mode.
+fn parse_tc_mode(value: Option<&str>) -> Result<loader::TcMode, DatapathError> {
+    match value {
+        None | Some("netlink") => Ok(loader::TcMode::Netlink),
+        Some("tcx") => Ok(loader::TcMode::Tcx),
+        Some(other) => Err(DatapathError::Device(format!(
+            "DAER_TC_ATTACH must be `netlink` or `tcx`, not `{other}`"
+        ))),
+    }
+}
+
+fn tc_mode() -> Result<loader::TcMode, DatapathError> {
+    parse_tc_mode(std::env::var("DAER_TC_ATTACH").ok().as_deref())
+}
+
 /// The `clsact` qdiscs this run created, removed when the datapath detaches.
 ///
-/// Aya detaches the filters it owns, but it does not remove the qdisc it created on demand.
+/// Only the classic netlink attach creates a qdisc; TCX is a `bpf_link` on the netdev. Aya
+/// detaches the filters it owns, but it does not remove the qdisc it created on demand.
 /// Leaving that qdisc behind is still a system modification: `tc qdisc show` names daer's
 /// handiwork after the service is gone. Only qdiscs this run created are removed; one that
 /// existed before attach belongs to the operator and may carry unrelated filters.
@@ -665,8 +702,11 @@ impl ClsactQdiscs {
         }
     }
 
-    fn ensure(&mut self, interface: &str) -> Result<(), DatapathError> {
-        if loader::ensure_clsact(interface).map_err(DatapathError::Object)? {
+    fn ensure(&mut self, interface: &str, mode: loader::TcMode) -> Result<(), DatapathError> {
+        // TCX is a bpf_link on the netdev; it creates no clsact qdisc to remove.
+        if mode == loader::TcMode::Netlink
+            && loader::ensure_clsact(interface).map_err(DatapathError::Object)?
+        {
             self.created.push(interface.to_owned());
             self.journal.record(&format!("qdisc\t{interface}\t"))?;
         }
@@ -708,12 +748,12 @@ fn delete_clsact(interface: &str) -> bool {
                 || message.contains("No such file")
                 || message.contains("not found");
             if !already_gone {
-                tracing::debug!(interface, error = %message.trim(), "could not remove the clsact qdisc");
+                daer_observe::warn!(daer_observe::EventCode::DatapathCleanupFailed,interface, error = %message.trim(), "could not remove the clsact qdisc");
             }
             already_gone
         }
         Err(error) => {
-            tracing::debug!(interface, %error, "could not run `tc` to remove the clsact qdisc");
+            daer_observe::warn!(daer_observe::EventCode::DatapathCleanupFailed,interface, %error, "could not run `tc` to remove the clsact qdisc");
             false
         }
     }
@@ -721,10 +761,11 @@ fn delete_clsact(interface: &str) -> bool {
 
 /// Detaches every host-side daer classifier from `interface`.
 ///
-/// This is the crash path: classic `cls_bpf` filters outlive the process that installed them,
-/// so a `SIGKILL` leaves traffic redirected into a listener that is gone. Detaching by program
-/// name needs no loaded object and no remembered link id, which is why the cleanup path can
-/// use it after the daemon has died.
+/// This is the crash path for the classic path: `cls_bpf` filters outlive the process that
+/// installed them, so a `SIGKILL` leaves traffic redirected into a listener that is gone.
+/// Detaching by program name needs no loaded object and no remembered link id, which is why
+/// the cleanup path can use it after the daemon has died. TCX links are fd-owned and are
+/// already gone; calling this is a no-op for them.
 fn detach_host_filters(interface: &str) {
     use aya::programs::tc::{TcAttachType, qdisc_detach_program};
     use daer_ebpf::names::program;
@@ -757,11 +798,26 @@ fn detach_host_filters(interface: &str) {
 }
 
 /// The undo records parsed from a journal file.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct JournalRecords {
+    /// `1` when the journal has no header (an older daemon), `2` for the current format.
+    version: u8,
     sysctls: Vec<(String, String)>,
     interfaces: Vec<String>,
     qdiscs: Vec<String>,
+}
+
+impl Default for JournalRecords {
+    fn default() -> Self {
+        Self {
+            // A journal without a header was written by a daemon that could leave host
+            // sysctls and a host namespace/pair behind; keep the full legacy cleanup for it.
+            version: 1,
+            sysctls: Vec::new(),
+            interfaces: Vec::new(),
+            qdiscs: Vec::new(),
+        }
+    }
 }
 
 /// Parses only complete records; a line truncated by a crash is not an instruction.
@@ -770,6 +826,7 @@ fn parse_journal(text: &str) -> JournalRecords {
     for line in text.lines() {
         let mut fields = line.split('\t');
         match (fields.next(), fields.next(), fields.next()) {
+            (Some("version"), Some("2"), _) => records.version = 2,
             (Some("sysctl"), Some(path), Some(value)) if !value.is_empty() => {
                 records.sysctls.push((path.to_owned(), value.to_owned()));
             }
@@ -787,9 +844,14 @@ fn parse_journal(text: &str) -> JournalRecords {
 
 /// Restores what a previous daemon run could not clean up itself.
 ///
+/// For a current (v2) journal this is **host-TC cleanup only**: the namespace, pair, ingress
+/// policy and ingress sysctls are released with the process (ADR-0038), and host-global
+/// sysctls are prerequisites the daemon never writes (ADR-0013). A pre-v2 journal, or a
+/// missing journal from an older run, still runs the full legacy restore because that state
+/// may predate those guarantees.
+///
 /// Safe to call when there is nothing to restore: every step is idempotent, and a missing
-/// journal merely means there is no sysctl/qdisc record to replay. The namespace, pair and
-/// host policy routing are always removed because they are daer-owned by definition.
+/// journal merely means there is nothing to replay.
 ///
 /// # Errors
 ///
@@ -798,8 +860,12 @@ fn parse_journal(text: &str) -> JournalRecords {
 pub fn cleanup_system_state() -> Result<(), DatapathError> {
     let mut first_error = None;
     let journal = fs::read_to_string(JOURNAL_PATH).ok();
+    // A missing journal is the legacy case: an older run may have changed host state before
+    // the journal existed. The full cleanup is idempotent, so it is the safe answer.
+    let mut legacy = journal.is_none();
     if let Some(journal) = journal {
         let records = parse_journal(&journal);
+        legacy = records.version < 2;
 
         // Stop redirecting first: a stale filter sends traffic into a listener that is gone.
         // This is the same order the normal Drop path uses (filters, qdisc, sysctls).
@@ -810,30 +876,34 @@ pub fn cleanup_system_state() -> Result<(), DatapathError> {
             delete_clsact(&interface);
         }
 
-        // Reverse order: the last value written before the crash is the first one to undo.
-        for (path, value) in records.sysctls.into_iter().rev() {
-            if value.is_empty() {
-                continue;
-            }
-            let full = format!("/proc/sys/{path}");
-            if let Err(error) = fs::write(&full, &value) {
-                // A per-interface knob whose device is already gone has nothing left to
-                // restore. Ignoring ENOENT is what makes cleanup idempotent after the link
-                // was removed before the journal was replayed.
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    first_error.get_or_insert_with(|| {
-                        DatapathError::Device(format!(
-                            "cannot restore {full} = {value} from the recovery journal: {error}"
-                        ))
-                    });
+        if legacy {
+            // Reverse order: the last value written before the crash is the first one to undo.
+            for (path, value) in records.sysctls.into_iter().rev() {
+                if value.is_empty() {
+                    continue;
+                }
+                let full = format!("/proc/sys/{path}");
+                if let Err(error) = fs::write(&full, &value) {
+                    // A per-interface knob whose device is already gone has nothing left to
+                    // restore. Ignoring ENOENT is what makes cleanup idempotent after the
+                    // link was removed before the journal was replayed.
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        first_error.get_or_insert_with(|| {
+                            DatapathError::Device(format!(
+                                "cannot restore {full} = {value} from the recovery journal: {error}"
+                            ))
+                        });
+                    }
                 }
             }
         }
     }
 
-    crate::netns::remove_ingress_namespace();
-    remove_device_pair();
-    clear_host_policy_routing();
+    if legacy {
+        crate::netns::remove_ingress_namespace();
+        remove_device_pair();
+        clear_host_policy_routing();
+    }
 
     match first_error {
         Some(error) => {
@@ -871,6 +941,7 @@ pub fn attach(
     use daer_ebpf::loader::attach_tc;
     use daer_ebpf::names::program;
 
+    let tc_mode = tc_mode()?;
     let mut ebpf = loader::load_path(object, param).map_err(DatapathError::Object)?;
 
     // The map is the runtime source of truth for the redirect target. Leaving it at its
@@ -900,7 +971,7 @@ pub fn attach(
 
     for (interface, kind) in &lan_kinds {
         qdiscs.remember_filters(interface)?;
-        qdiscs.ensure(interface)?;
+        qdiscs.ensure(interface, tc_mode)?;
         // LAN ingress: traffic *from* the local network being proxied. LAN egress: the
         // reply direction of a proxied flow, and the box's own traffic on a LAN-facing
         // device.
@@ -909,6 +980,7 @@ pub fn attach(
             kind.pick(program::LAN_INGRESS_L2, program::LAN_INGRESS_L3),
             interface,
             TcAttachType::Ingress,
+            tc_mode,
         )
         .map_err(DatapathError::Object)?;
         attach_tc(
@@ -916,13 +988,14 @@ pub fn attach(
             kind.pick(program::LAN_EGRESS_L2, program::LAN_EGRESS_L3),
             interface,
             TcAttachType::Egress,
+            tc_mode,
         )
         .map_err(DatapathError::Object)?;
     }
 
     for (interface, kind) in &wan_kinds {
         qdiscs.remember_filters(interface)?;
-        qdiscs.ensure(interface)?;
+        qdiscs.ensure(interface, tc_mode)?;
         // WAN ingress and egress: the box's own traffic and the return path of a proxied
         // flow. These two hooks are what make `daer` a gateway for the host itself.
         attach_tc(
@@ -930,6 +1003,7 @@ pub fn attach(
             kind.pick(program::WAN_INGRESS_L2, program::WAN_INGRESS_L3),
             interface,
             TcAttachType::Ingress,
+            tc_mode,
         )
         .map_err(DatapathError::Object)?;
         attach_tc(
@@ -937,6 +1011,7 @@ pub fn attach(
             kind.pick(program::WAN_EGRESS_L2, program::WAN_EGRESS_L3),
             interface,
             TcAttachType::Egress,
+            tc_mode,
         )
         .map_err(DatapathError::Object)?;
     }
@@ -949,6 +1024,7 @@ pub fn attach(
         program::DEVICE_INGRESS,
         DEVICE,
         TcAttachType::Ingress,
+        tc_mode,
     )
     .map_err(DatapathError::Object)?;
     // A redirected packet arrives on `daer0peer` with a non-local source *and*
@@ -965,12 +1041,12 @@ pub fn attach(
     daer_ebpf::publish_listeners(&mut ebpf, listeners)
         .map_err(|error| DatapathError::Device(format!("cannot publish the listeners: {error}")))?;
 
-    // The peer hook is attached last on purpose. Aya's classic `cls_bpf` link is detached by
-    // ifindex in the namespace that is current at drop time; if anything after this point
-    // failed, `Ebpf` would drop in the host namespace and could detach a different device
-    // that happens to have the same ifindex. Everything that can fail is therefore done
-    // before the peer gets a link. Namespace deletion is still the backstop for a process
-    // that dies without unwinding.
+    // The peer hook is attached last on purpose. On the classic netlink path, Aya detaches
+    // the link by ifindex in the namespace current at drop time; if anything after this point
+    // failed, `Ebpf` would drop in the host namespace and could detach a different device with
+    // the same ifindex. TCX links are fd-owned and detach from anywhere, but both modes keep
+    // this order. Namespace deletion is still the backstop for a process that dies without
+    // unwinding.
     let peer_link = ingress
         .namespace
         .with(|| {
@@ -979,6 +1055,7 @@ pub fn attach(
                 program::PEER_INGRESS,
                 PEER,
                 TcAttachType::Ingress,
+                tc_mode,
             )
         })
         .map_err(|error| {
@@ -1059,13 +1136,13 @@ impl Drop for Attached {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::debug!(
+                daer_observe::warn!(daer_observe::EventCode::DatapathPeerDetachFailed,
                     %error,
                     "could not detach the peer ingress link inside the namespace"
                 );
             }
             Err(error) => {
-                tracing::debug!(
+                daer_observe::warn!(daer_observe::EventCode::DatapathPeerDetachFailed,
                     %error,
                     "could not enter the ingress namespace to detach the peer link"
                 );
@@ -1090,6 +1167,21 @@ impl Attached {
     /// Returns a message when the object is no longer owned, which would be a shutdown race.
     pub fn with_ebpf<T>(&self, f: impl FnOnce(&mut aya::Ebpf) -> T) -> Result<T, String> {
         self.ebpf.with_ebpf(f)
+    }
+
+    /// Takes the telemetry maps out of the object.
+    ///
+    /// The caller owns the reader for the rest of the run. Taking the maps is deliberate:
+    /// one reader, no aliasing of a ring-buffer fd, and no hidden second consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the object is gone or a map has the wrong type.
+    pub fn take_telemetry(&mut self) -> Result<daer_ebpf::telemetry::DatapathTelemetry, String> {
+        self.ebpf
+            .with_ebpf(daer_ebpf::telemetry::DatapathTelemetry::attach)
+            .map_err(|error| format!("cannot access the datapath object: {error}"))?
+            .map_err(|error| format!("cannot take the datapath telemetry maps: {error}"))
     }
 }
 
@@ -1119,6 +1211,68 @@ enum Scope {
     Ingress,
 }
 
+/// Whether a host sysctl needs an undo record in the crash journal.
+///
+/// A knob under a device daer creates disappears when that device is deleted:
+/// `/proc/sys/net/{ipv4,ipv6}/conf/<device>` is owned by the netdev, so a crash cannot leave
+/// a value behind once cleanup removes the pair. Recording it would only make the journal
+/// longer and make `cleanup_system_state` write to a path that no longer exists. Any other
+/// path is treated as surviving the device and is recorded; the current datapath writes no
+/// such host path (the host-global settings are prerequisites, see [`check_host_sysctls`]),
+/// but the predicate keeps a future host write from silently skipping the journal.
+fn host_sysctl_needs_journal(path: &str) -> bool {
+    let is_device_knob = |device: &str| {
+        path.starts_with(&format!("net/ipv4/conf/{device}/"))
+            || path.starts_with(&format!("net/ipv6/conf/{device}/"))
+    };
+    ![DEVICE, PEER].iter().any(|device| is_device_knob(device))
+}
+
+/// Host-global settings the datapath needs but does not own.
+///
+/// These used to be written and restored by the daemon. A global forwarding policy is not
+/// daer state: a `SIGKILL` left the daemon's value behind until the next start, and the next
+/// start could mistake it for the operator's baseline. The operator sets them once; startup
+/// refuses to change a single packet's path when they are missing.
+const HOST_SYSCTL_PREREQUISITES: &[(&str, &str)] = &[
+    ("net/ipv4/ip_forward", "1"),
+    ("net/ipv4/conf/all/forwarding", "1"),
+    ("net/ipv4/conf/all/rp_filter", "0"),
+    ("net/ipv4/conf/all/arp_filter", "0"),
+];
+
+/// Checks the host-global settings the datapath needs but does not own.
+///
+/// IPv6 is optional: a kernel built without it has no
+/// `/proc/sys/net/ipv6/conf/all/forwarding`; a dual-stack kernel must have forwarding on.
+///
+/// # Errors
+///
+/// Returns [`DatapathError::Device`] naming the first missing setting and how to set it.
+pub fn check_host_sysctls() -> Result<(), DatapathError> {
+    for (path, expected) in HOST_SYSCTL_PREREQUISITES {
+        check_sysctl(path, expected)?;
+    }
+    if Path::new("/proc/sys/net/ipv6/conf/all/forwarding").exists() {
+        check_sysctl("net/ipv6/conf/all/forwarding", "1")?;
+    }
+    Ok(())
+}
+
+fn check_sysctl(path: &str, expected: &str) -> Result<(), DatapathError> {
+    let full = format!("/proc/sys/{path}");
+    let current = std::fs::read_to_string(&full)
+        .map_err(|error| DatapathError::Device(format!("cannot read {full}: {error}")))?;
+    let current = current.trim();
+    if current != expected {
+        return Err(DatapathError::Device(format!(
+            "{full} is `{current}`, but daer requires `{expected}`; add the value to \
+             /etc/sysctl.d/99-daer.conf and run `sysctl --system`"
+        )));
+    }
+    Ok(())
+}
+
 impl Sysctl {
     /// Disables reverse-path filtering on the peer and enables forwarding.
     ///
@@ -1141,19 +1295,14 @@ impl Sysctl {
             namespace: Arc::clone(namespace),
         };
         for (scope, path, value) in [
-            // Host: the peer is in the ingress namespace, but the reply crosses back through
-            // `daer0` and is forwarded to the client by the host stack. Without host
-            // forwarding and the all-interface martian check disabled, the reply is dropped
-            // before it reaches `wlan0`.
-            (Scope::Host, "net/ipv4/ip_forward", "1"),
-            (Scope::Host, "net/ipv4/conf/all/forwarding", "1"),
-            (Scope::Host, "net/ipv4/conf/all/rp_filter", "0"),
-            (Scope::Host, "net/ipv4/conf/all/arp_filter", "0"),
+            // Host-global forwarding and martian settings are prerequisites, checked before
+            // this guard runs (`check_host_sysctls`); they are not written here. What remains
+            // in the host namespace is owned by `daer0`: the device disappears with the pair,
+            // taking these per-device knobs with it.
             (Scope::Host, "net/ipv4/conf/daer0/rp_filter", "0"),
             (Scope::Host, "net/ipv4/conf/daer0/accept_local", "1"),
             (Scope::Host, "net/ipv4/conf/daer0/arp_filter", "0"),
             (Scope::Host, "net/ipv4/conf/daer0/forwarding", "1"),
-            (Scope::Host, "net/ipv6/conf/all/forwarding", "1"),
             (Scope::Host, "net/ipv6/conf/daer0/disable_ipv6", "0"),
             (Scope::Host, "net/ipv6/conf/daer0/forwarding", "1"),
             // Ingress: a redirected packet arrives with a non-local source and destination.
@@ -1173,7 +1322,7 @@ impl Sysctl {
                 // IPv6 has no /proc/sys/net/ipv6 tree; refusing to attach would turn a
                 // working IPv4 proxy into a startup failure.
                 if let Err(error) = guard.write(path, value, scope) {
-                    tracing::warn!(%error, "IPv6 sysctl is unavailable; continuing with IPv4");
+                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable,%error, "IPv6 sysctl is unavailable; continuing with IPv4");
                 }
                 continue;
             }
@@ -1193,15 +1342,18 @@ impl Sysctl {
                     return Ok(());
                 }
                 // The undo record precedes the write: a crash between the two leaves a
-                // harmless no-op restore, never a modified value with no way back.
-                self.journal.record(&format!(
-                    "sysctl\t{path}\t{}",
-                    previous
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim()
-                        .replace(['\t', '\n', '\r'], " ")
-                ))?;
+                // harmless no-op restore, never a modified value with no way back. A knob
+                // under `daer0`/`daer0peer` is skipped: deleting the device removes it.
+                if host_sysctl_needs_journal(path) {
+                    self.journal.record(&format!(
+                        "sysctl\t{path}\t{}",
+                        previous
+                            .as_deref()
+                            .unwrap_or("")
+                            .trim()
+                            .replace(['\t', '\n', '\r'], " ")
+                    ))?;
+                }
                 std::fs::write(&full, value).map_err(|error| {
                     DatapathError::Device(format!("cannot write {full} = {value}: {error}"))
                 })?;
@@ -1235,7 +1387,7 @@ impl Drop for Sysctl {
             match scope {
                 Scope::Host => {
                     if let Err(error) = std::fs::write(format!("/proc/sys/{path}"), value.trim()) {
-                        tracing::warn!(%error, path, "could not restore a host sysctl");
+                        daer_observe::warn!(daer_observe::EventCode::DatapathSysctlRestoreFailed,%error, path, "could not restore a host sysctl");
                         self.journal.mark_failed();
                     }
                 }
@@ -1331,7 +1483,8 @@ pub fn republish_policy(
     };
 
     if policy.equivalent {
-        tracing::info!(
+        daer_observe::info!(
+            daer_observe::EventCode::DatapathPolicyPublished,
             slot = target.index(),
             entries = published.entries,
             trie_entries = policy.lpms.len(),
@@ -1339,7 +1492,8 @@ pub fn republish_policy(
         );
     } else {
         let reasons: Vec<String> = policy.reasons.iter().map(ToString::to_string).collect();
-        tracing::warn!(
+        daer_observe::warn!(
+            daer_observe::EventCode::DatapathPolicyDeferred,
             slot = target.index(),
             entries = published.entries,
             reasons = ?reasons,
@@ -1445,12 +1599,25 @@ mod tests {
              qdisc\teth0\t\n\
              sysctl\tnet/ipv4/conf/all/rp_filter\t2\n",
         );
+        assert_eq!(records.version, 1, "an unheadered journal is legacy");
         assert_eq!(
             records.sysctls,
             vec![
                 ("net/ipv4/ip_forward".to_owned(), "1".to_owned()),
                 ("net/ipv4/conf/all/rp_filter".to_owned(), "2".to_owned()),
             ]
+        );
+        assert_eq!(records.interfaces, vec!["eth0".to_owned()]);
+        assert_eq!(records.qdiscs, vec!["eth0".to_owned()]);
+    }
+
+    #[test]
+    fn a_v2_journal_carries_host_tc_records_but_is_not_legacy() {
+        let records = parse_journal("version\t2\ninterface\teth0\t\nqdisc\teth0\t\n");
+        assert_eq!(records.version, 2);
+        assert!(
+            records.sysctls.is_empty(),
+            "current runs write no host sysctls"
         );
         assert_eq!(records.interfaces, vec!["eth0".to_owned()]);
         assert_eq!(records.qdiscs, vec!["eth0".to_owned()]);
@@ -1470,5 +1637,42 @@ mod tests {
         );
         assert!(records.interfaces.is_empty());
         assert!(records.qdiscs.is_empty());
+    }
+
+    #[test]
+    fn per_device_sysctls_are_not_journaled() {
+        // Deleting `daer0`/`daer0peer` removes their `/proc/sys/net/*/conf/<device>` entries,
+        // so recording those values would make cleanup write to a path that no longer exists.
+        for path in [
+            format!("net/ipv4/conf/{DEVICE}/rp_filter"),
+            format!("net/ipv4/conf/{PEER}/accept_local"),
+            format!("net/ipv6/conf/{DEVICE}/forwarding"),
+        ] {
+            assert!(!host_sysctl_needs_journal(&path), "{path}");
+        }
+        for path in [
+            "net/ipv4/ip_forward",
+            "net/ipv4/conf/all/rp_filter",
+            "net/ipv6/conf/all/forwarding",
+        ] {
+            assert!(host_sysctl_needs_journal(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_tc_attach_mode_defaults_to_netlink_and_rejects_typos() {
+        use daer_ebpf::loader::TcMode;
+
+        assert_eq!(parse_tc_mode(None).expect("default"), TcMode::Netlink);
+        assert_eq!(
+            parse_tc_mode(Some("netlink")).expect("explicit netlink"),
+            TcMode::Netlink
+        );
+        assert_eq!(parse_tc_mode(Some("tcx")).expect("tcx"), TcMode::Tcx);
+
+        // A typo must not silently keep the default: the gate would then "pass" while
+        // exercising the classic path, which is exactly the vacuous result ADR-0007 forbids.
+        let error = parse_tc_mode(Some("tcX")).expect_err("a typo must fail");
+        assert!(error.to_string().contains("DAER_TC_ATTACH"), "{error}");
     }
 }

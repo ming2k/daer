@@ -122,7 +122,7 @@ where
         let flow = match tokio::select! {
             () = &mut shutdown => {
                 let in_flight = supervisor.in_flight();
-                tracing::info!(
+                daer_observe::info!(daer_observe::EventCode::DaemonStopping,
                     in_flight,
                     "stopped accepting; live flows keep relaying"
                 );
@@ -131,7 +131,8 @@ where
             accepted = ingress.accept() => accepted,
         } {
             Ok(flow) => {
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::FlowAccepted,
+                    flow_id = %flow.flow_id,
                     source = %flow.source,
                     destination = %flow.destination,
                     "accepted redirected flow"
@@ -140,12 +141,12 @@ where
             }
             Err(RelayError::Rejected(reject)) => {
                 metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%reject, "dropped a flow that was not redirected");
+                daer_observe::debug!(daer_observe::EventCode::FlowRejected,%reject, "dropped a flow that was not redirected");
                 continue;
             }
             Err(RelayError::Accept(error)) if is_resource_exhausted(&error) => {
                 metrics.exhausted.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(%error, "accept failed on a resource limit; backing off");
+                daer_observe::warn!(daer_observe::EventCode::FlowAcceptResourceExhausted,%error, "accept failed on a resource limit; backing off");
                 tokio::time::sleep(EXHAUSTION_BACKOFF).await;
                 continue;
             }
@@ -157,17 +158,24 @@ where
             Ok(upstream) => upstream,
             Err(error) => {
                 metrics.failed.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%error, destination = %flow.destination, "no outbound leg");
+                daer_observe::debug!(
+                    daer_observe::EventCode::FlowNoOutbound,
+                    flow_id = %flow.flow_id,
+                    %error,
+                    destination = %flow.destination,
+                    "no outbound leg"
+                );
                 continue;
             }
         };
 
         // The relay owns both halves from here, and the supervisor owns the relay:
         // the loop keeps accepting, and stopping the loop leaves this flow running.
-        supervisor.spawn(async move {
+        supervisor.spawn_tracked(flow.flow_id, async move {
             match splice(flow.stream, upstream).await {
                 Ok(relayed) => {
-                    tracing::debug!(
+                    daer_observe::debug!(daer_observe::EventCode::FlowClosed,
+                        flow_id = %flow.flow_id,
                         destination = %flow.destination,
                         to_upstream = relayed.to_upstream,
                         to_client = relayed.to_client,
@@ -177,7 +185,13 @@ where
                     relayed
                 }
                 Err(error) => {
-                    tracing::debug!(%error, destination = %flow.destination, "relay failed");
+                    daer_observe::warn!(
+                        daer_observe::EventCode::FlowRelayFailed,
+                        flow_id = %flow.flow_id,
+                        %error,
+                        destination = %flow.destination,
+                        "relay failed"
+                    );
                     Relayed::default()
                 }
             }
@@ -209,7 +223,7 @@ where
         let flow = match tokio::select! {
             () = &mut shutdown => {
                 let in_flight = supervisor.in_flight();
-                tracing::info!(
+                daer_observe::info!(daer_observe::EventCode::DaemonStopping,
                     in_flight,
                     "stopped accepting; live flows keep relaying"
                 );
@@ -218,7 +232,8 @@ where
             accepted = ingress.accept() => accepted,
         } {
             Ok(flow) => {
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::FlowAccepted,
+                    flow_id = %flow.flow_id,
                     source = %flow.source,
                     destination = %flow.destination,
                     "accepted redirected flow"
@@ -227,12 +242,12 @@ where
             }
             Err(RelayError::Rejected(reject)) => {
                 metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%reject, "dropped a flow that was not redirected");
+                daer_observe::debug!(daer_observe::EventCode::FlowRejected,%reject, "dropped a flow that was not redirected");
                 continue;
             }
             Err(RelayError::Accept(error)) if is_resource_exhausted(&error) => {
                 metrics.exhausted.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(%error, "accept failed on a resource limit; backing off");
+                daer_observe::warn!(daer_observe::EventCode::FlowAcceptResourceExhausted,%error, "accept failed on a resource limit; backing off");
                 tokio::time::sleep(EXHAUSTION_BACKOFF).await;
                 continue;
             }
@@ -241,11 +256,12 @@ where
 
         metrics.accepted.fetch_add(1, Ordering::Relaxed);
         let destination = flow.destination;
+        let flow_id = flow.flow_id;
         let decide = Arc::clone(&decide);
         let task_supervisor = supervisor.handle();
         // The supervisor owns the task, so a failed decision is accounted for and does
         // not stall the loop. The relay itself is spawned only after the upstream exists.
-        supervisor.spawn(async move {
+        supervisor.spawn_tracked(flow_id, async move {
             let upstream = match decide.decide(&flow).await {
                 Ok(upstream) => upstream,
                 Err(error) => {
@@ -253,13 +269,20 @@ where
                         .metrics()
                         .failed
                         .fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%error, %destination, "no outbound leg");
+                    daer_observe::debug!(
+                        daer_observe::EventCode::FlowNoOutbound,
+                        flow_id = %flow_id,
+                        %error,
+                        %destination,
+                        "no outbound leg"
+                    );
                     return Relayed::default();
                 }
             };
             match splice(flow.stream, upstream).await {
                 Ok(relayed) => {
-                    tracing::debug!(
+                    daer_observe::debug!(daer_observe::EventCode::FlowClosed,
+                        flow_id = %flow_id,
                         destination = %destination,
                         to_upstream = relayed.to_upstream,
                         to_client = relayed.to_client,
@@ -269,7 +292,13 @@ where
                     relayed
                 }
                 Err(error) => {
-                    tracing::debug!(%error, %destination, "relay failed");
+                    daer_observe::warn!(
+                        daer_observe::EventCode::FlowRelayFailed,
+                        flow_id = %flow_id,
+                        %error,
+                        %destination,
+                        "relay failed"
+                    );
                     Relayed::default()
                 }
             }
@@ -369,7 +398,11 @@ where
         )
         .await;
         if let Err(error) = result {
-            tracing::warn!(%error, "datagram relay stopped");
+            daer_observe::warn!(
+                daer_observe::EventCode::DaemonUdpUnavailable,
+                %error,
+                "datagram relay stopped"
+            );
         }
     };
 
@@ -411,14 +444,47 @@ mod tests {
     #[derive(Debug)]
     struct PlainListener(TcpListener);
 
+    fn next_flow_id() -> daer_observe::FlowId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        daer_observe::FlowId::new(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
     impl Ingress for PlainListener {
         async fn accept(&self) -> Result<Accepted, RelayError> {
             let (stream, source) = self.0.accept().await.map_err(RelayError::Accept)?;
             let destination = stream.local_addr().map_err(RelayError::Socket)?;
             Ok(Accepted {
                 stream,
+                flow_id: next_flow_id(),
                 source,
                 destination,
+            })
+        }
+    }
+
+    /// A decider that records the ingress ID and then dials an echo server.
+    #[derive(Debug)]
+    struct RecordingDecide {
+        upstream: SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<daer_observe::FlowId>>>,
+    }
+
+    impl Decide for RecordingDecide {
+        type Upstream = tokio::net::TcpStream;
+        type Future<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Upstream, RelayError>> + Send + 'a>,
+        >;
+
+        fn decide<'a>(&'a self, flow: &'a Accepted) -> Self::Future<'a> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(flow.flow_id);
+            let upstream = self.upstream;
+            Box::pin(async move {
+                tokio::net::TcpStream::connect(upstream)
+                    .await
+                    .map_err(RelayError::Relay)
             })
         }
     }
@@ -677,6 +743,7 @@ mod tests {
                     .await
                     .map_err(RelayError::Socket)?;
                 Ok(Datagram {
+                    flow_id: daer_observe::FlowId::new(1),
                     source,
                     destination: self.destination,
                     len,
@@ -696,6 +763,39 @@ mod tests {
             // the pair instead of relying on the wire.
             Box::pin(async move { self.socket.send_to(payload, peer).await })
         }
+    }
+
+    #[tokio::test]
+    async fn a_flow_trace_is_joinable_by_id() {
+        // The ingress creates the ID; the decider must receive the same value. Without this,
+        // `flow.accepted` and `flow.decided` could only be joined by guessing from the 4-tuple.
+        let upstream = echo_server().await;
+        let listener = PlainListener(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("binds"),
+        );
+        let ingress_addr = listener.0.local_addr().expect("addr");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decide = Arc::new(RecordingDecide {
+            upstream,
+            seen: Arc::clone(&seen),
+        });
+        let supervisor = Supervisor::new();
+        let loop_task = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let shutdown = std::future::pending::<()>();
+            async move { serve_parallel(&listener, decide, &supervisor, shutdown).await }
+        });
+
+        assert_eq!(talk_to(ingress_addr, b"one").await, b"one");
+        assert_eq!(talk_to(ingress_addr, b"two").await, b"two");
+        loop_task.abort();
+        let _ = loop_task.await;
+        let ids = seen.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_ne!(ids[0], ids[1], "two flows cannot share a correlation ID");
+        assert!(ids.iter().all(|id| id.get() != 0));
     }
 
     #[tokio::test]

@@ -87,8 +87,8 @@ rules = [
 fallback = "proxy"
 ```
 
-- **Non-Root & XDG Compliance**:
-  Downloaded artifacts are stored in `$XDG_CACHE_HOME/daer/rules` or `$HOME/.cache/daer/rules` (with `/tmp` fallback). No root or `sudo` privilege is required.
+- **System-Wide Cache**:
+  Downloaded artifacts are stored in `/var/cache/daer/rules` by default; `DAER_RULE_CACHE_DIR` overrides the location.
 - **Invariant `[INV-PROVIDER-01]` (Rule Provider SSOT)**:
   Rule providers are resolved in `daer_control::load_resolved` prior to generation creation, ensuring diagnostic commands (`daer route`, `daer check --nodes`) never diverge from the running daemon.
 - **Offline Resilience**:

@@ -27,7 +27,7 @@ Controls global transparent proxy, networking, and daemon behaviors.
 | `wan-interface` | list of string | `["auto"]` | Egress interfaces toward the internet. `"auto"` resolves to the interface carrying the default route; an empty list is a configuration error. |
 | `lan-interface` | list of string | `[]` | Ingress interfaces receiving client traffic. |
 | `so-mark` | integer (hex/dec) | `0x0dae` when omitted | Socket mark applied before outbound `connect(2)` to evade loop redirection. Omitted, a privileged run picks `0x0dae` and an unprivileged one marks nothing. |
-| `log-level` | string | `"info"` | `tracing` filter directive: `"info"`, `"debug"`, or `"daer=debug,netune=trace"`. |
+| `log-level` | string | `"info"` | `tracing` filter directive: `"info"`, `"debug"`, or `"daer=debug,netune=trace"`. An unparseable directive fails `daer check` and startup; it never silently falls back to `info`. |
 | `disable-waiting-network` | boolean | `false` | When true, fails immediately if the default route is missing rather than waiting up to 2 minutes. |
 | `sniffing-timeout` | duration | `"30ms"` | How long to wait for a sniffable byte sequence before routing by IP. |
 | `auto-sniff-punt` | boolean | `true` | When false, a name is only used after the flow reaches userspace, never as a reason to hold it up. |
@@ -202,7 +202,7 @@ Declares pre-compiled DRB (`.drb`) or human-readable text rule sets from local f
 | `tag` | string | Required | Unique identifier for referencing in routing rules via `provider(tag)`. |
 | `type` | string | `"file"` | Provider type: `"file"` or `"http"`. |
 | `url` | string | Optional | Remote download URL (required when `type = "http"`). |
-| `path` | string | Optional | Local file path (required when `type = "file"`). |
+| `path` | string | Optional | Local file path (required when `type = "file"`). Relative paths resolve against the configuration directory; system-wide local sets belong under `/var/lib/daer/rules/`. |
 | `format` | string | `"drb"` | Artifact format: `"drb"` (binary zero-copy) or `"text"` (plain text). |
 | `interval` | string | Optional | Auto-update interval for HTTP providers (e.g. `"24h"`, `"12h"`). |
 
@@ -255,8 +255,9 @@ Configures the built-in DNS server, caching, and upstream transports.
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Enabling it also starts the DNS server. |
-| `inet` | string | `"198.18.0.0/15"` | The pool's prefix. |
-| `pool-size` | integer | `65535` | Number of synthetic addresses. |
+| `inet` | string | `"198.18.0.0/15"` | The IPv4 pool prefix. |
+| `inet6` | string | unset | Optional IPv6 pool prefix. When set, `AAAA` queries receive synthetic addresses too; when unset, `AAAA` is answered with an empty NOERROR so clients fall back to the synthetic `A`. |
+| `pool-size` | integer | `65535` | Number of synthetic addresses per address family. |
 | `exclude` | list of string | `[]` | Domains that must never get a synthetic address. Each entry is a domain pattern: a bare name (suffix), `.name` (subdomains only), or `=name` (exact); `keyword:`/`regex:` are also accepted here (ADR-0033, ADR-0036). |
 
 ---

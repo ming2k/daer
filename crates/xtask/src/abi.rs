@@ -37,6 +37,13 @@ pub struct Abi {
     pub l4_protos: Vec<Discriminant>,
     #[serde(default)]
     pub ip_versions: Vec<Discriminant>,
+    /// `bpf_stats_map` keys. These are a userspace-visible contract: a missing
+    /// consumer leaves a counter invisible.
+    #[serde(default)]
+    pub bpf_stats: Vec<Discriminant>,
+    /// `event_ringbuf` record types. Same contract as `bpf_stats`.
+    #[serde(default)]
+    pub event_types: Vec<Discriminant>,
     #[serde(default)]
     pub structs: std::collections::BTreeMap<String, Struct>,
 }
@@ -90,12 +97,26 @@ pub struct Struct {
     pub size: usize,
     pub align: usize,
     pub fields: Vec<StructField>,
+    /// Emit a Rust `#[repr(C)]` definition in `generated.rs`, not only layout constants.
+    ///
+    /// Existing entries are layout-only because their Rust types are hand-written with
+    /// domain names (`TuplesKey`, `RuntimeParam`). The event record is generated on both
+    /// sides because it crosses the ring-buffer boundary as raw bytes and has no second
+    /// domain representation.
+    #[serde(default)]
+    pub rust: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct StructField {
     pub name: String,
     pub offset: usize,
+    /// Rust/C type spelling (`u32`, `[u8; 16]`), required when `rust = true`.
+    #[serde(default)]
+    pub c_type: Option<String>,
+    /// Rust field name when it differs from the C name (`type` is a keyword).
+    #[serde(default)]
+    pub rust_name: Option<String>,
 }
 
 /// Turns a declared type into a C declaration.
@@ -113,6 +134,19 @@ fn c_declaration(ty: &str, name: &str) -> (String, String) {
         return (c_scalar(elem.trim()), format!("{name}[{len}]"));
     }
     (c_scalar(ty), name.to_owned())
+}
+
+/// `daer_event` -> `DaerEvent`.
+fn rust_type_name(name: &str) -> String {
+    name.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Maps a scalar type to its kernel spelling.
@@ -219,6 +253,22 @@ impl Abi {
         }
         let _ = writeln!(out, "}};\n");
 
+        // Structs that are generated on both sides. Layout-only entries are emitted into
+        // `daer_abi_assertions.h` below and declared by the module that owns them.
+        for (name, s) in self.structs.iter().filter(|(_, s)| s.rust) {
+            let _ = writeln!(out, "/* struct {name}, generated for both sides. */");
+            let _ = writeln!(out, "struct {name} {{");
+            for field in &s.fields {
+                let ty = field
+                    .c_type
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("struct {name}: field {} has no c_type", field.name));
+                let (decl, field_name) = c_declaration(ty, &field.name);
+                let _ = writeln!(out, "\t{decl} {field_name};");
+            }
+            let _ = writeln!(out, "}};\n");
+        }
+
         let _ = writeln!(
             out,
             "/* enum MatchType, packed: one byte inside struct match_set. */"
@@ -265,6 +315,11 @@ impl Abi {
         }
         let _ = writeln!(out, "}};\n");
 
+        // Kernel telemetry discriminants. They are consumed by userspace through
+        // `daer-ebpf::telemetry`; the generated header is the one declaration both sides see.
+        self.render_c_enum(&mut out, "bpf_stats_key", "BPF_STATS", &self.bpf_stats);
+        self.render_c_enum(&mut out, "daer_event_type", "DAER_EVENT", &self.event_types);
+
         let _ = writeln!(out, "\n#endif /* {guard} */");
         out
     }
@@ -305,6 +360,15 @@ impl Abi {
             }
         }
         out
+    }
+
+    fn render_c_enum(&self, out: &mut String, c_name: &str, _prefix: &str, items: &[Discriminant]) {
+        let _ = writeln!(out, "enum {c_name} {{");
+        for (index, item) in items.iter().enumerate() {
+            let comma = if index + 1 == items.len() { "" } else { "," };
+            let _ = writeln!(out, "\t{} = {}{comma}", item.name, item.value);
+        }
+        let _ = writeln!(out, "}};\n");
     }
 
     /// The Rust module, `crates/daer-ebpf/src/generated.rs`.
@@ -453,6 +517,67 @@ impl Abi {
             let _ = writeln!(out, "    pub const {name}: u8 = {};", item.value);
         }
         let _ = writeln!(out, "}}\n");
+
+        let _ = writeln!(
+            out,
+            "/// `enum bpf_stats_key`: the `bpf_stats_map` counters."
+        );
+        let _ = writeln!(out, "pub mod bpf_stats {{");
+        for item in &self.bpf_stats {
+            let name = item.rust_const.as_deref().unwrap_or(&item.name);
+            let _ = writeln!(out, "    pub const {name}: u32 = {};", item.value);
+        }
+        let _ = writeln!(out, "}}\n");
+
+        let _ = writeln!(
+            out,
+            "/// `enum daer_event_type`: the ring-buffer record types."
+        );
+        let _ = writeln!(out, "pub mod event_type {{");
+        for item in &self.event_types {
+            let name = item.rust_const.as_deref().unwrap_or(&item.name);
+            let _ = writeln!(out, "    pub const {name}: u32 = {};", item.value);
+        }
+        let _ = writeln!(out, "}}\n");
+
+        for (name, s) in self.structs.iter().filter(|(_, s)| s.rust) {
+            let module = name;
+            let rust_name = rust_type_name(name);
+            let _ = writeln!(
+                out,
+                "/// `struct {name}`, generated from `ebpf/abi.toml`.\npub mod {module} {{\n    #[repr(C)]\n    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]\n    pub struct {rust_name} {{"
+            );
+            for field in &s.fields {
+                let ty = field
+                    .c_type
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("struct {name}: field {} has no c_type", field.name));
+                let field_name = field.rust_name.as_deref().unwrap_or(&field.name);
+                let _ = writeln!(out, "        pub {field_name}: {ty},");
+            }
+            let _ = writeln!(out, "    }}\n");
+            let _ = writeln!(out, "    /// The declared size, in bytes.");
+            let _ = writeln!(out, "    pub const SIZE: usize = {};", s.size);
+            let _ = writeln!(out, "    /// The declared alignment, in bytes.");
+            let _ = writeln!(out, "    pub const ALIGN: usize = {};", s.align);
+            let _ = writeln!(
+                out,
+                "\n    const _: () = assert!(std::mem::size_of::<{rust_name}>() == SIZE);"
+            );
+            let _ = writeln!(
+                out,
+                "    const _: () = assert!(std::mem::align_of::<{rust_name}>() == ALIGN);"
+            );
+            for field in &s.fields {
+                let field_name = field.rust_name.as_deref().unwrap_or(&field.name);
+                let _ = writeln!(
+                    out,
+                    "    const _: () = assert!(std::mem::offset_of!({rust_name}, {field_name}) == {});",
+                    field.offset
+                );
+            }
+            let _ = writeln!(out, "}}\n");
+        }
 
         let _ = writeln!(
             out,

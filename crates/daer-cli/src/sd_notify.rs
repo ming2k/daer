@@ -62,7 +62,7 @@ impl Notifier {
             Err(error) => {
                 // Before `init_logging`, this line is intentionally unseen. The failure is
                 // still harmless: the service runs, only its status updates are missing.
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::DaemonSdNotifyDisabled,
                     %error,
                     "NOTIFY_SOCKET is not usable; systemd notifications are disabled"
                 );
@@ -172,7 +172,7 @@ impl Notifier {
             // `WouldBlock` means the notification queue is full. Status is best-effort and
             // must never block the daemon, so it is dropped rather than retried.
             if error.kind() != io::ErrorKind::WouldBlock {
-                tracing::debug!(%error, "could not send a systemd notification");
+                daer_observe::debug!(daer_observe::EventCode::DaemonSdNotifyFailed,%error, "could not send a systemd notification");
             }
         }
     }

@@ -16,6 +16,7 @@ use aya::EbpfError;
 use aya::EbpfLoader;
 use aya::maps::Array;
 use aya::maps::MapError;
+use aya::programs::LinkOrder;
 use aya::programs::ProgramError;
 use aya::programs::tc::NlOptions;
 use aya::programs::tc::SchedClassifier;
@@ -24,6 +25,7 @@ use aya::programs::tc::TcAttachOptions;
 use aya::programs::tc::TcAttachType;
 use aya::programs::tc::TcError;
 use aya::programs::tc::qdisc_add_clsact;
+use aya::util::KernelVersion;
 
 use crate::abi::RuntimeParam;
 use crate::names;
@@ -42,6 +44,8 @@ pub enum LoadError {
     Tc(TcError),
     /// The object is missing a map, program or global this crate references.
     NotFound(String),
+    /// The requested attachment mode is not available on this kernel.
+    Unsupported(String),
 }
 
 impl fmt::Display for LoadError {
@@ -53,6 +57,7 @@ impl fmt::Display for LoadError {
             Self::Map(err) => write!(f, "eBPF map error: {err}"),
             Self::Tc(err) => write!(f, "tc error: {err}"),
             Self::NotFound(name) => write!(f, "eBPF object is missing \"{name}\""),
+            Self::Unsupported(message) => write!(f, "unsupported attachment: {message}"),
         }
     }
 }
@@ -66,6 +71,7 @@ impl std::error::Error for LoadError {
             Self::Map(err) => Some(err),
             Self::Tc(err) => Some(err),
             Self::NotFound(_) => None,
+            Self::Unsupported(_) => None,
         }
     }
 }
@@ -249,34 +255,71 @@ pub fn ensure_clsact(interface: &str) -> Result<bool, LoadError> {
     }
 }
 
+/// How a `SchedClassifier` is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcMode {
+    /// Classic `cls_bpf` through netlink. The filter outlives the process and is removed by
+    /// the crash journal or the next start.
+    Netlink,
+    /// TCX through `bpf_link`. The link is fd-owned, so closing it detaches the program,
+    /// including when the process is killed.
+    Tcx,
+}
+
+/// Whether the running kernel has the TCX link type.
+fn tcx_supported() -> Result<bool, LoadError> {
+    let current = KernelVersion::current().map_err(|error| {
+        LoadError::Unsupported(format!("cannot read the kernel version: {error}"))
+    })?;
+    Ok(current >= KernelVersion::new(6, 6, 0))
+}
+
 /// Attaches one tc program to `interface` in `direction`.
 ///
-/// The clsact qdisc is created on demand. An existing qdisc is not an error:
-/// a reload keeps the qdisc of the previous generation, and the attach below is
-/// what actually has to succeed.
+/// The classic path creates the `clsact` qdisc on demand; an existing qdisc is not an error.
+/// TCX is a `bpf_link` on the netdev and creates no qdisc.
 pub fn attach_tc(
     ebpf: &mut Ebpf,
     program_name: &str,
     interface: &str,
     direction: TcAttachType,
+    mode: TcMode,
 ) -> Result<SchedClassifierLinkId, LoadError> {
     let program = ebpf
         .program_mut(program_name)
         .ok_or_else(|| LoadError::NotFound(program_name.to_owned()))?;
     let classifier: &mut SchedClassifier = program.try_into().map_err(LoadError::Program)?;
     classifier.load().map_err(LoadError::Program)?;
-    ensure_clsact(interface)?;
-    // Force the classic cls_bpf path. Aya's `attach` prefers TCX on kernels >= 6.6,
-    // but `bpf_sk_assign` is a classic TC-ingress helper on this data path; the
-    // reference implementation attaches the same programs with `tc`, and TCX left
-    // the assigned packet without ever reaching the listener's accept queue.
-    classifier
-        .attach_with_options(
-            interface,
-            direction,
-            TcAttachOptions::Netlink(NlOptions::default()),
-        )
-        .map_err(LoadError::Program)
+    match mode {
+        TcMode::Netlink => {
+            ensure_clsact(interface)?;
+            // The classic TC-ingress path is the one this data path was proven on:
+            // `bpf_sk_assign` is a classic TC helper, and a TCX attach was observed to leave
+            // the assigned packet without reaching the listener's accept queue. TCX is
+            // opt-in until the privileged transparent-path gate proves otherwise.
+            classifier
+                .attach_with_options(
+                    interface,
+                    direction,
+                    TcAttachOptions::Netlink(NlOptions::default()),
+                )
+                .map_err(LoadError::Program)
+        }
+        TcMode::Tcx => {
+            if !tcx_supported()? {
+                return Err(LoadError::Unsupported(
+                    "TCX attachment requires Linux 6.6 or newer".to_owned(),
+                ));
+            }
+            classifier
+                .attach_with_options(
+                    interface,
+                    direction,
+                    TcAttachOptions::TcxOrder(LinkOrder::default()),
+                )
+                .map_err(LoadError::Program)
+        }
+    }
 }
 
 /// Map names present in a loaded object.

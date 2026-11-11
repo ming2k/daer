@@ -1,8 +1,21 @@
 # Diagnostics
 
-Where to look, in the order you will need it. Every claim here is enforced by a
-test or by a field name that exists in the code — this page is a map, not
-aspiration.
+Where to look, in the order you will need it. Every event below has a stable code in
+[`docs/reference/events.md`](../reference/events.md); the message is presentation, the code is
+the contract. `daer status` is the first command; the rest of this page is the deep dive.
+
+## 0. "What does the daemon believe right now?"
+
+```sh
+daer status                 # live socket, or the last state file with a warning
+daer status --json          # the versioned snapshot for automation
+daer status --bundle DIR    # a redacted incident bundle
+```
+
+The snapshot answers generation, policy hash, datapath attachment, live flows, DNS counters,
+UDP sessions, exact event counters and the userspace mirror of the datapath counters. It is
+read-only: it cannot start, stop or reload anything (ADR-0041). `/run/daer/events.jsonl` is
+the JSONL flight recorder; `daer status --flow <ID>` prints every event for one flow from it.
 
 ## 1. "What is running?"
 
@@ -49,8 +62,8 @@ reload rejected: outbound (group) "nope" not found; gen4 is still serving
 ## 3. "This flow went to the wrong outbound."
 
 ```
-debug flow decided   generation=gen2 source=192.168.1.10:41234 destination=93.184.216.34:443
-                     rule=rule 0 outbound=block mark=0 must=false
+debug flow decided   flow_id=f0000000000000012 generation=gen2 source=192.168.1.10:41234
+                     destination=93.184.216.34:443 rule=rule 0 outbound=block mark=0 must=false
 ```
 
 `rule` is the index of the matching rule in the compiled program, or `fallback`
@@ -60,8 +73,9 @@ change what the kernel and the outbound do, and reading them from the log is fas
 than reading the config.
 
 ```
-trace node selected  group=proxy node=hk-01 protocol=Socks5
-debug flow closed    destination=93.184.216.34:443 to_upstream=512 to_client=4096 elapsed_ms=87
+trace node selected  flow_id=f0000000000000012 group=proxy node=hk-01 protocol=Socks5
+debug flow closed    flow_id=f0000000000000012 destination=93.184.216.34:443
+                     to_upstream=512 to_client=4096 elapsed_ms=87
 ```
 
 An empty relay (`to_upstream=0 to_client=0`) is a probe or a failed dial, not a
@@ -191,9 +205,9 @@ fires here" — visible as a rule that never appears in `flow decided` logs.
 | --- | --- | --- |
 | `debug dropped a flow that was not redirected` | `Reject::SelfConnect` | a client connected to the transparent port directly; nothing to route |
 | `debug blocked by a routing rule` | `Reject::Blocked` | a rule said `block`; the flow was dropped on purpose |
-| `debug no outbound leg` | `IngressError::Dial` | the group had no selectable node, or the dial failed |
+| `warn no outbound leg` | `IngressError::Dial` | the group had no selectable node, or the dial failed |
 | `warn accept failed on a resource limit; backing off` | `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` | fd or memory pressure; the loop backs off and keeps serving |
-| `warn a flow task failed` | a panicked flow | isolated to that flow; `panicked` in the counters |
+| `warn flow task ended abnormally` | a cancelled or panicked flow | isolated to that flow; `panicked` in the counters |
 
 Counters name the magnitude of each of those:
 
@@ -207,16 +221,23 @@ them apart.
 
 ### "The listener accepts a direct connection but redirected flows time out"
 
-This is the namespace boundary, not a routing rule. Check the topology from the host:
+This is the namespace boundary, not a routing rule. The namespace mount is private to the
+daemon's mount namespace, so the host's `ip netns list` does not show it. Address it through
+the daemon's root:
 
 ```sh
-ip netns list                         # daer0ns must exist while daer runs
-ip netns exec daer0ns ip link show daer0peer
-ip netns exec daer0ns ip rule show    # iif daer0peer -> table 2023
-ip netns exec daer0ns ip route show table 2023
-ip netns exec daer0ns ip route        # default via 169.254.0.1 dev daer0peer
-sudo bpftool map dump name listen_socket_map   # keys 0, 1, 2 must be present
+pid="$(systemctl show -p MainPID --value daer)"
+ns() { nsenter --mount="/proc/$pid/ns/mnt" "$@"; }
+ns ip netns list                      # daer0ns must exist while daer runs
+ns ip netns exec daer0ns ip link show daer0peer
+ns ip netns exec daer0ns ip rule show # iif daer0peer -> table 2023
+ns ip netns exec daer0ns ip route show table 2023
+ns ip netns exec daer0ns ip route     # default via 169.254.0.1 dev daer0peer
+sudo bpftool map dump name listen_socket_map   # keys 0, 1, 2, 3 must be present
 ```
+
+`nsenter` is part of util-linux. It is needed because the mount namespace is private: a path
+through `/proc/<pid>/root` does not cross the private bind mount.
 
 A `bpf_sk_assign` that returns success and a `tcp_v4_rcv ... NO_SOCKET` trace means the
 listener is not in the packet's namespace. `daer0peer` must be inside `daer0ns`, and the
@@ -551,6 +572,7 @@ routes nothing.
 | `supervise` | `drain` returns exactly when the last flow ends, from any number of concurrent waiters |
 | `generation` | a reload that fails publishes nothing; the message says whether anything is still serving, and only claims so when it is true; a flow keeps the generation it arrived under |
 | `daer route` | the printed decision is produced by the same compiled generation the data path uses, and its exit status distinguishes "served" from "dropped" |
+| `daer status` | the snapshot is read-only, names its source (live socket or state file), and never reports a stale file as live |
 | `daer-routing::explain` | `decided_by`/`outbound` always equal `first_hit`'s; predicates are grouped as the configuration nests them |
 | `daer-dns::wire` | every prefix of a message fails cleanly; compression pointers may only point backwards, with a hop budget |
 | `daer-dns::routing` | an undeclared upstream, an unsupported predicate or a missing fallback fails at load, not per query |

@@ -7,6 +7,7 @@ members = [
     "crates/daer-control",
     "crates/daer-dns",
     "crates/daer-ebpf",
+    "crates/daer-observe",
     "crates/daer-outbound",
     "crates/daer-proxy-protocols",
     "crates/daer-relay",
@@ -18,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
@@ -41,6 +42,7 @@ daer-config = { path = "crates/daer-config" }
 daer-control = { path = "crates/daer-control" }
 daer-dns = { path = "crates/daer-dns" }
 daer-ebpf = { path = "crates/daer-ebpf" }
+daer-observe = { path = "crates/daer-observe" }
 daer-outbound = { path = "crates/daer-outbound" }
 daer-proxy-protocols = { path = "crates/daer-proxy-protocols" }
 daer-relay = { path = "crates/daer-relay" }
@@ -98,13 +100,24 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
 ] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# A root-cause build is not the shipped build. It keeps line tables and unwinding so a panic
+# hook can capture a backtrace and the `FlowGuard`/RAII cleanup paths can run, at the cost of
+# size and a little speed. Use it when reproducing a production failure that has no useful
+# release backtrace; the incident bundle from the release build still names the flow and event
+# sequence, and this profile explains the frame.
+[profile.forensic]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+panic = "unwind"
 
 # `dev` and `test` carry full debuginfo by default, and for this workspace that is the
 # dominant cost of the build rather than a nicety:

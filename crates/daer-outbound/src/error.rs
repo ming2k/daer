@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::fmt;
+use std::time::Duration;
+
+use daer_observe::{DialFailure, DialStage, diagnostic::codes};
 
 use crate::alive::DialerId;
 
@@ -54,6 +57,71 @@ impl fmt::Display for OutboundError {
 }
 
 impl std::error::Error for OutboundError {}
+
+/// Maps an outbound failure into the relay's neutral diagnostic vocabulary.
+///
+/// This is the seam that keeps `daer-relay` free of routing/outbound types while preserving
+/// the stage and stable code all the way to the flow event and the incident bundle.
+impl From<OutboundError> for DialFailure {
+    fn from(error: OutboundError) -> Self {
+        let (stage, code, detail, timeout) = match error {
+            OutboundError::Timeout => (
+                DialStage::Tcp,
+                codes::RELAY_DIAL_TIMEOUT,
+                "outbound dial timed out".to_owned(),
+                true,
+            ),
+            OutboundError::Connect(message) => {
+                (DialStage::Tcp, codes::RELAY_DIAL_CONNECT, message, false)
+            }
+            OutboundError::UnknownDialer(id) => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_NO_NODE,
+                format!("dialer {id:?} is not in this group"),
+                false,
+            ),
+            OutboundError::FixedIndexOutOfRange { index, count } => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_NO_NODE,
+                format!(
+                    "selected dialer index {index} is out of range (the group has {count} dialer(s))"
+                ),
+                false,
+            ),
+            OutboundError::UnsupportedLink(message) => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_UNSUPPORTED,
+                message,
+                false,
+            ),
+            OutboundError::UnknownGroup(name) => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_UNKNOWN_GROUP,
+                format!("group {name:?} is not declared in this configuration"),
+                false,
+            ),
+            OutboundError::NoAliveNode(name) => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_NO_NODE,
+                format!("group {name:?} has no selectable node"),
+                false,
+            ),
+            OutboundError::NoDatagramSupport(name) => (
+                DialStage::Policy,
+                codes::RELAY_DIAL_NO_DATAGRAM,
+                format!("node {name:?} cannot carry datagrams in this build"),
+                false,
+            ),
+        };
+        DialFailure {
+            stage,
+            code,
+            detail,
+            elapsed: Duration::ZERO,
+            timeout,
+        }
+    }
+}
 
 impl From<daer_proxy_protocols::ProxyProtocolError> for OutboundError {
     fn from(err: daer_proxy_protocols::ProxyProtocolError) -> Self {

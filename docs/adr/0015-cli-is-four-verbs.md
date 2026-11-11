@@ -2,7 +2,7 @@
 id: ADR-0015
 title: "The CLI is four verbs: producers are not shipped inside the runtime"
 status: accepted
-amended-by: [ADR-0016]
+amended-by: [ADR-0016, ADR-0041]
 date: 2026-02-15
 scope: [cli/surface, architecture/boundary, routing/drb, dns]
 supersedes: []
@@ -13,7 +13,9 @@ supersedes: []
 - Status: Accepted
 - Date: 2026-02-15
 - Amended by: [ADR-0016](0016-cli-route-and-probe.md) — the four verbs keep their boundary, but
-  `explain` became `route <TARGET>` and `probe` was added, so the surface is now six names.
+  `explain` became `route <TARGET>` and `probe` was added, so the surface became six names.
+- Amended by: [ADR-0041](0041-runtime-status-verb.md) — `status` was added as a read-only
+  runtime inspector; it is not a producer and not a second service. The boundary is unchanged.
 - Deciders: Ming Li
 - Related: [ADR-0006](0006-wiring-ownership.md), [ADR-0014](0014-drb-rule-binary-and-providers.md)
 

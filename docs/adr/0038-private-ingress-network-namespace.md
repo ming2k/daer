@@ -114,14 +114,32 @@ context the packet has already lost.
    namespace is a startup failure, reported with the failing `ip` or `setns` step. A daemon
    that cannot create the context its datapath requires must not pretend to proxy.
 
+## Amendment (2026-11-11): the namespace mount is private
+
+The named namespace is unchanged, but its mount is no longer created in the host's
+`/run/netns`. `isolate_ingress_mounts` unshares a mount namespace and mounts a tmpfs at
+`/run/netns`; `ip netns add` then creates `daer0ns` there. The tmpfs is destroyed with the
+daemon, so a `SIGKILL` releases the namespace, the peer and the host end of the veth pair
+without `ExecStopPost`.
+
+- The host `ip netns list` no longer shows `daer0ns`; it must not. Diagnostics enter the
+  daemon's mount namespace with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`.
+- The host `/run/netns` is untouched. A mount left by an older daemon is removed before the
+  private tmpfs is mounted; a regular file left by a crashed `ip netns add` is unlinked.
+- `daer-cleanup` remains necessary for host state that is not namespace-owned: the WAN/LAN
+  TC filters and the qdiscs a classic attach created. A current (v2) journal carries only
+  those records; it no longer removes the namespace, the pair, or a host sysctl. A pre-v2
+  journal still triggers the full legacy restore.
+
 ## Consequences
 
 - `daer run` now needs `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` and `CAP_SYS_ADMIN`. The
   preflight reports all four by name. `daer run --no-datapath` still needs only
   `CAP_NET_ADMIN` for `IP_TRANSPARENT`, and `daer check`/`--dry-run` still need none.
-- Operators can inspect the topology with `ip netns list`, `ip -n daer0ns link`,
+- Operators can inspect the topology with
+  `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`, `ip -n daer0ns link`,
   `ip -n daer0ns rule`, and `ip -n daer0ns route`. Those names are part of the diagnostic
-  surface, not implementation trivia.
+  surface, not implementation trivia; the mount itself is private to the daemon.
 - The host no longer has a `local default` route in table 2023. A packet that is redirected but
   somehow reaches the host side has no policy route to deliver it; that is intentional: the
   only valid path is through the namespace.
@@ -137,7 +155,7 @@ context the packet has already lost.
   not the ingress topology. A process restart creates a fresh namespace and pair, so stale
   per-interface sysctls and routes cannot survive a crash.
 - The incident record and the eight-point convergence checklist are in
-  [`docs/dev/transparent-ingress-incident.md`](../dev/transparent-ingress-incident.md). It
+  [`docs/dev/incidents/0001-transparent-ingress.md`](../dev/incidents/0001-transparent-ingress.md). It
   records the other failure classes found while proving this fix — reply-socket readiness,
   accept-loop starvation, and unmarked health probes — so the next change to this area checks
   the composition, not only the namespace.
@@ -146,10 +164,11 @@ context the packet has already lost.
 
 | Claim | Falsifier |
 | --- | --- |
-| The listener is bound inside the namespace | `IngressNamespace::with` runs the bind on a thread that has entered `/run/netns/daer0ns`; a host-side bind would leave the fd in the host namespace and reproduce `NO_SOCKET` in the privileged end-to-end check. |
+| The listener is bound inside the namespace | `IngressNamespace::with` runs the bind on a thread that has entered the private `/run/netns/daer0ns`; a host-side bind would leave the fd in the host namespace and reproduce `NO_SOCKET` in the privileged end-to-end check. |
 | The policy is keyed by ingress, not mark | `datapath::tests::the_policy_rule_is_keyed_by_ingress_not_by_mark` asserts the rule contains `iif daer0peer` and no `fwmark`; a mark-keyed rule sends marked listener replies back to `lo`. |
 | The peer has a reply path | `IngressNamespace::configure_peer` requires address, link route, default route, and permanent neighbor; `ip -n daer0ns route` shows it. A missing route makes the listener's SYN-ACK disappear with no error in userspace. |
-| A clean shutdown removes both ends | `IngressNamespace`'s drop deletes the namespace; deleting the peer removes the veth pair. `ip link show daer0` and `ip netns list` must both be empty afterward. |
+| The namespace mount is private | `netns_lifecycle` starts a host-mount-namespace child before `prepare` and asserts `/proc/<child>/root/run/netns/daer0ns` does not exist while the ingress is alive. |
+| A clean shutdown removes both ends | `IngressNamespace`'s drop deletes the namespace; deleting the peer removes the veth pair. `ip link show daer0` on the host and the private `/run/netns/daer0ns` must both be empty afterward. |
 | The host does not keep the old policy | `clear_host_policy_routing` runs before the pair exists, so `ip rule show` has no table-2023 entry after startup. |
 
 `crates/daer-control/tests/netns_lifecycle.rs` is the real-kernel topology falsifier. It is

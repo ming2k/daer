@@ -10,6 +10,7 @@ description = "DNS controller, transports and cache for daer"
 
 [dependencies]
 daer-config.workspace = true
+daer-observe.workspace = true
 bytes.workspace = true
 ipnet.workspace = true
 libc.workspace = true
@@ -17,7 +18,6 @@ netune.workspace = true
 netune-trace.workspace = true
 regex.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

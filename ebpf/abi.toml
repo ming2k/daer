@@ -547,3 +547,217 @@ offset = 0
 [[structs.lpm_key.fields]]
 name = "data"
 offset = 4
+
+# `struct daer_event`: one `event_ringbuf` record, decoded by `daer-ebpf::telemetry`.
+#
+# Generated on both sides because it crosses the ring-buffer boundary as raw bytes. `type`
+# is a Rust keyword, so the Rust field is `kind`; the layout is what matters.
+[structs.daer_event]
+size = 72
+align = 8
+rust = true
+
+[[structs.daer_event.fields]]
+name = "timestamp"
+offset = 0
+c_type = "u64"
+
+[[structs.daer_event.fields]]
+name = "type"
+offset = 8
+c_type = "u32"
+rust_name = "kind"
+
+[[structs.daer_event.fields]]
+name = "pid"
+offset = 12
+c_type = "u32"
+
+[[structs.daer_event.fields]]
+name = "pname"
+offset = 16
+c_type = "[u8; 16]"
+
+[[structs.daer_event.fields]]
+name = "outbound"
+offset = 32
+c_type = "u8"
+
+[[structs.daer_event.fields]]
+name = "l4proto"
+offset = 33
+c_type = "u8"
+
+[[structs.daer_event.fields]]
+name = "pad"
+offset = 34
+c_type = "[u8; 2]"
+
+[[structs.daer_event.fields]]
+name = "sip"
+offset = 36
+c_type = "[u32; 4]"
+
+[[structs.daer_event.fields]]
+name = "dip"
+offset = 52
+c_type = "[u32; 4]"
+
+[[structs.daer_event.fields]]
+name = "sport"
+offset = 68
+c_type = "u16"
+
+[[structs.daer_event.fields]]
+name = "dport"
+offset = 70
+c_type = "u16"
+
+# `enum bpf_stats_key`: every counter in `bpf_stats_map`. A key without a userspace
+# consumer is an invisible degradation, so `event --check`/telemetry tests enumerate
+# this list rather than trusting a hand-written mirror.
+[[bpf_stats]]
+name = "BPF_STATS_UDP_CONN_OVERFLOW"
+rust_const = "UDP_CONN_OVERFLOW"
+value = 0
+
+[[bpf_stats]]
+name = "BPF_STATS_TCP_CONN_OVERFLOW"
+rust_const = "TCP_CONN_OVERFLOW"
+value = 1
+
+[[bpf_stats]]
+name = "BPF_STATS_REDIRECT_OVERFLOW"
+rust_const = "REDIRECT_OVERFLOW"
+value = 2
+
+[[bpf_stats]]
+name = "BPF_STATS_REDIRECT_UPDATE_FAILED"
+rust_const = "REDIRECT_UPDATE_FAILED"
+value = 3
+
+[[bpf_stats]]
+name = "BPF_STATS_REDIRECT_REBIND_REJECTED"
+rust_const = "REDIRECT_REBIND_REJECTED"
+value = 4
+
+[[bpf_stats]]
+name = "BPF_STATS_SYN_REBIND_REJECTED"
+rust_const = "SYN_REBIND_REJECTED"
+value = 5
+
+[[bpf_stats]]
+name = "BPF_STATS_STATELESS_TCP_PASSTHROUGH"
+rust_const = "STATELESS_TCP_PASSTHROUGH"
+value = 6
+
+[[bpf_stats]]
+name = "BPF_STATS_FRAG_TAIL_PASSED"
+rust_const = "FRAG_TAIL_PASSED"
+value = 7
+
+[[bpf_stats]]
+name = "BPF_STATS_PARSE_UNSUPPORTED_L4"
+rust_const = "PARSE_UNSUPPORTED_L4"
+value = 8
+
+[[bpf_stats]]
+name = "BPF_STATS_UNSOLICITED_UDP_SEEN"
+rust_const = "UNSOLICITED_UDP_SEEN"
+value = 9
+
+[[bpf_stats]]
+name = "BPF_STATS_SOCKMARK_FALLBACK"
+rust_const = "SOCKMARK_FALLBACK"
+value = 10
+
+[[bpf_stats]]
+name = "BPF_STATS_EVENT_DROP"
+rust_const = "EVENT_DROP"
+value = 11
+
+[[bpf_stats]]
+name = "BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE"
+rust_const = "REBIND_REROUTED_AFTER_EPOCH_CHANGE"
+value = 12
+
+[[bpf_stats]]
+name = "BPF_STATS_PEER_INGRESS"
+rust_const = "PEER_INGRESS"
+value = 13
+
+[[bpf_stats]]
+name = "BPF_STATS_PEER_INGRESS_UNMARKED"
+rust_const = "PEER_INGRESS_UNMARKED"
+value = 14
+
+[[bpf_stats]]
+name = "BPF_STATS_LISTENER_ASSIGN_FAILED"
+rust_const = "LISTENER_ASSIGN_FAILED"
+value = 15
+
+[[bpf_stats]]
+name = "BPF_STATS_PEER_INGRESS_NO_L4"
+rust_const = "PEER_INGRESS_NO_L4"
+value = 16
+
+[[bpf_stats]]
+name = "BPF_STATS_MAX"
+rust_const = "MAX"
+value = 17
+
+# `enum daer_event_type`: every record type `event_ringbuf` can carry.
+[[event_types]]
+name = "DAER_EVENT_BLOCKED"
+rust_const = "BLOCKED"
+value = 0
+
+[[event_types]]
+name = "DAER_EVENT_UDP_CONN_OVERFLOW"
+rust_const = "UDP_CONN_OVERFLOW"
+value = 1
+
+[[event_types]]
+name = "DAER_EVENT_TCP_CONN_OVERFLOW"
+rust_const = "TCP_CONN_OVERFLOW"
+value = 2
+
+[[event_types]]
+name = "DAER_EVENT_BLOCKED_ALIVE"
+rust_const = "BLOCKED_ALIVE"
+value = 3
+
+[[event_types]]
+name = "DAER_EVENT_REDIRECT_REBIND_REJECTED"
+rust_const = "REDIRECT_REBIND_REJECTED"
+value = 4
+
+[[event_types]]
+name = "DAER_EVENT_SYN_REBIND_REJECTED"
+rust_const = "SYN_REBIND_REJECTED"
+value = 5
+
+[[event_types]]
+name = "DAER_EVENT_RESERVED_STATELESS_TCP_PASSTHROUGH"
+rust_const = "RESERVED_STATELESS_TCP_PASSTHROUGH"
+value = 6
+
+[[event_types]]
+name = "DAER_EVENT_RESERVED_FRAG_TAIL_PASSED"
+rust_const = "RESERVED_FRAG_TAIL_PASSED"
+value = 7
+
+[[event_types]]
+name = "DAER_EVENT_REDIRECT_UPDATE_FAILED"
+rust_const = "REDIRECT_UPDATE_FAILED"
+value = 8
+
+[[event_types]]
+name = "DAER_EVENT_SYN_REBIND_REROUTED"
+rust_const = "SYN_REBIND_REROUTED"
+value = 9
+
+[[event_types]]
+name = "DAER_EVENT_MAX"
+rust_const = "MAX"
+value = 10

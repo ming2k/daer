@@ -9,7 +9,7 @@ This guide walks operators through creating, compiling, and distributing high-pe
 As specified in [ADR-0014](../adr/0014-drb-rule-binary-and-providers.md), `daer` uses **DRB** (`.drb`) as its native, pre-compiled rule artifact format.
 
 - **Fastest Cold-Start**: Pre-sorted IP intervals and pre-indexed domain patterns load in microseconds (`< 0.01ms`), bypassing all protobuf streaming and interval merging.
-- **Non-Root Operation**: Rule caches live under user XDG cache directories (`$XDG_CACHE_HOME/daer/rules`, or `~/.cache/daer/rules`), so an unprivileged run needs no `/usr/share/daer` access. `DAER_RULE_CACHE_DIR` overrides the location; under the shipped systemd unit (`ProtectHome=true`) it points at `/var/cache/daer/rules`, because a hardened `$HOME` makes the default unwritable.
+- **System-Wide Cache**: HTTP rule providers are cached under `/var/cache/daer/rules`; the shipped unit sets `DAER_RULE_CACHE_DIR` to that path and the loader defaults to it. Operator-managed local rule files live under `/var/lib/daer/rules`.
 - **Automated Lifecycle**: When an HTTP rule provider defines an `interval`, `daer` periodically checks for updates in the background, downloads updates conditionally using `If-None-Match` (ETag), and hot-reloads the active eBPF datapath generation with zero dropped connections.
 
 ---
@@ -113,14 +113,14 @@ format = "drb"
 [[rule-provider]]
 tag = "geosite-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/rules/release/geosite-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "geoip-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/rules/release/geoip-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"
 interval = "24h"
 
@@ -136,6 +136,22 @@ rules = [
 fallback = "proxy"
 ```
 
+### Where to put local rule files
+
+Do not put compiled `.drb` artifacts under `/etc` just because the configuration lives
+there. `/etc` is for operator configuration; rule packs are data. The supported paths are:
+
+| Content | Path |
+| :--- | :--- |
+| Configuration | `/etc/daer/config.toml` |
+| Local rule files (`.drb` or `.rules`) | `/var/lib/daer/rules/` |
+| HTTP download cache (disposable) | `/var/cache/daer/rules/` |
+
+Relative `path = "rules/foo.drb"` resolves against the directory containing the
+configuration file. A `~` is not expanded; use an absolute path or a path relative to the
+config file. The package creates `/var/lib/daer/rules`; the systemd unit creates
+`/var/cache/daer` and sets `DAER_RULE_CACHE_DIR=/var/cache/daer/rules`.
+
 ---
 
 ## 5. Dedicated Rule Asset Repository: `drb-sets`
@@ -143,10 +159,17 @@ fallback = "proxy"
 The runtime daemon `daer` consumes compiled `.drb` artifacts; it does not host scheduled upstream crawlers or data releases. Production rule distributions are maintained in a dedicated rule asset repository, typically named **`drb-sets`** (analogous to `v2fly/domain-list-community` or `Loyalsoldier/v2ray-rules-dat`).
 
 In the `drb-sets` repository, a lightweight GitHub Actions workflow runs daily:
-1. Downloads upstream `.dat` or plaintext rules (e.g. from Loyalsoldier).
-2. Unpacks each entry to `.rules`, then invokes `daer-drb compile` to build `.drb` artifacts.
-3. Tests generated outputs with `daer-drb test`.
-4. Computes `sha256sum.txt` and publishes artifacts to the `release` branch or GitHub Releases.
+1. Downloads upstream `.dat` into the CI runner only (never into Git).
+2. Generates base `.rules` and merges the tracked `rules/` overlays or authored sets
+   selected by `config/rules.toml`.
+3. Compiles `.drb` with `daer-drb`, verifies every artifact round-trips byte-for-byte, and
+   computes `sha256sums.txt` plus `manifest.json`.
+4. Publishes the artifacts as GitHub Release assets, and only when `content_sha256` changed.
+   There is no `release` branch and no generated artifact in Git history.
+
+The tracked source of truth is `config/geosite-tags.txt`, `config/geoip-tags.txt`,
+`config/rules.toml`, and the files under `rules/`. Upstream `.dat` files and compiled `.drb`
+files are build inputs/outputs, not repository content.
 
 End users reference the public URLs in `[[rule-provider]]`, receiving automated background updates without manual maintenance or root privileges.
 
@@ -161,14 +184,13 @@ For complete mathematical and kernel-level performance proofs, read the deep div
 Organize rules strictly by **outbound action** and **independent update lifecycle**:
 
 ```text
-/etc/daer/
-├── daer.toml
-└── providers/
-    ├── block-ads.drb          # Action: block (high update frequency, upstream)
-    ├── geosite-cn.drb         # Action: direct (medium update frequency, upstream)
-    ├── geoip-cn.drb           # Action: direct (low update frequency, upstream)
-    ├── proxy-special.drb      # Action: designated proxy group (e.g. streaming, AI)
-    └── corporate.drb          # Action: direct (internal IP subnets + private domains)
+/etc/daer/config.toml
+/var/lib/daer/rules/
+├── block-ads.drb          # Action: block (high update frequency, upstream)
+├── geosite-cn.drb         # Action: direct (medium update frequency, upstream)
+├── geoip-cn.drb           # Action: direct (low update frequency, upstream)
+├── proxy-special.drb      # Action: designated proxy group (e.g. streaming, AI)
+└── corporate.drb          # Action: direct (internal IP subnets + private domains)
 ```
 
 In `daer.toml`:
@@ -201,15 +223,14 @@ fallback = "proxy"
 
 ## 7. Production-Grade Deployment with Loyalsoldier Datasets
 
-The widely trusted [`Loyalsoldier/v2ray-rules-dat`](https://github.com/Loyalsoldier/v2ray-rules-dat) repository maintains canonical community categories (China direct domains, GFW proxy domains, ad tracking, and APNIC IP CIDRs). In production, these are converted and hosted via `drb-sets` into verified `.drb` artifacts:
+The widely trusted [`Loyalsoldier/v2ray-rules-dat`](https://github.com/Loyalsoldier/v2ray-rules-dat) repository maintains canonical community categories (China direct domains, non-mainland domains, ad tracking, and APNIC IP CIDRs). In production, these are converted and hosted via `drb-sets` into verified `.drb` artifacts:
 - `geosite-cn.drb` (Domestic domains for direct routing)
 - `geoip-cn.drb` (Domestic IP prefixes for direct routing)
-- `geosite-ads.drb` (Ad blocking and privacy tracking domains from `category-ads-all`)
-- `geosite-gfw.drb` (Blocked domains requiring proxy egress from `gfw`)
+- `geosite-category-ads-all.drb` (Ad blocking and privacy tracking domains)
+- `geosite-geolocation-!cn.drb` (Non-mainland domains requiring proxy egress)
 - `geoip-private.drb` (RFC1918 and loopback subnets for bypass)
-- `geosite-apple-cn.drb` (Apple mainland CDN endpoints)
-- `geosite-google-cn.drb` (Google mainland localized endpoints)
-- `geosite-tld-cn.drb` (`.cn` top-level domains)
+- `geosite-apple.drb` (Apple domains)
+- `geosite-google.drb` (Google domains)
 
 ### Compiling Locally with `daer-drb`
 
@@ -226,20 +247,13 @@ python3 scripts/rules/dat_to_rules.py --kind geosite \
     --dat geosite.dat --code cn --output geosite-cn.rules
 
 # 2. Review it. This step is the point: the file is plain text, diffable, and committable.
-$EDITOR geosite-cn.rules      # ip: …  domain.com  .sub.domain.com  =exact.com  @cn / @ads markers
+$EDITOR geosite-cn.rules      # ip: …  domain.com  .sub.domain.com  =exact.com
 
 # 3. Encode it.
 daer-drb compile geosite-cn.rules -o geosite-cn.drb
 ```
 
-Because geosite entries carry attributes (`@cn`, `@ads`, `@telemetry`, `@!cn`), a category that
-contains its own counter-examples can be filtered while it is still text:
-
-```bash
-# `google` tags 54 of its own domains @ads; publishing the whole category advertises them.
-# Filter them out directly during compilation with `--without` (or filter the text beforehand):
-daer-drb compile geosite-google.rules --without ads -o geosite-google.drb
-```
+Attribute fields in the upstream `.dat` file are ignored; CRS carries patterns, not provenance.
 
 Any published artifact can be read back, which is how you audit a release rather than trusting
 the file it came from:
@@ -271,7 +285,7 @@ lan-interface = ["lan0"]
 [[rule-provider]]
 tag = "ads"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-ads.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-ads.drb"
 format = "drb"
 interval = "24h"
 
@@ -279,7 +293,7 @@ interval = "24h"
 [[rule-provider]]
 tag = "private-ips"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-private.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
 format = "drb"
 interval = "168h"
 
@@ -287,7 +301,7 @@ interval = "168h"
 [[rule-provider]]
 tag = "geosite-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
@@ -295,7 +309,7 @@ interval = "24h"
 [[rule-provider]]
 tag = "geoip-cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"
 interval = "168h"
 
@@ -303,7 +317,7 @@ interval = "168h"
 [[rule-provider]]
 tag = "geosite-gfw"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-gfw.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-geolocation-!cn.drb"
 format = "drb"
 interval = "24h"
 

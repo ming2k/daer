@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.0.11"
+version = "0.0.12"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"
@@ -112,6 +112,10 @@ chmod 0640 ${STAGING_DIR}/etc/daer/config.toml
 # JSON schema definition
 install -Dm644 daer.schema.json ${STAGING_DIR}/usr/share/daer/daer.schema.json
 
+# Persistent operator-managed rule sets. The directory is intentionally empty: the package
+# ships no rules. The daemon reads only the paths declared in [[rule-provider]].
+install -dm755 ${STAGING_DIR}/var/lib/daer/rules
+
 # Validate the object as installed, not as built (ADR-0029). The path below is the one the
 # service unit passes to `daer run`, so this asserts what will actually be loaded — a stale or
 # drifted object is rejected here instead of crash-looping under systemd. This is the only
@@ -127,6 +131,7 @@ backup = ["/etc/daer/config.toml"]
 post_install = '''
 systemctl daemon-reload 2>/dev/null || true
 echo ":: Configure daer in /etc/daer/config.toml"
+echo ":: Put local .drb/.rules files in /var/lib/daer/rules"
 echo ":: Verify configuration with: daer check -c /etc/daer/config.toml"
 echo ":: Ensure permissions are restricted: chmod 0640 /etc/daer/config.toml"
 echo ":: Enable service with: systemctl enable --now daer.service"'''

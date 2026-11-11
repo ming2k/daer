@@ -15,13 +15,13 @@ daer-common.workspace = true
 daer-config.workspace = true
 daer-dns.workspace = true
 daer-ebpf.workspace = true
+daer-observe.workspace = true
 aya.workspace = true
 daer-outbound.workspace = true
 daer-relay.workspace = true
 daer-routing.workspace = true
 daer-sniff.workspace = true
 libc.workspace = true
-tracing.workspace = true
 tokio.workspace = true
 
 [[test]]

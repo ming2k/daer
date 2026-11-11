@@ -207,7 +207,7 @@ impl ProbeInstruments {
                         break;
                     }
                     Err(error) => {
-                        tracing::warn!(%entry, %error, "health check: unusable tcp-url entry");
+                        daer_observe::warn!(daer_observe::EventCode::ProviderUnusableTcpUrl,%entry, %error, "health check: unusable tcp-url entry");
                     }
                 }
             } else if entry.parse::<std::net::IpAddr>().is_ok() {
@@ -215,7 +215,7 @@ impl ProbeInstruments {
                 tcp_url_seen = true;
                 break;
             } else {
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::HealthTcpUrlName,
                     %entry,
                     "health check: tcp-url entry is a name, not an address; the node's own \
                      address is dialled instead"
@@ -322,7 +322,7 @@ impl Scheduler {
         for (group, ids) in self.router.probe_table() {
             for (dialer, name, protocol, address, udp) in ids {
                 let Some(address) = address else {
-                    tracing::debug!(%group, %name, "node has no literal address; not probed");
+                    daer_observe::debug!(daer_observe::EventCode::HealthNodeUnprobeable,%group, %name, "node has no literal address; not probed");
                     continue;
                 };
                 let _ = (&protocol, ProbeFailure::Unsupported(protocol.clone()));
@@ -420,7 +420,7 @@ impl Scheduler {
         let results = probe_all(self, &targets).await;
         for result in &results {
             if let Err(error) = self.record(result).await {
-                tracing::debug!(
+                daer_observe::warn!(daer_observe::EventCode::HealthProbeRecordFailed,
                     %error,
                     group = %result.target.group,
                     node = %result.target.name,
@@ -429,18 +429,22 @@ impl Scheduler {
                 break;
             }
             match (&result.latency, &result.failure) {
-                (Some(latency), _) => tracing::trace!(
-                    group = %result.target.group,
-                    node = %result.target.name,
-                    latency_ns = latency.as_nanos(),
-                    "node alive"
-                ),
-                (None, Some(failure)) => tracing::debug!(
-                    group = %result.target.group,
-                    node = %result.target.name,
-                    %failure,
-                    "node probe failed"
-                ),
+                (Some(latency), _) => {
+                    daer_observe::trace!(daer_observe::EventCode::HealthNodeAlive,
+                        group = %result.target.group,
+                        node = %result.target.name,
+                        latency_ns = latency.as_nanos(),
+                        "node alive"
+                    )
+                }
+                (None, Some(failure)) => {
+                    daer_observe::warn!(daer_observe::EventCode::HealthProbeFailed,
+                        group = %result.target.group,
+                        node = %result.target.name,
+                        %failure,
+                        "node probe failed"
+                    )
+                }
                 (None, None) => {}
             }
         }
@@ -454,7 +458,10 @@ impl Scheduler {
     /// needs one.
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
         if self.interval.is_zero() {
-            tracing::debug!("health probing disabled (check-interval is zero)");
+            daer_observe::debug!(
+                daer_observe::EventCode::HealthProbingDisabled,
+                "health probing disabled (check-interval is zero)"
+            );
             return;
         }
         let mut ticker = tokio::time::interval(self.interval);
@@ -463,7 +470,7 @@ impl Scheduler {
         loop {
             tokio::select! {
                 () = &mut shutdown => {
-                    tracing::info!("health scheduler stopped");
+                    daer_observe::info!(daer_observe::EventCode::HealthSchedulerStopped,"health scheduler stopped");
                     return;
                 }
                 _ = ticker.tick() => {
@@ -555,7 +562,8 @@ pub fn spawn(
     // as zero here keeps a bad value from spawning a busy loop.
     let interval = check.interval.as_std().unwrap_or(Duration::ZERO);
     if interval.is_zero() || !has_measurable_nodes(&router) {
-        tracing::debug!(
+        daer_observe::debug!(
+            daer_observe::EventCode::DaemonHealthDisabled,
             probes = with_interval(interval),
             "health probing not started; see check-interval and node addresses"
         );
@@ -564,7 +572,7 @@ pub fn spawn(
     // The method comes from `tcp-method`, which used to be validated and ignored: a probe that
     // pointed at an endpoint rejecting `HEAD` reported the node dead for a configuration reason.
     let method = daer_outbound::HttpMethod::parse(&check.tcp_method).unwrap_or_else(|error| {
-        tracing::warn!(
+        daer_observe::warn!(daer_observe::EventCode::ProviderUnusableTcpMethod,
             %error,
             method = %check.tcp_method,
             "health check: unusable tcp-method; falling back to HEAD"
@@ -577,7 +585,7 @@ pub fn spawn(
     };
     let instruments = ProbeInstruments::from_config(check, interval, method, socket_config);
     if !instruments.unresolved_udp.is_empty() {
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::ProviderUnresolvedUdp,
             entries = ?instruments.unresolved_udp,
             "health check: udp-dns entries that are names are not probed;              a probe must not resolve a name the data path resolves elsewhere"
         );

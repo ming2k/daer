@@ -86,6 +86,14 @@ for tool in nft ip; do
     fi
 done
 ok "kernel $(uname -r)"
+# The transparent tests use the loopback origin. In a disposable `unshare -n` namespace
+# `lo` starts down, so bring it up here; on a normal host this is already true and the
+# command is idempotent.
+if ip link set lo up 2>/dev/null; then
+    ok "loopback is up"
+else
+    bad "cannot bring loopback up"
+fi
 
 section "2. building the test binaries (as $builder, so cargo is findable)"
 build_one() {
@@ -98,7 +106,11 @@ build_one() {
         return
     fi
     local bin
-    bin="$(ls -t "target/debug/deps/$target"-* 2>/dev/null | grep -v '\.d$' | head -n 1)"
+    # Do not expand `$target-*` on the command line: a long-lived `target/` can contain
+    # tens of thousands of incremental objects, and `ls` then dies with E2BIG before it can
+    # select the newest test binary. `find` filters the directory internally.
+    bin="$(find target/debug/deps -maxdepth 1 -type f -name "$target-*" -perm -u+x \
+        -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
     if [[ -z "$bin" ]]; then
         bad "no $target test binary under target/debug/deps"
         printf -v "$var" '%s' ""
@@ -109,9 +121,11 @@ build_one() {
 }
 
 binary_transparent=""
+binary_udp6=""
 binary_netns=""
 binary_reload=""
 build_one daer-control transparent binary_transparent
+build_one daer-control transparent_udp6 binary_udp6
 build_one daer-control netns_lifecycle binary_netns
 build_one daer-cli reload binary_reload
 
@@ -133,6 +147,11 @@ else
         else
             bad "the TCP data path did not report a pass; see $logs/transparent.log"
         fi
+        if grep -q "a_redirected_ipv6_flow_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
+            ok "the IPv6 TCP path reached the daemon and returned the origin's nonce"
+        else
+            skip "3-tcp6" "the IPv6 TCP path skipped itself (no usable IPv6 loopback); see $logs/transparent.log"
+        fi
         if grep -q "a_redirected_datagram_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
             ok "a redirected datagram reached the daemon and the reply came back to the client port"
         else
@@ -146,7 +165,28 @@ else
     fi
 fi
 
-section "3a. the private ingress namespace"
+section "3a. IPv6 UDP through a real two-namespace tproxy topology"
+# The in-process test creates a client namespace, an origin namespace and the veth/nft/policy
+# fixture itself. A skip means the host cannot create namespaces; `DAER_REQUIRE=3-udp6` makes
+# that a failure in the privileged CI job.
+if [[ -z "$binary_udp6" ]]; then
+    skip "3-udp6" "no IPv6 UDP test binary; the build failed above"
+else
+    if "$binary_udp6" --nocapture --test-threads=1 >"$logs/transparent-udp6.log" 2>&1 \
+            && grep -q "test result: ok" "$logs/transparent-udp6.log"; then
+        if grep -q "skipped: " "$logs/transparent-udp6.log"; then
+            skip "3-udp6" "the IPv6 UDP topology skipped itself; see $logs/transparent-udp6.log"
+        else
+            ok "a redirected IPv6 datagram reached the daemon and the reply returned"
+        fi
+    else
+        bad "the IPv6 UDP data path failed; see $logs/transparent-udp6.log"
+        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent-udp6.log" 2>/dev/null \
+            | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
+    fi
+fi
+
+section "3b. the private ingress namespace"
 # This owns daer0ns and daer0/daer0peer for the duration of one test. It proves the namespace
 # is created, the peer moves, the policy is ingress-keyed, the return route exists, and drop
 # removes both the namespace and the host end. A running daer service must be stopped first.
@@ -165,6 +205,11 @@ else
             | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
     fi
 fi
+
+# TCX is deliberately not gated here: the transparent tests above drive the userspace relay
+# through an nftables redirect, not the eBPF TC hooks, so setting DAER_TC_ATTACH would change
+# nothing. The real-daemon script `scripts/ops/daer-netns-e2e.sh` is the delivery check
+# (`DAER_TC_ATTACH=tcx`), and the privileged kernel suite has the TCX attach test.
 
 section "4. reload: a SIGHUP must not abort the daemon"
 # `daer run` used to panic on its first `SIGHUP` because `reload` called `block_on` inside the

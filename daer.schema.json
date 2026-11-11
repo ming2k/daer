@@ -222,6 +222,13 @@
           "type": "string",
           "default": "198.18.0.0/15"
         },
+        "inet6": {
+          "description": "The optional IPv6 pool.\n\n`None` keeps the historic IPv4-only Fake-IP behaviour: `A` is synthesised and `AAAA`\nis answered with an empty NOERROR so a dual-stack client falls back to the synthetic\naddress. Setting a prefix enables IPv6 synthesis as well. The key is explicit rather\nthan a second meaning for `inet`, because one prefix cannot describe both families.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pool-size": {
           "type": "integer",
           "format": "uint",

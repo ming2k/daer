@@ -12,8 +12,8 @@ access to a host service.
 | `verify/kernel-check.sh` | root (`sudo`) | `cargo xtask kernel-check` | Does the eBPF object load, verify, attach, and pass the in-kernel datapath cases? |
 | `verify/e2e-check.sh` | root (`sudo`) | `cargo xtask e2e-check` | Does a real redirected flow reach the daemon and come back? |
 | `rules/dat_to_rules.py` | user | `python3 scripts/rules/dat_to_rules.py` | Converts a legacy `geoip.dat` / `geosite.dat` into Canonical Rule Source (`.rules`). |
-| `ops/daer-install-netns.sh` | root (`sudo`) | direct | Installs the local `daer` and `daer-drb` binaries, datapath object, systemd unit, and a site config, then restarts `daer`. |
-| `ops/daer-netns-e2e.sh` | root (`sudo`) | direct | Runs the private-ingress diagnostic and restores the host's prior network state. |
+| `ops/daer-install-netns.sh` | user, then root (re-execs `sudo`) | direct | Stages the local `daer`, `daer-cleanup`, and `daer-drb` binaries, datapath object, and systemd unit with `cargo xtask install`, copies the staged tree into `/usr`, installs a site config, and restarts `daer`. |
+| `ops/daer-netns-e2e.sh` | root (`sudo`); `--preflight` as user | direct | Runs the private-ingress diagnostic and restores the host's prior network state. `--preflight` checks the kernel, tools, artifacts, and config without root. |
 | `ops/remove-dae.sh` | root (`sudo`) | direct | Removes a legacy `dae` installation after backing up `/etc/dae`. |
 
 ## Verification scripts
@@ -37,10 +37,13 @@ script that emits them; see `docs/how-to/deployment.md` for the full list.
 The `ops/` scripts change the machine, not just the workspace. Read the header of the
 script before running it.
 
-`daer-install-netns.sh` and `daer-netns-e2e.sh` take the deployment/test config with
-`--config <path>`. Configs are site-specific and may contain node credentials, so they
-are **not** kept in the repository: keep them under the ignored `target/` directory or
-outside the tree. `daer-netns-e2e.sh` also accepts:
+`daer-install-netns.sh` stages with `cargo xtask install --destdir target/install-root`
+and then re-execs itself under `sudo` to copy the staged tree, install the config, and
+restart the service. Run it as your normal user so `cargo` stays on `PATH`; `--staged`
+is the internal root-half option. It and `daer-netns-e2e.sh` take the deployment/test
+config with `--config <path>`. Configs are site-specific and may contain node credentials,
+so they are **not** kept in the repository: keep them under the ignored `target/` directory
+or outside the tree. `daer-netns-e2e.sh` also accepts:
 
 | Variable | Meaning |
 | :--- | :--- |

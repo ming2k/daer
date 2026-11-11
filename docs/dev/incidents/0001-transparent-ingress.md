@@ -1,8 +1,24 @@
+---
+id: INC-0001
+title: "Transparent ingress NO_SOCKET: five layers, one observable failure"
+status: resolved
+date: 2026-11-11
+affected: ["0.0.11"]
+signal:
+  - event: datapath.policy_deferred
+  - counter: bpf_stats.listener_assign_failed
+regression:
+  - crates/daer-control/tests/transparent.rs::a_redirected_flow_is_proxied_by_the_daemon
+  - crates/daer-control/tests/netns_lifecycle.rs
+events_added: [datapath.event, datapath.stats, flow.dial_failed]
+adr: [ADR-0038]
+---
+
 # Transparent ingress: the `NO_SOCKET` incident and its safeguards
 
 - Status: resolved in `0.0.11`
 - Date: 2026-11-11
-- Decision: [ADR-0038](../adr/0038-private-ingress-network-namespace.md)
+- Decision: [ADR-0038](../../adr/0038-private-ingress-network-namespace.md)
 - Applies to: `daer-control`, `daer-relay`, the eBPF datapath, the service unit
 
 This is the internal record of why the transparent path served nothing even though
@@ -55,15 +71,15 @@ through the peer's default route, and the host forwards them to the client.
 
 The implementation is split at the namespace boundary:
 
-- [`daer-control::netns`](../../crates/daer-control/src/netns.rs) creates the namespace,
+- [`daer-control::netns`](../../../crates/daer-control/src/netns.rs) creates the namespace,
   moves the peer, configures the peer address/default route/permanent neighbor, and owns
   cleanup.
-- [`daer-control::datapath`](../../crates/daer-control/src/datapath.rs) attaches the peer
+- [`daer-control::datapath`](../../../crates/daer-control/src/datapath.rs) attaches the peer
   hook inside the namespace, installs the namespace-local table, and detaches the peer
   link on a thread that is inside the namespace. Aya's classic `cls_bpf` link detaches by
   ifindex in the *current* namespace; doing it on the host would target the wrong device
   after the peer moved.
-- [`Daemon`](../../crates/daer-control/src/daemon.rs) owns `PreparedIngress` and binds the
+- [`Daemon`](../../../crates/daer-control/src/daemon.rs) owns `PreparedIngress` and binds the
   listeners inside it. The ingress field is declared after every socket, so the namespace
   outlives the listener fds.
 
@@ -86,7 +102,7 @@ Two properties follow:
 2. A slow node dial for one client cannot prevent the next client from being accepted.
 
 The second property is implemented in
-[`serve_parallel`](../../crates/daer-relay/src/serve.rs) and falsified by
+[`serve_parallel`](../../../crates/daer-relay/src/serve.rs) and falsified by
 `serve::tests::a_slow_decision_does_not_block_accepting_the_next_flow`: a gated decider
 parks the first flow, the test connects a second client, and asserts `accepted >= 2` before
 the gate is released. The old inline loop reaches one accepted flow and fails that assertion.
@@ -111,7 +127,7 @@ The reply path is synchronous by design, so it now uses `std::net::UdpSocket`:
 - the namespace factory creates the socket inside `daer0ns`;
 - the socket is nonblocking, but the reply path calls `send_to` directly (not through Tokio
   readiness) and retries a few times on a genuine transient `WouldBlock`;
-- the cache remains bounded at [`REPLY_SOCKET_CACHE`](../../crates/daer-relay/src/inbound/udp.rs);
+- the cache remains bounded at [`REPLY_SOCKET_CACHE`](../../../crates/daer-relay/src/inbound/udp.rs);
 - TCP and UDP reply sockets still carry `so-mark`.
 
 The safeguard `inbound::udp::tests::the_reply_socket_factory_is_the_socket_that_sends`
@@ -150,7 +166,7 @@ flow closed ... to_upstream=1921 to_client=6509
 ```
 
 The real-kernel lifecycle falsifier is
-[`crates/daer-control/tests/netns_lifecycle.rs`](../../crates/daer-control/tests/netns_lifecycle.rs).
+[`crates/daer-control/tests/netns_lifecycle.rs`](../../../crates/daer-control/tests/netns_lifecycle.rs).
 It owns `daer0ns` and the pair, so it is gated on `DAER_NETNS_TEST=1` and runs in the
 privileged e2e script. It asserts:
 
@@ -163,12 +179,15 @@ privileged e2e script. It asserts:
 - dropping the guard removes the namespace and the host veth end (device destruction can be
   asynchronous, so the test polls).
 
-Operationally, the three commands that distinguish the failure classes are:
+Operationally, the three commands that distinguish the failure classes are (the namespace
+mount is private to the daemon, so address it through the daemon's root):
 
 ```bash
-ip netns list
-ip -n daer0ns -4 rule show
-ip -n daer0ns route show
+pid="$(systemctl show -p MainPID --value daer)"
+ns() { nsenter --mount="/proc/$pid/ns/mnt" "$@"; }
+ns ip netns list
+ns ip -n daer0ns -4 rule show
+ns ip -n daer0ns route show
 ```
 
 If the TCP listener is in the namespace but `accepted` stays at zero, look at accept-loop
@@ -177,7 +196,7 @@ not at routing. If `bpf_sk_assign` succeeds and `tcp_v4_rcv` reports `NO_SOCKET`
 the namespace boundary, not at another socket option.
 
 The operational diagnostic recipe is also in
-[`docs/how-to/diagnostics.md`](../how-to/diagnostics.md#the-listener-accepts-a-direct-connection-but-redirected-flows-time-out).
+[`docs/how-to/diagnostics.md`](../../how-to/diagnostics.md#the-listener-accepts-a-direct-connection-but-redirected-flows-time-out).
 
 One tooling lesson belongs here because it initially masked a success: a check that greps
 tracing output must strip ANSI escapes first. `flow decided ... outbound=proxy` is emitted as
@@ -200,9 +219,10 @@ These alternatives were considered and rejected:
 
 ## 8. Residual limits
 
-- **IPv6 UDP is not implemented.** The datapath has one datagram listener slot and it holds
-  the IPv4 socket. IPv6 TCP ingress code exists, but the current host has no global IPv6
-  route and the path is not end-to-end verified.
+- **IPv6-only hosts remain environment-dependent.** IPv6 TCP and UDP have dedicated listener
+  slots, and the ingress namespace configures IPv6 routes, neighbors and sysctls best-effort.
+  A host with IPv6 forwarding disabled or no IPv6 default route still proxies IPv4, and the
+  daemon reports the missing IPv6 ingress path instead of failing the whole service.
 - **The node address can rotate.** A production config should use the node hostname, with
   DNS direct, or update the literal address.
 - **A restrictive host firewall can still drop replies.** The e2e host's `nftables` input

@@ -95,6 +95,7 @@
 static const __u32 zero_key;
 static const __u32 one_key = 1;
 static const __u32 two_key = 2;
+static const __u32 three_key = 3;
 
 // Outbound Connectivity Map:
 

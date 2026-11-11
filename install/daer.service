@@ -36,10 +36,11 @@ OOMScoreAdjust=-100
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
 # The Rust guards are the primary cleanup path. This runs after them — and also after a
-# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal and removing the
-# namespace, veth pair, TC filters and host policy routing that would otherwise outlive it.
-# It is a dedicated helper, not a hidden flag on `daer run`: the operator CLI stays the six
-# verbs in ADR-0015, and systemd's post-stop hook is not one of them.
+# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal. A current (v2)
+# journal removes the host TC filters and qdiscs only; the namespace and pair die with the
+# daemon. A pre-v2 journal also runs the full legacy restore. It is a dedicated helper,
+# not a hidden flag on `daer run`: the operator CLI stays the six verbs in ADR-0015, and
+# systemd's post-stop hook is not one of them.
 ExecStopPost=/usr/bin/daer-cleanup
 
 # Restart policy. One second keeps a transient failure from turning into a five-second
@@ -64,9 +65,9 @@ SendSIGKILL=yes
 # - CAP_PERFMON for the verifier's allow_ptr_leaks: the fast parser advances a
 #   packet pointer by the IPv4 IHL and IPv6 extension-header lengths, which this
 #   kernel only permits for a process holding CAP_PERFMON (or full root)
-# - CAP_SYS_ADMIN creates the private ingress network namespace (`daer0ns`), moves
-#   `daer0peer` into it, enters it to bind the transparent listeners and attach the
-#   peer program, and removes it on shutdown
+# - CAP_SYS_ADMIN creates the private ingress network namespace (`daer0ns`), unshares the
+#   private mount namespace and mounts its tmpfs, moves `daer0peer` into it, enters it to bind
+#   the transparent listeners and attach the peer program, and removes it on shutdown
 # - CAP_NET_BIND_SERVICE for binding to privileged ports (< 1024, such as DNS port 53)
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
@@ -84,26 +85,32 @@ RestrictRealtime=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# Configuration directory, BPF filesystem, and write access for subscription persistence.
-# `RuntimeDirectory` creates /run/daer and /run/netns; `ReadWritePaths` keeps the namespace
-# mount point writable under ProtectSystem=strict so `ip netns add` can bind the entry.
+# Configuration directory and runtime state. `RuntimeDirectory` creates /run/daer and
+# /run/netns; the latter is the mount target for the daemon's private tmpfs.
 ConfigurationDirectory=daer
-# `daer` holds its crash-recovery journal in /run/daer and `ip netns add` mounts the ingress
-# entry under /run/netns. Both must be writable under ProtectSystem=strict.
+# `daer` holds its crash-recovery journal in /run/daer. The ingress namespace mounts a
+# private tmpfs at /run/netns inside its own mount namespace, so the host directory is not
+# modified; it still has to exist as the mount target.
 RuntimeDirectory=daer netns
 # `/run/netns` is shared with every other network namespace on the host. Do not let systemd
-# remove the whole directory when daer stops: the daemon removes only its own `daer0ns`
-# entry, and `ip netns list` must look exactly as it did before the service started.
+# remove the whole directory when daer stops: other applications' namespaces may be there,
+# and the directory is the mount target.
 RuntimeDirectoryPreserve=yes
+# `/run/netns` stays writable for a legacy mount an older version may have left; the daemon's
+# own namespace mount is private and never writes the host path.
 ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
-# Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
-# `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is
-# best-effort, so the failure is silent and only shows up as a provider that cannot survive
-# the network going away. `CacheDirectory=daer` creates /var/cache/daer and grants write
-# access to exactly it, and the variable points the loader there.
+# Persistent, operator-managed rule sets live in /var/lib/daer/rules. StateDirectory
+# creates /var/lib/daer and grants write access to it under ProtectSystem=strict; the
+# `rules` child is created by the package or by the operator.
+StateDirectory=daer
+# Where downloaded rule sets are cached (ADR-0014). CacheDirectory=daer creates
+# /var/cache/daer and grants write access to exactly it under ProtectSystem=strict.
+# The loader defaults to /var/cache/daer/rules; DAER_RULE_CACHE_DIR overrides it.
 CacheDirectory=daer
 Environment=DAER_RULE_CACHE_DIR=/var/cache/daer/rules
+# Incident bundles survive a panic or a restart. `/run` is tmpfs; `/var/lib/daer` above is
+# the persistent half, created and writable for the unit only.
 
 [Install]
 WantedBy=multi-user.target

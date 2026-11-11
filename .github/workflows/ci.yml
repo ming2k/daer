@@ -25,6 +25,13 @@ jobs:
       # green. The generated files are tracked, so this compares committed bytes.
       - name: Kernel ABI drift
         run: cargo xtask abi --check
+      # The diagnostic contract (ADR-0040). This is not a docs lint: the catalog generates
+      # the EventCode enum, and the check fails on a raw tracing macro or a call-site severity
+      # that disagrees with the declared contract.
+      - name: Diagnostic event catalog
+        run: cargo xtask events --check
+      - name: Incident records
+        run: cargo xtask incident --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
@@ -119,7 +126,7 @@ jobs:
         # `3-udp` is deliberately absent: a second network namespace is a stated skip that a
         # container runner cannot satisfy, so promoting it would make the job unrunnable.
         env:
-          DAER_REQUIRE: "3-tcp,4"
+          DAER_REQUIRE: "3-tcp,3-tcp6,3-udp6,4"
         run: cargo xtask e2e-check
 
   # The datapath is C from upstream; the object test is the ABI contract with it.

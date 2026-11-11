@@ -14,6 +14,14 @@ Before any change is merged or released, it must clear the verification gates th
 │    ebpf/abi.toml, daer_abi.h and generated.rs agree byte    │
 │    for byte; the CI `test` job runs this step separately    │
 ├─────────────────────────────────────────────────────────────┤
+│ 0b. Diagnostic Contract Gate: `cargo xtask events --check`  │
+│    The event catalog and generated reference agree; no raw  │
+│    `tracing` macro or call-site severity mismatch exists.   │
+├─────────────────────────────────────────────────────────────┤
+│ 0c. Incident Gate: `cargo xtask incident --check`           │
+│    Every incident record names a signal and a falsifier;    │
+│    every event code and regression reference resolves.      │
+├─────────────────────────────────────────────────────────────┤
 │ 1. Formatting Gate: `cargo fmt --all -- --check`            │
 │    Zero formatting deviations, consistent style across tree │
 ├─────────────────────────────────────────────────────────────┤
@@ -48,17 +56,18 @@ stated reason** when it is absent (ADR-0007 — a skip that says why is a fact).
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/vision_tls_inside.rs` | the only coverage of Vision's **raw-copy** path. Plaintext through the tunnel does not exercise it, so a client that cannot carry a TLS stream passes every plaintext test — that is how the `Direct` defect shipped, with `curl https://…` failing on every request while the suite was green |
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/{layer_matrix,vmess_live,hysteria2_live}.rs` | the layer matrix, VMess AEAD and the complete Hysteria 2 stack lose their only real-peer coverage (ADR-0028, ADR-0029, ADR-0030) |
 | `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the user-space data path is not exercised; `scripts/verify/e2e-check.sh` runs it with the capability |
-| `CAP_SYS_ADMIN` + writable `/run/netns` + `DAER_NETNS_TEST=1` | `daer-control/tests/netns_lifecycle.rs` | the namespace guard, peer move, `iif` rule and return route lose their real-kernel falsifier; run it in a disposable `unshare -Urnm` (ADR-0038) |
+| `nftables` + `CAP_NET_ADMIN` + `CAP_SYS_ADMIN` | `daer-control/tests/transparent_udp6.rs` | IPv6 UDP loses its real two-namespace tproxy falsifier; the test creates and removes its own client/origin namespaces, veths and nft rules |
+| `CAP_SYS_ADMIN` + a mountable `/run/netns` + `DAER_NETNS_TEST=1` | `daer-control/tests/netns_lifecycle.rs` | the namespace guard, peer move, `iif` rule and return route lose their real-kernel falsifier; run it in a disposable `unshare -Urnm` (ADR-0038) |
 | `nftables` + `CAP_NET_ADMIN` | `daer-cli/tests/reload.rs` | the `SIGHUP` test needs the transparent port, so it skips with a reason; `scripts/verify/e2e-check.sh` section 4 runs it |
 
 A release should not be cut from a run where the interop suite skipped: the `✅` in
 `docs/dev/roadmap.md` for REALITY means "CI exercised it", and a skip is the absence of that.
 
 `DAER_REQUIRE` is what enforces that in `scripts/verify/kernel-check.sh` and
-`scripts/verify/e2e-check.sh`: a comma-separated list of check keys (`4`, `3-tcp`, `3-udp`, …)
-whose **skip is a failure**. Without it, a green run over a skipped check is indistinguishable
-from a green run over a passing one — and that is precisely the failure ADR-0007 exists to
-prevent.
+`scripts/verify/e2e-check.sh`: a comma-separated list of check keys (`4`, `3-tcp`, `3-tcp6`,
+`3-udp6`, `3-udp`, …) whose **skip is a failure**. Without it, a green run over a skipped check
+is indistinguishable from a green run over a passing one — and that is precisely the failure
+ADR-0007 exists to prevent.
 
 ### Why `-j<nproc/2>`
 
@@ -89,7 +98,7 @@ Any commit or pull request that modifies user-visible or operator-facing surface
 Prior to creating a release tag:
 
 1. **Compilation Cleanliness**: Run `cargo check --workspace --all-targets` with zero warnings.
-2. **Full CI Ladder**: Run `cargo xtask ci` (fmt, clippy, tests, the ABI drift gate and the unprivileged preflight) and verify every gate passes cleanly, then confirm the `test` job in `.github/workflows/ci.yml` runs the same `cargo xtask abi --check`.
+2. **Full CI Ladder**: Run `cargo xtask ci` (fmt, clippy, tests, the ABI drift gate, the event catalog gate, the incident-record gate, and the unprivileged preflight) and verify every gate passes cleanly, then confirm the `test` job in `.github/workflows/ci.yml` runs the same `cargo xtask abi --check` and `cargo xtask events --check`.
 3. **eBPF Datapath Compilation**: Run `cargo xtask ebpf` to produce `target/ebpf/datapath.o`.
 4. **Privileged Verification**: Run `cargo xtask kernel-check` on a test kernel to verify verifier acceptance and TC attachment, and `cargo xtask e2e-check` to verify that a real redirected flow reaches the daemon. They are separate gates over separate dependency closures; passing one says nothing about the other.
 5. **Changelog Integrity**: Ensure all changes under `[Unreleased]` in `CHANGELOG.md` are accurately documented under the new release version header with current date.

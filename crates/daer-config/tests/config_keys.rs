@@ -194,9 +194,10 @@ fn every_configuration_key_has_a_consumer() {
 
     // The count is asserted so that adding a *struct* to `CONFIG_STRUCTS` without adding keys (a
     // typo, a renamed struct) fails loudly. It grew from 70 to 110 when ADR-0028/0025/0026 added the
-    // per-protocol node tables and the layer tables to the list.
+    // per-protocol node tables and the layer tables to the list, and to 111 with the independent
+    // IPv6 Fake-IP pool (`dns.fake-ip.inet6`).
     assert_eq!(
-        total, 110,
-        "expected exactly 110 configuration fields to be verified"
+        total, 111,
+        "expected exactly 111 configuration fields to be verified"
     );
 }

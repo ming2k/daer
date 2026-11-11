@@ -18,6 +18,7 @@ All engineering standards reside flatly in `docs/dev/standards/`:
 | **[`taxonomy.md`](taxonomy.md)** | **Documentation Taxonomy & Diátaxis Layout**: Four-quadrant Diátaxis information architecture, audience boundaries (Public vs Contributor), and root directory rules. |
 | **[`style.md`](style.md)** | **Documentation & Markdown Style**: Canonical hyperlink conventions, relative routing, formatting consistency, and prose guidelines. |
 | **[`adr.md`](adr.md)** | **Architectural Decision Records**: The 3-Question Test for ADR qualification, in-place lifecycle (`draft`, `accepted`, `superseded`, `rejected`), and authoring template. |
+| **[`observability.md`](observability.md)** | **Observability & Diagnostic Plane**: Typed event contract, severity policy, correlation IDs, incident bundles, kernel telemetry consumption, and the post-bug review gate. |
 
 ---
 

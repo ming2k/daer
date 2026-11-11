@@ -84,6 +84,11 @@ fn the_listener_map_is_a_sockmap_with_fd_sized_values() {
         4,
         "SOCKMAP values are socket fds (`int`), not u64; aya and the kernel both reject an 8-byte value"
     );
+    assert_eq!(
+        map.max_entries(),
+        4,
+        "listen_socket_map needs one slot per (protocol, family): tcp4, udp4, tcp6, udp6"
+    );
 }
 
 #[test]

@@ -2,6 +2,7 @@
 id: ADR-0016
 title: "CLI route and probe: natural networking mental model and tiered active diagnostics"
 status: accepted
+amended-by: [ADR-0041]
 date: 2026-02-16
 scope: [cli/surface, architecture/diagnostics, routing, outbound/probe]
 supersedes: []
@@ -11,6 +12,8 @@ supersedes: []
 
 - Status: Accepted
 - Date: 2026-02-16
+- Amended by: [ADR-0041](0041-runtime-status-verb.md) — `status` is the seventh verb and the
+  only live, read-only inspector; `route` remains offline and `probe` remains active I/O.
 - Deciders: Ming Li
 - Related: [ADR-0014](0014-drb-rule-binary-and-providers.md), [ADR-0015](0015-cli-is-four-verbs.md)
 

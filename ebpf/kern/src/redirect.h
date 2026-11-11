@@ -25,6 +25,8 @@ static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
 
 	if (l4proto == IPPROTO_TCP)
 		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
+	else if (l4proto == IPPROTO_UDP)
+		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &three_key : &one_key;
 
 	sk = bpf_map_lookup_elem(&listen_socket_map, key);
 

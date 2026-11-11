@@ -89,11 +89,11 @@ forwarded nothing (or the wrong thing).
    build does not attach them: a single-homed box has no such device, and attaching one anyway
    is how inbound internet traffic came to be proxied as if it were a client's.
 
-4. **The UDP listener is part of the same contract as TCP.** `Listeners` carries `tcp4`, `udp`,
-   and `tcp6` as one value with no `Option`, in `daer-ebpf` so the ABI keys live in one place.
-   A daemon that could not bind the datagram socket **refuses to attach** rather than
-   publishing two of the three: with the datapath live, a datagram is redirected regardless,
-   and a missing slot turns that into a silent drop.
+4. **The UDP listener is part of the same contract as TCP.** `Listeners` carries `tcp4`,
+   `udp4`, `tcp6`, and `udp6` as one value with no `Option`, in `daer-ebpf` so the ABI keys
+   live in one place. A daemon that could not bind a datagram socket **refuses to attach**
+   rather than publishing three of the four: with the datapath live, a datagram is redirected
+   regardless, and a missing slot turns that into a silent drop.
 
 5. **The kernel's facts reach the router through a trait, not a shared map handle.** A
    `KernelObserver` returns `KernelFacts` (MAC, DSCP, process name) for a flow;
@@ -194,3 +194,39 @@ Everything below about link-layer selection, listener publication, and observed 
 applies unchanged. The `Attached` guard now also holds the namespace through its route and
 sysctl guards, so dropping it removes the namespace's policy before the namespace itself is
 deleted.
+
+## Addendum — dual-stack listener slots
+
+The original decision had three `listen_socket_map` keys and made all datagrams use key `1`.
+That was sufficient for IPv4 but made a redirected IPv6 datagram look deliverable while being
+assigned to a socket that could not receive it. The current ABI has four keys, one per
+(protocol, family): `0` = tcp4, `1` = udp4, `2` = tcp6, `3` = udp6. `Listeners` carries all
+four fds, and `Daemon::listeners` refuses to attach if either datagram socket is missing, for
+the same reason it already refused a missing TCP or UDP slot. `tests/object.rs` pins the map's
+`max_entries` to four, so an object built with the old layout cannot silently pass.
+
+## Addendum — TCX is opt-in until the privileged gate proves it
+
+Classic `cls_bpf` is the default because it is the only attachment mode this data path has
+been proven on end to end. `DAER_TC_ATTACH=tcx` selects TCX (`bpf_link`) for the privileged
+transparent-path test: the host filter becomes fd-owned, so a `SIGKILL` detaches it, and no
+`clsact` qdisc is created.
+
+TCX is not the default until the real-daemon delivery check
+(`sudo DAER_TC_ATTACH=tcx scripts/ops/daer-netns-e2e.sh --config <config>`) shows that
+`bpf_sk_assign` delivers the redirected flow on a Linux 6.6+ kernel. A successful attach is
+not that proof; an earlier TCX trial attached but left the assigned packet short of the
+listener's accept queue. The privileged kernel suite has the TCX attach test, but attachment
+alone is not delivery. Until the delivery check is green, `daer-cleanup` keeps its
+host-filter duty.
+
+## Addendum — host-global forwarding settings are prerequisites
+
+The original decision made the datapath own every box-global setting it needed, including
+`ip_forward`, `all.forwarding`, `all.rp_filter` and `all.arp_filter`. That ownership is
+wrong for process-independent policy: after a `SIGKILL` the value remains until the next
+start, and the next start cannot distinguish daer's value from the operator's baseline.
+Those settings are now checked before any mutation and never written; the daemon still owns
+the per-device `daer0`/`daer0peer` knobs and the namespace-local knobs, which die with their
+devices. The operator's prerequisites are in
+[`docs/how-to/deployment.md`](../../how-to/deployment.md#host-sysctls).

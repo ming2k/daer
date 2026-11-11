@@ -78,6 +78,34 @@ impl DatapathStatus {
     }
 }
 
+/// Aborts a spawned task when its owner is dropped or cancelled.
+///
+/// `JoinHandle` detaches on drop, so cancelling `Daemon::serve` (an aborted test, a reload
+/// path that gives up, or a future dropped by its caller) used to leave the datagram relay
+/// running on a listener nobody owned any more. That task kept polling the close-on-drop
+/// socket path until the runtime shut down, which is a leak and, under an edge-triggered
+/// readiness loop, a CPU spin. The guard makes cancellation reach the task.
+struct AbortOnDrop<T> {
+    task: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self { task }
+    }
+
+    async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// A running daemon.
 pub struct Daemon {
     /// The listener the kernel redirects into.
@@ -86,6 +114,11 @@ pub struct Daemon {
     pub port: u16,
     /// The configuration generations, swapped on reload.
     pub generations: Arc<Generations>,
+    /// The process-wide correlation ID allocator.
+    ///
+    /// The listeners are the ingress boundary and allocate `FlowId`s from this allocator;
+    /// keeping it on the daemon means the run ID and every flow/query ID share one namespace.
+    pub ids: Arc<daer_observe::Ids>,
     /// Live flows, owned apart from the accept loop.
     pub supervisor: Supervisor,
     /// What the datapath could or could not do.
@@ -187,6 +220,7 @@ impl Daemon {
             Some(mark) => mark,
             None => config.global.so_mark,
         };
+        let ids = Arc::new(daer_observe::Ids::new());
         // Bound before the object is loaded: the port is part of `PARAM`, so it has to be
         // known first. Binding does not accept, so no flow is served before the datapath
         // exists.
@@ -214,6 +248,7 @@ impl Daemon {
             )
             .map_err(BindError::Ingress)?,
         };
+        let listener = listener.with_ids(Arc::clone(&ids));
         let port = listener.port();
         let generations = Generations::new(config, options).map_err(BindError::Config)?;
         // The datagram half. A failure here is not fatal: the box can still proxy TCP, and a
@@ -249,11 +284,12 @@ impl Daemon {
                         socket_mark,
                     })),
                     None => listener,
-                };
+                }
+                .with_ids(Arc::clone(&ids));
                 Some(Arc::new(listener) as Arc<dyn DatagramIngress>)
             }
             Err(error) => {
-                tracing::warn!(
+                daer_observe::warn!(daer_observe::EventCode::DaemonUdpUnavailable,
                     %error,
                     port,
                     "the UDP relay is not running: datagrams will not be proxied \
@@ -266,6 +302,7 @@ impl Daemon {
             listener,
             port,
             generations: Arc::new(generations),
+            ids,
             supervisor: Supervisor::new(),
             datapath: DatapathStatus::default(),
             datagrams: datagrams.clone(),
@@ -308,14 +345,14 @@ impl Daemon {
         self.ingress.as_ref()
     }
 
-    /// The three fds the datapath may assign a redirected flow to.
+    /// The four fds the datapath may assign a redirected flow to.
     ///
     /// # Errors
     ///
-    /// Returns a message naming the missing half when the UDP relay could not bind. The
+    /// Returns a message naming the missing half when a UDP relay could not bind. The
     /// datapath must not be attached in that state: a redirected datagram with no listener
-    /// in `listen_socket_map[1]` is shot after the datapath has already taken it off the
-    /// direct path, which looks exactly like a network outage.
+    /// in its `listen_socket_map` slot is shot after the datapath has already taken it off
+    /// the direct path, which looks exactly like a network outage.
     pub fn listeners(&self) -> Result<daer_ebpf::Listeners, String> {
         let Some(datagrams) = self.datagrams.as_ref() else {
             return Err(
@@ -325,17 +362,25 @@ impl Daemon {
                     .to_owned(),
             );
         };
-        let Some(udp) = datagrams.raw_fd() else {
+        let Some(udp4) = datagrams.raw_fd() else {
             return Err(
-                "the datagram ingress cannot expose a socket fd, so the datapath cannot \
-                 assign redirected datagrams to it"
+                "the datagram ingress cannot expose an IPv4 socket fd, so the datapath \
+                 cannot assign redirected IPv4 datagrams to it"
+                    .to_owned(),
+            );
+        };
+        let Some(udp6) = datagrams.raw_fd_v6() else {
+            return Err(
+                "the datagram ingress cannot expose an IPv6 socket fd, so the datapath \
+                 cannot assign redirected IPv6 datagrams to it"
                     .to_owned(),
             );
         };
         Ok(daer_ebpf::Listeners {
             tcp4: self.listener.raw_fd_v4(),
-            udp,
+            udp4,
             tcp6: self.listener.raw_fd_v6(),
+            udp6,
         })
     }
 
@@ -405,7 +450,7 @@ impl Daemon {
             let signal = Arc::clone(&signal);
             signal.notified_owned()
         };
-        let udp_task = tokio::spawn(async move {
+        let udp_task = AbortOnDrop::new(tokio::spawn(async move {
             let result = daer_relay::relay::serve_datagrams(
                 service.ingress,
                 service.router,
@@ -415,20 +460,20 @@ impl Daemon {
             )
             .await;
             if let Err(error) = result {
-                tracing::warn!(%error, "the datagram relay stopped");
+                daer_observe::warn!(daer_observe::EventCode::DaemonUdpUnavailable,%error, "the datagram relay stopped");
             }
-        });
+        }));
         let (stopped, ()) = tokio::join!(
             serve_parallel(&self.listener, Arc::clone(&loop_router), &supervisor, tcp),
             trigger,
         );
         // The UDP task observes the same notification. Stop it explicitly so an in-flight
         // datagram operation cannot outlive the daemon's ingress.
-        udp_task.abort();
-        let _ = udp_task.await;
+        udp_task.stop().await;
         stopped?;
         let stats = self.stats();
-        tracing::info!(
+        daer_observe::info!(
+            daer_observe::EventCode::FlowAcceptStopped,
             accepted = stats.accepted,
             rejected = stats.rejected,
             failed = stats.failed,
@@ -544,7 +589,14 @@ impl daer_relay::DatagramRouter for DatagramRouterForGeneration {
             router
                 .open_datagram(facts, &verdict, domain)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| match error {
+                    RelayError::Dial { failure, .. } => failure,
+                    other => daer_observe::DialFailure::new(
+                        daer_observe::DialStage::Policy,
+                        daer_observe::diagnostic::codes::INTERNAL,
+                        other.to_string(),
+                    ),
+                })
         })
     }
 }
@@ -599,7 +651,7 @@ pub fn resolve_interfaces(
     for entry in wan {
         if entry == "auto" {
             let detected = detect_wan_interface()?;
-            tracing::info!(interface = %detected, "detected the WAN interface");
+            daer_observe::info!(daer_observe::EventCode::DaemonWanDetected,interface = %detected, "detected the WAN interface");
             if !resolved_wan.contains(&detected) {
                 resolved_wan.push(detected);
             }

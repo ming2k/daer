@@ -34,22 +34,31 @@
 //! namespace from a crashed run is deleted before a new one is created: daer runs one
 //! ingress, and inheriting an older one would inherit its devices and policy state.
 //!
+//! The mount is private to the daemon. [`isolate_ingress_mounts`] unshares a mount namespace
+//! and mounts a tmpfs at `/run/netns`, so the namespace mount is destroyed with the process
+//! rather than surviving a `SIGKILL`. The host `/run/netns` is untouched; diagnostics enter
+//! the daemon's mount namespace with `nsenter --mount=/proc/<pid>/ns/mnt`.
+//!
 //! # Privilege
 //!
-//! Creating a named netns, moving a link into it and `setns(2)` all require
-//! `CAP_SYS_ADMIN`. The shipped unit carries it; `daer run --no-datapath` does not touch
-//! this module.
+//! Creating and mounting the private namespace, moving a link into it and `setns(2)` all
+//! require `CAP_SYS_ADMIN`. The shipped unit carries it; `daer run --no-datapath` does not
+//! touch this module.
 
+use std::fs;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::datapath::{self, DEVICE, DatapathError, PEER};
 
-/// The namespace name. This is part of the operator-visible topology (`ip netns list`).
+/// The namespace name.
+///
+/// It is used inside the daemon's private mount namespace. The host's `ip netns list` does
+/// not show it; diagnostics enter the mount namespace at `/proc/<pid>/ns/mnt`.
 pub const INGRESS_NETNS: &str = "daer0ns";
 
 /// The peer's IPv4 address inside the ingress namespace.
@@ -66,9 +75,125 @@ pub const HOST_IPV6: &str = "fe80::ecee:eeff:feee:eeee";
 /// The peer's IPv6 link-local address, which gives IPv6 replies a source interface.
 pub const PEER_IPV6: &str = "fe80::ecee:eeff:feee:eeef";
 
+/// The iproute2 namespace directory.
+///
+/// It is a private tmpfs in the daemon's mount namespace, so the mounts created below share
+/// the daemon's lifetime rather than the host's.
+const NETNS_DIR: &str = "/run/netns";
+
 /// The host path `ip netns` mounts the namespace on.
 fn namespace_path(name: &str) -> PathBuf {
-    Path::new("/run/netns").join(name)
+    Path::new(NETNS_DIR).join(name)
+}
+
+/// Isolates the ingress namespace mounts from the host.
+///
+/// `ip netns add` creates its mount under `/run/netns`. That mount is not owned by the
+/// process: after a `SIGKILL`, it keeps the namespace, the peer and the host end of the veth
+/// pair alive. Mounting a private tmpfs at `/run/netns` inside a private mount namespace
+/// gives the mount the same lifetime as the daemon: when the process exits, the mount
+/// namespace and the tmpfs are destroyed, the last reference to `daer0ns` drops, and the
+/// kernel deletes the namespace, its devices and its namespace-local sysctls with it.
+///
+/// This must run before the daemon creates worker threads. `unshare(CLONE_NEWNS)` changes the
+/// mount namespace of the calling thread; a mount made there is not visible to a sibling
+/// thread that kept the old namespace. `main` calls it before `block_on_daemon`, so every
+/// worker inherits the private namespace. The privileged test harness runs each test on its
+/// own thread; a thread that is not in the recorded namespace gets its own private tmpfs,
+/// which keeps the tests independent.
+///
+/// # Errors
+///
+/// Returns [`DatapathError::Device`] when the mount namespace cannot be unshared or the
+/// private tmpfs cannot be mounted.
+pub fn isolate_ingress_mounts() -> Result<(), DatapathError> {
+    static PRIVATE_NS: Mutex<Option<u64>> = Mutex::new(None);
+
+    let current = mount_namespace_id().map_err(|error| {
+        DatapathError::Device(format!("cannot read /proc/thread-self/ns/mnt: {error}"))
+    })?;
+    let mut private = PRIVATE_NS.lock().map_err(|_| {
+        DatapathError::Device("the ingress mount-namespace lock is poisoned".to_owned())
+    })?;
+    if *private == Some(current) {
+        return Ok(());
+    }
+
+    // A mount left by a daemon that predates this isolation lives in the host `/run/netns`;
+    // remove it before the private tmpfs hides that directory.
+    remove_legacy_ingress();
+    isolate().map_err(|error| DatapathError::Device(error.to_string()))?;
+    *private = Some(mount_namespace_id().map_err(|error| {
+        DatapathError::Device(format!("cannot read the private mount namespace: {error}"))
+    })?);
+    Ok(())
+}
+
+/// The inode of the calling thread's mount namespace.
+fn mount_namespace_id() -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata("/proc/thread-self/ns/mnt")?.ino())
+}
+
+/// Creates the private mount namespace and its tmpfs.
+fn isolate() -> io::Result<()> {
+    // SAFETY: `unshare` takes no pointers and only changes the caller's mount namespace.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // A new mount namespace starts as a copy of its parent. Make every mount private so a
+    // mount made here cannot propagate back to the host.
+    // SAFETY: all pointers are valid for the duration of the call; the kernel reads them
+    // only while servicing `mount(2)`.
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    // The unit creates `/run/netns` as a RuntimeDirectory; a manual run may not have it.
+    fs::create_dir_all(NETNS_DIR)?;
+    // SAFETY: source, target and filesystem type are NUL-terminated constants; `options`
+    // points to a NUL-terminated `mode=0755` string.
+    if unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/run/netns".as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            c"mode=0755".as_ptr().cast(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Removes a `daer0ns` mount left in the host `/run/netns` by an older daemon.
+///
+/// This runs before the private tmpfs is mounted. A failed `ip netns del` is not fatal: the
+/// path may be the regular file `ip netns add` creates before its bind mount, which has no
+/// namespace behind it. Unlinking that file is the cleanup.
+fn remove_legacy_ingress() {
+    let path = namespace_path(INGRESS_NETNS);
+    if !path.exists() {
+        return;
+    }
+    let _ = Command::new("ip")
+        .args(["netns", "del", INGRESS_NETNS])
+        .output();
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 fn format_mac(mac: [u8; 6]) -> String {
@@ -97,6 +222,10 @@ impl IngressNamespace {
     /// Returns [`DatapathError::Device`] with the failing `ip` command when the namespace
     /// cannot be created, or when its loopback cannot be brought up.
     pub fn create() -> Result<Self, DatapathError> {
+        // The namespace mount has to be private before `ip netns add` creates it. `main`
+        // does this before the runtime starts; the call here covers the privileged test and
+        // any caller that reaches the guard without going through `main`.
+        isolate_ingress_mounts()?;
         let stale = namespace_path(INGRESS_NETNS);
         if stale.exists() {
             let output = Command::new("ip")
@@ -271,10 +400,10 @@ impl IngressNamespace {
             PEER,
             "nodad",
         ]) {
-            tracing::warn!(%error, "IPv6 ingress address is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress address is unavailable");
         }
         if let Err(error) = self.ip(&["route", "add", "default", "via", HOST_IPV6, "dev", PEER]) {
-            tracing::warn!(%error, "IPv6 ingress route is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress route is unavailable");
         }
         if let Err(error) = self.ip(&[
             "neigh",
@@ -287,7 +416,7 @@ impl IngressNamespace {
             "nud",
             "permanent",
         ]) {
-            tracing::warn!(%error, "IPv6 ingress neighbor is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress neighbor is unavailable");
         }
         Ok(())
     }
@@ -370,7 +499,7 @@ pub(crate) fn remove_ingress_namespace() {
     }
     let _ = std::fs::remove_file(&path);
     if path.exists() {
-        tracing::warn!(
+        daer_observe::warn!(daer_observe::EventCode::NetnsCleanupFailed,
             path = %path.display(),
             "could not remove the ingress namespace mount; a stale mount may remain"
         );
@@ -432,6 +561,9 @@ impl PreparedIngress {
     /// Returns [`DatapathError`] naming the failing step. A partially prepared namespace is
     /// removed by its guard on drop; the host end is removed with its peer.
     pub fn prepare() -> Result<Self, DatapathError> {
+        // Host forwarding and martian settings are the operator's. Check them before creating
+        // a device or changing a route; the daemon does not mutate global policy to work.
+        datapath::check_host_sysctls()?;
         // Remove host policy state from a pre-namespace daer run before any listener binds.
         // The current table is installed inside the namespace, so leaving a host-level
         // mark rule in place would route the listener's own marked replies to `lo`.
@@ -451,7 +583,7 @@ impl PreparedIngress {
         datapath::link_up(DEVICE)?;
 
         if let Err(error) = datapath::add_ipv6_link_local(DEVICE) {
-            tracing::warn!(%error, "IPv6 host-side next hop is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 host-side next hop is unavailable");
         }
         namespace.configure_peer(device_mac)?;
         pair.disarm();

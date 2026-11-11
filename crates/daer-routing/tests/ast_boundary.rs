@@ -178,11 +178,3 @@ fn an_artifact_round_trips_through_text() {
         "an artifact that cannot be recompiled to itself cannot be audited"
     );
 }
-
-#[test]
-fn attributes_can_be_filtered_before_encoding() {
-    let mut rules = RuleSet::parse("a.com @ads\nb.com @cn\n").unwrap();
-    assert_eq!(rules.drop_attribute("ads"), 1);
-    assert_eq!(rules.domains().len(), 1);
-    assert_eq!(rules.domains()[0].pattern.value(), "b.com");
-}

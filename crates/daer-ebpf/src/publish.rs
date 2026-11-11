@@ -264,11 +264,11 @@ pub fn publish_outbound_connectivity(
 /// # Why this is not optional
 ///
 /// The datapath redirects a matching flow with `bpf_sk_assign` into the socket held in
-/// `listen_socket_map` — a `SOCKMAP` keyed by family (`0` = tcp4, `1` = udp, `2` = tcp6, per
-/// the C). If the map is empty, `assign_listener` returns -1 and **nothing reaches the
-/// listener**: the datapath decides "proxy", then has nowhere to put the packet, and the
-/// flow dies without a diagnostic on either side. Publishing the fd is what closes that gap,
-/// and it is separate from attaching the programs.
+/// `listen_socket_map` — a `SOCKMAP` keyed by protocol and family (`0` = tcp4, `1` = udp4,
+/// `2` = tcp6, `3` = udp6, per the C). If the map is empty, `assign_listener` returns -1 and
+/// **nothing reaches the listener**: the datapath decides "proxy", then has nowhere to put the
+/// packet, and the flow dies without a diagnostic on either side. Publishing the fd is what
+/// closes that gap, and it is separate from attaching the programs.
 ///
 /// # Errors
 ///
@@ -293,9 +293,10 @@ pub fn publish_listeners(
             crate::names::map::LISTEN_SOCKET
         ))
     })?;
-    // The keys are the C's own: 0 is tcp4, 1 is udp, 2 is tcp6. All three are written:
-    // leaving the UDP slot empty was how every datagram on the eBPF path disappeared, since
-    // `assign_listener(skb, IPPROTO_UDP)` looks up key 1 and returns -1 when it is absent.
+    // The keys are the C's own: 0 is tcp4, 1 is udp4, 2 is tcp6, 3 is udp6. All four are
+    // written: leaving the UDP slots empty was how every datagram on the eBPF path
+    // disappeared, since `assign_listener(skb, IPPROTO_UDP)` looks up the family slot and
+    // returns -1 when it is absent.
     // `SockMap::set` wants references: the fd is borrowed for the duration of the call and
     // the kernel takes its own reference, so the fd stays owned by the caller.
     for (key, fd, family) in listeners.entries() {

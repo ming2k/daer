@@ -41,6 +41,10 @@ use daer_control::{Daemon, RouterOptions};
 const ORIGIN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18_080);
 
+/// The IPv6 origin address. `::1` exists on every namespace with a loopback.
+const ORIGIN6: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 18_081);
+
 /// The mark daer's own dials carry, and the one the redirect rule excludes.
 const MARK: u32 = 0x0dae;
 
@@ -95,6 +99,24 @@ fallback = "direct"
 "#
     );
     daer_config::toml_config::load_str(&text).expect("the probe configuration must parse")
+}
+
+/// A config whose only outbound is `direct`, for the IPv6 data-path test.
+fn direct_config6(port: u16) -> daer_config::Config {
+    let text = format!(
+        r#"
+schema = 1
+[global]
+tproxy-port = {port}
+wan-interface = ["lo"]
+lan-interface = ["lo"]
+log-level = "debug"
+[routing]
+rules = []
+fallback = "direct"
+"#
+    );
+    daer_config::toml_config::load_str(&text).expect("the IPv6 probe configuration must parse")
 }
 
 /// A body that only this run's origin knows.
@@ -175,6 +197,63 @@ fn install_redirect(port: u16) -> bool {
 
 fn remove_redirect() {
     let _ = nft(&["delete", "table", "ip", "daer-test"]);
+}
+
+/// Installs the IPv6 equivalent of [`install_redirect`].
+fn install_redirect6(port: u16) -> bool {
+    if !nft(&["add", "table", "ip6", "daer-test6"]) {
+        return false;
+    }
+    if !nft(&[
+        "add",
+        "chain",
+        "ip6",
+        "daer-test6",
+        "pre",
+        "{",
+        "type",
+        "filter",
+        "hook",
+        "prerouting",
+        "priority",
+        "mangle",
+        ";",
+        "}",
+    ]) {
+        let _ = nft(&["delete", "table", "ip6", "daer-test6"]);
+        return false;
+    }
+    let mut args = vec![
+        "add",
+        "rule",
+        "ip6",
+        "daer-test6",
+        "pre",
+        "meta",
+        "mark",
+        "0x0dae",
+        "return",
+    ];
+    if !nft(&args) {
+        let _ = nft(&["delete", "table", "ip6", "daer-test6"]);
+        return false;
+    }
+    let rule = format!(
+        "ip6 daddr {} tcp dport {} tproxy to :{port}",
+        ORIGIN6.ip(),
+        ORIGIN6.port()
+    );
+    args = vec!["add", "rule", "ip6", "daer-test6", "pre"];
+    args.extend(rule.split(' '));
+    let installed = nft(&args);
+    if !installed {
+        let _ = nft(&["delete", "table", "ip6", "daer-test6"]);
+    }
+    installed
+}
+
+fn remove_redirect6() {
+    let _ = nft(&["delete", "table", "ip6", "daer-test6"]);
 }
 
 /// Runs `ip`, returning whether it succeeded.
@@ -440,8 +519,13 @@ impl Drop for Origin {
 /// silently returned left the client talking to nothing, and the test then reported a proxy
 /// failure that was really a fixture failure.
 fn spawn_origin(nonce: String) -> Origin {
-    let listener = std::net::TcpListener::bind(ORIGIN)
-        .unwrap_or_else(|error| panic!("the origin must bind {ORIGIN}: {error}"));
+    spawn_origin_at(ORIGIN, nonce)
+}
+
+/// Spawns an origin at `address`, for the IPv4 and IPv6 data-path tests.
+fn spawn_origin_at(address: SocketAddr, nonce: String) -> Origin {
+    let listener = std::net::TcpListener::bind(address)
+        .unwrap_or_else(|error| panic!("the origin must bind {address}: {error}"));
     listener
         .set_nonblocking(true)
         .expect("the listener can accept without blocking");
@@ -474,11 +558,16 @@ fn spawn_origin(nonce: String) -> Origin {
 
 /// One request/response exchange against `ORIGIN`, returning the whole reply.
 async fn request() -> std::io::Result<String> {
+    request_at(ORIGIN).await
+}
+
+/// One request/response exchange against `address`, returning the whole reply.
+async fn request_at(address: SocketAddr) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::net::TcpStream::connect(ORIGIN),
+        tokio::net::TcpStream::connect(address),
     )
     .await
     .map_err(|_| std::io::Error::other("connect timed out"))??;
@@ -553,6 +642,76 @@ async fn a_redirected_flow_is_proxied_by_the_daemon() {
 
     serve.abort();
     remove_redirect();
+    drop(origin);
+}
+
+/// An IPv6 TCP flow is redirected, decided, and relayed by the same accept loop.
+///
+/// The falsifier is the same as the IPv4 test: the origin's per-run nonce must return *and*
+/// the daemon's `accepted` counter must advance. A fixture that reaches the origin directly
+/// satisfies neither the counter assertion nor, if the redirect is misconfigured, necessarily
+/// the nonce assertion. IPv6 has its own nftables family (`ip6`) and its own listener fd, so
+/// reusing the IPv4 fixture would not exercise this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirected_ipv6_flow_is_proxied_by_the_daemon() {
+    let _fixture = Fixture::acquire();
+    // A fresh `unshare -Urn` namespace starts with `lo` down. Bringing it up also installs
+    // the kernel's IPv6 loopback, which is the address this test owns; on a normal host the
+    // bind already succeeds and this is a no-op.
+    let ipv6_ready = std::net::TcpListener::bind(ORIGIN6).is_ok() || {
+        ip(&["link", "set", "lo", "up"]);
+        std::net::TcpListener::bind(ORIGIN6).is_ok()
+    };
+    if !ipv6_ready {
+        eprintln!("skipped: this host has no usable IPv6 loopback");
+        return;
+    }
+    if !install_redirect6(12_353) {
+        eprintln!(
+            "skipped: cannot install the IPv6 tproxy rule (needs nftables and CAP_NET_ADMIN; \
+             run under `unshare -Urn`)"
+        );
+        return;
+    }
+
+    let nonce = nonce();
+    let origin = spawn_origin_at(ORIGIN6, nonce.clone());
+    let config = direct_config6(12_353);
+    let options = match can_mark_sockets() {
+        true => RouterOptions::default().with_socket_mark(Some(MARK)),
+        false => RouterOptions::default(),
+    };
+    let Ok(daemon) = Daemon::bind(&config, &options) else {
+        remove_redirect6();
+        panic!("the transparent port must bind (is CAP_NET_ADMIN present?)");
+    };
+    let daemon = std::sync::Arc::new(daemon);
+    let serve = tokio::spawn({
+        let daemon = std::sync::Arc::clone(&daemon);
+        async move {
+            daemon
+                .serve(std::future::pending::<()>())
+                .await
+                .expect("the accept loop must not fail");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reply = request_at(ORIGIN6)
+        .await
+        .expect("the redirected IPv6 flow must complete");
+    let stats = daemon.stats();
+    assert!(
+        reply.contains(&nonce),
+        "the origin's nonce must come back through the IPv6 proxy; got {reply:?}"
+    );
+    assert_eq!(
+        stats.accepted, 1,
+        "the daemon must have proxied exactly one IPv6 flow, got {stats:?}"
+    );
+
+    serve.abort();
+    remove_redirect6();
     drop(origin);
 }
 
@@ -649,16 +808,16 @@ async fn the_transparent_port_refuses_a_flow_that_was_not_redirected() {
 /// table N`, the datagram reaches the `tproxy` rule and is then dropped by routing — which an
 /// earlier attempt misread as "a single network namespace cannot do this". The rule is part of
 /// the deployment contract, not of the test: `docs/how-to/deployment.md` lists it for operators.
+#[ignore = "a single-namespace IPv4 UDP fixture is invalid: the origin and the transparent reply socket must own the same (address, port), so whichever binds second steals the other's datagrams. transparent_udp6.rs runs the real two-namespace topology; the relay itself is covered by the datagram unit tests."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_redirected_datagram_is_proxied_by_the_daemon() {
     let _fixture = Fixture::acquire();
-    // # The topology this needs, and why the test reports a skip instead of passing
+    // # The topology this needs, and why this single-namespace version is not run
     //
     // `TPROXY` redirects a datagram that **arrives on an interface**. Proving the relay end to
     // end therefore needs a datagram whose `iif` is not `lo`, which needs the origin in a
-    // different network namespace. Creating one needs mount privileges this environment does
-    // not have (`ip netns add` cannot create `/run/netns`), so the three in-namespace
-    // topologies were tried and each fails for a *fixture* reason, not a product one:
+    // different network namespace. The three in-namespace topologies were tried and each fails
+    // for a *fixture* reason, not a product one:
     //
     // 1. client and origin both on `127.0.0.0/8`: the rule catches the client's datagram and
     //    the origin's reply identically (same `iif`, same `dport`), so a `tproxy` there also
@@ -669,17 +828,24 @@ async fn a_redirected_datagram_is_proxied_by_the_daemon() {
     // 3. `ip rule fwmark … table …` + `local default dev lo`: necessary for `tproxy` to treat a
     //    marked datagram as local at all, and present below — but it does not create an `iif`.
     //
-    // What *is* verified without a second namespace, and is the part that regressed:
-    // `the_datagram_relay_is_wired_into_the_daemon` below; `datagram.rs`'s own tests, which
-    // prove session creation, the per-peer table, the replies going back to the right peer, and
-    // the ceiling; and — since this work — that the daemon runs on a runtime where a spawned
-    // forward is actually scheduled (`crates/daer-cli`'s `block_on_daemon`), which is the defect
-    // an end-to-end attempt *did* find.
+    // The hidden fourth failure is the one that makes this fixture unworkable on a host that
+    // *can* create namespaces: the origin binds the original destination (`127.0.0.1:18080`)
+    // and the transparent reply socket must bind that same (address, port) to put it on the
+    // reply. Two sockets cannot both own it, and the one that binds last receives the other's
+    // datagrams. `transparent_udp6.rs` avoids this by putting the origin in a real second
+    // namespace and is the end-to-end UDP gate. This test remains compiled for the fixture
+    // history and is intentionally ignored.
+    //
+    // What *is* verified without a second namespace: `the_datagram_relay_is_wired_into_the_daemon`
+    // below; `datagram.rs`'s own tests, which prove session creation, the per-peer table, the
+    // replies going back to the right peer, and the ceiling; and that the daemon runs on a
+    // runtime where a spawned forward is actually scheduled (`crates/daer-cli`'s
+    // `block_on_daemon`), which is the defect an end-to-end attempt *did* find.
     if !two_namespaces_available() {
         eprintln!(
             "skipped: proving UDP through `tproxy` needs the origin in a second network \
              namespace (so the datagram has a non-`lo` `iif`), and this environment cannot \
-             create one; see the comment on this test for the three topologies that were tried"
+             create one; see the comment on this test for the topologies that were tried"
         );
         return;
     }
@@ -789,5 +955,13 @@ async fn the_datagram_relay_is_wired_into_the_daemon() {
         daemon.datagram_stats().is_some(),
         "the relay's counters must be readable, or a deployment cannot tell working UDP from \
          silently dropped UDP"
+    );
+    let listeners = daemon
+        .listeners()
+        .expect("both datagram families must expose a listener fd");
+    assert_ne!(
+        listeners.udp4, listeners.udp6,
+        "IPv4 and IPv6 UDP must be distinct sockets; one dual-stack socket cannot be \
+         assigned to both flow families"
     );
 }

@@ -57,13 +57,20 @@ listen = "127.0.0.1:53"
 [dns.fake-ip]
 enabled = false
 inet = "198.18.0.0/15"           # Reserved benchmark range (RFC 2544 / RFC 3596)
-pool-size = 65535                 # Bound memory allocation
+# inet6 = "fdfe:dcba:9876::/64"  # optional; absent keeps AAAA suppressed for IPv4-only Fake-IP
+pool-size = 65535                 # Bound memory allocation per address family
 exclude = [
     "cn-example",                   # see the note below
     "local",
     "lan",
 ]
 ```
+
+> **IPv4 and IPv6 pools are independent.** `inet` is required and remains the IPv4 pool;
+> `inet6` is optional and enables AAAA synthesis. With `inet6` absent, AAAA is answered with
+> an empty NOERROR so a dual-stack client falls back to the synthetic A, exactly as before.
+> Setting both gives a domain one synthetic address in each family, with independent reverse
+> mappings; the data path chooses by the destination family.
 
 > **`geosite:` / `geoip:` in `exclude` is refused, not ignored.** This record was written when
 > a category reference could be expanded by the loader. [ADR-0014](0014-drb-rule-binary-and-providers.md)

@@ -10,12 +10,12 @@ description = "Transparent ingress and byte relaying for daer: the stable usersp
 
 [dependencies]
 daer-sniff.workspace = true
+daer-observe.workspace = true
 libc.workspace = true
 netune.workspace = true
 netune-trace.workspace = true
 socket2.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 # `tests/architecture.rs` asserts the crate's dependency closure, and `cargo metadata`

@@ -152,7 +152,18 @@ pub async fn resolve_subscriptions_with(
             let mut node = match Node::from_link(&url) {
                 Ok(node) => node,
                 Err(e) => {
-                    tracing::warn!(link = %url, error = %e, "unsupported subscription node link (skipped)");
+                    // A subscription link is a credential carrier. The only safe spelling in
+                    // a log or an incident bundle is the scheme plus an explicit redaction
+                    // marker; the tag is operator-chosen and is not secret.
+                    let link = daer_observe::RedactedLink::new(&url);
+                    daer_observe::warn!(
+                        daer_observe::EventCode::SubscriptionLinkRejected,
+                        scheme = %link.scheme(),
+                        link = %link,
+                        node = %tag,
+                        error = %e,
+                        "unsupported subscription node link (skipped)"
+                    );
                     continue;
                 }
             };

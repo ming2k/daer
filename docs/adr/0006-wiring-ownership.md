@@ -134,7 +134,7 @@ implemented and tested but not reached from `daer run`. It was subsequently wire
 accept loop and the UDP relay.
 
 The incident record
-[`transparent-ingress-incident.md`](../dev/transparent-ingress-incident.md) explains why the
+[`incidents/0001-transparent-ingress.md`](../dev/incidents/0001-transparent-ingress.md) explains why the
 composition matters as much as the individual adapters. The production TCP accept loop does
 not `await` a routing decision or a dial; each flow is decided in its own task. The UDP relay
 is a separate task as well, because sharing one `tokio::join!` task let a slow datagram

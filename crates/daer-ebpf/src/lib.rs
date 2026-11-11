@@ -33,6 +33,7 @@ pub mod names;
 pub mod loader;
 #[cfg(feature = "loader")]
 pub mod publish;
+pub mod telemetry;
 
 pub use abi::{PortRange, RuntimeParam, TuplesKey};
 pub use epoch::{
@@ -44,7 +45,7 @@ pub use listeners::Listeners;
 
 #[cfg(feature = "loader")]
 pub use loader::{
-    LoadError, ObjectReport, attach_tc, inspect_bytes, inspect_object, load, load_path,
+    LoadError, ObjectReport, TcMode, attach_tc, inspect_bytes, inspect_object, load, load_path,
     set_device_ifindex,
 };
 #[cfg(feature = "loader")]

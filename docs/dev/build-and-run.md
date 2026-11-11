@@ -30,9 +30,20 @@ cargo build --release                  # target/release/daer, target/release/dae
 cargo xtask ebpf                       # target/ebpf/datapath.o  (needs clang)
 ```
 
-`daer` is the single public binary: `run`, `check`, `route`, `probe`, `schema`, `version`
-(ADR-0015, `[INV-CLI-01]`). `daer-drb` is the rule-artifact producer and is *not* linked into
-the daemon — `crates/daer-cli/tests/surface.rs` asserts that closure stays empty (ADR-0031).
+`daer` is the single public binary: `run`, `check`, `route`, `probe`, `status`, `schema`,
+`version` (ADR-0015/ADR-0041, `[INV-CLI-01]`). `daer-drb` is the rule-artifact producer and is
+*not* linked into the daemon — `crates/daer-cli/tests/surface.rs` asserts that closure stays
+empty (ADR-0031).
+
+For a failure that needs a real backtrace, build the forensic profile:
+
+```bash
+cargo build --profile forensic        # line tables + unwinding, not the shipped build
+```
+
+The release build is deliberately stripped and `panic = "abort"`. The forensic build keeps
+line tables and unwinding so the panic hook and the RAII cleanup paths can produce evidence;
+use it only to explain a failure, never as the artifact you deploy.
 
 `cargo xtask ebpf` needs a `vmlinux.h` that matches the kernel it will be loaded on. It is
 per-kernel and is not vendored:
@@ -77,7 +88,12 @@ called.
 A real run creates `daer0ns` and moves `daer0peer` into it before binding the listeners. If the
 listener and the packet are in different namespaces, `bpf_sk_assign` can report success and the
 transport stack still answers `NO_SOCKET`; the namespace is a prerequisite, not an optimization.
-`ip netns list`, `ip -n daer0ns link`, and `ip -n daer0ns route` are the topology checks.
+The host must already have the forwarding and martian sysctls listed in
+[`docs/how-to/deployment.md#host-sysctls`](../how-to/deployment.md#host-sysctls); the daemon
+checks them and refuses to change them.
+`nsenter --mount=/proc/$(systemctl show -p MainPID --value daer)/ns/mnt ip -n daer0ns link`
+and `... route` are the topology checks; the mount is private to the daemon, so the host's
+`ip netns list` does not show it.
 
 ---
 
@@ -89,9 +105,11 @@ The unprivileged gate, and the one to run before pushing:
 cargo xtask ci
 ```
 
-It runs the ABI drift check, `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`
-and `daer check --object` over the object this tree just built. It needs no capability, and
-`.github/workflows/ci.yml` runs the same steps.
+It runs the ABI drift check, the diagnostic event catalog check
+(`cargo xtask events --check`), the incident-record check (`cargo xtask incident --check`),
+`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` and `daer check --object`
+over the object this tree just built. It needs no capability, and `.github/workflows/ci.yml`
+runs the same steps.
 
 The two privileged gates answer different questions over different dependency closures, so
 neither substitutes for the other:
@@ -106,6 +124,16 @@ missing. A skip is a fact on a laptop and a hole in CI, so `DAER_REQUIRE=<key,..
 skip into a failure; the keys are in `docs/how-to/deployment.md`. The full script layout,
 including the host-level `ops/` helpers, is documented in
 [`scripts/README.md`](../../scripts/README.md).
+
+`DAER_TC_ATTACH=tcx` selects TCX (`bpf_link`) for the host TC hooks. TCX makes the filter
+fd-owned, so it detaches on `SIGKILL`, and creates no `clsact` qdisc. It is **not** the
+default. The delivery check is the real-daemon script
+`sudo DAER_TC_ATTACH=tcx scripts/ops/daer-netns-e2e.sh --config <config>`: it must show the
+proxied HTTPS request returning 200, not merely that the link attached. Run it with
+`--preflight` first (no root): that checks the kernel, tools, release artifacts, and config
+and prints the exact sudo command. The privileged kernel suite adds the TCX attach test.
+Until that delivery check is green on a Linux 6.6+ kernel, classic `cls_bpf` stays the
+default and `daer-cleanup` keeps its host-filter duty.
 
 ---
 

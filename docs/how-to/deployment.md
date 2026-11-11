@@ -8,17 +8,60 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 | --- | --- |
 | Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
 | `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` | load and attach the datapath (`CAP_PERFMON` enables the verifier's `allow_ptr_leaks` for variable-offset packet parsing); `IP_TRANSPARENT` on the listeners |
-| `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, move `daer0peer` into it, and `setns` to bind the listeners and attach the peer program (ADR-0038) |
+| `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, unshare its private mount namespace, move `daer0peer` into it, and `setns` to bind the listeners and attach the peer program (ADR-0038) |
 | `ip` | create the `daer0`/`daer0peer` pair and configure the ingress namespace |
+| Host sysctls | `net.ipv4.ip_forward=1`, `net.ipv4.conf.all.forwarding=1`, `net.ipv4.conf.all.rp_filter=0`, `net.ipv4.conf.all.arp_filter=0`; `net.ipv6.conf.all.forwarding=1` on a dual-stack kernel. `daer` checks them at startup and refuses to change them. |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
-| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from disk, an `http` one is cached under `$XDG_CACHE_HOME/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it to `/var/cache/daer/rules`, which is the only path `ProtectHome=true` leaves writable) |
+| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from `/var/lib/daer/rules/` (or the declared path), an `http` one is cached under `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it explicitly) |
+
+The default TC attachment is classic `cls_bpf`, which works on Linux 5.17+. The opt-in TCX
+path (`DAER_TC_ATTACH=tcx`, used by the real-daemon delivery check) needs Linux 6.6+.
+
+### Host sysctls
+
+`daer` forwards transparently, so the host must already have forwarding enabled and
+reverse-path filtering relaxed. These are host-global settings; `daer` checks them and
+**does not change them**. A missing value is a startup failure that names the key.
+
+```ini
+# /etc/sysctl.d/99-daer.conf
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.all.arp_filter = 0
+# Only on a dual-stack kernel:
+net.ipv6.conf.all.forwarding = 1
+```
+
+```sh
+sudo sysctl --system
+```
+
+`rp_filter`/`arp_filter` are relaxed because a redirected packet carries the client's source
+address, which is not local to the host; strict reverse-path filtering drops it before the
+datapath sees it. The daemon still owns the `daer0`/`daer0peer` per-device knobs and the
+namespace-local knobs, which disappear with their devices.
 
 ## Build
 
 ```sh
 cargo xtask ebpf           # -> target/ebpf/datapath.o  (needs clang + a vmlinux.h tree)
-cargo build --release      # -> target/release/daer and target/release/daer-drb
+cargo build --release      # -> target/release/{daer,daer-cleanup,daer-drb}
 ```
+
+To install the built artifacts and the unit under `/usr`:
+
+```sh
+cargo xtask install                      # /usr/bin, /usr/lib/daer, /usr/lib/systemd/system
+cargo xtask install --prefix /usr/local  # unit paths follow the prefix
+cargo xtask install --destdir /tmp/pkg   # stage a package tree
+```
+
+`cargo xtask install` installs the exact set the unit names, including `daer-cleanup`; it
+does not write `/etc/daer/config.toml`, enable the unit, or start it. It runs as the
+invoking user, so writing `/usr` needs the permissions to do so. Use
+`scripts/ops/daer-install-netns.sh --config <path>` for those activation steps: it stages
+the same tree as your user and uses `sudo` only for the copy and the service restart.
 
 `cargo xtask ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
 (defaults to `ebpf/headers`). `ebpf/headers/vmlinux.h` is per-kernel and is not vendored;
@@ -30,6 +73,23 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
 
 A `vmlinux.h` from a newer kernel than the target's is the usual cause of a verifier
 rejection that names a struct offset.
+
+## Filesystem layout
+
+The supported deployment is system-wide:
+
+| Path | Purpose |
+| :--- | :--- |
+| `/etc/daer/config.toml` | Configuration. |
+| `/etc/daer/example.toml` | Annotated reference installed by the package. |
+| `/usr/bin/daer` | Daemon and inspection CLI. |
+| `/usr/lib/daer/datapath.o` | eBPF datapath object. |
+| `/var/lib/daer/rules/` | Operator-managed local `.drb` / `.rules` files. |
+| `/var/cache/daer/rules/` | Disposable HTTP provider cache. |
+
+A file provider reads only the path declared in its `[[rule-provider]]` entry. The daemon
+does not scan `/var/lib/daer/rules` automatically. Relative paths resolve against
+`/etc/daer/`; prefer absolute paths.
 
 ## Configuration
 
@@ -70,6 +130,7 @@ Check it before starting:
 
 ```sh
 daer check -c /etc/daer/config.toml
+daer check --host -c /etc/daer/config.toml   # also verifies the sysctl prerequisites
 daer route 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why -c /etc/daer/config.toml
 # or simply:
 daer route example.com --why -c /etc/daer/config.toml
@@ -94,9 +155,11 @@ INFO listening for redirected flows port=12345 namespace=Some("daer0ns") generat
 INFO datapath attached: redirected flows will be proxied port=12345 namespace=daer0ns device=daer0 peer=daer0peer
 ```
 
-The listener is created inside `daer0ns`, not the host. `ip netns list` shows the namespace
-while the daemon runs, and both `ip link show daer0` and the namespace disappear on a clean
-shutdown.
+The listener is created inside `daer0ns`, not the host. The namespace mount is private to the
+daemon's mount namespace, so the host's `ip netns list` does not show it; use the
+mount-namespace path in [Diagnostics](diagnostics.md). Both `ip link show daer0` and the
+namespace disappear on a clean shutdown, and the mount dies with the process even after
+`SIGKILL`.
 
 If the last line is missing, nothing is proxied however healthy the rest looks. `daer run`
 exits rather than serving when it cannot attach; `--no-datapath` is the explicit opt-in to
@@ -178,7 +241,9 @@ host forwarding path stay in the host. A redirected packet crosses the namespace
 its way to the listener, which is what makes `bpf_sk_assign` land in a socket the transport
 stack accepts.
 
-What it sets up, in order, before the first flow is served:
+What it sets up, in order, before the first flow is served. Host-global forwarding and
+martian values are prerequisites (see above), not entries in this table; the table lists what
+the daemon installs in the namespace and on the devices it owns.
 
 | State | Namespace | Why |
 | --- | --- | --- |
@@ -186,25 +251,28 @@ What it sets up, in order, before the first flow is served:
 | `ip rule add iif daer0peer table 2023` (v4 and v6) | ingress | a packet arriving on the private peer is ours; keying by interface is what distinguishes a redirect from a marked listener reply |
 | `ip route add local default dev lo table 2023` (v4 and v6) | ingress | the destination of that rule; a redirected packet has a **non-local** destination and must reach the local stack |
 | `169.254.0.11/32` on `daer0peer`, a link route to `169.254.0.1`, a default route through it, and a permanent neighbor for `daer0`'s MAC | ingress | listener replies use the client's original destination as their source and need an output route back through the host |
-| `net.ipv4.conf.daer0{peer,}.rp_filter = 0`, `net.ipv4.conf.all.rp_filter = 0` | host and ingress | reverse-path filtering would drop a packet with a non-local source before `bpf_sk_assign` could deliver it |
+| `net.ipv4.conf.daer0.rp_filter = 0` (host) and `net.ipv4.conf.daer0peer.rp_filter = 0` (ingress) | host and ingress | reverse-path filtering would drop a packet with a non-local source before `bpf_sk_assign` could deliver it; the host `all` value is a prerequisite |
 | `net.ipv4.conf.daer0{peer,}.accept_local = 1` | host and ingress | a host-generated flow's source is a local address on `wlan0`; without this the kernel treats it as a martian source and drops it on `daer0peer` |
-| `net.ipv4.conf.daer0{peer,}.arp_filter = 0`, `net.ipv4.conf.all.arp_filter = 0` | host and ingress | the pair must not filter ARP by the source interface |
-| `net.ipv4.ip_forward = 1`, `net.ipv4.conf.all.forwarding = 1`, `net.ipv4.conf.daer0.forwarding = 1` | host | the reply is forwarded from `daer0` to the client |
+| `net.ipv4.conf.daer0{peer,}.arp_filter = 0` | host and ingress | the pair must not filter ARP by the source interface; the host `all` value is a prerequisite |
+| `net.ipv4.conf.daer0.forwarding = 1` | host | the reply is forwarded from `daer0` to the client; `ip_forward` and `all.forwarding` are prerequisites |
 | `net.ipv4.conf.daer0peer.forwarding = 1` | ingress | the namespace gateway role |
 | TC classifiers on every `lan`/`wan` interface | host | see below |
 | `daer0` ingress TC, `daer0peer` ingress TC | host / ingress | the return path and the assign hook live on opposite sides of the boundary |
-| `listen_socket_map` entries `0` (tcp4), `1` (**udp**), `2` (tcp6) | — | `assign_listener` looks the socket up by key; an empty slot is a flow the datapath has already taken off the direct path and then drops |
+| `listen_socket_map` entries `0` (tcp4), `1` (udp4), `2` (tcp6), `3` (udp6) | — | `assign_listener` looks the socket up by protocol and family; an empty slot is a flow the datapath has already taken off the direct path and then drops |
 
 All of it is removed again when the daemon exits: the namespace guard deletes `daer0ns` (and
-with it the peer and the host end of the pair), the sysctls are restored to whatever they
-were, Aya detaches every TC filter, and the `clsact` qdisc is removed when daer created it. A
-clean shutdown leaves no host table-2023 rule and no daer-owned kernel state.
+with it the peer and the host end of the pair), the per-device `daer0` knobs disappear with
+the device, Aya detaches every TC filter, and the `clsact` qdisc is removed when daer created
+it. A clean shutdown leaves no host table-2023 rule and no daer-owned kernel state. The
+host-global prerequisites are never changed.
 
-Two backstops cover the cases where Rust destructors cannot run: the daemon writes an undo
-journal under `/run/daer` before it changes a sysctl or creates a qdisc, and the unit's
-`ExecStopPost=daer-cleanup` replays that journal and removes the namespace, pair, TC filters
-and host policy routing after a `SIGKILL`, panic or stop timeout. The same recovery runs
-before a new daemon starts, so a crash cannot compound leftovers.
+The namespace mount is private to the daemon, so a `SIGKILL` releases `daer0ns`, the pair, and
+the ingress policy and sysctls with the process. Host-side state that is not namespace-owned
+is covered by two backstops: the daemon writes an undo journal under `/run/daer` before it
+creates a qdisc, and the unit's `ExecStopPost=daer-cleanup` replays it after a `SIGKILL`,
+panic or stop timeout. A current (v2) journal removes host TC filters and qdiscs only; a
+pre-v2 journal also restores host sysctls and a host namespace/pair from older releases. The
+same recovery runs before a new daemon starts, so a crash cannot compound leftovers.
 
 ### Which TC program goes on which interface
 
@@ -274,10 +342,11 @@ OOMScoreAdjust=-100
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
 # The Rust guards are the primary cleanup path. This runs after them — and also after a
-# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal and removing the
-# namespace, veth pair, TC filters and host policy routing that would otherwise outlive it.
-# It is a dedicated helper, not a hidden flag on `daer run`: the operator CLI stays the six
-# verbs in ADR-0015, and systemd's post-stop hook is not one of them.
+# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal. A current (v2)
+# journal removes the host TC filters and qdiscs only; the namespace and pair die with the
+# daemon. A pre-v2 journal also runs the full legacy restore. It is a dedicated helper,
+# not a hidden flag on `daer run`: the operator CLI stays the six verbs in ADR-0015, and
+# systemd's post-stop hook is not one of them.
 ExecStopPost=/usr/bin/daer-cleanup
 
 # Restart policy. One second keeps a transient failure from turning into a five-second
@@ -300,7 +369,8 @@ SendSIGKILL=yes
 # The capabilities the datapath, private ingress namespace, and privileged listeners
 # (e.g. port 53) need. CAP_PERFMON is the verifier's allow_ptr_leaks gate: the fast parser
 # advances a packet pointer by the IPv4 IHL and IPv6 extension-header lengths.
-# CAP_SYS_ADMIN creates and enters daer0ns and mounts its /run/netns entry.
+# CAP_SYS_ADMIN creates and enters the private daer0ns, unshares its mount namespace and
+# mounts the private /run/netns tmpfs.
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -317,24 +387,28 @@ PrivateTmp=true
 # The listener and the device pair need the network, so `PrivateNetwork` is off.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# Configuration directory, BPF filesystem, and write access for subscription persistence.
-# `RuntimeDirectory` creates /run/daer and /run/netns; `ReadWritePaths` keeps the namespace
-# mount point writable under ProtectSystem=strict so `ip netns add` can bind the entry.
+# Configuration directory and runtime state. `RuntimeDirectory` creates /run/daer and
+# /run/netns; the latter is the mount target for the daemon's private tmpfs.
 ConfigurationDirectory=daer
-# `daer` holds its crash-recovery journal in /run/daer and `ip netns add` mounts the ingress
-# entry under /run/netns. Both must be writable under ProtectSystem=strict.
+# `daer` holds its crash-recovery journal in /run/daer. The ingress namespace mounts a
+# private tmpfs at /run/netns inside its own mount namespace, so the host directory is not
+# modified; it still has to exist as the mount target.
 RuntimeDirectory=daer netns
 # `/run/netns` is shared with every other network namespace on the host. Do not let systemd
-# remove the whole directory when daer stops: the daemon removes only its own `daer0ns`
-# entry, and `ip netns list` must look exactly as it did before the service started.
+# remove the whole directory when daer stops: other applications' namespaces may be there,
+# and the directory is the mount target.
 RuntimeDirectoryPreserve=yes
+# `/run/netns` stays writable for a legacy mount an older version may have left; the daemon's
+# own namespace mount is private and never writes the host path.
 ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
-# Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
-# `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is
-# best-effort, so the failure is silent and only shows up as a provider that cannot survive
-# the network going away. `CacheDirectory=daer` creates /var/cache/daer and grants write
-# access to exactly it, and the variable points the loader there.
+# Persistent, operator-managed rule sets live in /var/lib/daer/rules. StateDirectory
+# creates /var/lib/daer and grants write access to it under ProtectSystem=strict; the
+# `rules` child is created by the package or by the operator.
+StateDirectory=daer
+# Where downloaded rule sets are cached (ADR-0014). CacheDirectory=daer creates
+# /var/cache/daer and grants write access to exactly it under ProtectSystem=strict.
+# The loader defaults to /var/cache/daer/rules; DAER_RULE_CACHE_DIR overrides it.
 CacheDirectory=daer
 Environment=DAER_RULE_CACHE_DIR=/var/cache/daer/rules
 
@@ -434,19 +508,26 @@ script exists; this one they can, and it is cheaper than a reboot.
 ## Verifying it works
 
 ```sh
-# 1. is the datapath attached?
+# 1. what does the daemon believe right now?
+daer status
+
+# 2. is the datapath attached?
 journalctl -u daer -b | grep 'datapath attached'
 
-# 2. is the policy what you think?
+# 3. is the policy what you think?
 daer route example.com --why -c /etc/daer/config.toml
 
-# 3. does a flow actually get proxied?
+# 4. does a flow actually get proxied?
 curl -sS -o /dev/null -w '%{http_code}\n' --interface eth0 https://example.com
 journalctl -u daer -b | tail -20     # a `flow decided` line per connection at debug
 
-# 4. does a reload keep flows alive?
+# 5. does a reload keep flows alive?
 systemctl reload daer
 ```
+
+During an incident, `kill -USR1 "$(systemctl show -p MainPID --value daer)"` writes a
+redacted bundle under `/var/lib/daer/incidents/`; `daer status --flow <ID>` prints the JSON
+events for one connection.
 
 `RUST_LOG=daer=debug` overrides `log-level` for a one-off investigation, which is what makes
 [Diagnostics Guide](diagnostics.md) usable without editing the configuration.
@@ -460,8 +541,10 @@ Be aware before trusting it with traffic:
 * A REALITY node has **no datagram transport**, so a UDP flow routed to such a group is
   refused rather than silently sent direct. Silence there would be a leak: the client would
   believe UDP was tunnelled when it was not.
-* The **event ring** (per-flow trace) is not consumed yet: there is no per-flow trace beyond
-  the `debug` logs.
+* **The event ring and counters are consumed.** `bpf_stats_map` and `event_ringbuf` are read
+  by the daemon, surfaced by `daer status`, and retained in an incident bundle after
+  `SIGUSR1`, a panic or an error burst. The ring is rate-limited per key; volume comes from
+  the counters, never from the event count (ADR-0040).
 * **`domain(...)` rules keep flows on the userspace path.** The kernel cannot evaluate a
   domain predicate without `domain_routing_map`, an IP-keyed bitmap the control plane would
   have to maintain from DNS answers; this build does not maintain it. Every flow is then
@@ -470,18 +553,14 @@ Be aware before trusting it with traffic:
   did observe (source MAC, DSCP, process name) **are** read back from
   `routing_handoff_map`, so `mac(...)`, `dscp(...)`, and `pname(...)` rules do match on that
   path.
-* **IPv6 UDP is not proxied on the eBPF path.** The datapath's `assign_listener` uses one
-  family-independent key for datagrams (`key = &one_key`) while TCP picks a key by family, so
-  `listen_socket_map` has a single datagram slot and it holds the IPv4 socket. A v6 datagram
-  redirected by the kernel is assigned to a socket that cannot receive it. IPv4 UDP and all TCP
-  are unaffected; the daemon says so at `WARN` when it attaches. The fix belongs in the C
-  datapath (a fourth key, or `bpf_sk_lookup_udp`), not in userspace, and guessing a second slot
-  would silently mismatch the object.
-* The **`tproxy` redirect of a datagram is not proven end to end**, and the reason is the test
-  topology rather than the code: `TPROXY` matches on the ingress interface, so proving it needs
-  the origin in a second network namespace, which a development sandbox cannot create. Three
-  single-namespace topologies were tried and each failed for a fixture reason. On a
-  two-namespace box, run `crates/daer-control/tests/transparent.rs` there; it states the
-  limitation and skips with the reason. What *is* proven in one namespace: the reply leaves
-  from the original destination (not from the transparent port), one client port talking to
-  two destinations gets two sessions, and the reply-socket cache evicts instead of leaking fds.
+* The **`tproxy` redirect of a datagram is not proven end to end** in the unprivileged
+  workspace suite, and the reason is the test topology rather than the code: `TPROXY` matches
+  on the ingress interface, so proving it needs the origin in a second network namespace,
+  which a development sandbox cannot create. The privileged e2e gate runs the same test on a
+  two-namespace host. What *is* proven in one namespace: the reply leaves from the original
+  destination (not from the transparent port), one client port talking to two destinations
+  gets two sessions, and the reply-socket cache evicts instead of leaking fds.
+* **IPv6 dual-stack** is implemented for TCP and UDP, including the `udp6` listener slot and
+  independent IPv4/IPv6 Fake-IP pools. IPv6-only operation still depends on the host having
+  IPv6 forwarding and a default route; the daemon configures both best-effort and reports a
+  missing IPv6 ingress path at `WARN` without taking IPv4 down.

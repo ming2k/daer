@@ -3297,6 +3297,14 @@ pub struct DnsRouting {
 pub struct FakeIpConfig {
     pub enabled: bool,
     pub inet: String,
+    /// The optional IPv6 pool.
+    ///
+    /// `None` keeps the historic IPv4-only Fake-IP behaviour: `A` is synthesised and `AAAA`
+    /// is answered with an empty NOERROR so a dual-stack client falls back to the synthetic
+    /// address. Setting a prefix enables IPv6 synthesis as well. The key is explicit rather
+    /// than a second meaning for `inet`, because one prefix cannot describe both families.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inet6: Option<String>,
     pub pool_size: usize,
     pub exclude: Vec<String>,
 }
@@ -3306,6 +3314,7 @@ impl Default for FakeIpConfig {
         Self {
             enabled: false,
             inet: "198.18.0.0/15".to_owned(),
+            inet6: None,
             pool_size: 65535,
             exclude: Vec::new(),
         }

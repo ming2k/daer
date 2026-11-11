@@ -1,7 +1,8 @@
 # Command Line Interface (CLI) Reference
 
-The `daer` CLI provides the runtime daemon, deployment gates, and diagnostics for the
-transparent proxy. Build-time rule producers live in the companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb).
+The `daer` CLI provides the runtime daemon, deployment gates, live inspection, and diagnostics
+for the transparent proxy. Build-time rule producers live in the companion tool
+[`daer-drb`](#4-drb-producer-tooling-daer-drb).
 
 ---
 
@@ -52,6 +53,11 @@ With `--object` it also validates the compiled datapath object against the ABI �
 sections, and the BTF `func_info` invariant the kernel enforces — without loading it, so the
 check needs no capability and can gate a packaged artifact (ADR-0029).
 
+With `--host` it also checks the host-global sysctl prerequisites the datapath requires
+(forwarding on, `rp_filter`/`arp_filter` relaxed). It reads `/proc/sys`; it still needs no
+capability and changes nothing. A deployment gate should pass this flag so a host that would
+refuse to start is caught before the service is restarted.
+
 ```bash
 daer check [OPTIONS]
 ```
@@ -61,9 +67,10 @@ daer check [OPTIONS]
 | `-c`, `--config <PATH>` | Path to the configuration file. |
 | `--nodes` | Also print every node in every group with its protocol and security identity. |
 | `--object <PATH>` | Also validate the compiled datapath object. Pass `--object none` to skip it. |
+| `--host` | Also check the host-global sysctl prerequisites. |
 
-Exit status is the contract: `0` when the configuration would run, non-zero otherwise. That is
-what a deployment gate or a systemd `ExecStartPre=` should call.
+Exit status is the contract: `0` when the configuration and every requested check would run,
+non-zero otherwise. That is what a deployment gate or a systemd `ExecStartPre=` should call.
 
 ### 2.3 `route` — resolve routing decisions offline
 
@@ -136,7 +143,25 @@ Phased diagnostic reporting:
 
 A single probe is subject to the usual loss on a long-haul link; `--timeout` interacts with that (the default 5 s is tight for a node at 200 ms RTT on a lossy path), and a handshake reset is retried once before being reported. That is a property of the path being measured, not of `daer`: `xray` against the same node shows the same distribution.
 
-### 2.5 `schema` — JSON Schema for editors
+### 2.5 `status` — read-only runtime inspector
+
+Answers "what does the running daemon believe right now" without a packet capture or a debug
+log level. It reads `/run/daer/control.sock`; when the daemon is gone it falls back to the last
+`/run/daer/state.json` and prints that the answer is a file, not a live process.
+
+```bash
+daer status                 # human summary
+daer status --json          # versioned snapshot for automation
+daer status --bundle DIR    # redacted incident bundle
+daer status --flow ID       # every JSON event for one flow/session
+```
+
+The snapshot contains the current and previous generation, policy hash, datapath attachment,
+live flow and datagram counters, DNS counters, health state, and the userspace mirror of the
+17 `bpf_stats_map` counters. It is read-only: it cannot start, stop or reload the daemon. A
+missing socket and state file is a named error, not a panic (ADR-0041).
+
+### 2.6 `schema` — JSON Schema for editors
 
 Prints the JSON Schema of a configuration file to stdout. Point an editor at it
 (`#:schema ./daer.schema.json`) or validate a file in CI.
@@ -145,7 +170,7 @@ Prints the JSON Schema of a configuration file to stdout. Point an editor at it
 daer schema
 ```
 
-### 2.6 `version` — build information
+### 2.7 `version` — build information
 
 ```bash
 daer version
@@ -172,9 +197,8 @@ Under ADR-0036, rule syntax is symbolic (`=domain` for exact match, `domain` for
 It links no Protobuf reader and no `.dat` converter (ADR-0031).
 
 ```bash
-# Compile plain-text rules to .drb (with optional attribute filtering)
+# Compile plain-text rules to .drb
 daer-drb compile company-direct.rules -o company-direct.drb
-daer-drb compile geosite-google.rules --without ads -o geosite-google.drb
 
 # Inspect metadata and counts of a .drb file
 daer-drb inspect company-direct.drb

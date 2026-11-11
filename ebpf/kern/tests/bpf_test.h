@@ -39,7 +39,6 @@ static __always_inline int ab_store_l2_addrs(struct __sk_buff *skb, __u8 smac,
 				   sizeof(dest), 0) ? 2 : 0;
 }
 
-static const __u32 three_key = 3;
 static const __u32 four_key = 4;
 
 /* Reads a bpf_stats_map counter. Callers compare deltas because all test

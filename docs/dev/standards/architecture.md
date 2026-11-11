@@ -35,6 +35,7 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 │  - C eBPF datapath program: `ebpf/kern/`                               │
 │  - TOML configuration schema & expression AST: `crates/daer-config`    │
 │  - Shared constants & network primitives: `crates/daer-common`         │
+│  - Typed events, correlation IDs, incident primitives: `daer-observe`  │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

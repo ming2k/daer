@@ -253,7 +253,7 @@ impl AnyTlsSession {
                     }
                     Command::Alert => {
                         let alert_msg = String::from_utf8_lossy(&frame.data);
-                        tracing::warn!(alert = %alert_msg, "anytls received alert from server");
+                        daer_observe::warn!(daer_observe::EventCode::ProtocolAnyTlsAlert,alert = %alert_msg, "anytls received alert from server");
                         break;
                     }
                     Command::Syn | Command::Unknown(_) => {
@@ -269,7 +269,7 @@ impl AnyTlsSession {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::debug!(error = %err, "anytls session read error");
+                    daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session read error");
                     break;
                 }
             }
@@ -305,11 +305,11 @@ impl AnyTlsSession {
             }
 
             if let Err(err) = writer.write_all(&write_buf).await {
-                tracing::debug!(error = %err, "anytls session write error");
+                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session write error");
                 break;
             }
             if let Err(err) = writer.flush().await {
-                tracing::debug!(error = %err, "anytls session flush error");
+                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session flush error");
                 break;
             }
         }

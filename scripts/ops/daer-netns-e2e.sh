@@ -12,17 +12,30 @@
 #   DAER_E2E_WAN          WAN interface to watch (default: the default route's device)
 #   DAER_E2E_LOG          daemon log path (default: target/daer-netns-e2e.log)
 #   DAER_E2E_RESTORE_DIR  host-state snapshot directory (default: target/daer-netns-restore)
+#   DAER_TC_ATTACH        host TC attachment: `netlink` (default) or `tcx` (Linux 6.6+)
 set -uo pipefail
+
+case "${DAER_TC_ATTACH:-netlink}" in
+    netlink | tcx) ;;
+    *)
+        echo "error: DAER_TC_ATTACH must be netlink or tcx" >&2
+        exit 2
+        ;;
+esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 config=""
+preflight=0
 
 usage() {
     cat <<'EOF'
-usage: sudo scripts/ops/daer-netns-e2e.sh --config <daer.toml>
+usage: scripts/ops/daer-netns-e2e.sh --config <daer.toml> [--preflight]
 
 Runs the private-ingress end-to-end diagnostic against a locally built daemon.
 The config file is required and may contain node credentials; keep it out of git.
+
+  --preflight   Check the kernel, tools, release artifacts, and configuration without
+                root and without changing the host. Prints the sudo command to run.
 EOF
 }
 
@@ -35,6 +48,10 @@ while (($# > 0)); do
             ;;
         --config=*)
             config="${1#*=}"
+            shift
+            ;;
+        --preflight)
+            preflight=1
             shift
             ;;
         -h | --help)
@@ -52,6 +69,44 @@ done
 [[ -n "$config" ]] || { echo "error: --config is required" >&2; usage >&2; exit 2; }
 [[ -f "$config" ]] || { echo "error: config not found: $config" >&2; exit 1; }
 config="$(cd "$(dirname "$config")" && pwd)/$(basename "$config")"
+
+if [[ "$preflight" -eq 1 ]]; then
+    failures=0
+    fail() {
+        echo "preflight: $*" >&2
+        failures=$((failures + 1))
+    }
+
+    if [[ "${DAER_TC_ATTACH:-netlink}" == "tcx" ]]; then
+        kernel_major="$(uname -r | cut -d. -f1)"
+        kernel_minor="$(uname -r | cut -d. -f2)"
+        if [[ "$kernel_major" -lt 6 || ( "$kernel_major" -eq 6 && "$kernel_minor" -lt 6 ) ]]; then
+            fail "TCX needs Linux 6.6+; running $(uname -r)"
+        fi
+    fi
+    for tool in ip nft tc bpftool curl tcpdump nsenter sysctl; do
+        command -v "$tool" >/dev/null 2>&1 || fail "$tool is missing"
+    done
+    if [[ ! -x "$root/target/release/daer" ]]; then
+        fail "target/release/daer is missing; run cargo build --release -p daer-cli --bin daer"
+    fi
+    if [[ ! -f "$root/target/ebpf/datapath.o" ]]; then
+        fail "target/ebpf/datapath.o is missing; run cargo xtask ebpf"
+    fi
+    if [[ -x "$root/target/release/daer" && -f "$root/target/ebpf/datapath.o" ]]; then
+        "$root/target/release/daer" check -c "$config" --object "$root/target/ebpf/datapath.o" \
+            || fail "daer check rejected the config or object"
+    fi
+
+    if [[ "$failures" -ne 0 ]]; then
+        echo "preflight failed: $failures issue(s)" >&2
+        exit 1
+    fi
+    echo "preflight ok"
+    echo "tc attach: ${DAER_TC_ATTACH:-netlink}"
+    echo "run: sudo DAER_TC_ATTACH=${DAER_TC_ATTACH:-netlink} $0 --config $config"
+    exit 0
+fi
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "run this with sudo: sudo $0 --config <path>" >&2
@@ -134,6 +189,8 @@ cleanup() {
 }
 
 cd "$root" || exit 1
+command -v nsenter >/dev/null 2>&1 \
+    || { echo "nsenter (util-linux) is required for the ingress topology checks" >&2; exit 1; }
 for file in target/release/daer target/ebpf/datapath.o; do
     [[ -f "$file" ]] || { echo "missing $file; build it first" >&2; exit 1; }
 done
@@ -164,6 +221,15 @@ trap 'exit 130' INT TERM HUP
         [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value"
     done
 } >"$restore_dir/sysctls"
+# The daemon now refuses to change these host-global settings itself; the script sets them
+# for the test and the snapshot above restores them on every exit path.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+sysctl -w net.ipv4.conf.all.arp_filter=0 >/dev/null
+if [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]]; then
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+fi
 ip rule show >"$restore_dir/rules-before.txt" 2>&1
 ip route show table 2023 >"$restore_dir/route-before.txt" 2>&1
 
@@ -193,8 +259,9 @@ curl -4 -sS --max-time 12 --resolve example.com:443:172.66.147.243 \
     -o /dev/null -w 'direct-example http=%{http_code}\n' https://example.com/ || true
 timeout 8 getent ahostsv4 example.com | head -2 || true
 
-echo "=== start daer ==="
+echo "=== start daer (tc attach: ${DAER_TC_ATTACH:-netlink}) ==="
 RUST_LOG=daer=debug,daer_control=debug,daer_relay=debug,daer_outbound=debug,netune=debug \
+DAER_TC_ATTACH="${DAER_TC_ATTACH:-netlink}" \
     ./target/release/daer run -c "$config" --object target/ebpf/datapath.o >"$log" 2>&1 &
 daer_pid=$!
 chown "$owner" "$log" 2>/dev/null
@@ -216,33 +283,38 @@ fi
 
 echo
 echo "=== topology ==="
-ip netns list
-ip -n daer0ns -o link show daer0peer
+echo "tc attach: ${DAER_TC_ATTACH:-netlink}"
+# The namespace mount is private to the daemon's mount namespace. Enter the mount namespace
+# with nsenter so `ip` sees the same /run/netns the daemon created.
+ns_mnt="/proc/$daer_pid/ns/mnt"
+ns_ip() { nsenter --mount="$ns_mnt" ip "$@"; }
+ns_ip netns list
+ns_ip -n daer0ns -o link show daer0peer
 echo "-- ingress rules --"
-ip -n daer0ns -4 rule show
-ip -n daer0ns -4 route show table 2023
-ip -n daer0ns -6 rule show
+ns_ip -n daer0ns -4 rule show
+ns_ip -n daer0ns -4 route show table 2023
+ns_ip -n daer0ns -6 rule show
 echo "-- host rules --"
 ip rule show
 echo "-- neighbor --"
-ip -n daer0ns neigh show
+ns_ip -n daer0ns neigh show
 echo "-- tc --"
 tc filter show dev "$wan_if" egress | head -20
-ip netns exec daer0ns tc filter show dev daer0peer ingress | head -20
+ns_ip netns exec daer0ns tc filter show dev daer0peer ingress | head -20
 echo "-- listener --"
-ip netns exec daer0ns ss -lntup | grep 12345 || true
+ns_ip netns exec daer0ns ss -lntup | grep 12345 || true
 
 echo
 echo "=== direct userspace path (literal IP, no DNS) ==="
 curl -4 -sS --max-time 15 -o /dev/null -w 'http=%{http_code}\n' http://1.1.1.1/ || true
 echo "-- sockets inside daer0ns --"
-ip netns exec daer0ns ss -tanp | head -20
+ns_ip netns exec daer0ns ss -tanp | head -20
 echo "-- sockets on host to 12345 --"
 ss -tanp | grep -E ':12345' || true
 
 echo
 echo "-- raw UDP send from daer0ns with a non-local source --"
-ip netns exec daer0ns python3 - <<'PY'
+ns_ip netns exec daer0ns python3 - <<'PY'
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_IP, 19, 1)  # IP_TRANSPARENT
@@ -288,6 +360,14 @@ if [[ -n "$node_ip" ]]; then
 fi
 cat "$log.curl"
 echo "example.com http=${proxy_status:-failed}"
+if [[ "${DAER_TC_ATTACH:-netlink}" == "tcx" ]]; then
+    if [[ "${proxy_status:-}" == "200" ]]; then
+        echo "TCX delivery: the redirected flow reached the daemon and returned 200"
+    else
+        echo "TCX delivery failed: example.com http=${proxy_status:-failed}" >&2
+        exit 1
+    fi
+fi
 echo
 echo "=== relevant log ==="
 grep -aE "flow decided|datagram|session|node selected|flow closed|accepted|rejected|failed|refused|no outbound|relay|dial" "$log" | tail -160 || true
@@ -317,14 +397,12 @@ if kill -0 "$daer_pid" 2>/dev/null; then
 fi
 wait "$daer_pid" 2>/dev/null || true
 daer_pid=""
-for _ in $(seq 1 50); do
-    ip netns list 2>/dev/null | grep -q daer0ns || break
-    sleep 0.1
-done
-if ip netns list 2>/dev/null | grep -q daer0ns; then
-    echo "namespace daer0ns still exists; cleanup will remove it" >&2
+# The namespace mount was private to the daemon's mount namespace, so the host path must
+# never have held it. `daer0` is the host-visible state that has to be gone.
+if [[ -e /run/netns/daer0ns ]]; then
+    echo "host /run/netns/daer0ns exists; cleanup will remove it" >&2
 else
-    echo "namespace removed"
+    echo "host /run/netns is clean"
 fi
 if ip link show daer0 >/dev/null 2>&1; then
     echo "daer0 still exists; cleanup will remove it" >&2

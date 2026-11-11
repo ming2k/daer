@@ -35,7 +35,8 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: Vision, **inner TLS** | ✅ a TLS stream through the tunnel works (`curl https://…`, three runs, against a local reference node with a local TLS origin). This was broken until the peer's `Direct` was implemented: the node stops encrypting and a client that keeps decrypting reads ciphertext as plaintext (`the record was altered`). Plaintext (HTTP) inside the tunnel always worked, which is exactly why the gap survived — the e2e probe tier was a plaintext GET, so `daer probe node` reported "fully operational" for a node that could not carry a single HTTPS request |
 | Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
 | Datagrams: netune transport + SOCKS5 UDP associate (netune side) | ✅ |
-| Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; not yet wired to a daemon entry point |
+| Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; wired into `Daemon::serve` |
+| Datapath: IPv6 TCP and UDP | ✅ separate tcp6/udp6 listener slots, family-aware `assign_listener`, IPv6 extension-header parsing, and independent IPv6 Fake-IP allocation (`dns.fake-ip.inet6`) |
 | Health checks: probes + scheduler (`UdpDnsChecker`, `Scheduler`) | ✅ probe instrument follows the node's claims; results record into the live generation |
 | DNS: wire format (parse/encode, compression, records) | ✅ |
 | DNS: `[dns.request]` / `[dns.response]` routing | ✅ |
@@ -334,13 +335,18 @@ What remains is the part that needs a working data path: direct-path throughput 
 P99 connect latency at parity with the reference implementation, measured end to end
 rather than per component.
 
-## 7. Observability and trace 🟡
+## 7. Observability and trace 🟢
 
-Latency tables and health-check statistics exist, and an observed dial now keeps
-one netune `TraceCollector` with a `DialObserverSink`: DNS/TCP/TLS phases are
-derived from the transport's own events instead of a wall-clock span. Dials with
-no observer use `TraceCollector::disabled()`, so the per-flow path pays nothing.
-Remaining: per-flow traces and the `trace` feature (needs `bpf_trace_printk`).
+Latency tables and health-check statistics exist, and an observed dial keeps one netune
+`TraceCollector` with a `DialObserverSink`: DNS/TCP/TLS phases are derived from the transport's
+own events instead of a wall-clock span. Dials with no observer use
+`TraceCollector::disabled()`, so the per-flow path pays nothing.
+
+The diagnostic plane (ADR-0040) closes the rest of the surface: typed events with a generated
+catalog, `flow_id`/`query_id` correlation, `warn` events for client-visible failures, the
+JSON event stream, panic/`SIGUSR1` incident bundles, `daer status`, and a userspace consumer
+for all 17 `bpf_stats_map` counters and the `event_ringbuf` record types. `bpf_trace_printk`
+is not needed and remains deliberately unused: the ring buffer is the structured channel.
 
 ## Open decisions
 

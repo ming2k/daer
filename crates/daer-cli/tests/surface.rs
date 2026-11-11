@@ -106,6 +106,49 @@ fn daer_cli_dependencies() -> BTreeSet<String> {
         .collect()
 }
 
+/// The macro firewall from ADR-0040: `tracing` is an implementation detail of the diagnostic
+/// plane, not an API every crate can reach for. `tracing-subscriber` is the CLI's sink and is
+/// allowed only there.
+#[test]
+fn only_the_observe_plane_depends_on_tracing() {
+    let metadata = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--manifest-path",
+        ])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .output()
+        .expect("runs cargo metadata");
+    assert!(metadata.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("metadata is JSON");
+    let packages = value["packages"].as_array().expect("packages");
+    for package in packages {
+        let name = package["name"].as_str().unwrap_or_default();
+        if !name.starts_with("daer-") && name != "xtask" {
+            continue;
+        }
+        let deps = package["dependencies"].as_array().expect("dependencies");
+        for dep in deps {
+            let dep_name = dep["name"].as_str().unwrap_or_default();
+            if dep["kind"].as_str().is_some_and(|kind| kind != "normal") {
+                continue;
+            }
+            assert!(
+                !(dep_name == "tracing" && name != "daer-observe"),
+                "{name} depends on `tracing` directly; use daer-observe's EventCode macros"
+            );
+            assert!(
+                !(dep_name == "tracing-subscriber" && name != "daer-cli"),
+                "{name} installs a subscriber; only the binary owns process-wide logging"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_daemon_links_no_producer() {
     let dependencies = daer_cli_dependencies();
@@ -168,8 +211,10 @@ fn the_surface_is_clean_verbs() {
     listed.sort_unstable();
     assert_eq!(
         listed,
-        ["check", "probe", "route", "run", "schema", "version"],
-        "the surface is `run`, `check`, `route`, `probe`, `schema`, `version`"
+        [
+            "check", "probe", "route", "run", "schema", "status", "version"
+        ],
+        "the surface is `run`, `check`, `route`, `probe`, `status`, `schema`, `version`"
     );
 }
 

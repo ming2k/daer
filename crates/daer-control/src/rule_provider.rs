@@ -32,31 +32,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Environment variable to override the rule cache directory.
 pub const RULE_CACHE_ENV: &str = "DAER_RULE_CACHE_DIR";
 
-/// Default directory where rule provider caches live.
+/// Default directory where HTTP rule provider caches live.
 ///
-/// Follows XDG Base Directory specification so non-root users do not need root
-/// privileges or `/etc` access to download and cache rule sets.
+/// The supported deployment is system-wide: `/var/cache/daer/rules`. The shipped unit
+/// sets this explicitly, and `DAER_RULE_CACHE_DIR` overrides it for non-standard
+/// installations. Cache writes are best-effort.
 #[must_use]
-pub fn cache_directory(config_directory: &Path) -> PathBuf {
+pub fn cache_directory() -> PathBuf {
     if let Ok(dir) = std::env::var(RULE_CACHE_ENV)
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("daer").join("rules");
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("daer")
-            .join("rules");
-    }
-    config_directory.join("rules.d")
+    PathBuf::from("/var/cache/daer/rules")
 }
 
 /// What resolving one `RuleProvider` produced.
@@ -243,7 +231,7 @@ pub async fn resolve_rule_providers_with(
         return resolution;
     }
 
-    let cache_dir = cache_directory(config_directory);
+    let cache_dir = cache_directory();
     let _ = fs::create_dir_all(&cache_dir);
 
     let mut pool = RuleProviderPool::new();
@@ -393,7 +381,7 @@ async fn fetch_http_provider(
                 && let Ok(cached_bytes) = fs::read(cache_file)
                 && let Ok(set) = DrbSet::decode(&cached_bytes)
             {
-                tracing::debug!(
+                daer_observe::debug!(daer_observe::EventCode::ProviderNotModified,
                     provider = %tag,
                     "rule provider not modified (HTTP 304); loaded from cached DRB"
                 );
@@ -427,7 +415,7 @@ async fn fetch_http_provider(
                 && let Ok(cached_bytes) = fs::read(cache_file)
                 && let Ok(set) = DrbSet::decode(&cached_bytes)
             {
-                tracing::warn!(
+                daer_observe::warn!(daer_observe::EventCode::ProviderCacheFallback,
                     %fetch_err,
                     provider = %tag,
                     cache = %cache_file.display(),
@@ -499,8 +487,8 @@ pub async fn refresh_rule_provider(
         },
         ProviderType::Http => match &provider.url {
             Some(url) => {
-                let cache_file = cache_directory(config_directory).join(format!("{tag}.drb"));
-                let _ = fs::create_dir_all(cache_directory(config_directory));
+                let cache_file = cache_directory().join(format!("{tag}.drb"));
+                let _ = fs::create_dir_all(cache_directory());
                 fetch_http_provider(url, &cache_file, &tag, format, timeout)
                     .await
                     .map(|(set, _from_cache)| set)

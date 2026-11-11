@@ -37,16 +37,16 @@ use tokio::net::UdpSocket;
 use crate::error::RelayError;
 use crate::inbound::is_self_connect;
 
-/// Which address family a datagram flow uses, and whether the datapath can deliver it.
+/// Which address family a datagram flow uses.
 ///
-/// Exists so "IPv6 UDP is not proxied on the eBPF path" is a value the daemon reports rather
-/// than a sentence in a document: the C's `assign_listener` has one family-independent slot for
-/// datagrams (`key = &one_key`), so only the IPv4 socket can receive a redirected datagram.
+/// The datapath has one listener slot per family (`1` for UDP4, `3` for UDP6), so both are
+/// deliverable. The type stays distinct because the listener and reply socket are family
+/// specific even when the relay above them is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatagramFamily {
-    /// Delivered: `listen_socket_map[1]` holds the wildcard IPv4 socket.
+    /// `listen_socket_map[1]` holds the wildcard IPv4 socket.
     Ipv4,
-    /// **Not** delivered on the eBPF path: there is no slot for a v6 datagram socket.
+    /// `listen_socket_map[3]` holds the wildcard IPv6 socket.
     Ipv6,
 }
 
@@ -64,7 +64,7 @@ impl DatagramFamily {
     /// True when the datapath can assign a redirected datagram of this family.
     #[must_use]
     pub const fn is_deliverable(self) -> bool {
-        matches!(self, Self::Ipv4)
+        matches!(self, Self::Ipv4 | Self::Ipv6)
     }
 }
 
@@ -74,6 +74,8 @@ impl DatagramFamily {
 /// is the part the data path has to get right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Datagram {
+    /// The run-local correlation ID for the datagram's first session observation.
+    pub flow_id: daer_observe::FlowId,
     /// The client that sent it.
     pub source: SocketAddr,
     /// The destination the kernel redirected, from the ancillary message.
@@ -113,12 +115,20 @@ pub trait DatagramIngress: Send + Sync + std::fmt::Debug {
         peer: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>>;
 
-    /// The socket fd the datapath may assign a redirected datagram to, when there is one.
+    /// The IPv4 socket fd the datapath may assign a redirected datagram to, when there is one.
     ///
     /// `None` for an ingress that is not backed by a real socket: a test double has no fd to
     /// publish, and reporting a wrong one would put a foreign socket in
     /// `listen_socket_map[1]`.
     fn raw_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    /// The IPv6 socket fd the datapath may assign a redirected datagram to, when there is one.
+    ///
+    /// The v6 socket is separate from the v4 one because a transparent v4 socket cannot
+    /// receive a v6 flow. `None` follows the same rule as [`Self::raw_fd`].
+    fn raw_fd_v6(&self) -> Option<RawFd> {
         None
     }
 }
@@ -148,6 +158,10 @@ impl DatagramIngress for TransparentDatagramListener {
 
     fn raw_fd(&self) -> Option<RawFd> {
         Some(TransparentDatagramListener::raw_fd(self))
+    }
+
+    fn raw_fd_v6(&self) -> Option<RawFd> {
+        Some(TransparentDatagramListener::raw_fd_v6(self))
     }
 }
 
@@ -199,6 +213,8 @@ pub struct TransparentDatagramListener {
     /// The namespace the reply sockets must be created in, when the listener itself lives in
     /// a private ingress namespace. `None` means the caller's namespace (host tests).
     reply_factory: Option<Arc<dyn ReplySocketFactory>>,
+    /// The process-wide ID allocator, shared with the daemon and the TCP listener.
+    ids: Arc<daer_observe::Ids>,
 }
 
 /// How many reply sockets one ingress keeps.
@@ -318,7 +334,15 @@ impl TransparentDatagramListener {
             socket_mark,
             sources: std::sync::Mutex::new(ReplySockets::default()),
             reply_factory: None,
+            ids: Arc::new(daer_observe::Ids::new()),
         })
+    }
+
+    /// Shares the daemon's ID allocator, so TCP and UDP flows live in one ID namespace.
+    #[must_use]
+    pub fn with_ids(mut self, ids: Arc<daer_observe::Ids>) -> Self {
+        self.ids = ids;
+        self
     }
 
     /// Creates reply sockets in the ingress namespace instead of the caller's.
@@ -340,34 +364,14 @@ impl TransparentDatagramListener {
     }
 
     /// The IPv4 socket's fd, for `listen_socket_map` key `1`.
-    ///
-    /// # The IPv6 limitation this encodes
-    ///
-    /// The C's `assign_listener` picks the key by family for TCP (`0` v4, `2` v6) but uses the
-    /// single family-independent key `1` for every datagram:
-    ///
-    /// ```c
-    /// const __u32 *key = &one_key;
-    /// if (l4proto == IPPROTO_TCP)
-    ///     key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
-    /// ```
-    ///
-    /// There is therefore **one** datagram slot, and it can hold one socket. A v6 datagram
-    /// redirected by the eBPF path is assigned to this v4 socket, which cannot receive it.
-    ///
-    /// The fix belongs in the datapath (a fourth key for `udp6`, or `bpf_sk_lookup_udp`), not
-    /// here: guessing a second slot would silently mismatch the object this crate does not own.
-    /// Until then the daemon reports it — see [`DatagramFamily::Ipv6`] and the startup warning
-    /// in `daer run` — rather than letting v6 UDP look like a network outage.
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.v4.as_raw_fd()
     }
 
-    /// The IPv6 socket's fd, which the datapath has **no slot** for today.
+    /// The IPv6 socket's fd, for `listen_socket_map` key `3`.
     ///
-    /// Returned so the limitation is visible in one place and a future object that gains a
-    /// `udp6` key only has to change `Listeners` and this accessor. Nothing publishes it: an
-    /// unused fd in a `SOCKMAP` slot the C never looks up would be a lie about what works.
+    /// It is a separate socket, not a dual-stack v4 socket: a transparent v4 socket cannot
+    /// receive a v6 flow, and `bpf_sk_assign` must be handed a socket in the flow's family.
     pub fn raw_fd_v6(&self) -> std::os::fd::RawFd {
         self.v6.as_raw_fd()
     }
@@ -393,7 +397,16 @@ impl TransparentDatagramListener {
             tokio::select! {
                 ready = self.v4.readable() => {
                     ready.map_err(RelayError::Socket)?;
-                    match recvmsg_once(self.v4.as_raw_fd(), buffer) {
+                    // `try_io` clears the readiness flag when the syscall reports
+                    // `WouldBlock`. Calling `recvmsg` directly after `readable()` and then
+                    // looping on `WouldBlock` leaves the flag set and turns a cancelled
+                    // relay into a 100% CPU spin on `recvmsg(EAGAIN)`.
+                    match self
+                        .v4
+                        .try_io(tokio::io::Interest::READABLE, || {
+                            recvmsg_once(self.v4.as_raw_fd(), buffer)
+                        })
+                    {
                         Ok(Some(received)) => return self.accept_datagram(received),
                         // Not redirected, or nothing to read: try the other family.
                         Ok(None) => continue,
@@ -403,7 +416,12 @@ impl TransparentDatagramListener {
                 }
                 ready = self.v6.readable() => {
                     ready.map_err(RelayError::Socket)?;
-                    match recvmsg_once(self.v6.as_raw_fd(), buffer) {
+                    match self
+                        .v6
+                        .try_io(tokio::io::Interest::READABLE, || {
+                            recvmsg_once(self.v6.as_raw_fd(), buffer)
+                        })
+                    {
                         Ok(Some(received)) => return self.accept_datagram(received),
                         Ok(None) => continue,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
@@ -471,6 +489,7 @@ impl TransparentDatagramListener {
             return Err(crate::error::Reject::SelfConnect { destination }.into());
         }
         Ok(Datagram {
+            flow_id: self.ids.flow(),
             source: unmap(source),
             destination,
             len,
@@ -831,13 +850,12 @@ mod tests {
     }
 
     #[test]
-    fn only_ipv4_datagrams_are_deliverable_on_the_ebpf_path() {
-        // The falsifier for "v6 UDP silently does not work". The C's `assign_listener` uses one
-        // family-independent key for datagrams, so the map holds the v4 socket only; a v6
-        // datagram assigned to it cannot be received. Asserting the split here is what keeps
-        // the daemon's warning honest instead of a claim in a document.
+    fn both_datagram_families_are_deliverable_on_the_ebpf_path() {
+        // The falsifier for a v6 datagram being assigned to the v4 socket. The C has one
+        // listener slot per family (`1` for UDP4, `3` for UDP6); both must be present, or
+        // the daemon would attach a datapath that silently drops one family.
         assert!(DatagramFamily::Ipv4.is_deliverable());
-        assert!(!DatagramFamily::Ipv6.is_deliverable());
+        assert!(DatagramFamily::Ipv6.is_deliverable());
         assert_eq!(
             DatagramFamily::of("192.0.2.1:53".parse().expect("addr")),
             DatagramFamily::Ipv4

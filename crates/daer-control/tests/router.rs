@@ -32,6 +32,7 @@ impl Ingress for PlainIngress {
         let (stream, source) = self.listener.accept().await.map_err(RelayError::Accept)?;
         Ok(Accepted {
             stream,
+            flow_id: daer_observe::FlowId::new(1),
             source,
             destination: self.destination,
         })

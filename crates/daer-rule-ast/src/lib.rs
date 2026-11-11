@@ -5,7 +5,6 @@
 //! Under ADR-0031, ADR-0033, and ADR-0036, `RuleSet` is the single source of truth for routing rules:
 //! * **IP**: Normalized as mathematical disjoint closed intervals (`v4_intervals`, `v6_intervals`).
 //! * **Domain**: Normalized as hierarchical patterns (`Suffix` and `Full`, rendered as `=domain`, `.domain`, `domain`).
-//! * **Attributes**: Preserved for pipeline filtering (`--without ads`), omitted from binary.
 
 mod error;
 mod pattern;
@@ -19,40 +18,21 @@ use std::str::FromStr;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
-/// One domain rule, optionally annotated with provenance attributes.
+/// One domain rule.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DomainRule {
     pub pattern: DomainPattern,
-    pub attributes: Vec<String>,
 }
 
 impl DomainRule {
     #[must_use]
     pub fn new(pattern: DomainPattern) -> Self {
-        Self {
-            pattern,
-            attributes: Vec::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn has_attribute(&self, name: &str) -> bool {
-        self.attributes.iter().any(|a| a.eq_ignore_ascii_case(name))
+        Self { pattern }
     }
 
     pub fn canonical(self) -> Result<Self, AstError> {
-        let mut attributes = self.attributes;
-        for a in &mut attributes {
-            *a = a.trim().to_ascii_lowercase();
-            if a.is_empty() {
-                return Err(AstError::new("an attribute name is empty"));
-            }
-        }
-        attributes.sort_unstable();
-        attributes.dedup();
         Ok(Self {
             pattern: self.pattern.canonical()?,
-            attributes,
         })
     }
 }
@@ -122,25 +102,6 @@ impl RuleSet {
         self.domains.push(rule);
     }
 
-    /// Drops any domain rule carrying `attribute`.
-    pub fn drop_attribute(&mut self, attribute: &str) -> usize {
-        let before = self.domains.len();
-        self.domains.retain(|r| !r.has_attribute(attribute));
-        before - self.domains.len()
-    }
-
-    /// Strips attributes while retaining domain rules.
-    pub fn strip_attributes(&mut self) -> usize {
-        let mut count = 0;
-        for r in &mut self.domains {
-            if !r.attributes.is_empty() {
-                count += 1;
-                r.attributes.clear();
-            }
-        }
-        count
-    }
-
     /// Normalizes, merges IP intervals, and sorts/prunes domain patterns.
     pub fn canonical(mut self) -> Result<Self, AstError> {
         self.v4_intervals = merge_u32_ranges(std::mem::take(&mut self.v4_intervals));
@@ -151,23 +112,11 @@ impl RuleSet {
             canonical_domains.push(rule.canonical()?);
         }
 
-        // Sort by pattern value
+        // Sort by pattern value and remove duplicate patterns.
         canonical_domains.sort_by(|a, b| a.pattern.cmp(&b.pattern));
+        canonical_domains.dedup_by(|a, b| a.pattern == b.pattern);
 
-        // Deduplicate and merge attributes
-        let mut merged: Vec<DomainRule> = Vec::with_capacity(canonical_domains.len());
-        for rule in canonical_domains {
-            match merged.last_mut() {
-                Some(last) if last.pattern == rule.pattern => {
-                    last.attributes.extend(rule.attributes);
-                    last.attributes.sort_unstable();
-                    last.attributes.dedup();
-                }
-                _ => merged.push(rule),
-            }
-        }
-
-        self.domains = merged;
+        self.domains = canonical_domains;
         Ok(self)
     }
 
@@ -197,12 +146,8 @@ impl RuleSet {
             return self.push_ip_directive(rest.trim());
         }
         if let Some(rest) = line.strip_prefix('=') {
-            let (val_clean, attrs) = split_attributes(rest);
-            let pattern = DomainPattern::from_kind("=", val_clean)?;
-            self.domains.push(DomainRule {
-                pattern,
-                attributes: attrs,
-            });
+            let pattern = DomainPattern::from_kind("=", rest)?;
+            self.domains.push(DomainRule::new(pattern));
             return Ok(());
         }
         if let Some((kind, _val)) = line.split_once(':') {
@@ -228,21 +173,17 @@ impl RuleSet {
         if let Ok(()) = self.push_ip_directive(line) {
             return Ok(());
         }
-        let (val_clean, attrs) = split_attributes(line);
-        let pattern = if let Some(rest) = val_clean.strip_prefix('=') {
+        let pattern = if let Some(rest) = line.strip_prefix('=') {
             DomainPattern::from_kind("=", rest)?
         } else {
-            DomainPattern::from_kind("suffix", val_clean)?
+            DomainPattern::from_kind("suffix", line)?
         };
-        self.domains.push(DomainRule {
-            pattern,
-            attributes: attrs,
-        });
+        self.domains.push(DomainRule::new(pattern));
         Ok(())
     }
 
     fn push_ip_directive(&mut self, val: &str) -> Result<(), AstError> {
-        // Range: start - end
+        // Range: start-end (spaces around the dash are accepted for compatibility).
         if let Some((start_s, end_s)) = val.split_once('-') {
             let start_s = start_s.trim();
             let end_s = end_s.trim();
@@ -344,13 +285,7 @@ impl RuleSet {
         }
 
         for rule in &self.domains {
-            let rendered = rule.pattern.to_string();
-            if rule.attributes.is_empty() {
-                let _ = writeln!(out, "{rendered}");
-            } else {
-                let attrs: Vec<String> = rule.attributes.iter().map(|a| format!("@{a}")).collect();
-                let _ = writeln!(out, "{rendered} {}", attrs.join(" "));
-            }
+            let _ = writeln!(out, "{}", rule.pattern);
         }
 
         out
@@ -372,24 +307,6 @@ fn strip_comment(line: &str) -> &str {
     }
     let cut = trimmed.find('#').unwrap_or(trimmed.len());
     trimmed[..cut].trim()
-}
-
-fn split_attributes(value: &str) -> (&str, Vec<String>) {
-    let mut attributes = Vec::new();
-    let mut rest = value.trim_end();
-    while let Some(head) = rest.rsplit_once(char::is_whitespace) {
-        let candidate = head.1;
-        let Some(name) = candidate.strip_prefix('@') else {
-            break;
-        };
-        if name.is_empty() || name.contains('@') {
-            break;
-        }
-        attributes.push(name.to_owned());
-        rest = head.0.trim_end();
-    }
-    attributes.reverse();
-    (rest, attributes)
 }
 
 fn merge_u32_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -487,7 +404,7 @@ mod tests {
     #[test]
     fn parses_and_merges_ip_intervals() {
         let text =
-            "name: test\nip: 192.168.1.0/24\nip: 192.168.2.0/24\nip: 192.168.3.1 - 192.168.3.254\n";
+            "name: test\nip: 192.168.1.0/24\nip: 192.168.2.0/24\nip: 192.168.3.1-192.168.3.254\n";
         let set = RuleSet::parse(text).unwrap();
         // 192.168.1.0/24 + 192.168.2.0/24 are adjacent! Merges into [192.168.1.0, 192.168.2.255]
         assert_eq!(set.v4_intervals().len(), 2);
@@ -529,5 +446,12 @@ mod tests {
 
         let err_suffix = RuleSet::parse("suffix: example.com").unwrap_err();
         assert!(err_suffix.to_string().contains("retired"), "{err_suffix}");
+    }
+
+    #[test]
+    fn attribute_suffixes_are_not_valid_syntax() {
+        // No special-case parser code: the ordinary domain/IP validation rejects `@`.
+        assert!(RuleSet::parse("example.com @ads").is_err());
+        assert!(RuleSet::parse("ip: 1.2.3.4 @ads").is_err());
     }
 }

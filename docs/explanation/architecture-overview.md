@@ -50,6 +50,21 @@
 
 ---
 
+## 1b. The Diagnostic Plane
+
+`daer-observe` (Layer 1) is the typed diagnostic interface every layer emits through. A flow
+or DNS query receives an ID at the ingress boundary (`FlowId`, `QueryId`); every decision,
+dial, relay and DNS event carries it. The catalog in `crates/daer-observe/events.toml` declares
+each event's severity, required fields, counter and remediation; `cargo xtask events --check`
+generates the Rust enum and reference and fails on drift or a raw `tracing` call.
+
+The daemon consumes the datapath's `bpf_stats_map` and `event_ringbuf`, writes a JSON event
+stream, and keeps a read-only snapshot at `/run/daer/state.json` and
+`/run/daer/control.sock`. `daer status` is the read-only inspector; a panic or `SIGUSR1`
+writes a redacted incident bundle (ADR-0040, ADR-0041).
+
+---
+
 ## 2. Ingress & Egress Isolation
 
 A common failure mode in transparent proxies is the "self-proxy loop": when the proxy dials out to an origin server, its own outbound packets are caught by the firewall or eBPF filter and redirected back into itself.

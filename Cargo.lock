@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -552,21 +552,21 @@ dependencies = [
  "daer-control",
  "daer-dns",
  "daer-ebpf",
+ "daer-observe",
  "daer-outbound",
  "daer-routing",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "daer-common"
-version = "0.0.11"
+version = "0.0.12"
 
 [[package]]
 name = "daer-config"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "daer-common",
  "glob",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -587,33 +587,33 @@ dependencies = [
  "daer-config",
  "daer-dns",
  "daer-ebpf",
+ "daer-observe",
  "daer-outbound",
  "daer-relay",
  "daer-routing",
  "daer-sniff",
  "libc",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "daer-dns"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "bytes",
  "daer-config",
+ "daer-observe",
  "ipnet",
  "libc",
  "netune",
  "netune-trace",
  "regex",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "daer-drb"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aya",
  "aya-obj",
@@ -633,11 +633,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "daer-observe"
+version = "0.0.12"
+dependencies = [
+ "fastrand",
+ "tracing",
+]
+
+[[package]]
 name = "daer-outbound"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "daer-common",
  "daer-config",
+ "daer-observe",
  "daer-proxy-protocols",
  "fastrand",
  "netune",
@@ -645,12 +654,11 @@ dependencies = [
  "regex",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -659,6 +667,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "daer-config",
+ "daer-observe",
  "fastrand",
  "getrandom 0.3.4",
  "hkdf",
@@ -681,15 +690,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "tracing",
  "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "daer-relay"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
+ "daer-observe",
  "daer-sniff",
  "libc",
  "netune",
@@ -697,12 +706,11 @@ dependencies = [
  "serde_json",
  "socket2",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "daer-routing"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aya-obj",
  "daer-common",
@@ -716,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -724,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2067,6 +2075,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2076,12 +2094,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
@@ -2377,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "serde",
  "toml",

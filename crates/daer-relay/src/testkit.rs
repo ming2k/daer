@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use netune::{SocketConfig, UdpConnector};
 
-use crate::error::{DialFailure, RelayError};
+use daer_observe::{DialFailure, DialStage, diagnostic::codes};
+
+use crate::error::RelayError;
 use crate::inbound::FlowFacts;
 use crate::relay::datagram::{DatagramLeg, DatagramRouter, OpenDatagram};
 
@@ -55,7 +57,13 @@ impl DatagramRouter for RefusingRouter {
         _domain: Option<&'a str>,
     ) -> OpenDatagram<'a> {
         let reason = self.0;
-        Box::pin(async move { Err::<DatagramLeg, DialFailure>(reason.to_owned()) })
+        Box::pin(async move {
+            Err::<DatagramLeg, DialFailure>(DialFailure::new(
+                DialStage::Policy,
+                codes::RELAY_DIAL_NO_NODE,
+                reason,
+            ))
+        })
     }
 }
 

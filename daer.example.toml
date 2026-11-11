@@ -196,6 +196,16 @@ optimistic-cache-ttl = 60
 optimistic-stale-reply-ttl = 30
 max-cache-size = 65536
 
+# Synthetic DNS answers. Disabled by default. `inet6` is optional: when set, AAAA queries
+# receive synthetic addresses too; when unset, AAAA is answered empty so a dual-stack client
+# falls back to the synthetic A record.
+#[dns.fake-ip]
+#enabled = false
+#inet = "198.18.0.0/15"
+#inet6 = "fdfe:dcba:9876::/64"
+#pool-size = 65535
+#exclude = ["local"]
+
 # Per-domain TTL overrides, in seconds.
 [dns.fixed-domain-ttl]
 #".example.com" = 60
@@ -219,29 +229,36 @@ fallback = "accept"
 #   python3 scripts/rules/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
 #   daer-drb compile cn-ip.rules -o geoip-cn.drb
 #
-# Dedicated rules distribution repository: https://github.com/daer-proxy/drb-sets
+# Dedicated rules distribution repository: https://github.com/daeuniverse/drb-sets
 # These URLs resolve once that repository has published its first build. Until then (or with
 # no network at all) `daer check` names every provider it could not load and the cache path it
 # looked in, rather than starting with an empty rule — that is the intended behaviour, not a
 # failure of the example. Point `path` at a local `.drb` to work offline.
+#
+# For a locally managed set, place the file under /var/lib/daer/rules and declare:
+#   [[rule-provider]]
+#   tag = "company"
+#   type = "file"
+#   path = "/var/lib/daer/rules/company.drb"
+#   format = "drb"
 [[rule-provider]]
 tag = "private"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-private.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "cn"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geosite-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
 tag = "cn-ip"
 type = "http"
-url = "https://raw.githubusercontent.com/daer-proxy/drb-sets/release/geoip-cn.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"
 interval = "24h"
 

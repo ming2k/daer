@@ -7,8 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-11-11
+
 ### Added
 
+- **Typed diagnostic plane ([ADR-0040](docs/adr/0040-typed-diagnostic-plane.md)).** New
+  Layer 1 `daer-observe` crate with a generated event catalog (`crates/daer-observe/events.toml`),
+  stable event codes/severity/remediation, `flow_id`/`query_id` correlation, neutral
+  `DialFailure`/`ErrorCode`, typed redaction (`Secret`, `RedactedLink`), and a dependency
+  firewall: only `daer-observe` and the CLI subscriber may use `tracing`. Client-visible
+  failures (dial, relay, DNS upstream, datagram session) are now `warn` events instead of
+  `debug`-only lines. `cargo xtask events --check` fails on catalog drift, a raw `tracing`
+  macro, or a call-site severity mismatch.
+- **`daer status` and runtime snapshots ([ADR-0041](docs/adr/0041-runtime-status-verb.md)).**
+  The daemon writes `/run/daer/state.json` every five seconds and serves the same snapshot on
+  a read-only `/run/daer/control.sock`; `daer status [--json|--bundle]` reads the live socket
+  or falls back to the state file and says which it used. The snapshot includes generation,
+  policy hash, datapath attachment, flow/datagram/DNS counters, and the BPF counters.
+- **Kernel telemetry has a consumer.** `bpf_stats_map` (17 keys) and `event_ringbuf` (10
+  record types) are declared in `ebpf/abi.toml`, generated on both sides, and read by
+  `daer-ebpf::telemetry`. The daemon drains the ring, emits `datapath.event`, and publishes
+  non-zero `bpf_stats_map` deltas as `datapath.stats`. A dropped kernel event is counted by
+  `BPF_STATS_EVENT_DROP`, not silently lost.
+- **Incident artifacts and post-bug enforcement.** Panic hook and `SIGUSR1` write a redacted
+  bundle (`manifest.json`, `snapshot.json`, `events.jsonl`, `README.txt`) under
+  `/var/lib/daer/incidents`; the JSON event stream is written to `/run/daer/events.jsonl`.
+  Incident records moved to `docs/dev/incidents/` and are validated by
+  `cargo xtask incident --check` (signal, event codes, regression test references).
+
+- **Opt-in TCX attachment for the host TC hooks.** `DAER_TC_ATTACH=tcx` uses `bpf_link`
+  instead of classic `cls_bpf`, so the host filters detach with the process (including
+  `SIGKILL`) and no `clsact` qdisc is created. It is a validation knob, not the default:
+  the real-daemon delivery check (`DAER_TC_ATTACH=tcx scripts/ops/daer-netns-e2e.sh`) must
+  prove `bpf_sk_assign` delivery on a 6.6+ kernel before the default changes.
+- **`daer check --host` gates the host sysctl prerequisites.** It reads `/proc/sys` and
+  exits non-zero on a missing forwarding or martian setting; the host install script runs it
+  before restarting the service, so a misconfigured host fails the gate instead of the unit.
+- **Full IPv6 dual-stack data path.** `listen_socket_map` now has four slots — tcp4, udp4,
+  tcp6, udp6 — and `assign_listener` selects by protocol and family. The daemon publishes the
+  IPv6 UDP listener fd and refuses to attach if either datagram family is missing, so a v6
+  datagram can no longer be assigned to a v4 socket. `tests/object.rs` pins the map capacity
+  and `daer-ebpf` pins the key order.
+- **Optional IPv6 Fake-IP (`dns.fake-ip.inet6`).** A second, independent synthetic pool
+  answers `AAAA` with addresses in the configured IPv6 prefix. When `inet6` is absent the
+  historical IPv4-only behavior is preserved: `AAAA` is an empty NOERROR so dual-stack clients
+  fall back to the synthetic `A`.
 - **Systemd readiness, watchdog and lifecycle notifications (`daer-cli`, `install/daer.service`).**
   `daer run` now implements the small `sd_notify` protocol directly: it reports startup
   progress, sends `READY=1` only after the listeners and datapath are attached,
@@ -20,11 +63,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the ten-second manual default.
 - **Transparent-ingress incident record and convergence checklist.** The private-namespace
   fix, reply-socket readiness, accept-loop liveness, and health-probe failures are documented
-  together in [`docs/dev/transparent-ingress-incident.md`](docs/dev/transparent-ingress-incident.md),
+  together in [`docs/dev/incidents/0001-transparent-ingress.md`](docs/dev/incidents/0001-transparent-ingress.md),
   with the falsifier for each and an eight-point checklist for future changes.
 
 ### Changed
 
+- **Host forwarding sysctls are prerequisites, not daemon state.** `daer run` no longer writes
+  `net.ipv4.ip_forward`, `net.ipv4.conf.all.forwarding`, `net.ipv4.conf.all.rp_filter`,
+  `net.ipv4.conf.all.arp_filter` or `net.ipv6.conf.all.forwarding`; it fails with the exact
+  key and a `/etc/sysctl.d/99-daer.conf` remediation when they are not set. A `SIGKILL` can
+  no longer leave a host-global forwarding policy changed. The `daer0`/`daer0peer` per-device
+  and namespace-local knobs are still owned and removed with their devices. See
+  [`docs/how-to/deployment.md#host-sysctls`](docs/how-to/deployment.md#host-sysctls).
+- **The recovery journal is versioned, and `daer-cleanup` is host-TC-only for current runs.**
+  A v2 journal carries `interface`/`qdisc` records only; the namespace, pair and ingress
+  sysctls die with the process, and host-global sysctls are prerequisites. A pre-v2 journal
+  (or a missing journal from an older run) still triggers the full legacy restore. This is
+  the last step before `daer-cleanup` can be retired once the host TC attachment is fd-owned.
+- **Rule provider paths are system-wide only.** HTTP providers cache under
+  `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides); operator-managed local
+  `.drb`/`.rules` files belong under `/var/lib/daer/rules`; `/etc/daer` is configuration
+  only. The XDG/`$HOME/.cache` fallback and package-shipped rule paths are removed. The
+  systemd unit creates `/var/lib/daer` via `StateDirectory` and `/var/cache/daer` via
+  `CacheDirectory`, and the package creates the empty `/var/lib/daer/rules`.
+- **A cancelled daemon now stops its datagram task instead of leaving it spinning.**
+  `Daemon::serve` wraps the spawned UDP relay in an abort-on-drop guard, and
+  `TransparentDatagramListener::recv` clears Tokio readiness with `try_io` when `recvmsg`
+  returns `WouldBlock`. Dropping the serving future previously detached the relay; an
+  edge-triggered readiness loop could then spin on `recvmsg(EAGAIN)` until the runtime shut
+  down.
+- **Rule attributes are removed from Canonical Rule Source ([ADR-0039](docs/adr/0039-remove-rule-attributes.md)).**
+  `@attribute` suffixes, `DomainRule::attributes`, `RuleSet::drop_attribute`/`strip_attributes`,
+  and `daer-drb compile --without` are gone. The DRB v2 binary is unchanged; the text grammar
+  carries patterns only. `dat_to_rules.py` ignores the upstream `.dat` attribute fields.
+- **The ingress namespace mount now dies with the daemon.** `daer run` unshares a private
+  mount namespace and mounts a tmpfs at `/run/netns` before creating `daer0ns`. A `SIGKILL`
+  therefore releases the namespace, its veth pair, its policy routes, and its namespace-local
+  sysctls with the process; the host `/run/netns` is untouched. Diagnostics enter the
+  daemon's mount namespace with `nsenter --mount=/proc/<pid>/ns/mnt`. `daer-cleanup` remains
+  for the host-side TC filters and global sysctls, which are not namespace-owned.
 - **Runtime system state is now self-cleaning, including after a crash.** The datapath
   journal records every host sysctl change and every `clsact` qdisc it creates under
   `/run/daer` before making it; normal Rust destructors restore them, and the dedicated
@@ -69,6 +146,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sd_notify::tests::a_filesystem_socket_receives_the_exact_datagram` fails if readiness is
   never sent; `a_status_value_cannot_smuggle_extra_fields` fails if a status line can inject
   another notification field.
+- `daer-control/tests/transparent_udp6.rs` builds a real client/origin two-namespace
+  topology, installs an `ip6` tproxy rule and policy route, requires the negative control to
+  fail without the daemon, then requires the origin's nonce and the relay counters to advance.
+  `scripts/verify/e2e-check.sh` runs it as `3-udp6`; CI makes a skip fatal.
+
+### Fixed
+
+- **`cargo xtask install` now installs under the live `/usr` by default.** An empty
+  `DESTDIR` was treated as a relative base, so the default command created `./usr/bin`
+  under the caller's working directory instead of `/usr/bin`. The install target is
+  normalised once, and a test pins both the default and a staged tree.
+- **The host install script no longer forgets `daer-cleanup`.** `daer-install-netns.sh`
+  stages with `cargo xtask install --destdir` and copies that tree instead of naming
+  binaries itself, so the unit's `ExecStopPost=` helper cannot be omitted. `cargo xtask
+  install` also fails when the datapath object or the unit is missing instead of silently
+  installing a service that cannot start.
+- **The crash journal no longer records per-device sysctls.** `daer0`/`daer0peer` knobs
+  disappear with the device, so recording them only made cleanup write to paths that no
+  longer exist. Global and `all/` values are still journaled.
 
 ## [0.0.11] - 2026-11-11
 

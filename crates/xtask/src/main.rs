@@ -8,9 +8,12 @@
 //! Subcommands:
 //!     ebpf    - Compiles the eBPF C datapath into target/ebpf/datapath.o
 //!     schema  - Prints or writes (--write) the published JSON schema
+//!     events  - Generates the diagnostic event catalog (ADR-0040)
 //!     ci      - Runs the entire CI suite locally (fmt, clippy, tests)
 
 mod abi;
+mod events;
+mod incident;
 
 use std::env;
 use std::fs;
@@ -302,6 +305,21 @@ fn run_ci() {
         std::process::exit(1);
     }
 
+    // The diagnostic catalog is generated too (ADR-0040). It is checked before the compile
+    // for the same reason as the ABI: a raw `tracing` macro or a call-site severity that
+    // disagrees with the catalog is a contract failure, not a style warning.
+    println!("> cargo xtask events --check");
+    if let Err(error) = events::run(&root, true) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+
+    println!("> cargo xtask incident --check");
+    if let Err(error) = incident::run(&root) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+
     run_command("cargo", &["fmt", "--all", "--", "--check"]);
     run_command(
         "cargo",
@@ -431,57 +449,105 @@ fn run_install(args: &[String]) {
         }
     }
 
-    let base = Path::new(&destdir);
-    let clean_prefix = prefix.strip_prefix('/').unwrap_or(&prefix);
-    let target_prefix = base.join(clean_prefix);
+    match install_layout(&root, &prefix, Path::new(&destdir)) {
+        Ok(installed) => {
+            for path in installed {
+                println!("installed: {}", path.display());
+            }
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
 
+/// Resolves where `prefix` is installed under `destdir`.
+///
+/// An empty `DESTDIR` means the live filesystem. `Path::new("").join("usr")` is the relative
+/// path `usr`, so treating the empty string as a base used to create `./usr` under the
+/// caller's working directory instead of writing `/usr`. Normalising here keeps the default
+/// install and the staged install on the same code path.
+fn install_target_prefix(prefix: &str, destdir: &Path) -> PathBuf {
+    let base = if destdir.as_os_str().is_empty() {
+        Path::new("/")
+    } else {
+        destdir
+    };
+    base.join(prefix.strip_prefix('/').unwrap_or(prefix))
+}
+
+/// Copies every installed artifact into `destdir/prefix` and returns the paths written.
+///
+/// This function is the single definition of an install. `scripts/ops/daer-install-netns.sh`
+/// copies the staged tree rather than listing binaries again, and the test below pins the
+/// exact file set, so a helper that drops out of this list (as `daer-cleanup` did in the
+/// script) fails CI instead of failing on a host.
+fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathBuf>, String> {
+    let binaries = ["daer", "daer-cleanup", "daer-drb"];
+
+    // Validate every source before writing anything: a skipped build step must not leave a
+    // half-installed tree whose unit names a binary or object that was never copied.
+    for name in binaries {
+        if !root.join("target/release").join(name).is_file() {
+            return Err(format!(
+                "target/release/{name} does not exist. Run `cargo build --release` first."
+            ));
+        }
+    }
+    let src_obj = root.join("target/ebpf/datapath.o");
+    if !src_obj.is_file() {
+        return Err(format!(
+            "{} does not exist. Run `cargo xtask ebpf` first.",
+            src_obj.display()
+        ));
+    }
+    let src_service = root.join("install/daer.service");
+    if !src_service.is_file() {
+        return Err(format!("{} is missing", src_service.display()));
+    }
+
+    let target_prefix = install_target_prefix(prefix, destdir);
     let bin_dir = target_prefix.join("bin");
     let lib_dir = target_prefix.join("lib/daer");
     let unit_dir = target_prefix.join("lib/systemd/system");
-
-    fs::create_dir_all(&bin_dir).expect("failed to create bin directory");
-    fs::create_dir_all(&lib_dir).expect("failed to create lib/daer directory");
-    fs::create_dir_all(&unit_dir).expect("failed to create systemd unit directory");
-
-    install_binary(&root, &bin_dir, "daer");
-
-    // Internal lifecycle helper used by the unit's `ExecStopPost=`. It shares the cleanup
-    // library with `daer` but is not another operator-facing verb.
-    install_binary(&root, &bin_dir, "daer-cleanup");
-
-    // `daer-drb` is the companion rule-artifact producer. It is not linked into the
-    // daemon (ADR-0031), but operators need it to compile `.rules` into `.drb`, so a
-    // local install that omits it installs half the shipped surface.
-    install_binary(&root, &bin_dir, "daer-drb");
-
-    let src_obj = root.join("target/ebpf/datapath.o");
-    if src_obj.exists() {
-        let dest_obj = lib_dir.join("datapath.o");
-        fs::copy(&src_obj, &dest_obj).expect("failed to copy datapath object");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dest_obj, fs::Permissions::from_mode(0o644));
-        }
-        println!("installed: {}", dest_obj.display());
+    for directory in [&bin_dir, &lib_dir, &unit_dir] {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
     }
 
-    let src_service = root.join("install/daer.service");
-    if src_service.exists() {
-        let dest_service = unit_dir.join("daer.service");
-        // The unit source names the canonical `/usr` install. Rewrite the two executable
-        // paths when a different prefix was requested: copying it verbatim made
-        // `--prefix /usr/local` install a binary that systemd could not find.
-        let unit = fs::read_to_string(&src_service).expect("failed to read systemd service unit");
-        let unit = service_unit_for_prefix(&unit, &prefix);
-        fs::write(&dest_service, unit).expect("failed to write systemd service unit");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dest_service, fs::Permissions::from_mode(0o644));
-        }
-        println!("installed: {}", dest_service.display());
+    let mut installed = Vec::with_capacity(binaries.len() + 2);
+    for name in binaries {
+        // `daer-cleanup` is the unit's `ExecStopPost=` helper; `daer-drb` is the rule-artifact
+        // producer operators need to compile `.rules` (ADR-0031). Omitting either ships half
+        // the surface.
+        installed.push(install_binary(root, &bin_dir, name)?);
     }
+
+    let dest_obj = lib_dir.join("datapath.o");
+    fs::copy(&src_obj, &dest_obj).map_err(|error| {
+        format!(
+            "cannot copy {} to {}: {error}",
+            src_obj.display(),
+            dest_obj.display()
+        )
+    })?;
+    set_mode(&dest_obj, 0o644)?;
+    installed.push(dest_obj);
+
+    // The unit source names the canonical `/usr` install. Rewrite the two executable paths
+    // when a different prefix was requested: copying it verbatim made `--prefix /usr/local`
+    // install a binary that systemd could not find.
+    let unit = fs::read_to_string(&src_service)
+        .map_err(|error| format!("cannot read {}: {error}", src_service.display()))?;
+    let unit = service_unit_for_prefix(&unit, prefix);
+    let dest_service = unit_dir.join("daer.service");
+    fs::write(&dest_service, unit)
+        .map_err(|error| format!("cannot write {}: {error}", dest_service.display()))?;
+    set_mode(&dest_service, 0o644)?;
+    installed.push(dest_service);
+
+    Ok(installed)
 }
 
 /// Rewrites the canonical `/usr` paths in the unit for the requested install prefix.
@@ -500,20 +566,39 @@ fn service_unit_for_prefix(unit: &str, prefix: &str) -> String {
 }
 
 /// Copies one built binary into `<prefix>/bin` with the executable bit set.
-fn install_binary(root: &Path, bin_dir: &Path, name: &str) {
+fn install_binary(root: &Path, bin_dir: &Path, name: &str) -> Result<PathBuf, String> {
     let src = root.join("target/release").join(name);
-    if !src.exists() {
-        eprintln!("target/release/{name} does not exist. Run `cargo build --release` first.");
-        std::process::exit(1);
+    if !src.is_file() {
+        return Err(format!(
+            "target/release/{name} does not exist. Run `cargo build --release` first."
+        ));
     }
     let dest = bin_dir.join(name);
-    fs::copy(&src, &dest).unwrap_or_else(|error| panic!("failed to copy {name}: {error}"));
+    fs::copy(&src, &dest).map_err(|error| {
+        format!(
+            "cannot copy {} to {}: {error}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    set_mode(&dest, 0o755)?;
+    Ok(dest)
+}
+
+/// Sets an exact mode on Unix.
+///
+/// The binary is Linux-only, but keeping the mode in one helper means the install test sees
+/// the same permissions the caller gets instead of depending on the workspace's umask.
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("cannot set mode {mode:o} on {}: {error}", path.display()))?;
     }
-    println!("installed: {}", dest.display());
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
 }
 
 /// Runs one of the privileged verification scripts under `scripts/verify/`.
@@ -558,6 +643,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("events") => {
+            let check = args.any(|a| a == "--check");
+            let root = workspace_root();
+            if let Err(error) = events::run(&root, check) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Some("incident") => {
+            let root = workspace_root();
+            if let Err(error) = incident::run(&root) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
         Some("preflight") => {
             let root = workspace_root();
             if let Err(error) = run_preflight(&root) {
@@ -575,6 +675,8 @@ fn main() {
             println!(
                 "    cargo xtask abi [--check]      Generate the kernel ABI from ebpf/abi.toml"
             );
+            println!("    cargo xtask events [--check]   Generate the diagnostic event catalog");
+            println!("    cargo xtask incident           Validate the post-bug incident records");
             println!(
                 "    cargo xtask ebpf [--tests]     Compile eBPF C datapath (and the test object)"
             );
@@ -584,7 +686,7 @@ fn main() {
             );
             println!("    cargo xtask ci                 Run full CI suite (fmt, clippy, test)");
             println!(
-                "    cargo xtask install            Install binaries, datapath, and systemd unit"
+                "    cargo xtask install            Install binaries, datapath, and unit (--prefix/--destdir)"
             );
             println!("    cargo xtask kernel-check       Run privileged kernel datapath tests");
             println!("    cargo xtask e2e-check          Run privileged end-to-end ingress tests");
@@ -599,6 +701,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -637,5 +741,133 @@ mod tests {
 
         // The package build installs under `/usr`; its unit must stay byte-identical.
         assert_eq!(service_unit_for_prefix(unit, "/usr"), unit);
+    }
+
+    /// Creates a fake workspace with every source artifact `install_layout` expects.
+    fn temporary_root() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "daer-xtask-install-{}-{stamp}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in ["target/release", "target/ebpf", "install"] {
+            fs::create_dir_all(root.join(directory)).expect("create fake workspace directory");
+        }
+        for name in ["daer", "daer-cleanup", "daer-drb"] {
+            fs::write(root.join("target/release").join(name), b"fake binary")
+                .expect("write fake binary");
+        }
+        fs::write(root.join("target/ebpf/datapath.o"), b"fake object").expect("write fake object");
+        fs::write(
+            root.join("install/daer.service"),
+            "[Service]\n\
+             ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.o\n\
+             ExecStopPost=/usr/bin/daer-cleanup\n",
+        )
+        .expect("write fake unit");
+        root
+    }
+
+    #[test]
+    fn the_staged_tree_is_exactly_the_documented_file_set() {
+        let root = temporary_root();
+        let destdir = root.join("stage");
+        let installed = install_layout(&root, "/usr", &destdir).expect("install layout");
+
+        let relative: BTreeSet<String> = installed
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&destdir)
+                    .expect("installed path is under destdir")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            relative,
+            BTreeSet::from([
+                "usr/bin/daer".to_owned(),
+                "usr/bin/daer-cleanup".to_owned(),
+                "usr/bin/daer-drb".to_owned(),
+                "usr/lib/daer/datapath.o".to_owned(),
+                "usr/lib/systemd/system/daer.service".to_owned(),
+            ])
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for (relative, mode) in [
+                ("usr/bin/daer", 0o755),
+                ("usr/bin/daer-cleanup", 0o755),
+                ("usr/bin/daer-drb", 0o755),
+                ("usr/lib/daer/datapath.o", 0o644),
+                ("usr/lib/systemd/system/daer.service", 0o644),
+            ] {
+                let actual = fs::metadata(destdir.join(relative))
+                    .expect("staged file exists")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(actual, mode, "{relative}");
+            }
+        }
+
+        let unit = fs::read_to_string(destdir.join("usr/lib/systemd/system/daer.service"))
+            .expect("read staged unit");
+        assert!(unit.contains("ExecStopPost=/usr/bin/daer-cleanup"));
+
+        fs::remove_dir_all(&root).expect("remove fake workspace");
+    }
+
+    #[test]
+    fn a_missing_cleanup_binary_fails_the_install() {
+        // The falsifier for the old script bug: dropping the helper from the set must fail,
+        // not produce a unit whose ExecStopPost points at a file that was never installed.
+        let root = temporary_root();
+        fs::remove_file(root.join("target/release/daer-cleanup")).expect("remove cleanup");
+
+        let error = install_layout(&root, "/usr", &root.join("stage")).expect_err("must fail");
+        assert!(error.contains("daer-cleanup"), "{error}");
+
+        fs::remove_dir_all(&root).expect("remove fake workspace");
+    }
+
+    #[test]
+    fn a_missing_datapath_object_fails_the_install() {
+        // The unit's ExecStart names this object. Installing the unit without it used to
+        // succeed silently; the service then failed only after systemd started it.
+        let root = temporary_root();
+        fs::remove_file(root.join("target/ebpf/datapath.o")).expect("remove datapath object");
+
+        let error = install_layout(&root, "/usr", &root.join("stage")).expect_err("must fail");
+        assert!(error.contains("cargo xtask ebpf"), "{error}");
+
+        fs::remove_dir_all(&root).expect("remove fake workspace");
+    }
+
+    #[test]
+    fn the_install_target_defaults_to_the_live_root() {
+        assert_eq!(
+            install_target_prefix("/usr", Path::new("")),
+            PathBuf::from("/usr")
+        );
+        assert_eq!(
+            install_target_prefix("/usr", Path::new("/tmp/pkg")),
+            PathBuf::from("/tmp/pkg/usr")
+        );
+        assert_eq!(
+            install_target_prefix("/usr/local", Path::new("/tmp/pkg")),
+            PathBuf::from("/tmp/pkg/usr/local")
+        );
     }
 }

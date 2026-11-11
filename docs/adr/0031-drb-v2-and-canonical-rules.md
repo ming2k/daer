@@ -31,7 +31,7 @@ We execute a **Clean Break** across the rule specification, compiler, binary for
 
 `daer-drb` accepts exactly one text format (`.rules`) and outputs exactly one binary format (`.drb`):
 - `name: <set-name>`
-- `ip: <cidr | address | start - end>`
+- `ip: <cidr | address | start-end>`
 - `<domain>` (suffix: the name and every subdomain)
 - `.<domain>` (subdomains only)
 - `=<domain>` (exact match)

@@ -107,6 +107,8 @@ pub struct Generation {
     health_interval: daer_config::HealthCheck,
     build_time: Duration,
     built_at: Instant,
+    /// Non-fatal warnings from compilation, for the reload report and snapshot.
+    warnings: Vec<String>,
 }
 
 impl Generation {
@@ -124,6 +126,7 @@ impl Generation {
         let started = Instant::now();
         let router = Router::new(config, id, options)?;
         let policy_hash = hash_normalized_program(router.program())?;
+        let warnings = router.warnings().to_vec();
         Ok(Self {
             id,
             rules: router.matches().len(),
@@ -134,7 +137,14 @@ impl Generation {
             health_interval: config.global.health_check.clone(),
             build_time: started.elapsed(),
             built_at: Instant::now(),
+            warnings,
         })
+    }
+
+    /// Non-fatal compile warnings from this generation.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// How often this generation wants its nodes probed.
@@ -180,6 +190,18 @@ impl Generation {
     #[must_use]
     pub const fn rules(&self) -> usize {
         self.rules
+    }
+
+    /// Number of declared groups.
+    #[must_use]
+    pub const fn groups(&self) -> usize {
+        self.groups
+    }
+
+    /// Number of declared nodes.
+    #[must_use]
+    pub const fn nodes(&self) -> usize {
+        self.nodes
     }
 
     /// How long building this generation took.
@@ -306,7 +328,7 @@ impl Generations {
     pub fn new(config: &Config, options: &RouterOptions) -> Result<Self, ReloadError> {
         let first = GenerationId(1);
         let generation = Generation::build(first, config, options).map_err(|source| {
-            tracing::error!(
+            daer_observe::error!(daer_observe::EventCode::GenerationStartupRejected,
                 generation = %first,
                 error = %source,
                 "configuration rejected; nothing is serving"
@@ -316,7 +338,7 @@ impl Generations {
                 serving: None,
             }
         })?;
-        tracing::info!(
+        daer_observe::info!(daer_observe::EventCode::GenerationLoaded,
             generation = %generation.id(),
             rules = generation.rules(),
             groups = generation.groups,
@@ -358,7 +380,7 @@ impl Generations {
         let id = GenerationId(self.next_id.fetch_add(1, Ordering::Relaxed));
 
         let generation = Generation::build(id, config, options).map_err(|source| {
-            tracing::error!(
+            daer_observe::error!(daer_observe::EventCode::GenerationReloadRejected,
                 generation = %id,
                 serving = %previous.id(),
                 error = %source,
@@ -379,13 +401,13 @@ impl Generations {
             groups: generation.groups,
             nodes: generation.nodes,
             routing_changed,
-            warnings: Vec::new(),
+            warnings: generation.warnings().to_vec(),
         };
 
         self.current.store(Arc::new(generation));
         self.published.fetch_add(1, Ordering::Relaxed);
 
-        tracing::info!(
+        daer_observe::info!(daer_observe::EventCode::GenerationReloaded,
             generation = %report.generation,
             previous = %report.previous,
             rules = report.rules,
@@ -435,6 +457,21 @@ mod tests {
         assert_eq!(current.rules(), 1);
         assert_eq!(generations.published(), 1);
         assert!(current.describe().contains("gen1"));
+    }
+
+    #[test]
+    fn a_reload_report_carries_compile_warnings() {
+        // A warning that only reaches the log is not reviewable after the fact. The report
+        // is what a snapshot and an incident bundle carry, so it must not drop the sink.
+        let generations = Generations::new(&config(DIRECT), &options()).expect("builds");
+        let warned = "[routing]\nrules = [\"pname(this_process_name_is_too_long) -> direct\"]\nfallback = \"direct\"\n";
+        let report = generations
+            .reload(&config(warned), &options())
+            .expect("reloads");
+        assert!(
+            !report.warnings.is_empty(),
+            "a truncated pname must be reported: {report:?}"
+        );
     }
 
     #[test]

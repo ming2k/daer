@@ -48,7 +48,7 @@ We believe that system-level network tools should be lightweight, reliable, and 
 - **Zero-Intrusion Ergonomics**: Operates quietly in the background without needing PAC files, client-side extensions, or manual SOCKS5/HTTP toggling.
 - **Extreme Efficiency & Low Footprint**: Built with modern Rust for memory safety, high concurrency, and near line-rate throughput with minimal CPU and memory overhead.
 - **Protocol Robustness**: Engineered to handle complex network topologies, high latency variance, and challenging packet conditions gracefully.
-- **Built-in First-Party Diagnostics**: Includes comprehensive CLI tools for configuration checking, route simulation (`daer route`), and node reachability testing (`daer probe`).
+- **Built-in First-Party Diagnostics**: Configuration checking, route simulation (`daer route`), active node probes (`daer probe`), and a read-only runtime inspector (`daer status`) with redacted incident bundles.
 
 ---
 

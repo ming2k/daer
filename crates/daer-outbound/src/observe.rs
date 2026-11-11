@@ -53,6 +53,8 @@ pub trait DialObserver: Send + Sync + std::fmt::Debug {
 /// holding a reference to the dialer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialId {
+    /// The flow/session this dial belongs to.
+    pub flow_id: daer_observe::FlowId,
     /// The node's tag (`direct` for a direct dial).
     pub node: Arc<str>,
     /// The authority the dial targeted.
@@ -60,9 +62,14 @@ pub struct DialId {
 }
 
 impl DialId {
-    /// Builds an id from the node tag and the dialed authority.
-    pub fn new(node: impl Into<Arc<str>>, authority: impl Into<Arc<str>>) -> Self {
+    /// Builds an id from the flow, node tag and dialed authority.
+    pub fn new(
+        flow_id: daer_observe::FlowId,
+        node: impl Into<Arc<str>>,
+        authority: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
+            flow_id,
             node: node.into(),
             authority: authority.into(),
         }
@@ -71,7 +78,7 @@ impl DialId {
 
 impl std::fmt::Display for DialId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}→{}", self.node, self.authority)
+        write!(f, "{} {}→{}", self.flow_id, self.node, self.authority)
     }
 }
 
@@ -117,13 +124,23 @@ pub struct LogObserver;
 impl DialObserver for LogObserver {
     fn finished(&self, dial: &DialId, timings: Option<&DerivedTimings>) {
         let Some(timings) = timings else {
-            tracing::debug!(dial = %dial, "dial finished without timings");
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowDialFinishedWithoutTimings,
+                flow_id = %dial.flow_id,
+                dial = %dial,
+                node = %dial.node,
+                authority = %dial.authority,
+                "dial finished without timings"
+            );
             return;
         };
         // A `Reading` is reported as its value or as why there is none: a fabricated zero
         // would make a reused connection look instantaneous rather than not-applicable.
-        tracing::debug!(
+        daer_observe::debug!(daer_observe::EventCode::FlowDialFinished,
+            flow_id = %dial.flow_id,
             dial = %dial,
+            node = %dial.node,
+            authority = %dial.authority,
             dns_us = ?timings.dns_us.value(),
             tcp_us = ?timings.tcp_us.value(),
             tls_us = ?timings.tls_us.value(),
@@ -153,6 +170,7 @@ pub type ObserverSlot = Option<Arc<dyn DialObserver>>;
 pub struct ObservedDialer {
     dialer: Arc<crate::node_dialer::NodeDialer>,
     observer: ObserverSlot,
+    flow_id: daer_observe::FlowId,
     tag: Arc<str>,
 }
 
@@ -171,11 +189,13 @@ impl ObservedDialer {
     pub fn new(
         dialer: Arc<crate::node_dialer::NodeDialer>,
         observer: ObserverSlot,
+        flow_id: daer_observe::FlowId,
         tag: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             dialer,
             observer,
+            flow_id,
             tag: tag.into(),
         }
     }
@@ -193,7 +213,7 @@ impl ObservedDialer {
         let dial = self
             .observer
             .as_ref()
-            .map(|_| DialId::new(Arc::clone(&self.tag), authority.to_owned()));
+            .map(|_| DialId::new(self.flow_id, Arc::clone(&self.tag), authority.to_owned()));
         let collector = match (&self.observer, &dial) {
             (Some(observer), Some(dial)) => {
                 let sink = DialObserverSink::new(dial.clone(), Arc::clone(observer));
@@ -207,6 +227,22 @@ impl ObservedDialer {
             .dialer
             .connect_with_collector(authority, &collector)
             .await;
+
+        if let Err(error) = &result {
+            // One failure event per dial, at the layer that knows the stage and stable code.
+            // The relay's generic "no outbound leg" line stays at debug; this is the warn.
+            let failure = daer_observe::DialFailure::from(error.clone());
+            daer_observe::warn!(
+                daer_observe::EventCode::FlowDialFailed,
+                flow_id = %self.flow_id,
+                destination = %authority,
+                group = %self.tag,
+                stage = %failure.stage,
+                error_code = %failure.code,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "flow dial failed"
+            );
+        }
 
         if let (Some(observer), Some(dial)) = (&self.observer, dial) {
             let log = collector.log();
@@ -318,7 +354,7 @@ mod tests {
         // and "it timed out" with no span is the least useful answer there is.
         let collector = Arc::new(Collector::default());
         let slot: ObserverSlot = Some(Arc::clone(&collector) as Arc<dyn DialObserver>);
-        let dial = DialId::new("n1", "example.com:443");
+        let dial = DialId::new(daer_observe::FlowId::new(1), "n1", "example.com:443");
         slot.as_ref()
             .expect("set")
             .finished(&dial, Some(&wall_clock_timings(1)));
@@ -354,7 +390,11 @@ mod tests {
         }
 
         let recorder = Arc::new(EventRecorder::default());
-        let dial = DialId::new("node-test", "api.example.com:443");
+        let dial = DialId::new(
+            daer_observe::FlowId::new(2),
+            "node-test",
+            "api.example.com:443",
+        );
         let sink =
             DialObserverSink::new(dial.clone(), Arc::clone(&recorder) as Arc<dyn DialObserver>);
         assert_eq!(sink.dial(), &dial);

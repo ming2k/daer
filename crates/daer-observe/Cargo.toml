@@ -1,0 +1,16 @@
+[package]
+name = "daer-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Typed diagnostic plane for daer: event codes, correlation IDs, and incident primitives"
+
+[dependencies]
+fastrand.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

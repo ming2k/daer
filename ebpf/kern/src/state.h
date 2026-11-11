@@ -7,9 +7,9 @@
 // Sockmap:
 struct {
 	__uint(type, BPF_MAP_TYPE_SOCKMAP);
-	__type(key, __u32); // 0 is tcp4, 1 is udp, 2 is tcp6.
+	__type(key, __u32); // 0 is tcp4, 1 is udp4, 2 is tcp6, 3 is udp6.
 	__type(value, __u32); // fd of socket; SOCKMAP values are `int`, not `u64`.
-	__uint(max_entries, 3);
+	__uint(max_entries, 4);
 } listen_socket_map SEC(".maps");
 
 union ip6 {
@@ -100,10 +100,11 @@ struct routing_handoff_entry {
 	struct routing_result result;
 };
 
-/* `struct daer_param`, `enum MatchType`, `OUTBOUND_*`, `L4ProtoType` and
- * `IpVersionType` come from `daer_abi.h`, which `cargo xtask abi` generates from
- * `ebpf/abi.toml` (ADR-0021). They are not declared here: one declaration, two languages,
- * and `cargo xtask abi --check` fails the build if the generated header drifts. */
+/* `struct daer_param`, `struct daer_event`, `enum MatchType`, `OUTBOUND_*`,
+ * `L4ProtoType`, `IpVersionType`, `enum bpf_stats_key` and `enum daer_event_type`
+ * come from `daer_abi.h`, which `cargo xtask abi` generates from `ebpf/abi.toml`
+ * (ADR-0021, amended by ADR-0040). They are not declared here: one declaration, two
+ * languages, and `cargo xtask abi --check` fails the build if the generated header drifts. */
 const volatile struct daer_param PARAM = {};
 
 /* daer_ifindex_map holds the runtime-updatable ifindex of the daer0 device.
@@ -410,55 +411,6 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } conn_state_map SEC(".maps");
 
-enum bpf_stats_key {
-	// key=0: UDP conn state map overflow count (drives janitor pressure).
-	BPF_STATS_UDP_CONN_OVERFLOW = 0,
-	// key=1: TCP conn state map overflow count (drives janitor pressure).
-	BPF_STATS_TCP_CONN_OVERFLOW = 1,
-	// key=2: redirect_track update rejected because the HASH is full.
-	BPF_STATS_REDIRECT_OVERFLOW = 2,
-	// key=3: redirect_track update failed for a reason other than a full map.
-	BPF_STATS_REDIRECT_UPDATE_FAILED = 3,
-	// key=4: reply binding kept because a different publisher raced a fresh
-	// entry (see publish_redirect_track_for_packet).
-	BPF_STATS_REDIRECT_REBIND_REJECTED = 4,
-	// key=5: pure SYN refused to rewrite an ACTIVE flow's routing metadata.
-	BPF_STATS_SYN_REBIND_REJECTED = 5,
-	// key=6: established TCP forwarded without any cached routing decision
-	// (e.g. flows that predate a restart). Visibility only, no policy change.
-	BPF_STATS_STATELESS_TCP_PASSTHROUGH = 6,
-	// key=7: non-initial fragment forwarded without routing. Visibility only:
-	// dropping fragments is a separate policy decision.
-	BPF_STATS_FRAG_TAIL_PASSED = 7,
-	// key=8: packet whose IP header parsed but whose L4 protocol is not
-	// TCP/UDP, forwarded without routing.
-	BPF_STATS_PARSE_UNSUPPORTED_L4 = 8,
-	// key=9: WAN-ingress UDP packet whose flow had no forward state yet (an
-	// unsolicited inbound flow). Observability only: the state is still
-	// created, because the is_wan_ingress_direction marker it carries is
-	// what keeps host-terminated UDP replies on the pass-through path.
-	BPF_STATS_UNSOLICITED_UDP_SEEN = 9,
-	// key=10: pid_is_control_plane fell back to the reserved-mark bit test
-	// because no so_mark was injected into PARAM.
-	BPF_STATS_SOCKMARK_FALLBACK = 10,
-	// key=11: datapath events dropped because the ringbuf had no room. The
-	// consumers are advisory, but a dropped event must never be invisible.
-	BPF_STATS_EVENT_DROP = 11,
-	// key=12: pure SYN on a live ACTIVE flow whose cached routing belongs to
-	// a different routing epoch or datapath generation. The entry is
-	// re-created from the current generation instead of being locked, so a
-	// connection that outlives a reload ends up on the current rules.
-	BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE = 12,
-	// key=13: packets that reached the daer0peer ingress hook after a redirect.
-	BPF_STATS_PEER_INGRESS = 13,
-	// key=14: such a packet lost the TPROXY_MARK control-buffer handshake.
-	BPF_STATS_PEER_INGRESS_UNMARKED = 14,
-	// key=15: assign_listener could not find or assign the listener socket.
-	BPF_STATS_LISTENER_ASSIGN_FAILED = 15,
-	// key=16: a redirected packet reached daer0peer without an L4 tag.
-	BPF_STATS_PEER_INGRESS_NO_L4 = 16,
-	BPF_STATS_MAX = 17,
-};
 
 // Per-packet datapath counters, indexed by enum bpf_stats_key. Userspace reads
 // them on the janitor tick (readMapOverflowCounters / checkBpfMapHealth); the
@@ -543,49 +495,7 @@ struct {
 } alive_block_rate_map SEC(".maps");
 
 // Events delivered to userspace via ring buffer.
-enum daer_event_type {
-	DAER_EVENT_BLOCKED = 0,       // Connection blocked (OUTBOUND_BLOCK)
-	DAER_EVENT_UDP_CONN_OVERFLOW = 1, // UDP conn state map overflow
-	DAER_EVENT_TCP_CONN_OVERFLOW = 2, // TCP conn state map overflow
-	DAER_EVENT_BLOCKED_ALIVE = 3, // Connection blocked (outbound not alive)
-	// A different publisher tried to steal a fresh reply binding.
-	DAER_EVENT_REDIRECT_REBIND_REJECTED = 4,
-	// A pure SYN was refused rewrite of an ACTIVE flow's routing.
-	DAER_EVENT_SYN_REBIND_REJECTED = 5,
-	// Reserved, never emitted: established TCP forwarded without a
-	// cached routing decision is the normal state of every pre-existing flow
-	// after a restart, so it is counted per packet
-	// (BPF_STATS_STATELESS_TCP_PASSTHROUGH) and summarised by userspace on the
-	// health tick instead of warning per event. The number stays reserved so
-	// the remaining types keep their wire values.
-	DAER_EVENT_RESERVED_STATELESS_TCP_PASSTHROUGH = 6,
-	// Reserved, never emitted: forwarding a non-initial fragment is the
-	// intended policy and it is counted per packet
-	// (BPF_STATS_FRAG_TAIL_PASSED). The tuple such an event could carry has no
-	// L4 header to read either: the parser returns before L4 parsing
-	// (parse_transport_fast), so its ports are scratch values, not wire data.
-	DAER_EVENT_RESERVED_FRAG_TAIL_PASSED = 7,
-	// redirect_track could not store a reply binding. The matching
-	// bpf_stats_map key separates "map full" from "update failed".
-	DAER_EVENT_REDIRECT_UPDATE_FAILED = 8,
-	// A pure SYN on a live flow was re-routed because the flow's cached
-	// routing belonged to a different routing epoch or datapath generation.
-	DAER_EVENT_SYN_REBIND_REROUTED = 9,
-};
 
-struct daer_event {
-	__u64 timestamp;
-	__u32 type;
-	__u32 pid;
-	__u8 pname[16];
-	__u8 outbound;
-	__u8 l4proto;
-	__u8 pad[2];
-	__u32 sip[4];
-	__u32 dip[4];
-	__u16 sport;
-	__u16 dport;
-};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);

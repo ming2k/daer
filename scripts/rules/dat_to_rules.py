@@ -113,7 +113,7 @@ def parse_geoip_entry(entry_bytes: bytes) -> tuple[str, list[str]]:
 
 def parse_geosite_entry(
     entry_bytes: bytes,
-) -> tuple[str, list[tuple[str, str, list[str]]], int]:
+) -> tuple[str, list[tuple[str, str]], int]:
     """
     Parses a single SiteGroup message:
       field 1: tag / country_code (string)
@@ -121,9 +121,9 @@ def parse_geosite_entry(
         Domain:
           field 1: type (0=Plain, 1=Regex, 2=RootDomain, 3=Full)
           field 2: value (string)
-          field 3: attribute (message Attribute: field 1 key, field 2 bool_value)
+          field 3: attribute (ignored; attributes are not part of CRS)
     Returns:
-      (tag, rules [(kind, pattern, attrs)], skipped_plain_regex_count)
+      (tag, rules [(kind, pattern)], skipped_plain_regex_count)
     """
     fields = parse_protobuf_fields(entry_bytes)
     tag = ""
@@ -138,22 +138,12 @@ def parse_geosite_entry(
             d_fields = parse_protobuf_fields(val)
             d_type = 0
             d_val = ""
-            attrs = []
 
             for df_num, df_wire, df_val in d_fields:
                 if df_num == 1 and df_wire == 0:
                     d_type = df_val
                 elif df_num == 2 and df_wire == 2:
                     d_val = df_val.decode("utf-8", errors="replace").strip()
-                elif df_num == 3 and df_wire == 2:
-                    # Attribute
-                    a_fields = parse_protobuf_fields(df_val)
-                    key = ""
-                    for af_num, af_wire, af_val in a_fields:
-                        if af_num == 1 and af_wire == 2:
-                            key = af_val.decode("utf-8", errors="replace").strip()
-                    if key:
-                        attrs.append(key)
 
             if not d_val:
                 continue
@@ -170,9 +160,9 @@ def parse_geosite_entry(
             # 3: Full -> exact match: =<domain>
             # 0: Plain, 1: Regex -> not supported as routing predicates
             if d_type == 2:
-                rules.append(("suffix", d_val, attrs))
+                rules.append(("suffix", d_val))
             elif d_type == 3:
-                rules.append(("=", d_val, attrs))
+                rules.append(("=", d_val))
             else:
                 skipped_count += 1
 
@@ -215,7 +205,7 @@ def unpack_geoip(
 
 def unpack_geosite(
     dat_path: str, target_code: str | None, list_only: bool
-) -> tuple[str, list[tuple[str, str, list[str]]], int]:
+) -> tuple[str, list[tuple[str, str]], int]:
     with open(dat_path, "rb") as f:
         data = f.read()
 
@@ -319,16 +309,13 @@ def main():
 
         lines.append(f"name: geosite-{code}")
         lines.append("")
-        for kind, pattern, attrs in rules:
-            attr_suffix = (
-                (" " + " ".join(f"@{a.lower()}" for a in attrs)) if attrs else ""
-            )
+        for kind, pattern in rules:
             if kind == "=":
-                lines.append(f"={pattern}{attr_suffix}")
+                lines.append(f"={pattern}")
             elif kind == "suffix":
-                lines.append(f"{pattern}{attr_suffix}")
+                lines.append(f"{pattern}")
             else:
-                lines.append(f"{kind}: {pattern}{attr_suffix}")
+                lines.append(f"{kind}: {pattern}")
 
     content = "\n".join(lines) + "\n"
     if args.output == "-" or not args.output:

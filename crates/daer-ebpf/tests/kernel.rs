@@ -105,7 +105,43 @@ fn a_tc_program_attaches_to_loopback() {
         daer_ebpf::names::program::DEVICE_INGRESS,
         "lo",
         TcAttachType::Ingress,
+        daer_ebpf::TcMode::Netlink,
     )
     .expect("attaching to lo must work");
     println!("attached as link id {link:?}");
+}
+
+/// TCX is the opt-in fd-owned attachment. This proves it attaches on Linux 6.6+, not that
+/// `bpf_sk_assign` delivers a flow: the real-daemon delivery check is
+/// `scripts/ops/daer-netns-e2e.sh` run with `DAER_TC_ATTACH=tcx`.
+#[test]
+#[ignore = "needs CAP_BPF and CAP_NET_ADMIN; TCX needs Linux 6.6+"]
+fn a_tcx_program_attaches_to_loopback() {
+    use aya::programs::tc::TcAttachType;
+    use aya::util::KernelVersion;
+
+    let current = KernelVersion::current().expect("the running kernel version");
+    if current < KernelVersion::new(6, 6, 0) {
+        eprintln!("skipped: TCX needs Linux 6.6 or newer; running {current:?}");
+        return;
+    }
+
+    let path = object_path();
+    if !path.exists() {
+        eprintln!(
+            "skipped: {} is missing; run `cargo xtask ebpf`",
+            path.display()
+        );
+        return;
+    }
+    let mut ebpf = daer_ebpf::load_path(&path, &param()).expect("the object must load");
+    let link = daer_ebpf::attach_tc(
+        &mut ebpf,
+        daer_ebpf::names::program::DEVICE_INGRESS,
+        "lo",
+        TcAttachType::Ingress,
+        daer_ebpf::TcMode::Tcx,
+    )
+    .expect("TCX must attach on this kernel");
+    println!("attached TCX as link id {link:?}");
 }

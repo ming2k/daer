@@ -11,6 +11,7 @@
 //!   daer check                    does this configuration run, and what would it do
 //!   daer route <TARGET>           which rule and outbound decide this flow or target
 //!   daer probe <SUBCOMMAND>       active probe for node reachability, handshake, and health
+//!   daer status                   read-only snapshot of the running daemon
 //!   daer schema                   the JSON Schema, for an editor
 //!   daer version                  build information
 //! ```
@@ -30,10 +31,12 @@
 //! [ADR-0014]: ../docs/adr/0014-drb-rule-binary-and-providers.md
 
 mod dns;
+mod incident;
 mod preflight;
 mod probe;
 mod run;
 mod sd_notify;
+mod status;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -114,7 +117,7 @@ enum Command {
         /// Print every node in every group, with its protocol and security identity.
         #[arg(long)]
         nodes: bool,
-        /// The compiled datapath object to validate against the ABI.
+        /// Validate the compiled datapath object against the ABI.
         ///
         /// Defaults to the path `daer run` resolves — the same fallback chain, including the
         /// packaged install locations — so an installed artifact is validated without a flag.
@@ -124,6 +127,13 @@ enum Command {
         /// the kernel, so it needs no capability (ADR-0029).
         #[arg(long, value_name = "PATH")]
         object: Option<PathBuf>,
+        /// Also check the host-global sysctl prerequisites the datapath requires.
+        ///
+        /// Reads `/proc/sys` and needs no capability. Without this flag, `daer check`
+        /// validates only the configuration and the object; a deployment gate that wants to
+        /// catch a host that would refuse to start should pass it.
+        #[arg(long)]
+        host: bool,
     },
     /// Route a flow, IP, or domain through the routing engine without running the daemon.
     ///
@@ -150,6 +160,26 @@ enum Command {
     Probe {
         #[command(subcommand)]
         command: ProbeCommand,
+    },
+    /// Read the running daemon's snapshot without changing anything.
+    ///
+    /// Reads `/run/daer/control.sock`; when the daemon is not reachable it falls back to the
+    /// last `/run/daer/state.json` and says so. This is the first command in an incident
+    /// runbook: it answers "what does the daemon believe right now" without a packet capture
+    /// or a debug log level.
+    Status {
+        /// Print the versioned JSON snapshot instead of the human summary.
+        #[arg(long)]
+        json: bool,
+        /// Write a self-contained incident bundle to this directory.
+        #[arg(long, value_name = "DIR")]
+        bundle: Option<PathBuf>,
+        /// Print every event recorded for one flow/session ID.
+        ///
+        /// The JSON event stream is the flow record: `flow.accepted`, `flow.decided`,
+        /// `flow.node_selected`, `flow.dial_finished`, `flow.closed` all carry the same ID.
+        #[arg(long, value_name = "FLOW_ID")]
+        flow: Option<String>,
     },
     /// Print the JSON Schema of a configuration file.
     ///
@@ -286,31 +316,98 @@ fn block_on_daemon<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Installs the log subscriber once, from `RUST_LOG` or the configuration's `log-level`.
+/// The reload handle for the process-wide log filter.
 ///
-/// # Why this is not in a library
+/// The daemon installs a bootstrap filter before it reads the configuration, because
+/// `load_resolved` resolves subscriptions and rule providers and those paths can warn. The
+/// configured `log-level` is applied by reloading this filter after the file is read. A
+/// second subscriber is not installed: process-wide state has one owner.
+static LOG_FILTER: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
+> = std::sync::OnceLock::new();
+
+/// Installs the bootstrap subscriber before any configuration is read.
+fn init_bootstrap_logging(json_stream: bool) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let from_env = tracing_subscriber::EnvFilter::try_from_default_env();
+    if from_env.is_err() && std::env::var_os("RUST_LOG").is_some() {
+        eprintln!("warning: RUST_LOG is not a valid tracing filter; using info");
+    }
+    let filter = from_env.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    // A pipe is not a terminal. Writing ANSI escapes into a file or a CI log makes every
+    // consumer strip them; `NO_COLOR` is the standard opt-out even on a terminal.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && std::env::var_os("NO_COLOR").is_none();
+    let subscriber = tracing_subscriber::registry().with(filter).with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(ansi)
+            .with_target(true)
+            .with_writer(std::io::stderr),
+    );
+    // The JSON stream is the machine-readable half of the same events. Only `daer run` opens
+    // it: a diagnostic verb that truncated a running daemon's `/run/daer/events.jsonl` would
+    // destroy the evidence it was invoked to inspect. The file lives under `/run` so a crash
+    // leaves it for the incident recorder. If the directory is not writable (an
+    // unprivileged test), the human stream is still installed; a diagnostic failure cannot
+    // become a startup failure.
+    if !json_stream {
+        if subscriber.try_init().is_ok() {
+            let _ = LOG_FILTER.set(handle);
+        }
+        return;
+    }
+    let _ = std::fs::create_dir_all("/run/daer");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(crate::incident::EVENT_LOG_PATH)
+    {
+        Ok(writer) => {
+            let json = tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_writer(writer);
+            if subscriber.with(json).try_init().is_ok() {
+                let _ = LOG_FILTER.set(handle);
+            }
+        }
+        Err(_) => {
+            if subscriber.try_init().is_ok() {
+                let _ = LOG_FILTER.set(handle);
+            }
+        }
+    }
+}
+
+/// Applies the configuration's `log-level` unless `RUST_LOG` overrides it.
 ///
-/// A binary owns its process-wide state, and a library that installs a subscriber takes that
-/// decision away from the program that links it. Every `tracing::info!` in `daer-control` and
-/// `daer-dns` was written expecting *someone* to install one; before this existed they were
-/// all silently dropped, including the reload and per-flow fields `docs/how-to/diagnostics.md`
-/// documents as the way to answer "why did this flow go there".
-fn init_logging(level: &str) {
+/// A malformed directive is an error, not a silent fallback: a config that says `debug` and a
+/// daemon that logs at `info` is the same class of lie as a key with no reader.
+fn set_log_filter(level: &str) -> Result<(), String> {
     use tracing_subscriber::EnvFilter;
-    // `RUST_LOG` wins: it is what an operator reaches for when a service misbehaves, and it
-    // has to work without editing the configuration file.
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    if std::env::var_os("RUST_LOG").is_some() {
+        return Ok(());
+    }
+    let filter = EnvFilter::try_new(level)
+        .map_err(|error| format!("global.log-level {level:?} is not a tracing filter: {error}"))?;
+    let Some(handle) = LOG_FILTER.get() else {
+        return Ok(());
+    };
+    handle
+        .reload(filter)
+        .map_err(|error| format!("could not apply global.log-level {level:?}: {error}"))
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json_stream = matches!(&cli.command, Command::Run { dry_run: false, .. });
+    init_bootstrap_logging(json_stream);
+    incident::install_panic_hook();
     let result = match cli.command {
         Command::Run {
             config,
@@ -319,6 +416,17 @@ fn main() -> ExitCode {
             dry_run,
             shutdown_timeout,
         } => resolve_config(config).and_then(|path| {
+            // The ingress mount must be private before the runtime starts. `unshare(CLONE_NEWNS)`
+            // changes the caller's mount namespace, and a worker thread created first would keep
+            // the host one. A dry run changes nothing and `--no-datapath` creates no ingress, so
+            // both skip this (ADR-0029).
+            if !dry_run && !no_datapath {
+                daer_control::netns::isolate_ingress_mounts().map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot isolate the ingress mounts (requires CAP_SYS_ADMIN): {error}"
+                    )
+                })?;
+            }
             // The daemon supervises spawned tasks (relays, datagrams, probes); see
             // `block_on_daemon` for why a current-thread runtime starves them.
             block_on_daemon(async move {
@@ -336,8 +444,9 @@ fn main() -> ExitCode {
             config,
             nodes,
             object,
+            host,
         } => resolve_config(config)
-            .and_then(|path| block_on(async move { check(&path, nodes, object).await })),
+            .and_then(|path| block_on(async move { check(&path, nodes, object, host).await })),
         Command::Route {
             target,
             destination,
@@ -418,6 +527,9 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Command::Status { json, bundle, flow } => {
+            block_on(async move { status::run(status::StatusOptions { json, bundle, flow }).await })
+        }
         Command::Schema => {
             println!("{}", daer_config::schema::json_schema());
             Ok(())
@@ -481,7 +593,12 @@ fn removed_verb(verb: &str, replacement: &str) -> anyhow::Error {
 /// every group, check every node this build can speak — so a configuration that passes here
 /// is one the daemon can serve. `--nodes` additionally prints the resolved node pool, which is
 /// what `daer route nodes` used to be.
-async fn check(path: &Path, nodes: bool, object: Option<PathBuf>) -> anyhow::Result<()> {
+async fn check(
+    path: &Path,
+    nodes: bool,
+    object: Option<PathBuf>,
+    host: bool,
+) -> anyhow::Result<()> {
     let report = validate_config(path).await?;
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
@@ -514,6 +631,11 @@ async fn check(path: &Path, nodes: bool, object: Option<PathBuf>) -> anyhow::Res
             ),
             Err(error) => anyhow::bail!("{}: {error}", object.display()),
         }
+    }
+
+    if host {
+        daer_control::datapath::check_host_sysctls().map_err(|error| anyhow::anyhow!("{error}"))?;
+        println!("host sysctl prerequisites: ok");
     }
 
     println!(
@@ -793,6 +915,14 @@ struct ValidationReport {
 /// than the one that will serve.
 async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     let mut loaded = load_config(path)?;
+    // `daer check` is the deployment gate. A filter directive that the daemon would reject
+    // at startup must fail here, where the operator is looking, not after a restart.
+    tracing_subscriber::EnvFilter::try_new(&loaded.config.global.log_level).map_err(|error| {
+        anyhow::anyhow!(
+            "global.log-level {:?} is not a tracing filter: {error}",
+            loaded.config.global.log_level
+        )
+    })?;
     let mut warnings = loaded.warnings.clone();
 
     let config_dir = path
@@ -1019,6 +1149,15 @@ fn resolve_outbound(config: &Config, name: &str) -> Result<(), RoutingError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn check_accepts_the_host_gate_flag() {
+        let cli = Cli::try_parse_from(["daer", "check", "--host"]).expect("check --host parses");
+        match cli.command {
+            Command::Check { host, .. } => assert!(host, "--host must set the host gate"),
+            other => panic!("expected check, got {other:?}"),
+        }
+    }
 
     /// The reference configuration, asserted by a test rather than printed by a command.
     ///

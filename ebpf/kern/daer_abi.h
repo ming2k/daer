@@ -16,6 +16,21 @@ struct daer_param {
 	__u32 socket_mark;
 };
 
+/* struct daer_event, generated for both sides. */
+struct daer_event {
+	__u64 timestamp;
+	__u32 type;
+	__u32 pid;
+	__u8 pname[16];
+	__u8 outbound;
+	__u8 l4proto;
+	__u8 pad[2];
+	__u32 sip[4];
+	__u32 dip[4];
+	__u16 sport;
+	__u16 dport;
+};
+
 /* enum MatchType, packed: one byte inside struct match_set. */
 enum __attribute__((packed)) MatchType {
 	MatchType_DomainSet = 0,
@@ -55,6 +70,41 @@ enum IpVersionType {
 	IpVersionType_4 = 1,
 	IpVersionType_6 = 2,
 	IpVersionType_X = 3
+};
+
+enum bpf_stats_key {
+	BPF_STATS_UDP_CONN_OVERFLOW = 0,
+	BPF_STATS_TCP_CONN_OVERFLOW = 1,
+	BPF_STATS_REDIRECT_OVERFLOW = 2,
+	BPF_STATS_REDIRECT_UPDATE_FAILED = 3,
+	BPF_STATS_REDIRECT_REBIND_REJECTED = 4,
+	BPF_STATS_SYN_REBIND_REJECTED = 5,
+	BPF_STATS_STATELESS_TCP_PASSTHROUGH = 6,
+	BPF_STATS_FRAG_TAIL_PASSED = 7,
+	BPF_STATS_PARSE_UNSUPPORTED_L4 = 8,
+	BPF_STATS_UNSOLICITED_UDP_SEEN = 9,
+	BPF_STATS_SOCKMARK_FALLBACK = 10,
+	BPF_STATS_EVENT_DROP = 11,
+	BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE = 12,
+	BPF_STATS_PEER_INGRESS = 13,
+	BPF_STATS_PEER_INGRESS_UNMARKED = 14,
+	BPF_STATS_LISTENER_ASSIGN_FAILED = 15,
+	BPF_STATS_PEER_INGRESS_NO_L4 = 16,
+	BPF_STATS_MAX = 17
+};
+
+enum daer_event_type {
+	DAER_EVENT_BLOCKED = 0,
+	DAER_EVENT_UDP_CONN_OVERFLOW = 1,
+	DAER_EVENT_TCP_CONN_OVERFLOW = 2,
+	DAER_EVENT_BLOCKED_ALIVE = 3,
+	DAER_EVENT_REDIRECT_REBIND_REJECTED = 4,
+	DAER_EVENT_SYN_REBIND_REJECTED = 5,
+	DAER_EVENT_RESERVED_STATELESS_TCP_PASSTHROUGH = 6,
+	DAER_EVENT_RESERVED_FRAG_TAIL_PASSED = 7,
+	DAER_EVENT_REDIRECT_UPDATE_FAILED = 8,
+	DAER_EVENT_SYN_REBIND_REROUTED = 9,
+	DAER_EVENT_MAX = 10
 };
 
 

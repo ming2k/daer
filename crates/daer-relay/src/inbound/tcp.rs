@@ -44,6 +44,12 @@ use crate::error::{Reject, RelayError};
 #[derive(Debug)]
 pub struct Accepted {
     pub stream: TcpStream,
+    /// The run-local correlation ID for this flow.
+    ///
+    /// It is assigned by the ingress at `accept(2)` and carried by every later event:
+    /// decision, node selection, dial, relay close. Without it the four log lines that
+    /// describe one flow cannot be joined except by heuristics on the same 4-tuple.
+    pub flow_id: daer_observe::FlowId,
     /// Who opened the flow (`peer_addr` of the accepted socket).
     pub source: SocketAddr,
     /// Where the client wanted to go (`local_addr` of the accepted socket, restored
@@ -62,6 +68,7 @@ impl Accepted {
     #[must_use]
     pub const fn facts(&self) -> FlowFacts {
         FlowFacts {
+            flow_id: self.flow_id,
             source: self.source,
             destination: self.destination,
         }
@@ -76,6 +83,8 @@ impl Accepted {
 /// hand a datagram flow a transport it can never use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowFacts {
+    /// The flow/session correlation ID.
+    pub flow_id: daer_observe::FlowId,
     /// Who opened the flow.
     pub source: SocketAddr,
     /// Where the client wanted to go.
@@ -91,6 +100,8 @@ pub struct TransparentListener {
     v4: TcpListener,
     v6: TcpListener,
     port: u16,
+    /// The process-wide ID allocator, shared with the daemon and the datagram listener.
+    ids: std::sync::Arc<daer_observe::Ids>,
     /// Whether a flow whose original destination *is* the transparent port is refused.
     ///
     /// `global.tproxy-port-protect`, default `true`. It is not decoration: with the check off, a
@@ -158,8 +169,20 @@ impl TransparentListener {
             v4,
             v6,
             port,
+            ids: std::sync::Arc::new(daer_observe::Ids::new()),
             protect,
         })
+    }
+
+    /// Shares the daemon's ID allocator.
+    ///
+    /// The listener is the ingress boundary and therefore the place a `FlowId` is born;
+    /// sharing the allocator with the daemon keeps `RunId` and every kind of ID in one
+    /// namespace.
+    #[must_use]
+    pub fn with_ids(mut self, ids: std::sync::Arc<daer_observe::Ids>) -> Self {
+        self.ids = ids;
+        self
     }
 
     /// The port both families are bound to.
@@ -214,6 +237,7 @@ impl TransparentListener {
 
         Ok(Accepted {
             stream,
+            flow_id: self.ids.flow(),
             source: unmap(source),
             destination: unmap(destination),
         })

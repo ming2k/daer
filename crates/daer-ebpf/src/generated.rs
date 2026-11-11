@@ -221,11 +221,108 @@ pub mod ip_version {
     pub const X: u8 = 3;
 }
 
+/// `enum bpf_stats_key`: the `bpf_stats_map` counters.
+pub mod bpf_stats {
+    pub const UDP_CONN_OVERFLOW: u32 = 0;
+    pub const TCP_CONN_OVERFLOW: u32 = 1;
+    pub const REDIRECT_OVERFLOW: u32 = 2;
+    pub const REDIRECT_UPDATE_FAILED: u32 = 3;
+    pub const REDIRECT_REBIND_REJECTED: u32 = 4;
+    pub const SYN_REBIND_REJECTED: u32 = 5;
+    pub const STATELESS_TCP_PASSTHROUGH: u32 = 6;
+    pub const FRAG_TAIL_PASSED: u32 = 7;
+    pub const PARSE_UNSUPPORTED_L4: u32 = 8;
+    pub const UNSOLICITED_UDP_SEEN: u32 = 9;
+    pub const SOCKMARK_FALLBACK: u32 = 10;
+    pub const EVENT_DROP: u32 = 11;
+    pub const REBIND_REROUTED_AFTER_EPOCH_CHANGE: u32 = 12;
+    pub const PEER_INGRESS: u32 = 13;
+    pub const PEER_INGRESS_UNMARKED: u32 = 14;
+    pub const LISTENER_ASSIGN_FAILED: u32 = 15;
+    pub const PEER_INGRESS_NO_L4: u32 = 16;
+    pub const MAX: u32 = 17;
+}
+
+/// `enum daer_event_type`: the ring-buffer record types.
+pub mod event_type {
+    pub const BLOCKED: u32 = 0;
+    pub const UDP_CONN_OVERFLOW: u32 = 1;
+    pub const TCP_CONN_OVERFLOW: u32 = 2;
+    pub const BLOCKED_ALIVE: u32 = 3;
+    pub const REDIRECT_REBIND_REJECTED: u32 = 4;
+    pub const SYN_REBIND_REJECTED: u32 = 5;
+    pub const RESERVED_STATELESS_TCP_PASSTHROUGH: u32 = 6;
+    pub const RESERVED_FRAG_TAIL_PASSED: u32 = 7;
+    pub const REDIRECT_UPDATE_FAILED: u32 = 8;
+    pub const SYN_REBIND_REROUTED: u32 = 9;
+    pub const MAX: u32 = 10;
+}
+
+/// `struct daer_event`, generated from `ebpf/abi.toml`.
+pub mod daer_event {
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct DaerEvent {
+        pub timestamp: u64,
+        pub kind: u32,
+        pub pid: u32,
+        pub pname: [u8; 16],
+        pub outbound: u8,
+        pub l4proto: u8,
+        pub pad: [u8; 2],
+        pub sip: [u32; 4],
+        pub dip: [u32; 4],
+        pub sport: u16,
+        pub dport: u16,
+    }
+
+    /// The declared size, in bytes.
+    pub const SIZE: usize = 72;
+    /// The declared alignment, in bytes.
+    pub const ALIGN: usize = 8;
+
+    const _: () = assert!(std::mem::size_of::<DaerEvent>() == SIZE);
+    const _: () = assert!(std::mem::align_of::<DaerEvent>() == ALIGN);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, timestamp) == 0);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, kind) == 8);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, pid) == 12);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, pname) == 16);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, outbound) == 32);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, l4proto) == 33);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, pad) == 34);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, sip) == 36);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, dip) == 52);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, sport) == 68);
+    const _: () = assert!(std::mem::offset_of!(DaerEvent, dport) == 70);
+}
+
 /// Byte-layout assertions for the structs that cross the boundary.
 ///
 /// Each is emitted as a `const` assertion, so a field whose offset drifts fails to
 /// compile here rather than misreading a map value in production.
 pub mod layout {
+    /// `struct daer_event`.
+    pub mod daer_event {
+        /// The declared size, in bytes.
+        pub const SIZE: usize = 72;
+        /// The declared alignment, in bytes.
+        pub const ALIGN: usize = 8;
+
+        /// `(field name, byte offset)` for every field.
+        pub const FIELDS: [(&str, usize); 11] = [
+            ("timestamp", 0),
+            ("type", 8),
+            ("pid", 12),
+            ("pname", 16),
+            ("outbound", 32),
+            ("l4proto", 33),
+            ("pad", 34),
+            ("sip", 36),
+            ("dip", 52),
+            ("sport", 68),
+            ("dport", 70),
+        ];
+    }
     /// `struct lpm_key`.
     pub mod lpm_key {
         /// The declared size, in bytes.
@@ -307,6 +404,77 @@ mod tests {
     /// The declared struct sizes are self-consistent.
     #[test]
     fn declared_layouts_are_internally_consistent() {
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "timestamp" && *o == 0),
+            "struct daer_event must declare timestamp at offset 0"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "type" && *o == 8),
+            "struct daer_event must declare type at offset 8"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "pid" && *o == 12),
+            "struct daer_event must declare pid at offset 12"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "pname" && *o == 16),
+            "struct daer_event must declare pname at offset 16"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "outbound" && *o == 32),
+            "struct daer_event must declare outbound at offset 32"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "l4proto" && *o == 33),
+            "struct daer_event must declare l4proto at offset 33"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "pad" && *o == 34),
+            "struct daer_event must declare pad at offset 34"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "sip" && *o == 36),
+            "struct daer_event must declare sip at offset 36"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "dip" && *o == 52),
+            "struct daer_event must declare dip at offset 52"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "sport" && *o == 68),
+            "struct daer_event must declare sport at offset 68"
+        );
+        assert!(
+            layout::daer_event::FIELDS
+                .iter()
+                .any(|(n, o)| *n == "dport" && *o == 70),
+            "struct daer_event must declare dport at offset 70"
+        );
+        assert_eq!(
+            layout::daer_event::SIZE % layout::daer_event::ALIGN,
+            0,
+            "struct daer_event: size must be a multiple of its alignment"
+        );
         assert!(
             layout::lpm_key::FIELDS
                 .iter()

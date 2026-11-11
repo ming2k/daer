@@ -6,6 +6,8 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 
+pub use daer_observe::DialFailure;
+
 /// The reason an accepted flow is not eligible for proxying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
@@ -35,14 +37,6 @@ impl fmt::Display for Reject {
 
 impl std::error::Error for Reject {}
 
-/// Why an outbound leg could not be opened.
-///
-/// Deliberately a string: this crate owns no routing policy and therefore has no
-/// vocabulary for *why* a decision refused — the decider does. Copying a foreign
-/// error enum here would make every new selection failure a change to the data path,
-/// which is exactly the coupling this crate exists to avoid.
-pub type DialFailure = String;
-
 /// Errors raised while accepting, deciding or relaying.
 #[derive(Debug)]
 pub enum RelayError {
@@ -57,7 +51,7 @@ pub enum RelayError {
     /// The outbound leg could not be opened.
     Dial {
         destination: SocketAddr,
-        reason: DialFailure,
+        failure: DialFailure,
     },
 }
 
@@ -70,8 +64,8 @@ impl fmt::Display for RelayError {
             Self::Relay(error) => write!(f, "relay failed: {error}"),
             Self::Dial {
                 destination,
-                reason,
-            } => write!(f, "cannot reach {destination}: {reason}"),
+                failure,
+            } => write!(f, "cannot reach {destination}: {failure}"),
         }
     }
 }
@@ -81,7 +75,7 @@ impl std::error::Error for RelayError {
         match self {
             Self::Socket(error) | Self::Accept(error) | Self::Relay(error) => Some(error),
             Self::Rejected(reject) => Some(reject),
-            Self::Dial { .. } => None,
+            Self::Dial { failure, .. } => Some(failure),
         }
     }
 }
