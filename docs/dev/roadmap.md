@@ -51,7 +51,8 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Sniffing: connection-side loop, `dial-mode = domain` wired into routing | ✅ |
 | Sniffing: QUIC Initial decryption | ⬜ |
 | UDP: relay wired and driven | ✅ `Daemon::serve` runs the datagram service, one session per peer, replies routed back to the right peer, counters readable |
-| UDP: proven through `tproxy` | ⬜ needs the origin in a **second network namespace** (`TPROXY` matches on the ingress interface); a sandbox without mount privileges cannot create one. The test states this and skips with the reason rather than passing |
+| UDP: IPv6 proven through `tproxy` | ✅ `tests/transparent_udp6.rs` builds a real client/origin two-namespace topology, requires the negative control to fail without the daemon, and checks the origin's nonce plus the relay counters; CI makes its skip fatal as `3-udp6` |
+| UDP: IPv4 proven through `tproxy` | ⬜ needs the same **second network namespace** (`TPROXY` matches on the ingress interface). The single-namespace fixture cannot work: the origin and the transparent reply socket must own the same `(address, port)`. The IPv4 test is ignored with that reason rather than passing vacuously |
 | Daemon runtime: spawned tasks are scheduled | ✅ `daer run` uses a multi-threaded runtime. A current-thread runtime starved the spawned datagram forward — session opened, reply never sent — which took a debugging pass to attribute to the runtime rather than the relay (`crates/daer-cli/tests/runtime.rs`) |
 | Configuration: every accepted key has a consumer | ✅ enforced by `daer-config::tests::config_keys` |
 | Control plane: transparent accept, relay, accept loop with metrics | ✅ |

@@ -553,13 +553,14 @@ Be aware before trusting it with traffic:
   did observe (source MAC, DSCP, process name) **are** read back from
   `routing_handoff_map`, so `mac(...)`, `dscp(...)`, and `pname(...)` rules do match on that
   path.
-* The **`tproxy` redirect of a datagram is not proven end to end** in the unprivileged
-  workspace suite, and the reason is the test topology rather than the code: `TPROXY` matches
-  on the ingress interface, so proving it needs the origin in a second network namespace,
-  which a development sandbox cannot create. The privileged e2e gate runs the same test on a
-  two-namespace host. What *is* proven in one namespace: the reply leaves from the original
-  destination (not from the transparent port), one client port talking to two destinations
-  gets two sessions, and the reply-socket cache evicts instead of leaking fds.
+* **IPv4 `tproxy` datagrams are not proven end to end** in the unprivileged workspace
+  suite. `TPROXY` matches on the ingress interface, so a real fixture needs the origin in a
+  second network namespace; a single-namespace fixture cannot work because the origin and the
+  transparent reply socket must own the same `(address, port)`. The privileged e2e gate runs
+  `transparent_udp6.rs`, which builds the real client/origin two-namespace topology and is
+  required as `3-udp6` in CI. What *is* proven without that topology: the reply leaves from
+  the original destination (not from the transparent port), one client port talking to two
+  destinations gets two sessions, and the reply-socket cache evicts instead of leaking fds.
 * **IPv6 dual-stack** is implemented for TCP and UDP, including the `udp6` listener slot and
   independent IPv4/IPv6 Fake-IP pools. IPv6-only operation still depends on the host having
   IPv6 forwarding and a default route; the daemon configures both best-effort and reports a
