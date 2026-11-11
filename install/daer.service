@@ -8,7 +8,15 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Readiness comes from the daemon itself (`READY=1` via sd_notify), not from a successful
+# `execve`. systemd therefore reports the unit started only after the configuration loaded,
+# the private ingress exists, the listeners are bound and the datapath is attached — the
+# state in which traffic is actually proxied.
+Type=notify
+NotifyAccess=main
+# A wedged control plane is restarted instead of silently accepting traffic and proxying
+# nothing. The daemon feeds this at half the interval, including while a reload is running.
+WatchdogSec=30s
 User=root
 
 # Resource limits
@@ -20,21 +28,36 @@ LimitMEMLOCK=infinity
 # -100 means daer is less likely to be killed than normal processes
 OOMScoreAdjust=-100
 
-# Validate configuration before starting. A broken configuration exits with non-zero
-# and prevents starting or restarting with an invalid state. `daer check` is the one
-# pre-bind gate: it resolves subscriptions and rule providers, compiles every rule and
-# builds every group, so a configuration that would fail at runtime fails here instead.
-ExecStartPre=/usr/bin/daer check -c /etc/daer/config.toml
-ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
+# There is deliberately no ExecStartPre=/usr/bin/daer check:
+# `daer run` performs the identical load_resolved validation before it binds a socket or
+# mutates kernel state, and Type=notify above makes systemd wait for that gate. Running
+# `daer check` first repeated every subscription and rule-provider fetch on each start and
+# restart, doubling startup network work without adding a check.
+ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
+# The Rust guards are the primary cleanup path. This runs after them — and also after a
+# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal and removing the
+# namespace, veth pair, TC filters and host policy routing that would otherwise outlive it.
+# It is a dedicated helper, not a hidden flag on `daer run`: the operator CLI stays the six
+# verbs in ADR-0015, and systemd's post-stop hook is not one of them.
+ExecStopPost=/usr/bin/daer-cleanup
 
-# Restart policy
+# Restart policy. One second keeps a transient failure from turning into a five-second
+# outage; StartLimit above still stops a genuine crash loop.
 Restart=on-failure
-RestartSec=5s
+RestartSec=1s
 
-# Timeout configuration
-TimeoutStartSec=120
-TimeoutStopSec=30
+# Timeout configuration.
+# Startup includes the daemon's bounded wait for a default route (120s), so systemd's clock
+# must not expire first. Stopping drains live flows for at most the 5s passed above, then
+# tears down the namespace and datapath; 15s leaves room for that without masking a hang.
+TimeoutStartSec=180
+TimeoutStopSec=15
+# SIGTERM goes to the main process only; the final SIGKILL covers any helper child a stuck
+# teardown left behind, without signalling the daemon twice.
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
 
 # Capability bounding and ambient capabilities:
 # - CAP_BPF & CAP_NET_ADMIN for loading and attaching the eBPF datapath and tproxy
@@ -62,10 +85,16 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # Configuration directory, BPF filesystem, and write access for subscription persistence.
-# `/run/netns` is the mount point `ip netns add` uses for the private ingress namespace; it
-# must exist and be writable for CAP_SYS_ADMIN to bind the namespace mount.
+# `RuntimeDirectory` creates /run/daer and /run/netns; `ReadWritePaths` keeps the namespace
+# mount point writable under ProtectSystem=strict so `ip netns add` can bind the entry.
 ConfigurationDirectory=daer
-RuntimeDirectory=netns
+# `daer` holds its crash-recovery journal in /run/daer and `ip netns add` mounts the ingress
+# entry under /run/netns. Both must be writable under ProtectSystem=strict.
+RuntimeDirectory=daer netns
+# `/run/netns` is shared with every other network namespace on the host. Do not let systemd
+# remove the whole directory when daer stops: the daemon removes only its own `daer0ns`
+# entry, and `ip netns list` must look exactly as it did before the service started.
+RuntimeDirectoryPreserve=yes
 ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
 # Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or

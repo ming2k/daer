@@ -126,6 +126,7 @@ fn test_dat_to_rules_and_compile_pipeline() {
         .parent()
         .unwrap()
         .join("scripts")
+        .join("rules")
         .join("dat_to_rules.py");
     assert!(
         script_path.is_file(),

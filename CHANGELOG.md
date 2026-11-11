@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Systemd readiness, watchdog and lifecycle notifications (`daer-cli`, `install/daer.service`).**
+  `daer run` now implements the small `sd_notify` protocol directly: it reports startup
+  progress, sends `READY=1` only after the listeners and datapath are attached,
+  `RELOADING=1`/`READY=1` around `SIGHUP`, `STOPPING=1` before draining, and feeds
+  `WATCHDOG=1` when the unit sets `WatchdogSec=`. The shipped unit is `Type=notify`,
+  `NotifyAccess=main`, and restarts a wedged control plane instead of leaving it "active".
+- **`daer run --shutdown-timeout <SECONDS>`.** Bounds the grace period for already-relayed
+  flows after `SIGTERM`/`SIGINT`; `0` stops immediately. The shipped unit uses `5` rather
+  than the ten-second manual default.
 - **Transparent-ingress incident record and convergence checklist.** The private-namespace
   fix, reply-socket readiness, accept-loop liveness, and health-probe failures are documented
   together in [`docs/dev/transparent-ingress-incident.md`](docs/dev/transparent-ingress-incident.md),
@@ -16,6 +25,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Runtime system state is now self-cleaning, including after a crash.** The datapath
+  journal records every host sysctl change and every `clsact` qdisc it creates under
+  `/run/daer` before making it; normal Rust destructors restore them, and the dedicated
+  `daer-cleanup` helper invoked by `ExecStopPost=` replays the journal after `SIGKILL`,
+  panic or a stop timeout. Cleanup also detaches stale host TC filters, deletes the ingress
+  namespace and veth pair, and removes host table-2023 policy routing. A failed
+  `PreparedIngress` setup now removes the pair it created, and
+  `RuntimeDirectoryPreserve=yes` prevents systemd from deleting the shared `/run/netns`
+  directory (and other applications' namespaces) on stop.
+- **The service unit no longer duplicates configuration loading at startup.**
+  `ExecStartPre=/usr/bin/daer check` re-ran the same subscription and rule-provider fetches
+  that `daer run` performs before it binds anything, doubling startup network work on every
+  start and restart. `Type=notify` now makes systemd wait for the daemon's own pre-bind gate,
+  so a broken configuration still fails before the service is considered started. The unit
+  also restarts after one second instead of five and bounds shutdown at 15 seconds instead of
+  thirty.
+- **Scripts now have one home and one purpose per directory.** The privileged
+  verification gates live under `scripts/verify/`, the legacy GeoData unpacker under
+  `scripts/rules/`, and the host install/diagnostic helpers under `scripts/ops/`.
+  `cargo xtask kernel-check` and `cargo xtask e2e-check` resolve the new paths, the
+  `daer-drb` unpack test follows the rules tool, and `scripts/README.md` is the
+  entry-point map. The host helpers take their site configuration with `--config`
+  instead of reading a hardcoded path, so credentials stay out of the repository.
+  The local install helper and `cargo xtask install` now install `daer-drb` beside
+  `daer`, matching the package staging layout.
 - **The TCP accept loop no longer shares a task with the datagram relay or a flow decision.**
   `Daemon::serve` uses `serve_parallel`; the join-based `serve_with_datagrams` composition is
   private to the relay's tests instead of part of the public surface.
@@ -32,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path bypasses the namespace factory.
 - `health::tests::a_fixed_group_has_nothing_to_probe` fails if a fixed group re-enters the
   probe path.
+- `sd_notify::tests::a_filesystem_socket_receives_the_exact_datagram` fails if readiness is
+  never sent; `a_status_value_cannot_smuggle_extra_fields` fails if a status line can inject
+  another notification field.
 
 ## [0.0.11] - 2026-11-11
 

@@ -47,17 +47,18 @@ stated reason** when it is absent (ADR-0007 — a skip that says why is a fact).
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/reality_interop.rs` | REALITY + Vision interop is skipped, which is the only end-to-end coverage of that path |
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/vision_tls_inside.rs` | the only coverage of Vision's **raw-copy** path. Plaintext through the tunnel does not exercise it, so a client that cannot carry a TLS stream passes every plaintext test — that is how the `Direct` defect shipped, with `curl https://…` failing on every request while the suite was green |
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/{layer_matrix,vmess_live,hysteria2_live}.rs` | the layer matrix, VMess AEAD and the complete Hysteria 2 stack lose their only real-peer coverage (ADR-0028, ADR-0029, ADR-0030) |
-| `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the user-space data path is not exercised; `scripts/e2e-check.sh` runs it with the capability |
+| `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the user-space data path is not exercised; `scripts/verify/e2e-check.sh` runs it with the capability |
 | `CAP_SYS_ADMIN` + writable `/run/netns` + `DAER_NETNS_TEST=1` | `daer-control/tests/netns_lifecycle.rs` | the namespace guard, peer move, `iif` rule and return route lose their real-kernel falsifier; run it in a disposable `unshare -Urnm` (ADR-0038) |
-| `nftables` + `CAP_NET_ADMIN` | `daer-cli/tests/reload.rs` | the `SIGHUP` test needs the transparent port, so it skips with a reason; `scripts/e2e-check.sh` section 4 runs it |
+| `nftables` + `CAP_NET_ADMIN` | `daer-cli/tests/reload.rs` | the `SIGHUP` test needs the transparent port, so it skips with a reason; `scripts/verify/e2e-check.sh` section 4 runs it |
 
 A release should not be cut from a run where the interop suite skipped: the `✅` in
 `docs/dev/roadmap.md` for REALITY means "CI exercised it", and a skip is the absence of that.
 
-`DAER_REQUIRE` is what enforces that in `scripts/kernel-check.sh` and `scripts/e2e-check.sh`: a
-comma-separated list of check keys (`4`, `3-tcp`, `3-udp`, …) whose **skip is a failure**. Without it, a green run over a skipped
-check is indistinguishable from a green run over a passing one — and that is precisely the failure
-ADR-0007 exists to prevent.
+`DAER_REQUIRE` is what enforces that in `scripts/verify/kernel-check.sh` and
+`scripts/verify/e2e-check.sh`: a comma-separated list of check keys (`4`, `3-tcp`, `3-udp`, …)
+whose **skip is a failure**. Without it, a green run over a skipped check is indistinguishable
+from a green run over a passing one — and that is precisely the failure ADR-0007 exists to
+prevent.
 
 ### Why `-j<nproc/2>`
 
@@ -93,5 +94,5 @@ Prior to creating a release tag:
 4. **Privileged Verification**: Run `cargo xtask kernel-check` on a test kernel to verify verifier acceptance and TC attachment, and `cargo xtask e2e-check` to verify that a real redirected flow reaches the daemon. They are separate gates over separate dependency closures; passing one says nothing about the other.
 5. **Changelog Integrity**: Ensure all changes under `[Unreleased]` in `CHANGELOG.md` are accurately documented under the new release version header with current date.
 6. **Clean Git State**: Verify no untracked or dangling files remain in the working directory (`git status --porcelain`).
-7. **Installation Target Check**: Verify `cargo xtask install --destdir /tmp/test-pkg` produces the expected binary, datapath object, and systemd service files.
+7. **Installation Target Check**: Verify `cargo xtask install --destdir /tmp/test-pkg` produces the expected binaries (`daer`, `daer-cleanup`, `daer-drb`), datapath object, and systemd service files.
 8. **Release Build**: `cargo build --workspace --release` succeeds.

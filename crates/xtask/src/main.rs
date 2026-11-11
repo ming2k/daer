@@ -17,6 +17,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+/// Where the privileged verification scripts live. Keeping them in a subdirectory
+/// means `scripts/` can grow more categories without changing the command path.
+const VERIFY_SCRIPTS: &str = "scripts/verify";
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -439,19 +443,16 @@ fn run_install(args: &[String]) {
     fs::create_dir_all(&lib_dir).expect("failed to create lib/daer directory");
     fs::create_dir_all(&unit_dir).expect("failed to create systemd unit directory");
 
-    let src_bin = root.join("target/release/daer");
-    if !src_bin.exists() {
-        eprintln!("target/release/daer does not exist. Run `cargo build --release` first.");
-        std::process::exit(1);
-    }
-    let dest_bin = bin_dir.join("daer");
-    fs::copy(&src_bin, &dest_bin).expect("failed to copy binary");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dest_bin, fs::Permissions::from_mode(0o755));
-    }
-    println!("installed: {}", dest_bin.display());
+    install_binary(&root, &bin_dir, "daer");
+
+    // Internal lifecycle helper used by the unit's `ExecStopPost=`. It shares the cleanup
+    // library with `daer` but is not another operator-facing verb.
+    install_binary(&root, &bin_dir, "daer-cleanup");
+
+    // `daer-drb` is the companion rule-artifact producer. It is not linked into the
+    // daemon (ADR-0031), but operators need it to compile `.rules` into `.drb`, so a
+    // local install that omits it installs half the shipped surface.
+    install_binary(&root, &bin_dir, "daer-drb");
 
     let src_obj = root.join("target/ebpf/datapath.o");
     if src_obj.exists() {
@@ -468,7 +469,12 @@ fn run_install(args: &[String]) {
     let src_service = root.join("install/daer.service");
     if src_service.exists() {
         let dest_service = unit_dir.join("daer.service");
-        fs::copy(&src_service, &dest_service).expect("failed to copy systemd service unit");
+        // The unit source names the canonical `/usr` install. Rewrite the two executable
+        // paths when a different prefix was requested: copying it verbatim made
+        // `--prefix /usr/local` install a binary that systemd could not find.
+        let unit = fs::read_to_string(&src_service).expect("failed to read systemd service unit");
+        let unit = service_unit_for_prefix(&unit, &prefix);
+        fs::write(&dest_service, unit).expect("failed to write systemd service unit");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -478,7 +484,39 @@ fn run_install(args: &[String]) {
     }
 }
 
-/// Runs one of the privileged verification scripts under `scripts/`.
+/// Rewrites the canonical `/usr` paths in the unit for the requested install prefix.
+///
+/// The repository keeps one complete unit (`install/daer.service`) for packages, which always
+/// install under `/usr`. `cargo xtask install --prefix …` must not copy those paths verbatim:
+/// systemd would exec a binary the install never wrote. The rewrite is deliberately limited to
+/// the two paths the unit owns; the configuration path stays `/etc/daer/config.toml`.
+fn service_unit_for_prefix(unit: &str, prefix: &str) -> String {
+    let prefix_root = prefix.trim_end_matches('/');
+    unit.replace("/usr/bin/daer", &format!("{prefix_root}/bin/daer"))
+        .replace(
+            "/usr/lib/daer/datapath.o",
+            &format!("{prefix_root}/lib/daer/datapath.o"),
+        )
+}
+
+/// Copies one built binary into `<prefix>/bin` with the executable bit set.
+fn install_binary(root: &Path, bin_dir: &Path, name: &str) {
+    let src = root.join("target/release").join(name);
+    if !src.exists() {
+        eprintln!("target/release/{name} does not exist. Run `cargo build --release` first.");
+        std::process::exit(1);
+    }
+    let dest = bin_dir.join(name);
+    fs::copy(&src, &dest).unwrap_or_else(|error| panic!("failed to copy {name}: {error}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+    }
+    println!("installed: {}", dest.display());
+}
+
+/// Runs one of the privileged verification scripts under `scripts/verify/`.
 ///
 /// The two scripts answer different questions and have different dependency closures, so
 /// neither is a superset of the other: `kernel-check.sh` asks whether the eBPF object loads
@@ -487,9 +525,9 @@ fn run_install(args: &[String]) {
 /// what it claims, so both are named explicitly rather than folded into one entry point.
 fn run_privileged_script(name: &str, args: Vec<String>) {
     let root = workspace_root();
-    let script = root.join("scripts").join(name);
+    let script = root.join(VERIFY_SCRIPTS).join(name);
     if !script.is_file() {
-        eprintln!("error: scripts/{name} not found");
+        eprintln!("error: {VERIFY_SCRIPTS}/{name} not found");
         std::process::exit(1);
     }
     let status = Command::new(&script)
@@ -546,7 +584,7 @@ fn main() {
             );
             println!("    cargo xtask ci                 Run full CI suite (fmt, clippy, test)");
             println!(
-                "    cargo xtask install            Install binary, datapath, and systemd unit"
+                "    cargo xtask install            Install binaries, datapath, and systemd unit"
             );
             println!("    cargo xtask kernel-check       Run privileged kernel datapath tests");
             println!("    cargo xtask e2e-check          Run privileged end-to-end ingress tests");
@@ -556,5 +594,48 @@ fn main() {
             eprintln!("run `cargo xtask help` for usage");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_verification_scripts_exist_where_xtask_runs_them() {
+        let root = workspace_root();
+        for name in ["kernel-check.sh", "e2e-check.sh"] {
+            let path = root.join(VERIFY_SCRIPTS).join(name);
+            assert!(path.is_file(), "{} is missing", path.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path)
+                    .expect("script metadata")
+                    .permissions()
+                    .mode();
+                assert!(
+                    mode & 0o111 != 0,
+                    "{} is not executable (mode {mode:o})",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_installed_unit_follows_the_requested_prefix() {
+        let unit = "[Service]\n\
+                    ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.o\n\
+                    ExecStopPost=/usr/bin/daer-cleanup\n";
+        let custom = service_unit_for_prefix(unit, "/usr/local/");
+        assert!(custom.contains("ExecStart=/usr/local/bin/daer run"));
+        assert!(custom.contains("--object /usr/local/lib/daer/datapath.o"));
+        assert!(custom.contains("ExecStopPost=/usr/local/bin/daer-cleanup"));
+        assert!(!custom.contains("/usr/bin/daer"));
+        assert!(!custom.contains("/usr/lib/daer/datapath.o"));
+
+        // The package build installs under `/usr`; its unit must stay byte-identical.
+        assert_eq!(service_unit_for_prefix(unit, "/usr"), unit);
     }
 }

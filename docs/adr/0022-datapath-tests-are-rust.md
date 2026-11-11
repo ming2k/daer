@@ -51,7 +51,7 @@ programs need.
 4. **The suite is part of `cargo xtask ci`, and skips loudly without privileges.**
    `BPF_PROG_TEST_RUN` needs `CAP_BPF`. The harness detects that once, and either runs or
    prints the reason it skipped and a non-zero-exit instruction — the same contract
-   `tests/kernel.rs` already has. `scripts/kernel-check.sh` runs it with the privileges and
+   `tests/kernel.rs` already has. `scripts/verify/kernel-check.sh` runs it with the privileges and
    promotes the skip to a failure, so a green CI run on a developer box never implies the
    kernel tests passed.
 5. **`//go:build` directives are deleted with the Go files, and the C test file loses its

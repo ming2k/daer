@@ -20,7 +20,7 @@
 //! # Privileges
 //!
 //! `BPF_PROG_TEST_RUN` needs `CAP_BPF`/`CAP_NET_ADMIN`. Without them the harness skips
-//! and says so; `scripts/kernel-check.sh` runs it with the capability and promotes the
+//! and says so; `scripts/verify/kernel-check.sh` runs it with the capability and promotes the
 //! skip to a failure, so a green unprivileged run never implies the kernel tests passed.
 
 use std::collections::BTreeMap;
@@ -214,7 +214,7 @@ enum LoadOutcome {
 /// A privilege failure is separated from every other failure on purpose: on a machine
 /// with `unprivileged_bpf_disabled=2` or without `CAP_BPF`, *every* map creation fails,
 /// and reporting that as "the datapath is broken" is the kind of unfalsifiable red that
-/// makes people stop reading the output. `scripts/kernel-check.sh` runs this privileged
+/// makes people stop reading the output. `scripts/verify/kernel-check.sh` runs this privileged
 /// and turns the skip into a failure, so the suite cannot pass without having run.
 fn load_test_object(path: &std::path::Path) -> LoadOutcome {
     match daer_ebpf::load_path(path, &param()) {
@@ -240,7 +240,7 @@ fn load_test_object(path: &std::path::Path) -> LoadOutcome {
 fn skip_without_privilege(reason: &str) {
     eprintln!(
         "skipping: the kernel refused the test object for want of a capability.\n  {reason}\n\
-         Run it privileged: `sudo ./scripts/kernel-check.sh` (or `sudo cargo test -p \
+         Run it privileged: `sudo ./scripts/verify/kernel-check.sh` (or `sudo cargo test -p \
          daer-ebpf --test datapath -- --include-ignored`)."
     );
 }
@@ -261,7 +261,7 @@ fn param() -> RuntimeParam {
 }
 
 #[test]
-#[ignore = "needs CAP_BPF and CAP_NET_ADMIN; scripts/kernel-check.sh runs it privileged"]
+#[ignore = "needs CAP_BPF and CAP_NET_ADMIN; scripts/verify/kernel-check.sh runs it privileged"]
 fn every_datapath_case_passes() {
     let Some(path) = object_path() else {
         eprintln!(

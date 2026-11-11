@@ -85,6 +85,8 @@ cd source/daer-${VERSION}
 # surface.rs` asserts that closure, so installing it beside `daer` cannot make it reachable
 # from the running service.
 install -Dm755 target/release/daer ${STAGING_DIR}/usr/bin/daer
+# Internal lifecycle helper for the unit's ExecStopPost. Not an operator verb.
+install -Dm755 target/release/daer-cleanup ${STAGING_DIR}/usr/bin/daer-cleanup
 install -Dm755 target/release/daer-drb ${STAGING_DIR}/usr/bin/daer-drb
 
 # eBPF datapath object

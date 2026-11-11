@@ -103,7 +103,9 @@ cargo xtask e2e-check       # does a redirected flow reach the daemon and come b
 
 Both re-exec themselves under `sudo` and both report `skip` with a reason when a fixture is
 missing. A skip is a fact on a laptop and a hole in CI, so `DAER_REQUIRE=<key,...>` turns a named
-skip into a failure; the keys are in `docs/how-to/deployment.md`.
+skip into a failure; the keys are in `docs/how-to/deployment.md`. The full script layout,
+including the host-level `ops/` helpers, is documented in
+[`scripts/README.md`](../../scripts/README.md).
 
 ---
 

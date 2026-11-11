@@ -85,11 +85,11 @@ daer-drb inspect company-direct.drb
 
 ```bash
 # geosite category "cn"
-python3 scripts/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
+python3 scripts/rules/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
 daer-drb compile cn.rules -o geosite-cn.drb
 
 # geoip country "cn"
-python3 scripts/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
+python3 scripts/rules/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
 daer-drb compile cn-ip.rules -o geoip-cn.drb
 ```
 
@@ -222,7 +222,7 @@ unpacker; the shape is one small script per upstream format:
 
 ```bash
 # 1. Unpack the upstream .dat entry into Canonical Rule Source.
-python3 scripts/dat_to_rules.py --kind geosite \
+python3 scripts/rules/dat_to_rules.py --kind geosite \
     --dat geosite.dat --code cn --output geosite-cn.rules
 
 # 2. Review it. This step is the point: the file is plain text, diffable, and committable.

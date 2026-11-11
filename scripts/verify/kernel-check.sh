@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verifies the kernel datapath on a machine that has CAP_BPF.
 #
-#     ./scripts/kernel-check.sh          # will re-exec itself with sudo
-#     sudo ./scripts/kernel-check.sh     # or run it directly
+#     ./scripts/verify/kernel-check.sh          # will re-exec itself with sudo
+#     sudo ./scripts/verify/kernel-check.sh     # or run it directly
 #
 # # The privilege boundary
 #
@@ -16,7 +16,7 @@
 # Read the summary even if it exits non-zero — a `skip` is not a failure, a `fail` is.
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root" || exit 1
 
 # ── terminal ────────────────────────────────────────────────────────────────

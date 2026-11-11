@@ -22,7 +22,7 @@
 //!
 //! `tproxy` needs `nftables` and `CAP_NET_ADMIN`. Both are available inside
 //! `unshare -Urn`, which is what the module's own invocation uses. When neither is available the
-//! test **skips with a reason**, and `scripts/kernel-check.sh` is what runs it in CI — an
+//! test **skips with a reason**, and `scripts/verify/kernel-check.sh` is what runs it in CI — an
 //! ignored test nobody runs is how the vacuous version survived.
 
 use std::io::Write as _;

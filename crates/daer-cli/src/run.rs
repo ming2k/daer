@@ -29,6 +29,7 @@
 //! fails to build publishes nothing, so a typo cannot stop a working proxy.
 
 use crate::preflight;
+use crate::sd_notify::Notifier;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -60,6 +61,11 @@ pub struct RunOptions {
     /// created, before any sysctl or policy route is written, and before `bpf()`. It needs no
     /// capability (ADR-0029).
     pub dry_run: bool,
+    /// How long a stop may wait for live flows before the process exits.
+    ///
+    /// The listener stops accepting immediately. This is the upper bound for traffic that was
+    /// already relayed, and the value the service unit shortens to keep restarts responsive.
+    pub shutdown_timeout: Duration,
 }
 
 /// Runs the daemon until a signal stops it.
@@ -70,6 +76,11 @@ pub struct RunOptions {
 /// port that cannot be bound, a configuration that does not compile, or a datapath that
 /// cannot be attached.
 pub async fn run(options: RunOptions) -> anyhow::Result<()> {
+    // The unit is `Type=notify`: every status below is visible as the unit's state, and the
+    // final `READY=1` is what tells systemd the proxy can actually serve. Outside systemd
+    // this is a no-op, so a foreground `daer run` behaves exactly as before.
+    let notifier = Notifier::from_env();
+    notifier.status("loading configuration");
     // ADR-0006: one loader for the data path and the diagnostics. Startup and `SIGHUP` both go
     // through it, so a subscription node cannot exist in `daer route nodes` and not in the
     // running daemon.
@@ -82,6 +93,18 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         tracing::warn!(%warning, "configuration warning");
     }
 
+    // A previous run may have been killed before its guards ran. Its journal restores the
+    // sysctls, detaches TC filters and removes the qdiscs; the namespace, pair and host
+    // policy routing are removed even without a journal. This happens before the daemon
+    // waits for a route, so stale filters cannot keep redirecting traffic during that wait.
+    // A dry run changes nothing, so it deliberately skips this.
+    if !options.dry_run
+        && let Err(error) = datapath::cleanup_system_state()
+    {
+        tracing::warn!(%error, "could not fully recover state from a previous run");
+    }
+
+    notifier.status("waiting for network interfaces");
     // Interfaces first: `auto` is resolved once, so a reload cannot silently move the
     // attachment to a different interface.
     //
@@ -104,6 +127,8 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     if options.dry_run {
         return report_plan(&loaded, &options, &lan, &wan).await;
     }
+
+    notifier.status("preparing the private ingress");
 
     // The socket mark, decided once for the whole run.
     //
@@ -167,6 +192,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         );
         None
     } else {
+        notifier.status("attaching the kernel datapath");
         Some(attach(&daemon, &options, &lan, &wan, so_mark).await?)
     };
 
@@ -208,15 +234,16 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // latency policy's alive set stays empty and every flow to such a group is refused.
     let mut health = start_health(&daemon);
 
-    let result = serve_until_signal(
-        &daemon,
-        &loaded,
-        &options,
-        &options_router,
-        ebpf.as_ref(),
-        &mut health,
-        &resolved.rule_providers.pool,
-    )
+    let result = serve_until_signal(ServeInputs {
+        daemon: &daemon,
+        config: &loaded,
+        options: &options,
+        router_options: &options_router,
+        ebpf: ebpf.as_ref(),
+        health: &mut health,
+        resolved_pool: &resolved.rule_providers.pool,
+        notifier: &notifier,
+    })
     .await;
     health.stop();
     if let Some(dns) = dns {
@@ -589,16 +616,34 @@ fn resolve_object_path_in(
 /// kernel, which is exactly the case that causes self-capture.
 pub const DEFAULT_SOCKET_MARK: u32 = 0x0dae;
 
+/// The daemon state the signal/reload loop needs.
+///
+/// Grouped rather than passed one by one because the loop hands the same objects to the
+/// serving future, `reload` and the provider-refresh path. A separate argument list is how one
+/// of those paths would eventually be given a stale generation or a second notifier.
+struct ServeInputs<'a> {
+    daemon: &'a Daemon,
+    config: &'a daer_config::Config,
+    options: &'a RunOptions,
+    router_options: &'a RouterOptions,
+    ebpf: Option<&'a daer_control::datapath::Attached>,
+    health: &'a mut HealthScheduler,
+    resolved_pool: &'a RuleProviderPool,
+    notifier: &'a Notifier,
+}
+
 /// Serves until a signal, reloading on `SIGHUP` or provider refresh interval.
-async fn serve_until_signal(
-    daemon: &Daemon,
-    config: &daer_config::Config,
-    options: &RunOptions,
-    router_options: &RouterOptions,
-    ebpf: Option<&daer_control::datapath::Attached>,
-    health: &mut HealthScheduler,
-    resolved_pool: &RuleProviderPool,
-) -> anyhow::Result<()> {
+async fn serve_until_signal(inputs: ServeInputs<'_>) -> anyhow::Result<()> {
+    let ServeInputs {
+        daemon,
+        config,
+        options,
+        router_options,
+        ebpf,
+        health,
+        resolved_pool,
+        notifier,
+    } = inputs;
     #[cfg(unix)]
     let mut hangup = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -620,6 +665,17 @@ async fn serve_until_signal(
         let _ = tokio::signal::ctrl_c().await;
     });
     tokio::pin!(serve);
+
+    // Signal handlers exist and the serving future is constructed before the unit is declared
+    // ready: a SIGTERM arriving immediately after `READY=1` must stop the daemon normally, not
+    // hit the default disposition.
+    if options.no_datapath {
+        notifier.ready("serving without the kernel datapath (nothing is proxied)");
+    } else {
+        notifier.ready("serving; the kernel datapath is attached");
+    }
+    // systemd arms the watchdog when `READY=1` arrives, so the pings start after that.
+    let _watchdog = notifier.watchdog_handle();
 
     // The pool the refresh path mutates. It starts as the pool the loader produced, so a
     // provider refreshed before any change is compared against the rules actually in use.
@@ -643,8 +699,15 @@ async fn serve_until_signal(
                 // Live flows are owned by the supervisor, not by the loop, so stopping the
                 // loop leaves them relaying. Draining is what keeps a shutdown from
                 // truncating a response: a truncated body is indistinguishable from a wrong
-                // one at the client.
-                let drained = drain(daemon, DRAIN_TIMEOUT).await;
+                // one at the client. The bound is a flag so a reload/restart is not held
+                // hostage by an idle keep-alive connection.
+                notifier.stopping("stopping the listener; draining live flows");
+                notifier.extend_timeout(
+                    options
+                        .shutdown_timeout
+                        .saturating_add(std::time::Duration::from_secs(5)),
+                );
+                let drained = drain(daemon, options.shutdown_timeout).await;
                 tracing::info!(
                     drained,
                     in_flight = daemon.supervisor.in_flight(),
@@ -653,9 +716,17 @@ async fn serve_until_signal(
                 return Ok(());
             }
             _ = hangup.recv() => {
-                if let Some(reloaded_pool) =
-                    reload(daemon, options, router_options, ebpf, health).await
-                {
+                notifier.reloading();
+                let reloaded =
+                    reload(daemon, options, router_options, ebpf, health).await;
+                // `RELOADING=1` is only cleared by `READY=1`. It must be sent even when the
+                // new configuration was rejected, because the old generation is still serving.
+                if reloaded.is_some() {
+                    notifier.ready("reloaded; serving the new generation");
+                } else {
+                    notifier.ready("reload rejected; the previous generation is still serving");
+                }
+                if let Some(reloaded_pool) = reloaded {
                     provider_pool = reloaded_pool;
                     // SIGHUP may have changed `[[rule-provider]]`, so the cadence is rebuilt
                     // from the configuration that was just reloaded. Keeping the startup
@@ -1076,11 +1147,11 @@ async fn reload(
     }
 }
 
-/// How long a shutdown waits for live flows.
+/// Default grace period for live flows on a manual `SIGTERM`/`SIGINT`.
 ///
-/// Long enough for a normal response to finish, short enough that an operator restarting the
-/// service is not waiting on a stuck peer.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The shipped systemd unit passes a shorter value: a restart should not wait ten seconds on
+/// an idle keep-alive connection, while a manual stop keeps the more conservative default.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
 /// Closes live flows politely on shutdown.
 ///

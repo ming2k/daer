@@ -226,6 +226,29 @@ pub fn set_device_ifindex(ebpf: &mut Ebpf, ifindex: u32) -> Result<(), LoadError
     Ok(())
 }
 
+/// Ensures the `clsact` qdisc exists on `interface`.
+///
+/// Returns `true` when **this call created it**, so the owner can remove exactly the qdisc it
+/// added when the datapath detaches. A pre-existing qdisc belongs to the operator (or another
+/// program) and must survive a daer stop; deleting it would remove that program's filters too.
+///
+/// # Errors
+///
+/// Returns [`LoadError::Tc`] for a failure other than the qdisc already existing.
+pub fn ensure_clsact(interface: &str) -> Result<bool, LoadError> {
+    match qdisc_add_clsact(interface) {
+        Ok(()) => Ok(true),
+        // `ip link` and `tc` report an existing qdisc as EEXIST. Aya exposes the raw errno
+        // on its netlink error; matching the error kind alone is not enough because the
+        // netlink wrapper does not preserve a synthetic `AlreadyExists`.
+        Err(TcError::NetlinkError(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
+            Ok(false)
+        }
+        Err(TcError::AlreadyAttached) => Ok(false),
+        Err(error) => Err(LoadError::Tc(error)),
+    }
+}
+
 /// Attaches one tc program to `interface` in `direction`.
 ///
 /// The clsact qdisc is created on demand. An existing qdisc is not an error:
@@ -242,7 +265,7 @@ pub fn attach_tc(
         .ok_or_else(|| LoadError::NotFound(program_name.to_owned()))?;
     let classifier: &mut SchedClassifier = program.try_into().map_err(LoadError::Program)?;
     classifier.load().map_err(LoadError::Program)?;
-    let _ = qdisc_add_clsact(interface);
+    ensure_clsact(interface)?;
     // Force the classic cls_bpf path. Aya's `attach` prefers TCX on kernels >= 6.6,
     // but `bpf_sk_assign` is a classic TC-ingress helper on this data path; the
     // reference implementation attaches the same programs with `tc`, and TCX left

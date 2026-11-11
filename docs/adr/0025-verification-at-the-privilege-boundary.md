@@ -88,10 +88,10 @@ packaging script can run against the artifact they are about to install.
    before deploying that `domain(...)` rules force the deferral tier.
 
 5. **The privileged gate keeps its own script and does not depend on the unprivileged one.**
-   `scripts/kernel-check.sh` already answers "does the object load and behave" and
-   `scripts/e2e-check.sh` answers "does a redirected flow come back". Neither is merged into
-   `daer check`, because they need capabilities and the point of this ADR is that a
-   capability requirement is a property of the *check*, not of the project.
+   `scripts/verify/kernel-check.sh` already answers "does the object load and behave" and
+   `scripts/verify/e2e-check.sh` answers "does a redirected flow come back". Neither is
+   merged into `daer check`, because they need capabilities and the point of this ADR is that
+   a capability requirement is a property of the *check*, not of the project.
 
 6. **A capability failure is named where it is detected.** `Preflight` reports
    `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_SYS_ADMIN` by reading `CapEff` from

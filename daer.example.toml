@@ -211,12 +211,12 @@ fallback = "accept"
 
 # Rule Providers (ADR-0014, ADR-0019). A provider is a compiled `.drb` set or a plain-text rule file,
 # local or remote. This is how `geoip:` / `geosite:` are expressed now: the `.dat` format is
-# retired: unpack an existing .dat with scripts/dat_to_rules.py and compile with daer-drb.
+# retired: unpack an existing .dat with scripts/rules/dat_to_rules.py and compile with daer-drb.
 #
 # Compile with daer-drb (ADR-0027: every source is read into one rule set, then encoded):
-#   python3 scripts/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
+#   python3 scripts/rules/dat_to_rules.py --kind geosite --dat geosite.dat --code cn -o cn.rules
 #   daer-drb compile cn.rules -o geosite-cn.drb
-#   python3 scripts/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
+#   python3 scripts/rules/dat_to_rules.py --kind geoip --dat geoip.dat --code cn -o cn-ip.rules
 #   daer-drb compile cn-ip.rules -o geoip-cn.drb
 #
 # Dedicated rules distribution repository: https://github.com/daer-proxy/drb-sets

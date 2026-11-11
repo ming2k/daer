@@ -43,8 +43,12 @@
 //! header as a MAC address (or vice versa) and misclassifies every packet. [`LinkKind`] is
 //! read from `/sys/class/net/<if>/type` and picks exactly one.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use daer_ebpf::loader;
 
@@ -52,6 +56,109 @@ use daer_ebpf::loader;
 pub const DEVICE: &str = "daer0";
 /// Its peer, which the transparent listener is reachable through.
 pub const PEER: &str = "daer0peer";
+
+/// Where the crash-recovery journal lives.
+///
+/// `/run` is tmpfs: the journal disappears with a reboot, which is correct because the kernel
+/// state it describes does too. It is written before the first sysctl/qdisc change and removed
+/// only after every guard has restored its part of the system.
+const STATE_DIR: &str = "/run/daer";
+const JOURNAL_PATH: &str = "/run/daer/restore";
+
+/// Appends undo records before the corresponding system change.
+///
+/// # Why a journal at all
+///
+/// `Drop` is the primary cleanup path, and it covers a normal `SIGTERM`. It does not run after
+/// `SIGKILL`, a panic that aborts the process, or a timeout that makes systemd escalate. Those
+/// are exactly the cases where network state is most dangerous to leave behind: TC filters
+/// keep redirecting traffic into a listener that no longer exists, and a sysctl remains at a
+/// daer-chosen value that the next start would mistake for the operator's baseline.
+///
+/// One record is one tab-separated line:
+///
+/// ```text
+/// sysctl<TAB>net/ipv4/ip_forward<TAB>1
+/// interface<TAB>eth0<TAB>
+/// qdisc<TAB>eth0<TAB>
+/// ```
+///
+/// The writer flushes each line before the change it describes, so a crash cannot leave a
+/// change without its undo record. A truncated final line is ignored by the reader.
+#[derive(Debug, Clone)]
+struct RestoreJournal(Arc<JournalFile>);
+
+#[derive(Debug)]
+struct JournalFile {
+    file: Mutex<std::fs::File>,
+    path: PathBuf,
+    /// Set when a guard could not restore its part of the system. The file is then retained
+    /// for `ExecStopPost`/the next start instead of being deleted as if cleanup succeeded.
+    failed: AtomicBool,
+}
+
+impl RestoreJournal {
+    fn create() -> Result<Self, DatapathError> {
+        fs::create_dir_all(STATE_DIR).map_err(|error| {
+            DatapathError::Device(format!(
+                "cannot create the state directory {STATE_DIR}: {error}; refusing to modify \
+                 the system without a crash-recovery journal"
+            ))
+        })?;
+        let path = Path::new(JOURNAL_PATH).to_path_buf();
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|error| {
+                DatapathError::Device(format!(
+                    "cannot write the recovery journal {JOURNAL_PATH}: {error}"
+                ))
+            })?;
+        Ok(Self(Arc::new(JournalFile {
+            file: Mutex::new(file),
+            path,
+            failed: AtomicBool::new(false),
+        })))
+    }
+
+    fn record(&self, entry: &str) -> Result<(), DatapathError> {
+        let mut file = self.0.file.lock().map_err(|_| {
+            DatapathError::Device(
+                "the recovery journal lock is poisoned; refusing to change the system without \
+                 an undo record"
+                    .to_owned(),
+            )
+        })?;
+        writeln!(file, "{entry}")
+            .and_then(|()| file.flush())
+            .map_err(|error| {
+                self.0.failed.store(true, Ordering::Release);
+                DatapathError::Device(format!("cannot append to the recovery journal: {error}"))
+            })
+    }
+
+    /// Marks that a normal Drop could not finish the restore.
+    fn mark_failed(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for JournalFile {
+    fn drop(&mut self) {
+        if self.failed.load(Ordering::Acquire) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "a cleanup step failed; keeping the recovery journal for ExecStopPost"
+            );
+            return;
+        }
+        let _ = fs::remove_file(&self.path);
+        // Only removes the directory when it is empty; another writer's file wins.
+        let _ = fs::remove_dir(STATE_DIR);
+    }
+}
 
 /// Removes policy routing installed by earlier daer versions in the host namespace.
 ///
@@ -399,6 +506,19 @@ pub fn interface_exists(interface: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Deletes the veth pair from the host namespace, tolerating either end being absent.
+///
+/// Deleting either end deletes the pair. The host end is preferred because it is still
+/// reachable when a previous run failed before moving the peer, and it is not visible from a
+/// process that happens to be in another network namespace.
+pub fn remove_device_pair() {
+    for interface in [DEVICE, PEER] {
+        if interface_exists(interface) {
+            let _ = run(&["ip", "link", "del", interface]);
+        }
+    }
+}
+
 /// Creates a fresh veth pair after removing anything left by an earlier run.
 ///
 /// The private ingress owns the pair exclusively. Reusing a pair is not just unnecessary;
@@ -525,6 +645,210 @@ fn link_line(interface: &str) -> Result<String, DatapathError> {
     })
 }
 
+/// The `clsact` qdiscs this run created, removed when the datapath detaches.
+///
+/// Aya detaches the filters it owns, but it does not remove the qdisc it created on demand.
+/// Leaving that qdisc behind is still a system modification: `tc qdisc show` names daer's
+/// handiwork after the service is gone. Only qdiscs this run created are removed; one that
+/// existed before attach belongs to the operator and may carry unrelated filters.
+#[derive(Debug)]
+struct ClsactQdiscs {
+    created: Vec<String>,
+    journal: RestoreJournal,
+}
+
+impl ClsactQdiscs {
+    fn new(journal: RestoreJournal) -> Self {
+        Self {
+            created: Vec::new(),
+            journal,
+        }
+    }
+
+    fn ensure(&mut self, interface: &str) -> Result<(), DatapathError> {
+        if loader::ensure_clsact(interface).map_err(DatapathError::Object)? {
+            self.created.push(interface.to_owned());
+            self.journal.record(&format!("qdisc\t{interface}\t"))?;
+        }
+        Ok(())
+    }
+
+    fn remember_filters(&self, interface: &str) -> Result<(), DatapathError> {
+        // Recorded before the filter is attached: a crash after attach must still find the
+        // interface by name, because the program fd is gone and Aya's drop never ran.
+        self.journal.record(&format!("interface\t{interface}\t"))
+    }
+}
+
+impl Drop for ClsactQdiscs {
+    fn drop(&mut self) {
+        for interface in &self.created {
+            if !delete_clsact(interface) {
+                self.journal.mark_failed();
+            }
+        }
+    }
+}
+
+/// Removes the `clsact` qdisc from `interface`, usually because this run created it.
+///
+/// Returns `false` when the qdisc may still exist. A missing device/qdisc is success: it is
+/// already the state we asked for.
+fn delete_clsact(interface: &str) -> bool {
+    let result = Command::new("tc")
+        .args(["qdisc", "del", "dev", interface, "clsact"])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let message = String::from_utf8_lossy(&output.stderr);
+            // A missing device or qdisc is the state we asked for: the namespace or link is
+            // already gone. Anything else is worth a debug line.
+            let already_gone = message.contains("Cannot find")
+                || message.contains("No such file")
+                || message.contains("not found");
+            if !already_gone {
+                tracing::debug!(interface, error = %message.trim(), "could not remove the clsact qdisc");
+            }
+            already_gone
+        }
+        Err(error) => {
+            tracing::debug!(interface, %error, "could not run `tc` to remove the clsact qdisc");
+            false
+        }
+    }
+}
+
+/// Detaches every host-side daer classifier from `interface`.
+///
+/// This is the crash path: classic `cls_bpf` filters outlive the process that installed them,
+/// so a `SIGKILL` leaves traffic redirected into a listener that is gone. Detaching by program
+/// name needs no loaded object and no remembered link id, which is why the cleanup path can
+/// use it after the daemon has died.
+fn detach_host_filters(interface: &str) {
+    use aya::programs::tc::{TcAttachType, qdisc_detach_program};
+    use daer_ebpf::names::program;
+
+    // Only the LAN/WAN hooks belong on a physical interface. DEVICE_INGRESS lives on
+    // `daer0`, which is removed with the pair; PEER_INGRESS lives inside `daer0ns`, which is
+    // removed wholesale. Trying their names here would be harmless but misleading.
+    const HOST_PROGRAMS: [&str; 12] = [
+        program::LAN_INGRESS_L2,
+        program::LAN_INGRESS_L3,
+        program::LAN_EGRESS_L2,
+        program::LAN_EGRESS_L3,
+        program::LAN_WAN_EGRESS_L2,
+        program::LAN_WAN_EGRESS_L3,
+        program::WAN_INGRESS_L2,
+        program::WAN_INGRESS_L3,
+        program::WAN_EGRESS_L2,
+        program::WAN_EGRESS_L3,
+        program::WAN_LAN_INGRESS_L2,
+        program::WAN_LAN_INGRESS_L3,
+    ];
+    for direction in [TcAttachType::Ingress, TcAttachType::Egress] {
+        for name in HOST_PROGRAMS {
+            // NotFound means this variant was not the one selected for the interface's link
+            // kind, which is the normal case. Other failures have no better response during
+            // teardown than to keep going.
+            let _ = qdisc_detach_program(interface, direction, name);
+        }
+    }
+}
+
+/// The undo records parsed from a journal file.
+#[derive(Debug, Default)]
+struct JournalRecords {
+    sysctls: Vec<(String, String)>,
+    interfaces: Vec<String>,
+    qdiscs: Vec<String>,
+}
+
+/// Parses only complete records; a line truncated by a crash is not an instruction.
+fn parse_journal(text: &str) -> JournalRecords {
+    let mut records = JournalRecords::default();
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("sysctl"), Some(path), Some(value)) if !value.is_empty() => {
+                records.sysctls.push((path.to_owned(), value.to_owned()));
+            }
+            (Some("interface"), Some(interface), Some(_)) => {
+                records.interfaces.push(interface.to_owned());
+            }
+            (Some("qdisc"), Some(interface), Some(_)) => {
+                records.qdiscs.push(interface.to_owned());
+            }
+            _ => {}
+        }
+    }
+    records
+}
+
+/// Restores what a previous daemon run could not clean up itself.
+///
+/// Safe to call when there is nothing to restore: every step is idempotent, and a missing
+/// journal merely means there is no sysctl/qdisc record to replay. The namespace, pair and
+/// host policy routing are always removed because they are daer-owned by definition.
+///
+/// # Errors
+///
+/// Returns the first failure that could leave state behind, after attempting every other
+/// step. The caller decides whether that is fatal (startup) or only logged (`ExecStopPost`).
+pub fn cleanup_system_state() -> Result<(), DatapathError> {
+    let mut first_error = None;
+    let journal = fs::read_to_string(JOURNAL_PATH).ok();
+    if let Some(journal) = journal {
+        let records = parse_journal(&journal);
+
+        // Stop redirecting first: a stale filter sends traffic into a listener that is gone.
+        // This is the same order the normal Drop path uses (filters, qdisc, sysctls).
+        for interface in records.interfaces {
+            detach_host_filters(&interface);
+        }
+        for interface in records.qdiscs {
+            delete_clsact(&interface);
+        }
+
+        // Reverse order: the last value written before the crash is the first one to undo.
+        for (path, value) in records.sysctls.into_iter().rev() {
+            if value.is_empty() {
+                continue;
+            }
+            let full = format!("/proc/sys/{path}");
+            if let Err(error) = fs::write(&full, &value) {
+                // A per-interface knob whose device is already gone has nothing left to
+                // restore. Ignoring ENOENT is what makes cleanup idempotent after the link
+                // was removed before the journal was replayed.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    first_error.get_or_insert_with(|| {
+                        DatapathError::Device(format!(
+                            "cannot restore {full} = {value} from the recovery journal: {error}"
+                        ))
+                    });
+                }
+            }
+        }
+    }
+
+    crate::netns::remove_ingress_namespace();
+    remove_device_pair();
+    clear_host_policy_routing();
+
+    match first_error {
+        Some(error) => {
+            // Keep the journal: the next start or a later ExecStopPost can retry the part
+            // that failed instead of treating a partial restore as complete.
+            Err(error)
+        }
+        None => {
+            let _ = fs::remove_file(JOURNAL_PATH);
+            let _ = fs::remove_dir(STATE_DIR);
+            Ok(())
+        }
+    }
+}
+
 /// Loads the object, attaches every program, and returns the handle.
 ///
 /// The handle must be kept alive for the lifetime of the daemon: dropping it detaches the
@@ -561,7 +885,22 @@ pub fn attach(
     let lan_kinds = kinds(lan)?;
     let wan_kinds = kinds(wan)?;
 
+    // A previous process may have been SIGKILLed before it could detach its classic
+    // `cls_bpf` filters. Those filters survive the process and keep redirecting into a
+    // closed listener, so clear the configured interfaces before attaching this run's
+    // programs. The name-based detach is a no-op when the interface is clean.
+    for interface in lan.iter().chain(wan) {
+        detach_host_filters(interface);
+    }
+
+    // Every system change below is preceded by an undo record. Creating the journal before
+    // the first qdisc means a crash at any later point has something to replay.
+    let journal = RestoreJournal::create()?;
+    let mut qdiscs = ClsactQdiscs::new(journal.clone());
+
     for (interface, kind) in &lan_kinds {
+        qdiscs.remember_filters(interface)?;
+        qdiscs.ensure(interface)?;
         // LAN ingress: traffic *from* the local network being proxied. LAN egress: the
         // reply direction of a proxied flow, and the box's own traffic on a LAN-facing
         // device.
@@ -582,6 +921,8 @@ pub fn attach(
     }
 
     for (interface, kind) in &wan_kinds {
+        qdiscs.remember_filters(interface)?;
+        qdiscs.ensure(interface)?;
         // WAN ingress and egress: the box's own traffic and the return path of a proxied
         // flow. These two hooks are what make `daer` a gateway for the host itself.
         attach_tc(
@@ -614,7 +955,7 @@ pub fn attach(
     // destination, so reverse-path filtering would drop it before `bpf_sk_assign` could
     // matter. The peer's knobs and the `fwmark` table are namespace-scoped state owned by
     // the returned guards.
-    let sysctls = Sysctl::apply(&ingress.namespace)?;
+    let sysctls = Sysctl::apply(&ingress.namespace, &journal)?;
     let routes = RouteTable::install(&ingress.namespace)?;
 
     republish_policy(&mut ebpf, param.datapath_generation, policy)?;
@@ -650,9 +991,11 @@ pub fn attach(
 
     Ok(Attached {
         ebpf: std::sync::Arc::new(crate::decide::HandoffObserver::new(ebpf)),
+        _qdiscs: qdiscs,
         peer_link: Some(peer_link),
         _routes: routes,
         _sysctls: sysctls,
+        _journal: journal,
         namespace: Arc::clone(&ingress.namespace),
     })
 }
@@ -670,6 +1013,9 @@ pub struct Attached {
     /// `routing_handoff_map` out of this object, and republishing the policy on reload writes
     /// into it.
     ebpf: Arc<crate::decide::HandoffObserver>,
+    /// The host-side `clsact` qdiscs this run created. Dropped after `ebpf`, so Aya detaches
+    /// its filters before the qdisc that contains them is deleted.
+    _qdiscs: ClsactQdiscs,
     /// The peer ingress link, detached explicitly inside the namespace before the object
     /// drops. Aya's classic `cls_bpf` link detaches by ifindex in the *current* namespace,
     /// and the peer's ifindex is not meaningful in the host.
@@ -678,6 +1024,9 @@ pub struct Attached {
     _routes: RouteTable,
     /// The host and ingress sysctls.
     _sysctls: Sysctl,
+    /// The undo records for this run. Dropped last, after every guard above restored its
+    /// part of the system; a crash leaves the file for `cleanup_system_state`.
+    _journal: RestoreJournal,
     /// The namespace that owns the peer link and policy. Held past every guard that uses it.
     namespace: Arc<crate::netns::IngressNamespace>,
 }
@@ -758,6 +1107,8 @@ struct Sysctl {
     /// `(path, previous contents, namespace)` for every value written. `path` is relative
     /// to `/proc/sys/net`; the namespace field says which `/proc/sys/net` it belongs to.
     written: Vec<(String, Option<String>, Scope)>,
+    /// Crash-recovery records, written before each host value changes.
+    journal: RestoreJournal,
     /// The private ingress namespace. The guard keeps it alive until restoration.
     namespace: Arc<crate::netns::IngressNamespace>,
 }
@@ -780,9 +1131,13 @@ impl Sysctl {
     /// namespace boundary is the reason a host-generated packet can be assigned to a
     /// listener in the first place, and writing the peer's knobs in the host namespace
     /// would configure a device that is no longer there.
-    fn apply(namespace: &Arc<crate::netns::IngressNamespace>) -> Result<Self, DatapathError> {
+    fn apply(
+        namespace: &Arc<crate::netns::IngressNamespace>,
+        journal: &RestoreJournal,
+    ) -> Result<Self, DatapathError> {
         let mut guard = Self {
             written: Vec::new(),
+            journal: journal.clone(),
             namespace: Arc::clone(namespace),
         };
         for (scope, path, value) in [
@@ -837,6 +1192,16 @@ impl Sysctl {
                     // did not change.
                     return Ok(());
                 }
+                // The undo record precedes the write: a crash between the two leaves a
+                // harmless no-op restore, never a modified value with no way back.
+                self.journal.record(&format!(
+                    "sysctl\t{path}\t{}",
+                    previous
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .replace(['\t', '\n', '\r'], " ")
+                ))?;
                 std::fs::write(&full, value).map_err(|error| {
                     DatapathError::Device(format!("cannot write {full} = {value}: {error}"))
                 })?;
@@ -869,10 +1234,15 @@ impl Drop for Sysctl {
             };
             match scope {
                 Scope::Host => {
-                    let _ = std::fs::write(format!("/proc/sys/{path}"), value.trim());
+                    if let Err(error) = std::fs::write(format!("/proc/sys/{path}"), value.trim()) {
+                        tracing::warn!(%error, path, "could not restore a host sysctl");
+                        self.journal.mark_failed();
+                    }
                 }
                 Scope::Ingress => {
                     let key = path.strip_prefix("net/").unwrap_or(&path);
+                    // The namespace is deleted after this guard, so a failure here does not
+                    // need the journal: there is no surviving namespace value to restore.
                     let _ = self.namespace.write_sysctl(key, value.trim());
                 }
             }
@@ -1065,5 +1435,40 @@ mod tests {
                 "the error must name the interface: {error}"
             ),
         }
+    }
+
+    #[test]
+    fn the_recovery_journal_keeps_every_undo_record_in_order() {
+        let records = parse_journal(
+            "sysctl\tnet/ipv4/ip_forward\t1\n\
+             interface\teth0\t\n\
+             qdisc\teth0\t\n\
+             sysctl\tnet/ipv4/conf/all/rp_filter\t2\n",
+        );
+        assert_eq!(
+            records.sysctls,
+            vec![
+                ("net/ipv4/ip_forward".to_owned(), "1".to_owned()),
+                ("net/ipv4/conf/all/rp_filter".to_owned(), "2".to_owned()),
+            ]
+        );
+        assert_eq!(records.interfaces, vec!["eth0".to_owned()]);
+        assert_eq!(records.qdiscs, vec!["eth0".to_owned()]);
+    }
+
+    #[test]
+    fn a_journal_line_truncated_by_a_crash_is_ignored() {
+        // The last write may be cut off mid-line when the process is killed. Treating the
+        // prefix as a complete instruction would restore a partial sysctl value.
+        let records = parse_journal(
+            "sysctl\tnet/ipv4/ip_forward\t1\n\
+             sysctl\tnet/ipv4/conf/all/rp_filter\t",
+        );
+        assert_eq!(
+            records.sysctls,
+            vec![("net/ipv4/ip_forward".to_owned(), "1".to_owned())]
+        );
+        assert!(records.interfaces.is_empty());
+        assert!(records.qdiscs.is_empty());
     }
 }

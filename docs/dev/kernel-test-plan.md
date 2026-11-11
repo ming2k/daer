@@ -7,9 +7,9 @@ no `CAP_NET_ADMIN`:
 2. that the full path works — a packet redirected by the datapath reaching the listener, being
    decided, and coming back.
 
-`scripts/kernel-check.sh` covers (1) and the attach mechanics. (2) is what the steps below do on
-a real box. Everything that *can* be verified without privilege is, and is written to fail when
-it is wrong: the kernel policy table against the userspace evaluator
+`scripts/verify/kernel-check.sh` covers (1) and the attach mechanics. (2) is what the steps
+below do on a real box. Everything that *can* be verified without privilege is, and is written
+to fail when it is wrong: the kernel policy table against the userspace evaluator
 (`crates/daer-routing/tests/kernel_policy.rs`), the ABI against the compiled object, and the
 transparent path with a real `nftables tproxy` rule plus a negative control
 (`crates/daer-control/tests/transparent.rs`, [ADR-0007](../adr/0007-verification.md)).
@@ -25,8 +25,8 @@ cd /path/to/daer
 # vmlinux.h from the running kernel
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
 
-make ebpf          # -> target/ebpf/datapath.o
-make build         # -> target/release/daer
+cargo xtask ebpf       # -> target/ebpf/datapath.o
+cargo build --release  # -> target/release/daer
 
 # the userspace must be green before the kernel side is worth testing
 cargo test --workspace
@@ -37,7 +37,7 @@ Needs `clang`, `bpftool`, `ip`, `tc`, `go` (only for the optional `docs/how-to/v
 ## Step 1 — does the object load?
 
 ```sh
-./scripts/kernel-check.sh          # it re-execs itself under sudo
+./scripts/verify/kernel-check.sh          # it re-execs itself under sudo
 ```
 
 Run it **without** `sudo`: `cargo` and `rustup` usually live in your home, and `sudo cargo`
@@ -56,8 +56,9 @@ Expected:
   ok  a tc program attached to lo
 ```
 
-**Send me this output either way.** If step 3 fails, the log at `/tmp/daer-kernel-load.log`
-names the map or the struct offset and that tells me exactly what to change. This is the
+**Send me this output either way.** If step 3 fails, the log at
+`~/daer-kernel-check/load.log` (or `$DAER_LOG_DIR/load.log`) names the map or the struct
+offset and that tells me exactly what to change. This is the
 first time this object will meet a real verifier, so a failure here is expected information,
 not a surprise.
 
@@ -222,7 +223,7 @@ Any of these, whichever is the first thing that does not match:
 
 | Symptom | Send |
 | --- | --- |
-| step 1 fails | the whole `kernel-check.sh` output + `/tmp/daer-kernel-load.log` |
+| step 1 fails | the whole `kernel-check.sh` output + `~/daer-kernel-check/load.log` |
 | step 3 exits | `/tmp/daer-run.log` |
 | step 5 times out | `/tmp/daer-run.log` with `log-level = "debug"`, plus `nft list ruleset` |
 | step 5 reaches the wrong egress IP | `daer route --why` for the same flow, plus the log |

@@ -344,13 +344,70 @@ impl IngressNamespace {
     }
 }
 
+/// Deletes the named ingress namespace, including the fallback for a missing `ip`.
+///
+/// `ip netns del` is the normal path: it unmounts `/run/netns/daer0ns` and unlinks the mount
+/// point. If `ip` is unavailable, the namespace is still a bind mount; detaching it and
+/// unlinking the path is the same operation the tool performs. The function is deliberately
+/// idempotent so both the RAII guard and the post-crash cleanup can call it.
+pub(crate) fn remove_ingress_namespace() {
+    let path = namespace_path(INGRESS_NETNS);
+    let output = Command::new("ip")
+        .args(["netns", "del", INGRESS_NETNS])
+        .output();
+    if output.is_ok_and(|output| output.status.success()) && !path.exists() {
+        return;
+    }
+
+    // The namespace is mounted by `ip netns add`; a plain `remove_file` would fail with
+    // EBUSY. `MNT_DETACH` is what `ip netns del` uses, and it releases the mount even when a
+    // process still holds a reference to the namespace.
+    if let Ok(path_c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        // SAFETY: `path_c` is a valid NUL-terminated path for the duration of the call.
+        unsafe {
+            libc::umount2(path_c.as_ptr(), libc::MNT_DETACH);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    if path.exists() {
+        tracing::warn!(
+            path = %path.display(),
+            "could not remove the ingress namespace mount; a stale mount may remain"
+        );
+    }
+}
+
 impl Drop for IngressNamespace {
     fn drop(&mut self) {
-        // Best effort: the namespace is ours, and the next start deletes a stale one if this
-        // fails. A drop cannot report, and refusing shutdown over a stale mount is worse.
-        let _ = Command::new("ip")
-            .args(["netns", "del", &self.name])
-            .output();
+        remove_ingress_namespace();
+    }
+}
+
+/// Removes the host-visible pair if preparation fails before the namespace owns the peer.
+///
+/// `reset_device_pair` creates both ends before the namespace exists. Every later step can
+/// fail (`ip netns add`, moving the peer, configuring it), and without this guard a failed
+/// start leaves `daer0`/`daer0peer` in the host namespace even though no daemon is running.
+#[derive(Debug)]
+struct DevicePairGuard {
+    armed: bool,
+}
+
+impl DevicePairGuard {
+    const fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DevicePairGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            datapath::remove_device_pair();
+        }
     }
 }
 
@@ -380,6 +437,10 @@ impl PreparedIngress {
         // mark rule in place would route the listener's own marked replies to `lo`.
         datapath::clear_host_policy_routing();
         datapath::reset_device_pair()?;
+        // From here until the namespace owns the peer, a failure must not leave the pair
+        // behind. Disarmed only after the peer is inside the namespace, where deleting the
+        // namespace removes both ends.
+        let pair = DevicePairGuard::armed();
         let peer_mac = datapath::peer_mac()?;
         let device_mac = datapath::link_mac(DEVICE)?;
         let device_ifindex = datapath::ifindex(DEVICE)?;
@@ -393,6 +454,7 @@ impl PreparedIngress {
             tracing::warn!(%error, "IPv6 host-side next hop is unavailable");
         }
         namespace.configure_peer(device_mac)?;
+        pair.disarm();
 
         Ok(Self {
             namespace: Arc::new(namespace),

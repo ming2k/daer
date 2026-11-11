@@ -7,10 +7,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Command line interface for daer"
+default-run = "daer"
 
 [[bin]]
 name = "daer"
 path = "src/main.rs"
+
+[[bin]]
+name = "daer-cleanup"
+path = "src/bin/daer-cleanup.rs"
 
 [dependencies]
 anyhow.workspace = true

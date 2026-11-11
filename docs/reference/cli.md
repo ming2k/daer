@@ -35,8 +35,12 @@ daer run [OPTIONS]
 | `--object <PATH>` | `target/ebpf/datapath.o` | Compiled eBPF datapath object. |
 | `--no-datapath` | `false` | Serve without attaching the kernel program; removes the `CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_ADMIN` requirements, but the transparent listener still needs `CAP_NET_ADMIN`. No traffic is redirected, so nothing is proxied. |
 | `--dry-run` | `false` | Report what the daemon would do and **change nothing**: no port bind, no device pair, no private ingress namespace, no sysctl, no policy route, no `bpf()`. Needs no capability. |
+| `--shutdown-timeout <SECONDS>` | `10` | Maximum grace period for live flows after `SIGTERM`/`SIGINT`; the listener stops accepting immediately. `0` exits without draining. The shipped systemd unit passes `5`. |
 
 Reloads on `SIGHUP`, and refreshes `[[rule-provider]]` entries on their configured `interval`.
+Under systemd it reports readiness (`READY=1`), reload (`RELOADING=1`) and shutdown (`STOPPING=1`)
+through `sd_notify`, so `Type=notify` units wait for the datapath to be attached before marking
+the service started.
 
 ### 2.2 `check` — will this configuration run
 
@@ -153,7 +157,7 @@ daer version
 
 | Not in `daer` | Use instead |
 | :--- | :--- |
-| Compiling rules to `.drb`, decompiling, inspecting or unit-testing `.drb` | Companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb); unpack legacy `.dat` with `scripts/dat_to_rules.py`. |
+| Compiling rules to `.drb`, decompiling, inspecting or unit-testing `.drb` | Companion tool [`daer-drb`](#4-drb-producer-tooling-daer-drb); unpack legacy `.dat` with `scripts/rules/dat_to_rules.py`. |
 | Converting a `vless://` / `ss://` link into a `[[node]]` table | Any subscription converter, or declare a `[[subscription]]`: `daer` parses links at runtime. |
 | Running a standalone DNS server | `daer run` serves DNS; `daer check` reports unusable upstreams. |
 | Formatting a configuration | An editor plus `daer.example.toml`. |

@@ -103,8 +103,13 @@ exits rather than serving when it cannot attach; `--no-datapath` is the explicit
 serving without it, and it says so at `WARN` because a daemon that forwards nothing is worse
 than one that refuses to start.
 
-`SIGHUP` reloads; `SIGTERM`/`SIGINT` stop accepting and give live flows 10s to finish. A
-reload that fails to build publishes nothing, so a typo cannot stop a working proxy.
+`SIGHUP` reloads; `SIGTERM`/`SIGINT` stop accepting and give live flows up to ten seconds
+by default to finish. The shipped unit passes `--shutdown-timeout 5`, because a service
+restart should not wait on idle keep-alive connections; set it to `0` for an immediate stop.
+Under systemd the daemon reports `RELOADING=1`/`READY=1` around a reload and `STOPPING=1`
+before draining, so `systemctl status` shows the real lifecycle rather than `active` for a
+proxy that has not finished starting. A reload that fails to build publishes nothing, so a
+typo cannot stop a working proxy.
 
 ## The DNS server, and when it starts
 
@@ -192,7 +197,14 @@ What it sets up, in order, before the first flow is served:
 
 All of it is removed again when the daemon exits: the namespace guard deletes `daer0ns` (and
 with it the peer and the host end of the pair), the sysctls are restored to whatever they
-were, and a clean shutdown leaves no host table-2023 rule.
+were, Aya detaches every TC filter, and the `clsact` qdisc is removed when daer created it. A
+clean shutdown leaves no host table-2023 rule and no daer-owned kernel state.
+
+Two backstops cover the cases where Rust destructors cannot run: the daemon writes an undo
+journal under `/run/daer` before it changes a sysctl or creates a qdisc, and the unit's
+`ExecStopPost=daer-cleanup` replays that journal and removes the namespace, pair, TC filters
+and host policy routing after a `SIGKILL`, panic or stop timeout. The same recovery runs
+before a new daemon starts, so a crash cannot compound leftovers.
 
 ### Which TC program goes on which interface
 
@@ -237,7 +249,15 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Readiness comes from the daemon itself (`READY=1` via sd_notify), not from a successful
+# `execve`. systemd therefore reports the unit started only after the configuration loaded,
+# the private ingress exists, the listeners are bound and the datapath is attached — the
+# state in which traffic is actually proxied.
+Type=notify
+NotifyAccess=main
+# A wedged control plane is restarted instead of silently accepting traffic and proxying
+# nothing. The daemon feeds this at half the interval, including while a reload is running.
+WatchdogSec=30s
 User=root
 
 # Resource limits
@@ -246,21 +266,36 @@ LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 OOMScoreAdjust=-100
 
-# Validate configuration before starting. A broken configuration exits with non-zero
-# and prevents starting or restarting with an invalid state. `daer check` is the one
-# pre-bind gate: it resolves subscriptions and rule providers, compiles every rule and
-# builds every group, so a configuration that would fail at runtime fails here instead.
-ExecStartPre=/usr/bin/daer check -c /etc/daer/config.toml
-ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o
+# There is deliberately no ExecStartPre=/usr/bin/daer check:
+# `daer run` performs the identical load_resolved validation before it binds a socket or
+# mutates kernel state, and Type=notify above makes systemd wait for that gate. Running
+# `daer check` first repeated every subscription and rule-provider fetch on each start and
+# restart, doubling startup network work without adding a check.
+ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
+# The Rust guards are the primary cleanup path. This runs after them — and also after a
+# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal and removing the
+# namespace, veth pair, TC filters and host policy routing that would otherwise outlive it.
+# It is a dedicated helper, not a hidden flag on `daer run`: the operator CLI stays the six
+# verbs in ADR-0015, and systemd's post-stop hook is not one of them.
+ExecStopPost=/usr/bin/daer-cleanup
 
-# Restart policy
+# Restart policy. One second keeps a transient failure from turning into a five-second
+# outage; StartLimit above still stops a genuine crash loop.
 Restart=on-failure
-RestartSec=5s
+RestartSec=1s
 
-# Timeout configuration
-TimeoutStartSec=120
-TimeoutStopSec=30
+# Timeout configuration.
+# Startup includes the daemon's bounded wait for a default route (120s), so systemd's clock
+# must not expire first. Stopping drains live flows for at most the 5s passed above, then
+# tears down the namespace and datapath; 15s leaves room for that without masking a hang.
+TimeoutStartSec=180
+TimeoutStopSec=15
+# SIGTERM goes to the main process only; the final SIGKILL covers any helper child a stuck
+# teardown left behind, without signalling the daemon twice.
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
 
 # The capabilities the datapath, private ingress namespace, and privileged listeners
 # (e.g. port 53) need. CAP_PERFMON is the verifier's allow_ptr_leaks gate: the fast parser
@@ -283,10 +318,16 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # Configuration directory, BPF filesystem, and write access for subscription persistence.
-# `RuntimeDirectory=netns` creates /run/netns; `ReadWritePaths` keeps it writable under
-# ProtectSystem=strict so `ip netns add` can mount the namespace entry.
+# `RuntimeDirectory` creates /run/daer and /run/netns; `ReadWritePaths` keeps the namespace
+# mount point writable under ProtectSystem=strict so `ip netns add` can bind the entry.
 ConfigurationDirectory=daer
-RuntimeDirectory=netns
+# `daer` holds its crash-recovery journal in /run/daer and `ip netns add` mounts the ingress
+# entry under /run/netns. Both must be writable under ProtectSystem=strict.
+RuntimeDirectory=daer netns
+# `/run/netns` is shared with every other network namespace on the host. Do not let systemd
+# remove the whole directory when daer stops: the daemon removes only its own `daer0ns`
+# entry, and `ip netns list` must look exactly as it did before the service started.
+RuntimeDirectoryPreserve=yes
 ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
 # Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
@@ -312,6 +353,13 @@ sudo systemctl enable --now daer
 `ExecReload` is what makes SIGHUP usable: `systemctl reload daer` then swaps the policy
 without dropping a connection.
 
+The unit does **not** run `daer check` as an `ExecStartPre=`. `daer run` performs the same
+`load_resolved` validation before it binds a socket or mutates kernel state, and `Type=notify`
+makes systemd wait for the daemon's `READY=1`. A separate check would repeat every subscription
+and rule-provider fetch on each start and restart, doubling the startup network work without
+testing anything the daemon does not test itself. Keep `daer check` in deployment pipelines and
+before a manual edit; it is still the command that answers "will this configuration run".
+
 ## Verifying the kernel datapath
 
 Two scripts, two questions. They are separate because a failure in one must not be readable as
@@ -319,13 +367,13 @@ a failure in the other:
 
 | Script | Question | Depends on |
 | --- | --- | --- |
-| `sudo ./scripts/kernel-check.sh` | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
-| `sudo ./scripts/e2e-check.sh` | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
+| `sudo ./scripts/verify/kernel-check.sh` | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
+| `sudo ./scripts/verify/e2e-check.sh` | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
 
 Run the kernel one before `daer run` on a new machine:
 
 ```sh
-sudo ./scripts/kernel-check.sh
+sudo ./scripts/verify/kernel-check.sh
 ```
 
 The steps that matter are 4 and 7:

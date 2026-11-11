@@ -265,7 +265,7 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 The retired Protobuf `geoip:` / `geosite:` databases are gone (ADR-0014/ADR-0015): domestic and
 regional routing is expressed as a `[[rule-provider]]` holding a compiled `.drb` set plus
-`provider(tag)` in a rule. Legacy `.dat` files can be unpacked once with `scripts/dat_to_rules.py`
+`provider(tag)` in a rule. Legacy `.dat` files can be unpacked once with `scripts/rules/dat_to_rules.py`
 and compiled via `daer-drb compile`.
 
 An outbound chain (`a -> b`) is rejected at load time rather than silently truncated to its first

@@ -69,7 +69,7 @@ jobs:
         # never named a key that would have noticed.
         run: cargo xtask ebpf --tests
       - name: Kernel datapath (verifier, tc attach, in-kernel cases)
-        # The keys are the script's own (`scripts/kernel-check.sh`), not section numbers: a
+        # The keys are the script's own (`scripts/verify/kernel-check.sh`), not section numbers: a
         # key in `DAER_REQUIRE` turns its *skip* into a failure. This list said
         # `7-tcp,8` — neither of which this script emits — so every check could skip and
         # the job still exited zero. The UDP half of the in-kernel cases still has a named

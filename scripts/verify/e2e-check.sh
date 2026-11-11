@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verifies the user-space data path end to end, on a machine that has CAP_NET_ADMIN.
 #
-#     ./scripts/e2e-check.sh          # will re-exec itself with sudo
-#     sudo ./scripts/e2e-check.sh     # or run it directly
+#     ./scripts/verify/e2e-check.sh          # will re-exec itself with sudo
+#     sudo ./scripts/verify/e2e-check.sh     # or run it directly
 #
 # # Why this is not part of kernel-check.sh
 #
@@ -26,7 +26,7 @@
 
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root" || exit 1
 
 if [[ -t 1 ]]; then
@@ -203,7 +203,7 @@ if [[ "$failures" -eq 0 ]]; then
         printf 'No check was skipped: every gate above ran and passed.\n'
     fi
     printf 'Logs: %s\n' "$logs"
-    printf 'The kernel side is a different question: %ssudo ./scripts/kernel-check.sh%s\n' \
+    printf 'The kernel side is a different question: %ssudo ./scripts/verify/kernel-check.sh%s\n' \
         "$BOLD" "$OFF"
     exit 0
 fi

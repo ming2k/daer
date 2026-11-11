@@ -75,11 +75,11 @@ identifiers belong to another project.
 
 - Vendor the datapath C source into `ebpf/kern/`, with the headers it needs.
 - Rename its identifiers to `daer*` (`daer0`, `daer_ifindex_map`, `daer_param`).
-- Revalidate with `make ebpf` + `cargo test -p daer-ebpf`, and record the ABI in
+- Revalidate with `cargo xtask ebpf` + `cargo test -p daer-ebpf`, and record the ABI in
   one place: generate the map/program name tables from the datapath's sync spec
   and fail CI on drift.
 
-**Exit:** `make ebpf` builds from `ebpf/kern` with no external checkout, and
+**Exit:** `cargo xtask ebpf` builds from `ebpf/kern` with no external checkout, and
 `names.rs` is generated.
 
 ## 2. Data path (`daer-relay` + `daer-control`) 🟡
@@ -131,7 +131,7 @@ The largest piece. Order matters: this is what makes the binary useful.
    panic the daemon (`reload` called `block_on` from inside the runtime), which no unit test
    saw because none of them signalled a running process. `crates/daer-cli/tests/reload.rs`
    now starts the real binary, sends `SIGHUP`, and asserts the process is alive **and** that
-   generation 2 was published; `scripts/kernel-check.sh` section 8 runs it where the
+   generation 2 was published; `scripts/verify/kernel-check.sh` section 8 runs it where the
    transparent port can bind. **Exit:** 1000 reloads under a long-lived connection with zero
    drops, and a kernel-tier assertion that the table was rewritten rather than merely
    republished in userspace. A reload is also synchronous inside the signal loop, so a slow
@@ -349,4 +349,4 @@ Remaining: per-flow traces and the `trace` feature (needs `bpf_trace_printk`).
 | Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | [`netune-requests.md`](netune-requests.md) |
 | QUIC implementation for hysteria2/tuic | **resolved** — netune owns the QUIC/H3 client transport (netune ADR-0016); daer consumes `netune-quic`/`netune-http3` and keeps only product protocol layers (ADR-0035) | milestone 5 |
 | Matcher data structures | performance ceiling of the data path | milestone 6 |
-| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/transparent.rs`, `scripts/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |
+| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/transparent.rs`, `scripts/verify/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |

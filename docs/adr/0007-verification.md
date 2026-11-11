@@ -40,7 +40,7 @@ Both halves are wrong:
 The test was green, `docs/dev/kernel-test-plan.md` cited it as the userland half of the
 proof, and the data path it claimed to cover had never executed once.
 
-This is not an isolated slip; it is a category. `scripts/kernel-check.sh` proves the
+This is not an isolated slip; it is a category. `scripts/verify/kernel-check.sh` proves the
 verifier accepts the object and that a `tc` program attaches to `lo` — both real,
 both valuable — and then prints `Next: sudo daer run …` as if the next step were a
 formality. It is not: it is the step that fails.
@@ -71,7 +71,7 @@ part of the template for any test that claims to prove a data path.
 
 An `#[ignore = "needs CAP_NET_ADMIN"]` test is not coverage until it runs somewhere.
 Each ignored test declares the environment it needs in its attribute, and
-`scripts/kernel-check.sh` is extended to run them under `unshare -Urn` when the
+`scripts/verify/kernel-check.sh` is extended to run them under `unshare -Urn` when the
 privilege is available, so "no privilege here" is a `skip` with a reason instead of
 a silent gap in CI. A test that is ignored, not run by any script, and cited in the
 docs is the exact configuration that produced the vacuous test.

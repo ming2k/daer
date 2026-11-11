@@ -33,6 +33,7 @@ mod dns;
 mod preflight;
 mod probe;
 mod run;
+mod sd_notify;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -90,6 +91,16 @@ enum Command {
         /// It is not `--no-datapath`: that one serves and skips only the kernel half.
         #[arg(long)]
         dry_run: bool,
+        /// Maximum time in seconds to let live flows finish on SIGTERM/SIGINT.
+        ///
+        /// The listener stops accepting immediately; this bounds only the wait for
+        /// already-relayed connections. Zero exits as soon as the listener is closed.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = run::DEFAULT_SHUTDOWN_TIMEOUT_SECS
+        )]
+        shutdown_timeout: u64,
     },
     /// Check that a configuration would run, and print what it would do.
     ///
@@ -306,6 +317,7 @@ fn main() -> ExitCode {
             object,
             no_datapath,
             dry_run,
+            shutdown_timeout,
         } => resolve_config(config).and_then(|path| {
             // The daemon supervises spawned tasks (relays, datagrams, probes); see
             // `block_on_daemon` for why a current-thread runtime starves them.
@@ -315,6 +327,7 @@ fn main() -> ExitCode {
                     object,
                     no_datapath,
                     dry_run,
+                    shutdown_timeout: std::time::Duration::from_secs(shutdown_timeout),
                 })
                 .await
             })
