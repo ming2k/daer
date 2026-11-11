@@ -24,13 +24,19 @@ We execute a **Clean Break** across the rule specification, compiler, binary for
 
 ### 1. Canonical Rule Source (CRS v1) is the Sole Compiler Input
 
+> **Amended by [ADR-0036](0036-canonical-rule-source-v2-and-symbolic-syntax.md):** the domain
+> spellings below (`suffix:`/`full:`) were replaced by the symbolic CRS v2 forms `name`,
+> `.name` and `=name`. Everything else — the single text format, the single binary format —
+> stands.
+
 `daer-drb` accepts exactly one text format (`.rules`) and outputs exactly one binary format (`.drb`):
 - `name: <set-name>`
 - `ip: <cidr | address | start - end>`
-- `suffix: <domain | .domain>`
-- `full: <domain>`
+- `<domain>` (suffix: the name and every subdomain)
+- `.<domain>` (subdomains only)
+- `=<domain>` (exact match)
 
-All legacy Protobuf `.dat` decoding is **completely removed** from the `daer` repository. `crates/daer-geodata` is deleted. External data sources must be converted to CRS v1 prior to invoking `daer-drb compile`.
+All legacy Protobuf `.dat` decoding is **completely removed** from the `daer` repository. `crates/daer-geodata` is deleted. External data sources must be converted to CRS prior to invoking `daer-drb compile`.
 
 ### 2. Disjoint Closed Intervals as the Single IP Truth
 
@@ -44,7 +50,7 @@ In DRB v2:
 ### 3. Domain matching is hierarchical only (encoding superseded by ADR-0032)
 
 `keyword:` and `regex:` domain matching are removed from the architecture. A domain rule is
-either exact (`full:`) or hierarchical (`suffix:`, with a leading dot for subdomains only), and
+either exact (`=name`) or hierarchical (`name`, with a leading dot for subdomains only), and
 the two are evaluated over one table.
 
 > The original encoding here was a Compact Reverse Label Radix. It was measured to produce no

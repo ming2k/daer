@@ -196,13 +196,14 @@ fn every_hit_and_miss_agrees_with_a_reference_matcher() {
     let mut patterns: Vec<String> = Vec::new();
     for rule in rules.domains() {
         patterns.push(format!(
-            "suffix: {}{}",
+            "{}{}",
             match &rule.pattern {
+                daer_rule_ast::DomainPattern::Full(_) => "=",
                 daer_rule_ast::DomainPattern::Suffix(
                     _,
                     daer_rule_ast::SuffixScope::SubdomainsOnly,
                 ) => ".",
-                _ => "",
+                daer_rule_ast::DomainPattern::Suffix(..) => "",
             },
             rule.pattern.value()
         ));

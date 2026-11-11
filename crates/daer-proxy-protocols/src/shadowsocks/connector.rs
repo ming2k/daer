@@ -4,14 +4,14 @@
 
 use std::fmt;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
     Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, SocketConfig,
     Target, TcpConnector, Transport,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::AsyncWriteExt;
 
 use super::link::{Link, decode_base64_bytes, decode_base64_string};
@@ -128,7 +128,7 @@ impl ShadowSocksConnector {
     pub async fn connect(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         let (host, port) =
             split_authority(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
@@ -200,7 +200,7 @@ impl ShadowSocksConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        _recorder: &Arc<Mutex<Recorder>>,
+        _recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let (host, port) = split_authority(authority).map_err(NetError::Protocol)?;
         let addr_bytes = encode_address(host, port).map_err(NetError::Protocol)?;
@@ -326,13 +326,12 @@ impl Connector for ShadowSocksConnector {
     fn connect(
         &self,
         target: &Target,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> impl std::future::Future<Output = Result<Established, NetError>> + Send {
         let authority = target.authority.clone();
         let this = self.clone();
-        let recorder = Arc::clone(recorder);
         async move {
-            this.connect(&authority, &recorder)
+            this.connect(&authority, recorder)
                 .await
                 .map_err(|error| NetError::Connect(error.to_string()))
         }
@@ -364,14 +363,13 @@ impl DatagramConnector for ShadowSocksDatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 

@@ -775,7 +775,7 @@ mod tests {
 upstream = ["local:udp://127.0.0.1:53", "remote:udp://127.0.0.1:54"]
 
 [dns.request]
-rules = ["qname(suffix: blocked) -> reject", "qname(suffix: lan) -> asis"]
+rules = ["qname(blocked) -> reject", "qname(lan) -> asis"]
 fallback = "local"
 
 [dns.response]

@@ -31,9 +31,12 @@ silently forward nothing or forward the wrong thing:
    redirected packet reached `daer0peer`, the stack routed it as a *forwarded* packet, and it
    left the box again instead of reaching the `bpf_sk_assign`-ed listener.
 
-2. **No `rp_filter` or forwarding sysctls.** A redirected packet arrives on `daer0peer` with a
-   non-local source *and* destination, so reverse-path filtering dropped it before
-   `bpf_sk_assign` mattered. Both are per-interface state that a daemon has to set and restore.
+2. **No `rp_filter`, `accept_local` or forwarding sysctls.** A redirected packet arrives on
+   `daer0peer` with a non-local source *and* destination, so reverse-path filtering dropped
+   it before `bpf_sk_assign` mattered. A host-generated flow is worse: its source is a local
+   address on another interface, which the kernel classifies as a martian source unless
+   `accept_local` is set. All of them are per-interface state that a daemon has to set and
+   restore.
 
 3. **Both link-layer variants attached to every interface.** The datapath has an `_l2` and an
    `_l3` variant of every hook. `attach` attached both, with a comment claiming "the datapath
@@ -147,22 +150,47 @@ object, and it is the only place a verifier rejection is visible.
 
 ## The netune version boundary
 
-`daer` pins `netune` at a tag (`v0.0.5`) and verifies the lock with `--locked`. The netune work
-the observability half of this change wants — a `TraceSink` so a long-lived relay gets a stream
-rather than a ring window (netune ADR-0010) — is carried in `v0.0.5`.
+`daer` pins `netune` at a tag (`v0.0.24`) and verifies the lock with `--locked`. The transport
+observability this change consumes is carried by that release:
 
-That is recorded rather than worked around:
-
-* `daer-outbound::observe` measures the one span it can observe at a seam it owns (start of the
-  dial to the dial returning) and says so in its module documentation. It does **not** claim a
-  per-phase breakdown, because the phases live in a `Recorder` no connector hands back.
+* `TraceCollector` is the one cold-path handle (netune ADR-0018); `Recorder` is no longer
+  public, and byte events can only enter a trace through a typed `Tap`.
+* A dial that nobody observes uses `TraceCollector::disabled()`: no event is recorded,
+  no sink is installed, and no ring is filled. This is the production default on the
+  per-flow path.
+* When a `DialObserver` is installed, `ObservedDialer` creates one collector with a
+  `DialObserverSink`, so netune's DNS/TCP/TLS marks stream to the observer and the final log is
+  derived through netune's own `derive`. The phases are measurements, not a wall-clock total
+  relabelled as a handshake.
 * `DialObserver::observe` and `DialObserverSink` bridge streaming trace events to installed
   observers.
-* Local co-development uses `.cargo/config.local.toml` (git-ignored, opt-in via
-  `cargo --config`), which patches the netune crates to the sibling working tree. The committed
+* Local co-development may patch the netune crates to the sibling working tree. The committed
   `Cargo.toml` keeps the tag, and `cargo check --locked` is what proves the released
   combination still builds.
 
 The rule this leaves behind: **a capability daer needs is not consumed until the tag it depends
 on carries it.** The alternative — a `[patch]` in the committed manifest, or a lock file holding
 a path dependency — makes the published build depend on a working tree nobody else has.
+
+## Addendum — the state is namespace-local (ADR-0038)
+
+The decision above said the datapath owns its "box-global" state. That was true of the first
+implementation, but it was also the source of a production defect: a redirected host flow and
+its transparent listener shared one network namespace, and the transport stack could return
+`NO_SOCKET` after a successful `bpf_sk_assign`.
+
+[ADR-0038](0038-private-ingress-network-namespace.md) keeps the ownership principle and moves
+the scope boundary:
+
+- `daer0peer`, the transparent listeners, `table 2023`, the peer's `rp_filter`/
+  `accept_local`/forwarding knobs, and the peer TC program live in the private namespace
+  `daer0ns`.
+- `daer0`, the host-side forwarding knobs, and the host TC program stay in the host namespace.
+- The policy rule is `iif daer0peer table 2023`, not `fwmark … table 2023`. The mark remains
+  the datapath's ownership signal; a mark-keyed rule in the namespace would capture the
+  listener's deliberately marked replies.
+
+Everything below about link-layer selection, listener publication, and observed facts still
+applies unchanged. The `Attached` guard now also holds the namespace through its route and
+sysctl guards, so dropping it removes the namespace's policy before the namespace itself is
+deleted.

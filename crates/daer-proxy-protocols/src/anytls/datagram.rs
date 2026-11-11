@@ -5,10 +5,9 @@
 use std::fmt;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use netune::{DatagramConnector, DatagramTransport, EstablishedDatagrams, NetError};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::anytls::connector::AnyTlsConnector;
@@ -45,14 +44,13 @@ impl DatagramConnector for AnyTlsDatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<std::sync::Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 

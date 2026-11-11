@@ -520,7 +520,7 @@
           ]
         },
         {
-          "description": "quinn's BBRv2 implementation.",
+          "description": "netune's BBR model window.",
           "type": "string",
           "const": "bbr"
         },
@@ -591,15 +591,15 @@
       ]
     },
     "Hysteria2Quic": {
-      "description": "Hysteria 2's QUIC tuning (ADR-0029).\n\nEvery field maps onto a `quinn::TransportConfig`/`EndpointConfig` knob, so a value\nhere either changes the connection or is not in the model. The defaults are quinn's\nown, not the reference's, because a daer deployment shares one daemon across many\nnodes and a buffer sized for one node's 500 Mbit link would be wrong everywhere else.",
+      "description": "Hysteria 2's QUIC tuning (ADR-0029).\n\nEvery field maps onto a `netune_quic::QuicProfile`/`QuicTransportParameters` knob, so a\nvalue here either changes the connection or is not in the model. The defaults are netune's\n(30 s idle timeout, 10 MB connection window); they are daer's own, not the reference's,\nbecause a daer deployment shares one daemon across many nodes and a buffer sized for one\nnode's 500 Mbit link would be wrong everywhere else.",
       "type": "object",
       "properties": {
         "disable-path-mtu-discovery": {
-          "description": "Send at the largest size the path allows even when it wastes a little\nbandwidth, instead of coalescing: what Hysteria 2 does, and what makes a\nfixed-size packet pattern less visible.",
+          "description": "Disable netune's DPLPMTUD probing and keep datagrams at the QUIC\n1200-byte floor, matching the reference's `disablePathMTUDiscovery`.",
           "type": "boolean"
         },
         "disable-segmentation-offload": {
-          "description": "Skip GSO. Off by default because segmentation offload is the difference\nbetween one `sendmsg` and thirty.",
+          "description": "Skip GSO. The owned QUIC engine performs no segmentation offload, so\nthis key is already satisfied; it is accepted for reference\ncompatibility and read by the connector rather than silently dropped.",
           "type": "boolean"
         },
         "init-conn-receive-window": {
@@ -613,7 +613,7 @@
           "minimum": 0
         },
         "keep-alive-period-ms": {
-          "description": "Keep-alive period in milliseconds. `0` disables keep-alives.",
+          "description": "Keep-alive period in milliseconds. `0` keeps daer's 10 s default.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
@@ -624,7 +624,7 @@
           "minimum": 0
         },
         "max-idle-timeout-ms": {
-          "description": "Connection idle timeout in milliseconds. `0` keeps quinn's default.",
+          "description": "Connection idle timeout in milliseconds. `0` keeps netune's default.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0

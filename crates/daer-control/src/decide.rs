@@ -357,6 +357,8 @@ pub struct Router {
     kernel_observer: Option<Arc<dyn KernelObserver>>,
     /// Where a dial's measurement goes.
     dial_observer: daer_outbound::ObserverSlot,
+    /// The mark every socket daer creates carries, including health probes.
+    so_mark: Option<u32>,
 }
 
 impl Router {
@@ -490,7 +492,14 @@ impl Router {
             dns_snooper,
             kernel_observer: options.kernel_observer.clone(),
             dial_observer: options.dial_observer.clone(),
+            so_mark,
         })
+    }
+
+    /// The mark every socket daer creates must carry, including health probes.
+    #[must_use]
+    pub const fn socket_mark(&self) -> Option<u32> {
+        self.so_mark
     }
 
     /// The generation this router belongs to.
@@ -987,7 +996,7 @@ impl Router {
 
     /// The routing verdict for a flow, with a sniffed domain.
     ///
-    /// A domain-sensitive rule (`domain(suffix: …)`) only fires through this entry point;
+    /// A domain-sensitive rule (`domain(… )`) only fires through this entry point;
     /// [`Router::verdict_for`] supplies `None` and therefore cannot match one. That is the
     /// same property the data path relies on.
     #[must_use]
@@ -1093,6 +1102,12 @@ impl Router {
         let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(groups.len());
         for (name, route) in groups.iter() {
+            // `fixed(n)` is explicit intent: probing it can only rewrite a choice the
+            // operator made, and it makes an external DNS endpoint look like a node
+            // property. Fixed groups are therefore absent from the probe table.
+            if !crate::health::policy_needs_measurement(route.group.policy()) {
+                continue;
+            }
             let mut rows = Vec::new();
             for dialer in route.group.dialers() {
                 let property = dialer.property();
@@ -1614,7 +1629,7 @@ fallback = "proxy"
         let router = router(
             r#"
 [routing]
-rules = ["domain(suffix: example.com) -> block"]
+rules = ["domain(example.com) -> block"]
 fallback = "direct"
 "#,
         );
@@ -1640,7 +1655,7 @@ fallback = "direct"
         // Deciding this per generation keeps a syscall and a wait off every flow of a
         // configuration that cannot use a name.
         let with_domain =
-            router("[routing]\nrules = [\"domain(suffix: a) -> direct\"]\nfallback = \"direct\"\n");
+            router("[routing]\nrules = [\"domain(a) -> direct\"]\nfallback = \"direct\"\n");
         assert!(!with_domain.sniffing_timeout.is_zero());
 
         let without_domain = router(TWO_RULES);
@@ -1655,17 +1670,14 @@ fallback = "direct"
         let router = router(
             r#"
 [routing]
-rules = ["domain(suffix: example.com) -> block"]
+rules = ["domain(example.com) -> block"]
 fallback = "direct"
 "#,
         );
         let (source, destination) = flow(443);
         let explanation = router.explain_with_domain(source, destination, Some("api.example.com"));
         assert_eq!(explanation.rule, Some(0));
-        assert_eq!(
-            explanation.rule_text,
-            "domain(suffix: example.com) -> block"
-        );
+        assert_eq!(explanation.rule_text, "domain(example.com) -> block");
         assert_eq!(&*explanation.outbound.name, "block");
     }
 

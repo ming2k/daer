@@ -5,20 +5,20 @@
 //! # The stack
 //!
 //! ```text
-//!   quinn::Endpoint
+//!   netune_quic::QuicConnector
 //!         ▲
-//!         │  AsyncUdpSocket
+//!         │  QuicUdpSocket
 //!   ┌─────┴──────────────────────────────┐
-//!   │ hop    (rotate the local port)      │  optional
 //!   │ obfs   (salamander / gecko)         │  optional
+//!   │ hop    (rotate the local port)      │  optional
 //!   │ socket (tokio UdpSocket, SO_MARK)   │  always
 //!   └─────────────────────────────────────┘
 //! ```
 //!
-//! The endpoint is created with `Endpoint::new_with_abstract_socket`, the only constructor
-//! that accepts a layer. `Endpoint::new` is not used at all, so a socket wrapper cannot be
-//! forgotten — which is exactly what happened before ADR-0029: `obfs` was parsed, stored,
-//! printed by `Debug`, asserted by a test, and *not on the wire*.
+//! The connector receives the stack through a `QuicUdpSocketFactory`, invoked once per
+//! connection after egress confinement and before the first Initial packet, so a socket wrapper
+//! cannot be forgotten — which is exactly what happened before ADR-0029: `obfs` was parsed,
+//! stored, printed by `Debug`, asserted by a test, and *not on the wire*.
 //!
 //! # What the handshake negotiates
 //!
@@ -32,19 +32,22 @@
 //!   congestion control". Brutal needs it; the loss-based controllers ignore it.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{DatagramConnector, Established, EstablishedDatagrams, NetError};
-use netune_trace::Recorder;
-use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
+use netune_quic::{
+    CongestionAlgorithm, QuicConnection, QuicConnector, QuicProfile, QuicSocketConfig,
+    QuicTransportParameters,
+};
+use netune_trace::TraceCollector;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::ProxyProtocolError;
 use crate::hysteria2::auth::{self, H3Session};
 use crate::hysteria2::brutal::BrutalConfig;
 use crate::hysteria2::datagram::{Hysteria2DatagramConnector, Hysteria2DatagramSession};
-use crate::hysteria2::hop::{self, HopSchedule, PortHopper};
+use crate::hysteria2::hop::{HopSchedule, PortHopper, SocketStackFactory};
 use crate::hysteria2::obfs::Obfs;
 use crate::hysteria2::port_set::PortSet;
 use crate::hysteria2::tcp::open_tcp_stream;
@@ -61,7 +64,8 @@ pub struct Hysteria2Connector {
     up_mbps: u64,
     down_mbps: u64,
     obfs: Option<Obfs>,
-    congestion: Arc<dyn ControllerFactory + Send + Sync>,
+    congestion: daer_config::Hysteria2Congestion,
+    brutal: Option<Arc<BrutalConfig>>,
     quic: daer_config::Hysteria2Quic,
     ports: PortSet,
     options: DialerOptions,
@@ -70,19 +74,19 @@ pub struct Hysteria2Connector {
 
 /// An authenticated connection and what the server said about it.
 ///
-/// The **endpoint** is held here, not only the connection: a `quinn::Connection` is a handle, and
-/// dropping the last reference to its `Endpoint` closes every connection on it. That is a quiet
+/// The **endpoint** is held here, not only the connection: a QUIC connection is a handle, and
+/// dropping the last reference to its endpoint closes every connection on it. That is a quiet
 /// failure — `connect` succeeds, then the first stream operation reports "closed" — so the
 /// endpoint lives exactly as long as the session does.
 #[derive(Clone)]
 pub(crate) struct Connection {
-    /// Kept alive for the connection's lifetime; see this struct's own note.
-    _endpoint: quinn::Endpoint,
+    /// Kept alive for the connection's lifetime; owns the underlying QUIC endpoint.
+    _quic: Arc<QuicConnection>,
     /// Kept alive so a hop schedule stops with the session rather than running on.
-    _hopper: Option<Arc<crate::hysteria2::hop::PortHopper>>,
-    /// Kept alive because dropping it closes the QUIC connection (`auth::H3Session`).
+    _hopper: Option<Arc<PortHopper>>,
+    /// Kept alive because dropping it closes the HTTP/3 session.
     _h3: Arc<H3Session>,
-    connection: quinn::Connection,
+    connection: netune_quic::owned::Connection,
     /// Whether the server will relay UDP (`Hysteria-UDP`).
     udp_enabled: bool,
     /// The rate the server will take, in bytes per second; `None` means it did not say.
@@ -165,7 +169,8 @@ impl Hysteria2Connector {
             None => None,
         };
 
-        let congestion = controller_for(params.congestion, params.up_mbps, params.down_mbps)?;
+        let (congestion, brutal) =
+            controller_for(params.congestion, params.up_mbps, params.down_mbps)?;
 
         let server_name = params.sni.unwrap_or(params.server).to_owned();
         Ok(Self {
@@ -178,6 +183,7 @@ impl Hysteria2Connector {
             down_mbps: params.down_mbps,
             obfs,
             congestion,
+            brutal,
             quic: params.quic.clone(),
             ports: params.ports.clone(),
             options,
@@ -220,9 +226,9 @@ impl Hysteria2Connector {
     /// # Why this is not fed into the congestion controller
     ///
     /// The reference applies it *after* authentication, by mutating the live connection
-    /// (`congestion.UseBrutal(conn, actual_tx, …)` in `core/client/client.go`). Quinn fixes its
-    /// controller in `TransportConfig`, which is consumed when the endpoint dials — there is no
-    /// post-handshake hook, and forging one would mean reaching into `quinn-proto`'s private state.
+    /// (`congestion.UseBrutal(conn, actual_tx, …)` in `core/client/client.go`). netune selects
+    /// its controller when the connection is created; there is no post-handshake hook, and
+    /// adding one would make a connection's congestion state mutable outside its owner.
     ///
     /// So Brutal pins to `up-mbps` for the whole session, and this value is reported rather than
     /// silently claimed to be applied. ADR-0029 records the gap instead of asserting a behaviour
@@ -253,150 +259,104 @@ impl Hysteria2Connector {
         Arc::new(Hysteria2DatagramConnector::new(self.clone()))
     }
 
-    /// Builds the QUIC client configuration.
-    ///
-    /// The ALPN is `h3` because the authentication *is* an HTTP/3 request; a node that does
-    /// not see `h3` serves its masquerade page instead of answering `233`, which looks like a
-    /// wrong password.
-    pub(crate) fn client_config(&self) -> Result<quinn::ClientConfig, ProxyProtocolError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut crypto = if self.allow_insecure {
-            rustls::ClientConfig::builder_with_provider(provider)
+    /// Builds the netune QUIC profile this node's connection uses.
+    fn quic_profile(&self) -> Result<QuicProfile, ProxyProtocolError> {
+        let (transport_parameters, keep_alive) = self.transport_profile()?;
+        Ok(QuicProfile {
+            name: "hysteria2",
+            transport_parameters,
+            congestion: match self.congestion {
+                daer_config::Hysteria2Congestion::Bbr => CongestionAlgorithm::Bbr,
+                daer_config::Hysteria2Congestion::Cubic => CongestionAlgorithm::Cubic,
+                daer_config::Hysteria2Congestion::NewReno
+                | daer_config::Hysteria2Congestion::Brutal => CongestionAlgorithm::NewReno,
+            },
+            enable_0rtt: false,
+            path_mtu_discovery: !self.quic.disable_path_mtu_discovery,
+            keep_alive,
+            alpn: vec![b"h3".to_vec()],
+        })
+    }
+
+    /// Builds the `netune_quic::QuicConnector` configured for this Hysteria 2 session, and the
+    /// per-connection socket factory it will call once the target has passed confinement.
+    pub(crate) fn quic_connector(
+        &self,
+    ) -> Result<(QuicConnector, Arc<SocketStackFactory>), ProxyProtocolError> {
+        let profile = self.quic_profile()?;
+        let factory = Arc::new(SocketStackFactory::new(self.obfs.clone()));
+        let socket_config = QuicSocketConfig {
+            mark: self.options.so_mark,
+            ..QuicSocketConfig::default()
+        };
+        let mut connector = QuicConnector::new(profile)
+            .with_socket_config(socket_config)
+            .with_socket_factory(factory.clone());
+        if let Some(brutal) = &self.brutal {
+            connector = connector.with_congestion_factory(brutal.clone());
+        }
+
+        if self.allow_insecure {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let crypto = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .map_err(|error| ProxyProtocolError::Connect(format!("TLS versions: {error}")))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
-                .with_no_client_auth()
-        } else {
-            use rustls_platform_verifier::BuilderVerifierExt;
-            rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|error| ProxyProtocolError::Connect(format!("TLS versions: {error}")))?
-                .with_platform_verifier()
-                .map_err(|error| {
-                    ProxyProtocolError::Connect(format!("platform trust store: {error}"))
-                })?
-                .with_no_client_auth()
-        };
-        crypto.alpn_protocols = vec![b"h3".to_vec()];
+                .with_no_client_auth();
+            connector = connector.with_tls_config(crypto);
+        }
 
-        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .map_err(|error| ProxyProtocolError::Connect(format!("QUIC client crypto: {error}")))?;
-        let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-
-        let transport = self.transport_config()?;
-        config.transport_config(transport);
-        Ok(config)
+        Ok((connector, factory))
     }
 
-    /// Maps the node's `[node.quic]` table onto `quinn::TransportConfig`.
+    /// Maps the node's `[node.quic]` table onto netune's QUIC transport profile.
     ///
-    /// Every field either changes the connection or is not in the model, which is what
-    /// ADR-0006 requires of a key.
-    pub(crate) fn transport_config(
+    /// Every field either changes the connection or is rejected here, which is what ADR-0006
+    /// requires of a key. DPLPMTUD is on by default in netune and `disable-path-mtu-discovery`
+    /// turns it off by advertising the 1200-byte QUIC floor; the owned engine has no GSO, so
+    /// `disable-segmentation-offload` is already true rather than a runtime toggle.
+    pub(crate) fn transport_profile(
         &self,
-    ) -> Result<Arc<quinn::TransportConfig>, ProxyProtocolError> {
-        let mut transport = quinn::TransportConfig::default();
-
-        let idle = if self.quic.max_idle_timeout_ms > 0 {
-            Duration::from_millis(self.quic.max_idle_timeout_ms)
-        } else {
-            Duration::from_secs(30)
-        };
-        transport.max_idle_timeout(Some(idle.try_into().map_err(|error| {
-            ProxyProtocolError::UnsupportedLink(format!(
-                "hysteria2.quic.max-idle-timeout = {}ms is not a valid QUIC idle timeout: \
-                     {error}",
-                self.quic.max_idle_timeout_ms
-            ))
-        })?));
-        // Keep-alives are what stop a NAT from dropping the flow's mapping; the reference
-        // sends one every 10 s by default and the value here follows that, because a
-        // Hysteria node is usually reached through a NAT.
-        let keep_alive = if self.quic.keep_alive_period_ms > 0 {
-            Some(Duration::from_millis(self.quic.keep_alive_period_ms))
-        } else {
-            Some(Duration::from_secs(10))
-        };
-        transport.keep_alive_interval(keep_alive);
-
-        if self.quic.disable_path_mtu_discovery {
-            // `migration` is a server-side knob; on a client, disabling MTUD is what the
-            // reference's `disablePathMTUDiscovery` does. `None` means "use the initial MTU
-            // and do not probe".
-            transport.mtu_discovery_config(None);
-        }
-        transport.enable_segmentation_offload(!self.quic.disable_segmentation_offload);
-
-        if self.quic.init_stream_receive_window > 0 {
-            transport.stream_receive_window(
-                quinn::VarInt::from_u64(self.quic.init_stream_receive_window).map_err(|_| {
-                    ProxyProtocolError::UnsupportedLink(
-                        "hysteria2.quic.init-stream-receive-window is too large for a QUIC \
-                         varint"
-                            .to_owned(),
-                    )
-                })?,
-            );
-        }
-        if self.quic.init_conn_receive_window > 0 {
-            transport.receive_window(
-                quinn::VarInt::from_u64(self.quic.init_conn_receive_window).map_err(|_| {
-                    ProxyProtocolError::UnsupportedLink(
-                        "hysteria2.quic.init-conn-receive-window is too large for a QUIC varint"
-                            .to_owned(),
-                    )
-                })?,
-            );
-        }
+    ) -> Result<(QuicTransportParameters, Option<Duration>), ProxyProtocolError> {
         if self.quic.max_stream_receive_window > 0 || self.quic.max_conn_receive_window > 0 {
-            // quinn's flow control has no separate "max" knob: the window is what it is.
-            // Reporting that rather than silently ignoring the key is the ADR-0006 rule, so
-            // an operator who set it learns it has no effect *here* instead of at 3 a.m.
             return Err(ProxyProtocolError::UnsupportedLink(
                 "hysteria2.quic.max-stream-receive-window / max-conn-receive-window are \
-                 quic-go's growing-window knobs; quinn's flow control uses a fixed window, \
+                 quic-go's growing-window knobs; netune's flow control uses a fixed window, \
                  so set init-stream-receive-window / init-conn-receive-window instead"
                     .to_owned(),
             ));
         }
 
-        transport.congestion_controller_factory(Arc::clone(&self.congestion));
-        Ok(Arc::new(transport))
-    }
-
-    /// Builds the socket stack and the endpoint that sits on top of it.
-    ///
-    /// This is the function ADR-0029 exists for: every datagram layer is installed here and
-    /// `Endpoint::new` is not used at all.
-    async fn endpoint(
-        &self,
-        target: SocketAddr,
-    ) -> Result<(quinn::Endpoint, Option<PortHopper>), ProxyProtocolError> {
-        let is_ipv6 = target.is_ipv6();
-        // ADR-0029's stack: a marked socket, then the obfuscation layer if configured.
-        let socket = hop::build_stack(is_ipv6, self.options.so_mark, self.obfs.as_ref())?;
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )
-        .map_err(|error| ProxyProtocolError::Connect(format!("create quinn endpoint: {error}")))?;
-
-        let schedule =
-            HopSchedule::from_ports(&self.ports).map_err(ProxyProtocolError::UnsupportedLink)?;
-        let hopper = schedule.map(|schedule| {
-            PortHopper::start(
-                endpoint.clone(),
-                target,
-                self.ports.clone(),
-                schedule,
-                self.options.so_mark,
-                self.obfs.clone(),
-            )
+        let mut transport = QuicTransportParameters::default();
+        if self.quic.init_stream_receive_window > 0 {
+            transport.initial_max_stream_data_bidi_local = self.quic.init_stream_receive_window;
+            transport.initial_max_stream_data_bidi_remote = self.quic.init_stream_receive_window;
+            transport.initial_max_stream_data_uni = self.quic.init_stream_receive_window;
+        }
+        if self.quic.init_conn_receive_window > 0 {
+            transport.initial_max_data = self.quic.init_conn_receive_window;
+        }
+        transport.max_idle_timeout = Some(if self.quic.max_idle_timeout_ms > 0 {
+            Duration::from_millis(self.quic.max_idle_timeout_ms)
+        } else {
+            Duration::from_secs(30)
         });
-        Ok((endpoint, hopper))
+
+        // Keep-alives are what stop a NAT from dropping the flow's mapping; the reference
+        // sends one every 10 s by default and the value here follows that, because a
+        // Hysteria node is usually reached through a NAT.
+        let keep_alive = Some(if self.quic.keep_alive_period_ms > 0 {
+            Duration::from_millis(self.quic.keep_alive_period_ms)
+        } else {
+            Duration::from_secs(10)
+        });
+
+        // `disable-path-mtu-discovery` is consumed by `quic_profile`; the owned engine has no
+        // GSO, so disabling segmentation offload is already true rather than a runtime toggle.
+        let _ = self.quic.disable_segmentation_offload;
+
+        Ok((transport, keep_alive))
     }
 
     /// Resolves the node's first port.
@@ -414,40 +374,60 @@ impl Hysteria2Connector {
     }
 
     /// Gets an authenticated connection or establishes one.
-    pub(crate) async fn get_or_dial(&self) -> Result<Connection, ProxyProtocolError> {
+    ///
+    /// `collector` receives the QUIC handshake marks when an observer installed
+    /// one; an unobserved dial passes the disabled collector and no trace is
+    /// allocated.
+    pub(crate) async fn get_or_dial(
+        &self,
+        collector: &TraceCollector,
+    ) -> Result<Connection, ProxyProtocolError> {
         let mut state = self.state.lock().await;
         if let Some(connection) = state.as_ref()
-            && connection.connection.close_reason().is_none()
+            && !connection.connection.is_closed()
         {
             return Ok(connection.clone());
         }
 
         let target = self.resolve().await?;
-        let (endpoint, hopper) = self.endpoint(target).await?;
-        let config = self.client_config()?;
-        let connecting = endpoint
-            .connect_with(config, target, &self.server_name)
-            .map_err(|error| ProxyProtocolError::Connect(format!("quic connect: {error}")))?;
-        let connection = tokio::time::timeout(self.options.timeout, connecting)
+        let schedule =
+            HopSchedule::from_ports(&self.ports).map_err(ProxyProtocolError::UnsupportedLink)?;
+
+        let (connector, factory) = self.quic_connector()?;
+        let trace = collector.is_enabled().then(|| collector.clone());
+        let connect_fut = connector.connect(target, &self.server_name, trace);
+        let quic = tokio::time::timeout(self.options.timeout, connect_fut)
             .await
             .map_err(|_| ProxyProtocolError::Timeout)?
             .map_err(|error| {
                 ProxyProtocolError::Connect(format!("quic connection failed: {error}"))
             })?;
 
-        // `pin-sha256` is a post-handshake digest check, which is what the reference does:
-        // the certificate is already verified by the chain, and the pin is a second factor.
+        let hopper = match schedule {
+            Some(schedule) => {
+                let stack = factory.take().ok_or_else(|| {
+                    ProxyProtocolError::Connect(
+                        "the QUIC connector completed without creating its socket stack".to_owned(),
+                    )
+                })?;
+                Some(stack.start_hopper(schedule))
+            }
+            None => None,
+        };
+
         if let Some(expected) = self.pin_sha256 {
-            verify_pin(&connection, &expected)?;
+            verify_pin(quic.connection(), &expected)?;
         }
 
         // `Hysteria-CC-RX` is this client's *receive* rate in bytes per second, which is the
         // download figure converted from megabits. `0` means "unknown", and the server then
         // uses congestion control against us.
         let server_rx = self.down_mbps.saturating_mul(1_000_000) / 8;
-        let (outcome, h3) = auth::authenticate(&connection, &self.password, server_rx).await?;
+        let (outcome, h3) =
+            auth::authenticate(quic.connection(), &self.password, server_rx, collector).await?;
+        let connection = quic.connection().clone();
         let opened = Connection {
-            _endpoint: endpoint,
+            _quic: Arc::new(quic),
             _hopper: hopper.map(Arc::new),
             _h3: Arc::new(h3),
             connection,
@@ -462,9 +442,9 @@ impl Hysteria2Connector {
     pub async fn connect(
         &self,
         authority: &str,
-        _recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let connection = self.get_or_dial().await?;
+        let connection = self.get_or_dial(recorder).await?;
         let stream = open_tcp_stream(&connection.connection, authority).await?;
         Ok(Established {
             stream: Box::new(stream),
@@ -483,10 +463,10 @@ impl Hysteria2Connector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        _recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let connection = self
-            .get_or_dial()
+            .get_or_dial(recorder)
             .await
             .map_err(|error| NetError::Connect(error.to_string()))?;
         if !connection.udp_enabled {
@@ -505,18 +485,19 @@ impl Hysteria2Connector {
     }
 }
 
-/// Maps the node's congestion choice onto a Quinn controller factory.
+/// Maps the node's congestion choice onto netune's profile algorithm and, for Brutal, its
+/// pluggable-controller seam.
 fn controller_for(
     congestion: daer_config::Hysteria2Congestion,
     up_mbps: u64,
     down_mbps: u64,
-) -> Result<Arc<dyn ControllerFactory + Send + Sync>, ProxyProtocolError> {
+) -> Result<(daer_config::Hysteria2Congestion, Option<Arc<BrutalConfig>>), ProxyProtocolError> {
     use daer_config::Hysteria2Congestion;
 
-    Ok(match congestion {
-        Hysteria2Congestion::Bbr => Arc::new(BbrConfig::default()),
-        Hysteria2Congestion::Cubic => Arc::new(CubicConfig::default()),
-        Hysteria2Congestion::NewReno => Arc::new(NewRenoConfig::default()),
+    match congestion {
+        Hysteria2Congestion::Bbr | Hysteria2Congestion::Cubic | Hysteria2Congestion::NewReno => {
+            Ok((congestion, None))
+        }
         Hysteria2Congestion::Brutal => {
             // Brutal pins the *send* window, so the number it needs is this client's transmit
             // rate — `up-mbps`, not `down-mbps`. Pinning a sender to its receive rate is the one
@@ -538,9 +519,12 @@ fn controller_for(
                 ));
             }
             let _ = down_mbps;
-            Arc::new(BrutalConfig::from_bits_per_second(bits))
+            Ok((
+                Hysteria2Congestion::Brutal,
+                Some(Arc::new(BrutalConfig::from_bits_per_second(bits))),
+            ))
         }
-    })
+    }
 }
 
 /// Parses `pin-sha256`: 64 hex digits, colons and spaces tolerated.
@@ -573,25 +557,18 @@ fn parse_pin(text: &str) -> Result<[u8; 32], ProxyProtocolError> {
 
 /// Compares the peer's leaf certificate against the configured pin.
 fn verify_pin(
-    connection: &quinn::Connection,
+    connection: &netune_quic::owned::Connection,
     expected: &[u8; 32],
 ) -> Result<(), ProxyProtocolError> {
     use sha2::{Digest as _, Sha256};
 
-    let identity = connection.peer_identity().ok_or_else(|| {
+    let chain = connection.peer_certificates().ok_or_else(|| {
         ProxyProtocolError::Connect(
             "hysteria2.pin-sha256 is set but the QUIC session exposed no peer certificate, so \
              the pin cannot be checked"
                 .to_owned(),
         )
     })?;
-    let chain = identity
-        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-        .map_err(|_| {
-            ProxyProtocolError::Connect(
-                "the QUIC session's peer identity is not a certificate chain".to_owned(),
-            )
-        })?;
     let leaf = chain.first().ok_or_else(|| {
         ProxyProtocolError::Connect("the QUIC peer presented an empty certificate chain".to_owned())
     })?;
@@ -703,9 +680,6 @@ mod tests {
 
         // `down-mbps` alone is refused, not silently substituted.
         //
-        // `expect_err` cannot be used: the `Ok` side is `Arc<dyn ControllerFactory>`, which has no
-        // `Debug`. A test helper that unwrapped by hand would hide the very case being asserted, so
-        // the match is explicit.
         let error = match controller_for(daer_config::Hysteria2Congestion::Brutal, 0, 200) {
             Ok(_) => panic!("brutal with only down-mbps must be refused, not built"),
             Err(error) => error,
@@ -823,8 +797,8 @@ mod tests {
     }
 
     #[test]
-    fn a_quic_knob_quinn_cannot_honour_is_a_load_error_rather_than_ignored() {
-        // ADR-0006: a key the schema accepts must take effect or not exist. quinn's flow
+    fn a_quic_knob_netune_cannot_honour_is_a_load_error_rather_than_ignored() {
+        // ADR-0006: a key the schema accepts must take effect or not exist. netune's flow
         // control has no growing window, so `max-stream-receive-window` cannot mean what the
         // reference means by it — and silently ignoring it is what this test forbids.
         const GROWING: daer_config::Hysteria2Quic = daer_config::Hysteria2Quic {
@@ -847,7 +821,7 @@ mod tests {
         )
         .expect("construction succeeds; the error is at config build");
         let error = connector
-            .transport_config()
+            .transport_profile()
             .expect_err("a growing window is not implementable");
         assert!(
             error.to_string().contains("max-stream-receive-window"),
@@ -876,8 +850,34 @@ mod tests {
             options(),
         )
         .expect("builds");
-        connector
-            .transport_config()
+        let (transport, keep_alive) = connector
+            .transport_profile()
             .expect("every knob here is implementable");
+        assert_eq!(transport.initial_max_stream_data_bidi_local, 1_000_000);
+        assert_eq!(transport.initial_max_stream_data_bidi_remote, 1_000_000);
+        assert_eq!(transport.initial_max_data, 2_000_000);
+        assert_eq!(transport.max_idle_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(keep_alive, Some(Duration::from_secs(5)));
+        assert!(
+            !connector
+                .quic_profile()
+                .expect("profile builds")
+                .path_mtu_discovery,
+            "the node asked for fixed-size datagrams, so netune must not probe the path"
+        );
+    }
+
+    #[test]
+    fn path_mtu_discovery_stays_enabled_unless_the_node_disables_it() {
+        // The default is netune's DPLPMTUD path; only an explicit
+        // `disable-path-mtu-discovery = true` may turn it off.
+        let ports = PortSet::single(443);
+        let connector = Hysteria2Connector::new(params(&ports), options()).expect("builds");
+        assert!(
+            connector
+                .quic_profile()
+                .expect("profile builds")
+                .path_mtu_discovery
+        );
     }
 }

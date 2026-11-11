@@ -123,8 +123,8 @@ Four lines must appear, and the fourth is the one that decides whether traffic i
 ```text
 INFO interfaces resolved lan=["eth1"] wan=["eth0"]
 INFO configuration loaded generation=gen1 rules=2 groups=1 nodes=1 build_ms=2
-INFO listening for redirected flows port=12345 so_mark=Some(3566) generation=gen1 …
-INFO datapath attached: redirected flows will be proxied port=12345 device=daer0 peer=daer0peer
+INFO listening for redirected flows port=12345 so_mark=Some(3566) namespace=Some("daer0ns") generation=gen1 …
+INFO datapath attached: redirected flows will be proxied port=12345 namespace=daer0ns device=daer0 peer=daer0peer
 ```
 
 If the fourth line is missing the daemon exits rather than serving — send the error.

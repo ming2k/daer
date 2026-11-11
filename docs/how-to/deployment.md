@@ -7,8 +7,9 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 | Thing | Why |
 | --- | --- |
 | Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
-| `CAP_BPF`, `CAP_NET_ADMIN` | load and attach the datapath; `IP_TRANSPARENT` on the listener |
-| `ip` | creates the `daer0`/`daer0peer` pair |
+| `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` | load and attach the datapath (`CAP_PERFMON` enables the verifier's `allow_ptr_leaks` for variable-offset packet parsing); `IP_TRANSPARENT` on the listeners |
+| `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, move `daer0peer` into it, and `setns` to bind the listeners and attach the peer program (ADR-0038) |
+| `ip` | create the `daer0`/`daer0peer` pair and configure the ingress namespace |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
 | `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from disk, an `http` one is cached under `$XDG_CACHE_HOME/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it to `/var/cache/daer/rules`, which is the only path `ProtectHome=true` leaves writable) |
 
@@ -16,7 +17,7 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 
 ```sh
 cargo xtask ebpf           # -> target/ebpf/datapath.o  (needs clang + a vmlinux.h tree)
-cargo build --release      # -> target/release/daer
+cargo build --release      # -> target/release/daer and target/release/daer-drb
 ```
 
 `cargo xtask ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
@@ -89,9 +90,13 @@ Startup, in order, with the log line that proves each step:
 ```text
 INFO interfaces resolved lan=["eth0"] wan=["eth1"]
 INFO configuration loaded generation=gen1 rules=2 groups=1 nodes=1 build_ms=3
-INFO listening for redirected flows port=12345 generation=gen1 …
-INFO datapath attached: redirected flows will be proxied port=12345 device=daer0 peer=daer0peer
+INFO listening for redirected flows port=12345 namespace=Some("daer0ns") generation=gen1 …
+INFO datapath attached: redirected flows will be proxied port=12345 namespace=daer0ns device=daer0 peer=daer0peer
 ```
+
+The listener is created inside `daer0ns`, not the host. `ip netns list` shows the namespace
+while the daemon runs, and both `ip link show daer0` and the namespace disappear on a clean
+shutdown.
 
 If the last line is missing, nothing is proxied however healthy the rest looks. `daer run`
 exits rather than serving when it cannot attach; `--no-datapath` is the explicit opt-in to
@@ -133,19 +138,28 @@ was threaded through.
 so-mark = 0x0dae
 ```
 
-`daer run` applies that value in three places and logs it once:
+`daer run` applies that value in every place that creates a socket and logs it once:
 
 ```text
-INFO listening for redirected flows port=12345 so_mark=Some(3566) generation=gen1
+INFO listening for redirected flows port=12345 so_mark=Some(3566) namespace=Some("daer0ns") generation=gen1
 ```
 
 * the generation's dialers (`SocketConfig::mark`, applied **before** `connect(2)`);
-* `PARAM.dae_socket_mark`, which the datapath compares against `skb->mark`;
-* the redirect exclusion, which is the datapath's own check — there is no firewall rule to
-  write for it.
+* the TCP and UDP transparent listener sockets, so accepted replies and datagrams are
+  recognised as daer's own egress;
+* the UDP reply sockets that bind an original destination, created inside `daer0ns`;
+* health-check TCP, HTTP and UDP sockets, so probes are not captured as client flows;
+* `PARAM.socket_mark`, which the datapath compares against `skb->mark`;
+* the redirect exclusion is the datapath's own check — there is no firewall rule to write for
+  it.
 
-The mark is *not* applied by default: `SO_MARK` needs `CAP_NET_ADMIN`, so a default would make
-every unprivileged run fail to dial. Set it in production.
+The ingress policy rule is keyed by `iif daer0peer`, not by the mark: the mark on listener
+replies is what makes the host skip them, and a mark rule inside `daer0ns` would instead route
+those replies to `lo`.
+
+When the datapath is enabled, an absent `global.so-mark` uses the non-zero default `0x0dae`
+because a mark of `0` is exactly the self-capture case. `--no-datapath` uses no mark: nothing
+is redirected, so there is no loop to evade.
 
 ## The redirect and the policy routing
 
@@ -153,20 +167,32 @@ every unprivileged run fail to dial. Set it in production.
 `ip rule` to add by hand: the datapath redirects with `bpf_redirect` into the `daer0`/`daer0peer`
 pair, and `daer` owns the state that makes that work.
 
+The ingress half is not in the host namespace. `daer0peer`, both transparent listeners, the
+policy table, and the peer's sysctls live in the private namespace `daer0ns`; `daer0` and the
+host forwarding path stay in the host. A redirected packet crosses the namespace boundary on
+its way to the listener, which is what makes `bpf_sk_assign` land in a socket the transport
+stack accepts.
+
 What it sets up, in order, before the first flow is served:
 
-| State | Why |
-| --- | --- |
-| `daer0` / `daer0peer` veth pair, both up | the redirect target, and the path the listener is reachable through |
-| `ip rule add fwmark 0x8000000/0x8000000 table 2023` (v4 and v6) | a redirected packet carries a **non-local** destination; the rule is what sends it to a `local` route instead of the forward path |
-| `ip route add local default dev lo table 2023` (v4 and v6) | the destination of that route |
-| `net.ipv4.conf.daer0peer.rp_filter = 0` | reverse-path filtering would drop a packet with a non-local source before `bpf_sk_assign` could deliver it |
-| `net.ipv4.conf.daer0peer.forwarding = 1`, `net.ipv4.conf.all.forwarding = 1` | the gateway role |
-| TC classifiers on every `lan`/`wan` interface | see below |
-| `listen_socket_map` entries `0` (tcp4), `1` (**udp**), `2` (tcp6) | `assign_listener` looks the socket up by key; an empty slot is a flow the datapath has already taken off the direct path and then drops |
+| State | Namespace | Why |
+| --- | --- | --- |
+| `daer0` / `daer0peer` veth pair, both up | host / ingress | the redirect target, and the path the listener is reachable through |
+| `ip rule add iif daer0peer table 2023` (v4 and v6) | ingress | a packet arriving on the private peer is ours; keying by interface is what distinguishes a redirect from a marked listener reply |
+| `ip route add local default dev lo table 2023` (v4 and v6) | ingress | the destination of that rule; a redirected packet has a **non-local** destination and must reach the local stack |
+| `169.254.0.11/32` on `daer0peer`, a link route to `169.254.0.1`, a default route through it, and a permanent neighbor for `daer0`'s MAC | ingress | listener replies use the client's original destination as their source and need an output route back through the host |
+| `net.ipv4.conf.daer0{peer,}.rp_filter = 0`, `net.ipv4.conf.all.rp_filter = 0` | host and ingress | reverse-path filtering would drop a packet with a non-local source before `bpf_sk_assign` could deliver it |
+| `net.ipv4.conf.daer0{peer,}.accept_local = 1` | host and ingress | a host-generated flow's source is a local address on `wlan0`; without this the kernel treats it as a martian source and drops it on `daer0peer` |
+| `net.ipv4.conf.daer0{peer,}.arp_filter = 0`, `net.ipv4.conf.all.arp_filter = 0` | host and ingress | the pair must not filter ARP by the source interface |
+| `net.ipv4.ip_forward = 1`, `net.ipv4.conf.all.forwarding = 1`, `net.ipv4.conf.daer0.forwarding = 1` | host | the reply is forwarded from `daer0` to the client |
+| `net.ipv4.conf.daer0peer.forwarding = 1` | ingress | the namespace gateway role |
+| TC classifiers on every `lan`/`wan` interface | host | see below |
+| `daer0` ingress TC, `daer0peer` ingress TC | host / ingress | the return path and the assign hook live on opposite sides of the boundary |
+| `listen_socket_map` entries `0` (tcp4), `1` (**udp**), `2` (tcp6) | — | `assign_listener` looks the socket up by key; an empty slot is a flow the datapath has already taken off the direct path and then drops |
 
-All of it is removed again when the daemon exits: the rules and routes are owned by a guard
-that deletes them on drop, and the sysctls are restored to whatever they were.
+All of it is removed again when the daemon exits: the namespace guard deletes `daer0ns` (and
+with it the peer and the host end of the pair), the sysctls are restored to whatever they
+were, and a clean shutdown leaves no host table-2023 rule.
 
 ### Which TC program goes on which interface
 
@@ -191,8 +217,9 @@ no parser, rather than guessing.
 
 `--no-datapath` serves the accept/relay path **without attaching anything**. Nothing is
 redirected into the transparent port, so no traffic is proxied: it exists to exercise the
-control plane in a container without `CAP_BPF`/`CAP_NET_ADMIN`, and `daer run` says so at
-`WARN`. It is not a way to run a proxy with a firewall rule instead — the firewall `tproxy`
+control plane without `CAP_BPF`/`CAP_PERFMON`, and `daer run` says so at `WARN`. The transparent listener
+still needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`; use `unshare -Urn` for an unprivileged test.
+It is not a way to run a proxy with a firewall rule instead — the firewall `tproxy`
 path and the eBPF path are alternatives, and this build implements the eBPF one.
 
 ## systemd
@@ -235,15 +262,19 @@ RestartSec=5s
 TimeoutStartSec=120
 TimeoutStopSec=30
 
-# The capabilities the datapath and privileged listeners (e.g. port 53) need.
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# The capabilities the datapath, private ingress namespace, and privileged listeners
+# (e.g. port 53) need. CAP_PERFMON is the verifier's allow_ptr_leaks gate: the fast parser
+# advances a packet pointer by the IPv4 IHL and IPv6 extension-header lengths.
+# CAP_SYS_ADMIN creates and enters daer0ns and mounts its /run/netns entry.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
 # ProtectKernelTunables must remain false: daer needs to tune sysctls on its peer
-# devices (/proc/sys/net/ipv4/conf/daer0peer) and pin eBPF maps to /sys/fs/bpf.
+# devices (/proc/sys/net/ipv4/conf/daer0peer and the ingress namespace) and pin eBPF
+# maps to /sys/fs/bpf.
 ProtectKernelTunables=false
 LockPersonality=true
 RestrictRealtime=true
@@ -251,9 +282,12 @@ PrivateTmp=true
 # The listener and the device pair need the network, so `PrivateNetwork` is off.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# Configuration directory, BPF filesystem, and write access for subscription persistence
+# Configuration directory, BPF filesystem, and write access for subscription persistence.
+# `RuntimeDirectory=netns` creates /run/netns; `ReadWritePaths` keeps it writable under
+# ProtectSystem=strict so `ip netns add` can mount the namespace entry.
 ConfigurationDirectory=daer
-ReadWritePaths=/etc/daer /sys/fs/bpf
+RuntimeDirectory=netns
+ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
 # Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
 # `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is

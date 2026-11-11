@@ -344,16 +344,30 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
                 }
             }
         }
-        if let Some(interval) = provider.interval
-            && interval.as_nanos() <= 0
-        {
-            return Err(ConfigError::new(
-                "rule-provider.interval",
-                format!(
-                    "interval must be positive (got \"{}\") for rule provider {:?}",
-                    interval, provider.tag
-                ),
-            ));
+        if let Some(interval) = provider.interval {
+            // A file provider has no background checks, so an interval on it would be a key
+            // that is accepted and then never acted on. Rejecting it by name is the ADR-0006
+            // "removed" branch: the operator learns the truth at validation time, not by
+            // watching a daemon that silently ignores the declaration.
+            if provider.provider_type == ProviderType::File {
+                return Err(ConfigError::new(
+                    "rule-provider.interval",
+                    format!(
+                        "file provider {:?} must not set 'interval': a file has no background \
+                         checks, so remove the key or declare an http provider",
+                        provider.tag
+                    ),
+                ));
+            }
+            if interval.as_nanos() <= 0 {
+                return Err(ConfigError::new(
+                    "rule-provider.interval",
+                    format!(
+                        "interval must be positive (got \"{}\") for rule provider {:?}",
+                        interval, provider.tag
+                    ),
+                ));
+            }
         }
     }
     Ok(())

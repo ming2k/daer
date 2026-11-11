@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{Client, ClientConfig, Method, Pool, RequestHead, Target, TcpConnector, TlsConnector};
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -216,8 +217,8 @@ impl UpstreamSpec {
             [only] => match only {
                 Protocol::Udp => Arc::new(UdpUpstream::new(self)),
                 Protocol::Tcp => Arc::new(TcpUpstream::new(self)),
-                Protocol::Tls => Arc::new(TlsUpstream::new(self)),
-                Protocol::Https => Arc::new(HttpsUpstream::new(self)),
+                Protocol::Tls => Arc::new(TlsUpstream::new(self)?),
+                Protocol::Https => Arc::new(HttpsUpstream::new(self)?),
             },
             _ => Arc::new(ChainUpstream::new(self)?),
         };
@@ -502,12 +503,16 @@ impl fmt::Debug for TlsUpstream {
 }
 
 impl TlsUpstream {
-    fn new(spec: &UpstreamSpec) -> Self {
+    fn new(spec: &UpstreamSpec) -> Result<Self, UpstreamError> {
         let common = Common::new(spec);
         let connector =
             TlsConnector::platform(TcpConnector::new().with_connect_timeout(Some(common.timeout)))
-                .expect("the platform trust store is available");
-        Self { common, connector }
+                .map_err(|error| {
+                    UpstreamError::Failed(format!(
+                        "DNS-over-TLS needs a platform trust store: {error}"
+                    ))
+                })?;
+        Ok(Self { common, connector })
     }
 
     /// Overrides the exchange timeout.
@@ -534,7 +539,7 @@ impl Upstream for TlsUpstream {
             let address = self.common.address;
             let server_name = self.common.server_name.clone();
             let target = Target::tls(address.to_string(), server_name.clone());
-            let recorder = Arc::new(std::sync::Mutex::new(netune_trace::Recorder::start(16)));
+            let recorder = TraceCollector::disabled();
 
             let exchange = async {
                 let established =
@@ -580,11 +585,15 @@ impl fmt::Debug for HttpsUpstream {
 }
 
 impl HttpsUpstream {
-    fn new(spec: &UpstreamSpec) -> Self {
+    fn new(spec: &UpstreamSpec) -> Result<Self, UpstreamError> {
         let common = Common::new(spec);
         let connector =
             TlsConnector::platform(TcpConnector::new().with_connect_timeout(Some(common.timeout)))
-                .expect("the platform trust store is available");
+                .map_err(|error| {
+                    UpstreamError::Failed(format!(
+                        "DNS-over-HTTPS needs a platform trust store: {error}"
+                    ))
+                })?;
         let config = ClientConfig {
             // A redirect on a DNS endpoint is a configuration error, not a hop to follow:
             // silently querying a different host would send the query somewhere the
@@ -592,11 +601,11 @@ impl HttpsUpstream {
             max_redirects: 0,
             ..ClientConfig::default()
         };
-        Self {
+        Ok(Self {
             common,
             client: Client::new(connector, Pool::default(), config),
             path: spec.path.clone(),
-        }
+        })
     }
 
     /// Overrides the exchange timeout.

@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-11-06
 - Refines: [ADR-0020](0020-datapath-is-daer-own.md)
-- Enforced by: [INV-DATAPATH-ABI-01](../../dev/standards/invariants.md)
+- Enforced by: [INV-DATAPATH-ABI-01](../dev/standards/invariants.md)
 
 ## Context
 

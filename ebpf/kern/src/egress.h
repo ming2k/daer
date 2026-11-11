@@ -200,8 +200,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1))
 		return TC_ACT_SHOT;
-	skb->cb[0] = TPROXY_MARK;
-	skb->cb[1] = tcp_listener_l4proto(tcph);
+	set_tproxy_cb(skb, tcp_listener_l4proto(tcph));
 	return redirect_to_control_plane_egress();
 }
 
@@ -342,8 +341,7 @@ fast_path_skip_routing:
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1))
 		return TC_ACT_SHOT;
-	skb->cb[0] = TPROXY_MARK;
-	skb->cb[1] = IPPROTO_UDP;
+	set_tproxy_cb(skb, IPPROTO_UDP);
 	return redirect_to_control_plane_egress();
 }
 
@@ -437,10 +435,16 @@ int tproxy_lan_wan_egress_l3(struct __sk_buff *skb)
 SEC("classifier/daer0peer_ingress")
 int tproxy_daer0peer_ingress(struct __sk_buff *skb)
 {
+	bump_stat(BPF_STATS_PEER_INGRESS);
 	/* Only packets redirected from wan_egress or lan_ingress have this cb mark.
-   */
-	if (skb->cb[0] != TPROXY_MARK)
+	 * The L4 protocol travels in the high nibble of the same word: cb[1] is
+	 * overwritten by the redirect path on some kernels, and losing it makes
+	 * assign_listener skip the flow entirely. */
+	__u32 cb0 = skb->cb[0];
+	if ((cb0 & 0x0fffffff) != TPROXY_MARK) {
+		bump_stat(BPF_STATS_PEER_INGRESS_UNMARKED);
 		return TC_ACT_SHOT;
+	}
 
 	/* ip rule add fwmark 0x8000000/0x8000000 table 2023
    * ip route add local default dev lo table 2023
@@ -453,10 +457,14 @@ int tproxy_daer0peer_ingress(struct __sk_buff *skb)
 	 * first fragments that still expose those headers). Established TCP can
 	 * return to the stack without bpf_sk_assign.
 	 */
-	__u8 l4proto = skb->cb[1];
-
+	__u32 kind = (cb0 >> 28) & 0xf;
+	__u8 l4proto = kind == 1 ? IPPROTO_TCP : (kind == 2 ? IPPROTO_UDP : 0);
+	if (l4proto == 0)
+		l4proto = skb->cb[1];
 	if (l4proto != 0)
 		assign_listener(skb, l4proto);
+	else
+		bump_stat(BPF_STATS_PEER_INGRESS_NO_L4);
 	return TC_ACT_OK;
 }
 

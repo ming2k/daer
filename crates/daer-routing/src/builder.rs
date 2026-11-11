@@ -234,12 +234,32 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                     Ok(())
                 } else if is_retired_dat_key(key) {
                     Err(retired_dat_key("domain", key))
+                } else if matches!(key, "full" | "suffix" | "domain" | "root_domain") {
+                    Err(RoutingError::new(format!(
+                        "domain({key}: ...): the `{key}:` key is retired (ADR-0036); spell the \
+                         pattern directly — a bare name is a suffix, `.name` is subdomains only, \
+                         `=name` is an exact match"
+                    )))
+                } else if matches!(key, "keyword" | "regex" | "contains") {
+                    Err(RoutingError::new(format!(
+                        "domain({key}: ...): `{key}:` is not a routing predicate (ADR-0031, \
+                         ADR-0033); expand it into concrete names upstream"
+                    )))
                 } else {
-                    // The rule spells `domain(suffix: a, full: b)`; hand the sink complete
-                    // patterns rather than a key it would have to reassemble.
+                    // Hand the sink complete patterns rather than a key it would have to
+                    // reassemble. A bare param (`domain(example.com)`) and an exact prefix
+                    // (`domain(=example.com)`) carry their spelling verbatim so
+                    // `DomainTable::compile` classifies them under CRS v2 (ADR-0036).
                     let patterns: Vec<String> = values
                         .iter()
-                        .map(|value| format!("{key}:{value}"))
+                        .map(|value| {
+                            let trimmed = value.trim();
+                            if key.is_empty() || trimmed.starts_with('=') {
+                                trimmed.to_string()
+                            } else {
+                                format!("{key}:{trimmed}")
+                            }
+                        })
                         .collect();
                     self.sink.add_domain(negated, &patterns, target)
                 }
@@ -785,8 +805,9 @@ mod tests {
     ///
     /// The old matcher refused `domain(example.com)` and demanded `domain(suffix: example.com)`,
     /// which meant the same text had two meanings depending on whether it came from a config
-    /// rule or a `.rules` file. One vocabulary (ADR-0033) makes the bare name mean the suffix it
-    /// obviously reads as, and keeps the explicit spelling working.
+    /// rule or a `.rules` file. One vocabulary (ADR-0033, ADR-0036) makes the bare name mean the
+    /// suffix it obviously reads as: bare is a suffix, `.name` is subdomains only, `=name` is
+    /// exact.
     #[test]
     fn a_bare_domain_is_a_suffix() {
         let bare = rules("routing { domain(example.com) -> direct }");
@@ -794,29 +815,73 @@ mod tests {
         RulesBuilder::new(&mut sink)
             .apply(&bare)
             .expect("a bare name is a suffix");
+        match &sink.matches[0].value {
+            crate::matcher::MatchValue::Domain(table) => {
+                assert!(
+                    table.matches("example.com"),
+                    "suffix includes the bare name"
+                );
+                assert!(table.matches("www.example.com"));
+                assert!(table.patterns().iter().any(|p| p.as_ref() == "example.com"));
+            }
+            other => panic!("expected a domain table, got {other:?}"),
+        }
 
-        let explicit = rules("routing { domain(suffix: example.com) -> direct }");
+        let sub_only = rules("routing { domain(.corp.example) -> direct }");
         let mut sink = RecordingSink::default();
         RulesBuilder::new(&mut sink)
-            .apply(&explicit)
-            .expect("the explicit spelling still works");
+            .apply(&sub_only)
+            .expect("leading dot is subdomains only");
+        match &sink.matches[0].value {
+            crate::matcher::MatchValue::Domain(table) => {
+                assert!(table.matches("a.corp.example"));
+                assert!(
+                    !table.matches("corp.example"),
+                    "`.corp.example` excludes the bare name"
+                );
+            }
+            other => panic!("expected a domain table, got {other:?}"),
+        }
+
+        let exact = rules("routing { domain(=exact.example.com) -> direct }");
+        let mut sink = RecordingSink::default();
+        RulesBuilder::new(&mut sink)
+            .apply(&exact)
+            .expect("equals prefix compiles as exact match");
+        // The single lowered set must carry an exact-match domain table.
+        assert_eq!(sink.matches.len(), 1);
+        match &sink.matches[0].value {
+            crate::matcher::MatchValue::Domain(table) => {
+                assert!(table.matches("exact.example.com"));
+                assert!(
+                    !table.matches("sub.exact.example.com"),
+                    "= must not match a subdomain"
+                );
+                assert!(
+                    table
+                        .patterns()
+                        .iter()
+                        .any(|p| p.as_ref() == "=exact.example.com")
+                );
+            }
+            other => panic!("expected a domain table, got {other:?}"),
+        }
     }
 
     /// A retired key is refused by name and says where it went, rather than matching nothing.
     #[test]
     fn a_removed_domain_key_names_its_replacement() {
-        let retired = rules("routing { domain(regex: ^a.*z$) -> direct }");
-        let mut sink = RecordingSink::default();
-        RulesBuilder::new(&mut sink)
-            .apply(&retired)
-            .expect("compiling is not the failure point");
-        assert!(
-            sink.warnings
-                .iter()
-                .any(|warning| warning.contains("not a routing predicate")),
-            "a removed key must be reported: {:?}",
-            sink.warnings
-        );
+        for spelling in ["regex: ^a.*z$", "suffix: example.com", "full: example.com"] {
+            let retired = rules(&format!("routing {{ domain({spelling}) -> direct }}"));
+            let mut sink = RecordingSink::default();
+            let error = RulesBuilder::new(&mut sink)
+                .apply(&retired)
+                .expect_err("a retired key must be refused");
+            assert!(
+                error.to_string().contains("ADR-0033") || error.to_string().contains("ADR-0036"),
+                "the error must name the fix: {error} ({spelling})"
+            );
+        }
     }
 
     #[test]
@@ -856,7 +921,7 @@ mod tests {
     #[test]
     fn validation_sink_accepts_valid_rules() {
         let rules = rules(
-            "routing { domain(suffix:example.com) && l4proto(tcp, udp) && mac('aa:bb:cc:dd:ee:ff') -> group(mark: 1) }",
+            "routing { domain(example.com) && l4proto(tcp, udp) && mac('aa:bb:cc:dd:ee:ff') -> group(mark: 1) }",
         );
         let mut sink = ValidationSink::default();
         RulesBuilder::new(&mut sink)

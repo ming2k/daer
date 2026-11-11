@@ -17,7 +17,7 @@ systemd unit, which this page deliberately does not repeat.
 | Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
 | `clang` | compiles `ebpf/kern` — there is no prebuilt object in the repository |
 | `bpftool` | dumps the per-kernel `vmlinux.h` the datapath includes |
-| `CAP_BPF` + `CAP_NET_ADMIN` | only for the privileged gates in §4; building and the unprivileged gates need nothing |
+| `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON` + `CAP_SYS_ADMIN` | only for the privileged gates in §4; building and the unprivileged gates need nothing. The first three load/attach the datapath; `CAP_SYS_ADMIN` creates and enters the private ingress namespace (ADR-0038) |
 
 ---
 
@@ -71,7 +71,13 @@ daer run -c config.toml --dry-run --object target/ebpf/datapath.o
 That is the unprivileged half of the verification split in ADR-0029: it builds the generation,
 validates the object against the ABI, computes the runtime parameter and reports which
 capabilities the next phase would need — and returns before the port is bound, the device pair is
-created, any sysctl or policy route is written, or `bpf()` is called.
+created, the private ingress namespace exists, any sysctl or policy route is written, or `bpf()` is
+called.
+
+A real run creates `daer0ns` and moves `daer0peer` into it before binding the listeners. If the
+listener and the packet are in different namespaces, `bpf_sk_assign` can report success and the
+transport stack still answers `NO_SOCKET`; the namespace is a prerequisite, not an optimization.
+`ip netns list`, `ip -n daer0ns link`, and `ip -n daer0ns route` are the topology checks.
 
 ---
 

@@ -9,9 +9,7 @@ repository.workspace = true
 description = "DNS controller, transports and cache for daer"
 
 [dependencies]
-daer-common.workspace = true
 daer-config.workspace = true
-daer-routing.workspace = true
 bytes.workspace = true
 ipnet.workspace = true
 libc.workspace = true

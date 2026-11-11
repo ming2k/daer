@@ -73,16 +73,19 @@ enum Command {
         /// Serve without attaching the kernel program.
         ///
         /// Nothing is redirected into the transparent port in this mode, so no traffic is
-        /// proxied: it exists to exercise the accept/relay path without `CAP_NET_ADMIN`.
+        /// proxied: it exists to exercise the accept/relay path without `CAP_BPF`,
+        /// `CAP_PERFMON` or `CAP_SYS_ADMIN`. The transparent listener still needs
+        /// `CAP_NET_ADMIN` to bind `IP_TRANSPARENT`.
         #[arg(long)]
         no_datapath: bool,
         /// Report what would happen, and change nothing.
         ///
         /// Resolves the configuration, builds the generation, validates the object against
         /// the ABI, computes the runtime parameter and reports the capabilities the next
-        /// phase would need — then exits before the port is bound, the device pair is
-        /// created, any sysctl or policy route is written, or `bpf()` is called. It needs no
-        /// capability, which is what makes it usable as a deployment gate (ADR-0029).
+        /// phase would need — then exits before the port is bound, the device pair or private
+        /// ingress namespace is created, any sysctl or policy route is written, or `bpf()` is
+        /// called. It needs no capability, which is what makes it usable as a deployment gate
+        /// (ADR-0029).
         ///
         /// It is not `--no-datapath`: that one serves and skips only the kernel half.
         #[arg(long)]
@@ -1061,7 +1064,7 @@ mod tests {
         let cn_ip = dir.0.join("geoip-cn.drb");
         for (path, rules) in [
             (&private, "ip: 10.0.0.0/8\nip: 192.168.0.0/16\n"),
-            (&cn, "suffix: example.cn\n"),
+            (&cn, "example.cn\n"),
             (&cn_ip, "ip: 1.2.3.0/24\n"),
         ] {
             let set = daer_routing::DrbSet::from_text(
@@ -1077,22 +1080,27 @@ mod tests {
         let mut text = EXAMPLE_TOML.to_owned();
         for (tag, path) in [("private", &private), ("cn", &cn), ("cn-ip", &cn_ip)] {
             let marker = format!("[[rule-provider]]\ntag = \"{tag}\"\ntype = \"http\"");
-            let replacement = format!(
-                "[[rule-provider]]\ntag = \"{tag}\"\ntype = \"file\"\npath = \"{}\"",
-                path.display()
+            let start = text.find(&marker).unwrap_or_else(|| {
+                panic!("the shipped example must still declare provider {tag:?} as HTTP: {text}")
+            });
+            let end = text[start + marker.len()..]
+                .find("[[rule-provider]]")
+                .map_or(text.len(), |offset| start + marker.len() + offset);
+            let mut block = text[start..end].to_owned();
+            block = block.replace(
+                &marker,
+                &format!(
+                    "[[rule-provider]]\ntag = \"{tag}\"\ntype = \"file\"\npath = \"{}\"",
+                    path.display()
+                ),
             );
-            assert!(
-                text.contains(&marker),
-                "the shipped example must still declare provider {tag:?} as HTTP: {text}"
-            );
-            text = text.replace(&marker, &replacement);
-            // The block's `url` and `interval` lines are meaningless for a `file` provider:
-            // comment them out rather than delete them, so the example still reads as the
-            // declaration it started as.
-            text = text.replace(
-                &format!("\ntype = \"file\"\npath = \"{}\"\nurl = ", path.display()),
-                &format!("\ntype = \"file\"\npath = \"{}\"\n#url = ", path.display()),
-            );
+            // `url` and `interval` are meaningless for a `file` provider: comment them out
+            // rather than delete them, so the example still reads as the declaration it
+            // started as. Validation rejects `interval` on a file provider by name instead of
+            // accepting a key it would never act on (ADR-0006), so both must go.
+            block = block.replace("\nurl = ", "\n#url = ");
+            block = block.replace("\ninterval = ", "\n#interval = ");
+            text = format!("{}{}{}", &text[..start], block, &text[end..]);
         }
         dir.write("config.toml", text.as_bytes())
     }
@@ -1762,7 +1770,7 @@ fallback = "direct"
     #[test]
     fn rule_provider_integration_with_routing_and_explain() {
         let dir = TempDir::new("rule-provider-routing");
-        let _rules_file = dir.write("direct.rules", b"ip: 192.168.100.0/24\nsuffix: corp.lan\n");
+        let _rules_file = dir.write("direct.rules", b"ip: 192.168.100.0/24\ncorp.lan\n");
         let config = dir.write(
             "config.toml",
             br#"

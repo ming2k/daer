@@ -10,7 +10,9 @@ Before starting, ensure your system has:
 - Linux kernel 5.17 or newer (with BTF enabled at `/sys/kernel/btf/vmlinux`).
 - Clang and LLVM (`clang`, `llvm-strip`).
 - Rust 1.95+ toolchain.
-- Root or `CAP_BPF` and `CAP_NET_ADMIN` privileges.
+- Root or `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` and `CAP_SYS_ADMIN` privileges. The
+  last one creates the private `daer0ns` ingress namespace; without it redirected packets
+  cannot be assigned to the listener.
 
 ---
 
@@ -88,7 +90,8 @@ Look for the startup log confirming the datapath attachment:
 ```text
 INFO interfaces resolved lan=["eth0"] wan=["eth1"]
 INFO listening for redirected flows port=12345 ...
-INFO datapath attached: redirected flows will be proxied port=12345 device=daer0 peer=daer0peer
+INFO listening for redirected flows port=12345 namespace=Some("daer0ns") generation=gen1
+INFO datapath attached: redirected flows will be proxied port=12345 namespace=daer0ns device=daer0 peer=daer0peer
 ```
 
 ---

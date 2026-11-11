@@ -26,7 +26,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: anytls | ✅ multiplexed session, framing, datagrams |
 | Outbound: **vless as orthogonal layers** | ✅ per [ADR-0028](../adr/0028-protocol-layering.md): transport (`tcp`, `ws`) × security (`none`, `tls`, `reality`) × flow (`none`, `xtls-rprx-vision`). `tests/layer_matrix.rs` starts one local `xray` with five inbounds and takes a round trip through each reachable row, plus a negative control (a plaintext listener dialled as `security=tls`). Vision over `ws` is **refused at load**: the reference rejects it on both ends ("XTLS only supports TLS and REALITY directly for now"), and the fixture's configured-but-unused inbound is what makes that a test rather than a claim |
 | Outbound: **vmess AEAD** | ✅ per [ADR-0030](../adr/0030-vmess-aead-only.md): the reference's aliasing-hasher KDF (six vectors taken from `aead.KDF` itself), `AuthID`, the sealed header, the three size modes, both ciphers and both data planes. `tests/vmess_live.rs` takes a round trip through a real `xray` VMess inbound for `auto`/`aes-128-gcm`/`chacha20-poly1305`, with `AuthenticatedLength` on and off, and over `ws`. The legacy handshake is not expressible: a non-zero `aid` is a load error |
-| Outbound: **hysteria2, complete** | ✅ per [ADR-0029](../adr/0029-hysteria2-socket-stack.md): Salamander and Gecko on the datagram path (the `obfs` key used to be parsed and never applied — the defect the ADR exists for), per-flow session ids, fragmentation/reassembly, `Hysteria-UDP`/`Hysteria-CC-RX` honoured, Brutal congestion control, and port hopping via `Endpoint::rebind_abstract`. `tests/hysteria2_live.rs` starts the reference server itself — including one configured **with** Salamander, so the obfuscation is proven on the wire, not in a struct |
+| Outbound: **hysteria2, complete** | ✅ per [ADR-0029](../adr/0029-hysteria2-socket-stack.md): Salamander and Gecko on the datagram path (the `obfs` key used to be parsed and never applied — the defect the ADR exists for), per-flow session ids, fragmentation/reassembly, `Hysteria-UDP`/`Hysteria-CC-RX` honoured, Brutal congestion control, and source-port hopping through netune's `QuicUdpSocket` seam. `tests/hysteria2_live.rs` starts the reference server itself — including one configured **with** Salamander, so the obfuscation is proven on the wire, not in a struct |
 | Outbound: `tuic` | ⬜ the one family left: not implemented, listed and reported as unselectable |
 | Outbound: `[global.tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
@@ -87,7 +87,8 @@ identifiers belong to another project.
 The largest piece. Order matters: this is what makes the binary useful.
 
 1. **Ingress and relay** ✅ — `daer-relay` (ADR-0018): transparent listener
-   (`IP_TRANSPARENT` for both families, `SO_REUSEPORT` for reload handover),
+   (`IP_TRANSPARENT` for both families; no `SO_REUSEPORT`, because `bpf_sk_assign`
+   names the exact listener),
    original destination from the accepted socket, self-connect rejection,
    half-close-correct relay, accept loop with resource-exhaustion backoff and live
    counters. The loop is driven through `Ingress`/`Decide` traits, so its failure
@@ -313,10 +314,11 @@ netune's `Connector` seam. Chained links (`a -> b`) are refused at load rather t
 truncated. Shadowsocks 2022 is a separate protocol revision, not a cipher, and is not
 implemented.
 
-The last two are QUIC-based. UDP is no longer the blocker — netune owns datagrams
-(ADR-0008) — but a QUIC stack is, plus (for hysteria2) a pluggable congestion controller
-that stock implementations do not expose. That is a dependency decision to record before
-starting them.
+The last two are QUIC-based. Both blockers are closed: netune owns datagrams
+(ADR-0008) and first-class QUIC/HTTP-3 client transport (netune ADR-0016), and
+hysteria2 already composes its Salamander/Gecko socket layers, port hopping and
+Brutal controller over `netune-quic` (daer ADR-0035). tuic remains ordinary protocol
+work rather than a dependency decision.
 
 **Exit:** the eight protocols above interoperate against reference servers.
 
@@ -334,15 +336,17 @@ rather than per component.
 
 ## 7. Observability and trace 🟡
 
-Latency tables and health-check statistics exist. Remaining: the event ring
-consumer, per-flow traces, and the `trace` feature (needs
-`bpf_trace_printk`).
+Latency tables and health-check statistics exist, and an observed dial now keeps
+one netune `TraceCollector` with a `DialObserverSink`: DNS/TCP/TLS phases are
+derived from the transport's own events instead of a wall-clock span. Dials with
+no observer use `TraceCollector::disabled()`, so the per-flow path pays nothing.
+Remaining: per-flow traces and the `trace` feature (needs `bpf_trace_printk`).
 
 ## Open decisions
 
 | Decision | Impact | Where |
 | --- | --- | --- |
 | Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | [`netune-requests.md`](netune-requests.md) |
-| QUIC implementation for hysteria2/tuic | new dependency, affects the "no third-party HTTP/TLS" rule | milestone 5 |
+| QUIC implementation for hysteria2/tuic | **resolved** — netune owns the QUIC/H3 client transport (netune ADR-0016); daer consumes `netune-quic`/`netune-http3` and keeps only product protocol layers (ADR-0035) | milestone 5 |
 | Matcher data structures | performance ceiling of the data path | milestone 6 |
 | Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/transparent.rs`, `scripts/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |

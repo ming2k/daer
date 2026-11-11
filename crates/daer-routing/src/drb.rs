@@ -10,7 +10,7 @@
 //!   shared prefix front-coded away, plus a 64-entry rank index that narrows the search to a
 //!   contiguous span. Reverse-label sorting is what makes both properties true at once: a
 //!   suffix rule sits next to the names it covers, so a scan of the span answers
-//!   `suffix: example.com` for `www.example.com` by walking left until the key no longer matches.
+//!   `example.com` for `www.example.com` by walking left until the key no longer matches.
 //!
 //! # Why not a radix trie
 //!
@@ -70,6 +70,7 @@ pub enum DrbError {
     },
     InvalidUtf8(&'static str),
     InvalidInterval(&'static str),
+    InvalidLayout(&'static str),
     ParseError(String),
 }
 
@@ -98,6 +99,7 @@ impl fmt::Display for DrbError {
             ),
             Self::InvalidUtf8(field) => write!(f, "invalid UTF-8 string in DRB {field}"),
             Self::InvalidInterval(reason) => write!(f, "invalid interval in DRB: {reason}"),
+            Self::InvalidLayout(reason) => write!(f, "invalid DRB layout: {reason}"),
             Self::ParseError(msg) => write!(f, "failed to parse rule text: {msg}"),
         }
     }
@@ -144,6 +146,39 @@ pub struct DrbSummary {
     pub v6_intervals: usize,
     pub domain_patterns: usize,
     pub file_size: usize,
+}
+
+/// Returns a range inside the artifact's payload, refusing offsets that point into the
+/// header or past the end of the file.
+///
+/// A `.drb` artifact is downloaded from a provider, so every offset and count in its header
+/// is untrusted input. The checksum covers the payload only, which means it cannot protect the
+/// header itself; without this check a corrupted offset is a panic in the daemon rather than a
+/// rejected rule set.
+fn payload_slice<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    length: usize,
+    field: &'static str,
+) -> Result<&'a [u8], DrbError> {
+    let Some(payload) = bytes.get(DRB_HEADER_SIZE..) else {
+        return Err(DrbError::Truncated {
+            field,
+            needed: DRB_HEADER_SIZE,
+            available: bytes.len(),
+        });
+    };
+    let Some(start) = offset.checked_sub(DRB_HEADER_SIZE) else {
+        return Err(DrbError::InvalidLayout(field));
+    };
+    let Some(end) = start.checked_add(length) else {
+        return Err(DrbError::InvalidLayout(field));
+    };
+    payload.get(start..end).ok_or(DrbError::Truncated {
+        field,
+        needed: length,
+        available: payload.len().saturating_sub(start),
+    })
 }
 
 impl DrbSet {
@@ -316,12 +351,16 @@ impl DrbSet {
             });
         }
 
-        let name = std::str::from_utf8(&bytes[name_offset..name_offset + name_len])
+        let name = payload_slice(bytes, name_offset, name_len, "name")?;
+        let name = std::str::from_utf8(name)
             .map_err(|_| DrbError::InvalidUtf8("name"))?
             .to_owned();
 
+        let v4_bytes = v4_count
+            .checked_mul(8)
+            .ok_or(DrbError::InvalidLayout("IPv4 interval count overflows"))?;
         let mut v4_intervals = Vec::with_capacity(v4_count);
-        let mut cur = &bytes[v4_offset..v4_offset + v4_count * 8];
+        let mut cur = payload_slice(bytes, v4_offset, v4_bytes, "IPv4 intervals")?;
         for _ in 0..v4_count {
             let start = u32::from_le_bytes(cur[0..4].try_into().unwrap());
             let end = u32::from_le_bytes(cur[4..8].try_into().unwrap());
@@ -332,8 +371,11 @@ impl DrbSet {
             v4_intervals.push((start, end));
         }
 
+        let v6_bytes = v6_count
+            .checked_mul(32)
+            .ok_or(DrbError::InvalidLayout("IPv6 interval count overflows"))?;
         let mut v6_intervals = Vec::with_capacity(v6_count);
-        let mut cur = &bytes[v6_offset..v6_offset + v6_count * 32];
+        let mut cur = payload_slice(bytes, v6_offset, v6_bytes, "IPv6 intervals")?;
         for _ in 0..v6_count {
             let start = u128::from_le_bytes(cur[0..16].try_into().unwrap());
             let end = u128::from_le_bytes(cur[16..32].try_into().unwrap());
@@ -344,10 +386,8 @@ impl DrbSet {
             v6_intervals.push((start, end));
         }
 
-        let domains = DomainTable::decode_records(
-            &bytes[domain_offset..domain_offset + records_bytes],
-            domain_count,
-        )?;
+        let records = payload_slice(bytes, domain_offset, records_bytes, "domain records")?;
+        let domains = DomainTable::decode_records(records, domain_count)?;
 
         Ok(Self {
             name,
@@ -559,9 +599,9 @@ mod tests {
         let text = "name: corp\n\
                     ip: 192.168.1.0/24\n\
                     ip: 10.0.0.1\n\
-                    full: api.internal.local\n\
-                    suffix: example.com\n\
-                    suffix: .sub.example.com\n";
+                    =api.internal.local\n\
+                    example.com\n\
+                    .sub.example.com\n";
         let set = DrbSet::from_text("corp", text).expect("parses");
         let bytes = set.encode();
         let decoded = DrbSet::decode(&bytes).expect("decodes");
@@ -570,12 +610,8 @@ mod tests {
 
     #[test]
     fn an_enclosing_suffix_absorbs_the_names_it_covers() {
-        // `suffix: example.com` already answers all three; storing them would be dead weight.
-        let set = DrbSet::from_text(
-            "t",
-            "suffix: example.com\nfull: a.example.com\nsuffix: b.example.com\n",
-        )
-        .unwrap();
+        // `example.com` already answers all three; storing them would be dead weight.
+        let set = DrbSet::from_text("t", "example.com\n=a.example.com\nb.example.com\n").unwrap();
         assert_eq!(
             set.domain_patterns(),
             1,
@@ -588,7 +624,7 @@ mod tests {
 
     #[test]
     fn a_subdomains_only_suffix_does_not_cover_the_bare_name() {
-        let set = DrbSet::from_text("t", "suffix: .corp.example\n").unwrap();
+        let set = DrbSet::from_text("t", ".corp.example\n").unwrap();
         assert!(set.matches_domain("a.corp.example"));
         assert!(
             !set.matches_domain("corp.example"),
@@ -599,9 +635,9 @@ mod tests {
     #[test]
     fn lookups_agree_with_the_rules_that_produced_them() {
         let text = "name: t\n\
-                    suffix: example.com\n\
-                    suffix: .only-sub.example.org\n\
-                    full: exact.example.com\n";
+                    example.com\n\
+                    .only-sub.example.org\n\
+                    =exact.example.com\n";
         let set = DrbSet::from_text("t", text).unwrap();
 
         assert!(
@@ -610,7 +646,7 @@ mod tests {
         );
         assert!(set.matches_domain("www.example.com"));
         assert!(set.matches_domain("a.b.example.com"));
-        assert!(set.matches_domain("exact.example.com"), "full is stored");
+        assert!(set.matches_domain("exact.example.com"), "= exact is stored");
         assert!(
             !set.matches_domain("only-sub.example.org"),
             "subdomains-only must not match the bare name"
@@ -622,7 +658,7 @@ mod tests {
     #[test]
     fn front_coding_survives_a_key_that_is_a_prefix_of_the_next() {
         // `com.a` and `com.ab` share three bytes; decoding must not confuse them.
-        let set = DrbSet::from_text("t", "full: a.com\nfull: ab.com\nfull: abc.com\n").unwrap();
+        let set = DrbSet::from_text("t", "=a.com\n=ab.com\n=abc.com\n").unwrap();
         let decoded = DrbSet::decode(&set.encode()).unwrap();
         assert!(decoded.matches_domain("a.com"));
         assert!(decoded.matches_domain("ab.com"));
@@ -640,6 +676,43 @@ mod tests {
             DrbSet::decode(&bytes),
             Err(DrbError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn decoding_rejects_header_offsets_that_point_outside_the_payload() {
+        // The checksum covers the payload, not the header. A provider can serve an artifact
+        // whose offsets are corrupt even though the payload hash still matches, so every
+        // header field must be bounds-checked before it is used as a slice index.
+        let set = DrbSet::from_text("t", "ip: 1.1.1.0/24\nexample.com\n").unwrap();
+        let encoded = set.encode();
+        let header = |absolute: usize, value: u32| {
+            let mut bytes = encoded.clone();
+            bytes[absolute..absolute + 4].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+
+        // Offset into the fixed header is not a payload range.
+        let bytes = header(16, 0);
+        assert!(
+            matches!(DrbSet::decode(&bytes), Err(DrbError::InvalidLayout(_))),
+            "a v4 offset inside the header must be refused"
+        );
+
+        // Out-of-file offset and impossible count both fail closed.
+        for (offset, value, field) in [
+            (16, u32::MAX, "v4 offset"),
+            (20, u32::MAX, "v4 count"),
+            (24, u32::MAX, "v6 offset"),
+            (32, u32::MAX, "domain offset"),
+            (40, u32::MAX, "domain byte count"),
+            (44, u32::MAX, "name offset"),
+        ] {
+            let bytes = header(offset, value);
+            assert!(
+                matches!(DrbSet::decode(&bytes), Err(DrbError::Truncated { .. })),
+                "{field} must be rejected rather than used as a slice index"
+            );
+        }
     }
 
     #[test]

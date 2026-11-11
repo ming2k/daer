@@ -67,6 +67,26 @@ fn object_contains_every_map_we_reference() {
 }
 
 #[test]
+fn the_listener_map_is_a_sockmap_with_fd_sized_values() {
+    let Some(object) = parsed_object() else {
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        return;
+    };
+    let map = &object.maps[daer_ebpf::names::map::LISTEN_SOCKET];
+    assert_eq!(
+        map.map_type(),
+        aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_SOCKMAP as u32,
+        "listen_socket_map must stay a SOCKMAP; bpf_sk_assign looks sockets up there"
+    );
+    assert_eq!(map.key_size(), 4, "SOCKMAP keys are family u32 values");
+    assert_eq!(
+        map.value_size(),
+        4,
+        "SOCKMAP values are socket fds (`int`), not u64; aya and the kernel both reject an 8-byte value"
+    );
+}
+
+#[test]
 fn object_contains_every_program_we_reference() {
     let Some(object) = parsed_object() else {
         eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");

@@ -5,33 +5,24 @@
 //! # Why this exists
 //!
 //! `netune` records every transport step as an event and derives timings from them as pure
-//! functions (netune ADR-0001). `daer` created a `Recorder` per dial and then **dropped it**:
-//! `Recorder::start(64)` appeared in `direct.rs`, `check.rs`, `trojan.rs`, and `datagram.rs`,
-//! and nothing ever read one. The observability was paid for and thrown away, so a node's
-//! measured latency and a failed handshake's phase were both invisible.
+//! functions (netune ADR-0001). A dial that nobody observes used to allocate a throwaway
+//! event ring and then drop it, so the observability was paid for and discarded.
 //!
 //! This module is the consumer side: a [`DialObserver`] is what a dial reports to, and
-//! [`ObservedDialer`] is the seam where a caller installs one.
+//! [`ObservedDialer`] is the seam where a caller installs one. When an observer is present
+//! the dial gets one [`TraceCollector`] with a [`DialObserverSink`] attached; netune's
+//! DNS/TCP/TLS marks stream into the observer and the final log is derived through netune's
+//! own `derive`. When nobody is listening, the dial uses `TraceCollector::disabled()`: no
+//! event is recorded, no sink is installed, and no ring is filled (netune ADR-0017, ADR-0018).
 //!
-//! # What this can and cannot see, and why
-//!
-//! netune's per-event stream (`TraceSink`) is a **netune 0.0.5** capability. With `daer` pinned
-//! to `v0.0.5`, [`DialObserverSink`] bridges netune's trace stream into [`DialObserver::observe`],
-//! while [`ObservedDialer`] measures the overall wall-clock span from "start the dial" to
-//! "the dial returned". That is the number a health check and a "why is this node slow" report
-//! both need.
-//!
-//! What it is **not** is a per-phase breakdown (DNS / TCP / TLS). Claiming one would mean
-//! reading the transport's `Recorder`, which no connector hands back — reaching into seven
-//! connectors to change that would put instrumentation inside the transports, and the phases
-//! netune already derived would still be discarded. The honest statement is in the code and in
-//! the log: this is a total, and the phases are a netune-side capability daer does not yet
-//! consume.
+//! What this cannot see is a proxy protocol's own framing after netune's transport returns:
+//! that work is daer's and is not part of netune's trace vocabulary. The phases that *are*
+//! recorded are reported as phases; no wall-clock span is relabelled as a handshake.
 
 use std::sync::Arc;
 
 pub use netune_trace::TraceSink;
-use netune_trace::{DerivedTimings, Event, derive};
+use netune_trace::{DerivedTimings, Event, EventKind, EventLog, TraceCollector, derive};
 
 /// Where a dial's measurement goes.
 ///
@@ -106,16 +97,20 @@ impl DialObserverSink {
 }
 
 impl TraceSink for DialObserverSink {
-    fn event(&self, event: Event) {
+    fn event(&self, event: Event) -> netune_trace::Flow {
         self.observer.observe(&self.dial, event);
+        // The observer never rejects an event: dropping one would make the trace window
+        // silently narrower than the collector's ring, which is the opposite of what a
+        // consumer of the stream is promised.
+        netune_trace::Flow::Continue
     }
 }
 
 /// A [`DialObserver`] that logs one line per dial and keeps nothing.
 ///
-/// The default the daemon installs: it makes a dial's span visible in the journal without
-/// adding a metrics pipeline, and it is the thing that would have answered "why is this node
-/// slow" during the period when the recorder was discarded.
+/// The default the daemon installs: it makes the recorded phases visible in the journal
+/// without adding a metrics pipeline, and it is the thing that answers "why is this node
+/// slow" when the transport already derived the answer.
 #[derive(Debug, Default)]
 pub struct LogObserver;
 
@@ -129,9 +124,10 @@ impl DialObserver for LogObserver {
         // would make a reused connection look instantaneous rather than not-applicable.
         tracing::debug!(
             dial = %dial,
+            dns_us = ?timings.dns_us.value(),
             tcp_us = ?timings.tcp_us.value(),
             tls_us = ?timings.tls_us.value(),
-            ttfb_us = ?timings.ttfb_us.value(),
+            rtt_us = ?timings.rtt_us.value(),
             "dial finished"
         );
     }
@@ -186,44 +182,54 @@ impl ObservedDialer {
 
     /// Opens a connection, reporting the attempt to the observer when there is one.
     ///
-    /// The span is measured here rather than derived from the transport's recorder: a protocol
-    /// that owns its own `Recorder` (all of them do) does not hand it back, and reaching into
-    /// seven connectors to change that would put instrumentation inside the transports. The
-    /// wall-clock span is the honest number this seam can observe, and it is labelled as such —
-    /// the per-phase breakdown stays netune's, and daer does not yet consume it.
+    /// The collector is installed before the dial, not read after it: netune emits the
+    /// `DnsStart`/`TcpStart`/`TlsStart` marks into it as they happen, so the observer sees the
+    /// stream and the final derivation is over the exact events that produced the connection.
+    /// A dial with no observer uses the disabled collector, so its ring stays empty.
     pub async fn connect(
         &self,
         authority: &str,
     ) -> Result<crate::Established, crate::error::OutboundError> {
+        let dial = self
+            .observer
+            .as_ref()
+            .map(|_| DialId::new(Arc::clone(&self.tag), authority.to_owned()));
+        let collector = match (&self.observer, &dial) {
+            (Some(observer), Some(dial)) => {
+                let sink = DialObserverSink::new(dial.clone(), Arc::clone(observer));
+                TraceCollector::start(64).with_sink(Arc::new(sink))
+            }
+            _ => TraceCollector::disabled(),
+        };
+
         let started = std::time::Instant::now();
-        let result = self.dialer.connect(authority).await;
-        if let Some(observer) = &self.observer {
-            let dial = DialId::new(Arc::clone(&self.tag), authority.to_owned());
+        let result = self
+            .dialer
+            .connect_with_collector(authority, &collector)
+            .await;
+
+        if let (Some(observer), Some(dial)) = (&self.observer, dial) {
+            let log = collector.log();
             let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            observer.finished(&dial, Some(&wall_clock_timings(micros)));
+            let timings = if log.first_of(EventKind::Dispatch).is_some() {
+                trace_timings(log)
+            } else {
+                // A connector that records nothing (or an empty capacity) still owes the
+                // observer a span; keep the old wall-clock fallback, clearly synthetic.
+                wall_clock_timings(micros)
+            };
+            observer.finished(&dial, Some(&timings));
         }
         result
     }
 }
 
-/// A `DerivedTimings` whose TCP phase is the wall-clock span of a whole dial.
+/// Derives timings from the events a dial actually produced.
 ///
-/// # Why a synthetic trace rather than a constructed struct
-///
-/// `DerivedTimings` has private fields and a `Reading` that carries a validity verdict, so the
-/// only way to produce one is through `derive`. Recording a two-event trace (`TcpStart`,
-/// `TcpEnd`) and deriving it keeps the reported shape identical to netune's own: a hand-built
-/// struct would be a second definition of the same type's meaning.
-///
-/// The span covers the whole dial, including TLS and the proxy handshake, because that is what
-/// a health check wants to know. The per-phase split is netune's, in the transport's ring.
-fn wall_clock_timings(micros: u64) -> DerivedTimings {
-    use netune_trace::{EventKind, EventLog};
-    let mut log = EventLog::with_capacity(4);
-    log.push_at(0, EventKind::Dispatch, 0, 0);
-    log.push_at(0, EventKind::TcpStart, 0, 0);
-    // The derivation reads the log; nanoseconds are what the events carry.
-    log.push_at(micros.saturating_mul(1_000), EventKind::TcpEnd, 0, 0);
+/// This is the normal path: the collector's log is the transport's own record, and `derive` is
+/// netune's pure function over it. A phase netune did not record stays
+/// `not_applicable`/`not_estimable` rather than becoming a zero.
+fn trace_timings(log: EventLog) -> DerivedTimings {
     let trace = netune_trace::RequestTrace {
         id: netune_trace::TraceId::new("daer-dial"),
         attempt: netune_trace::AttemptRef {
@@ -237,10 +243,29 @@ fn wall_clock_timings(micros: u64) -> DerivedTimings {
             authority: String::new(),
         },
         connection: netune_trace::ConnectionInfo::default(),
+        // A dial has no request wire identity of its own; the default identity and the
+        // current envelope version keep the derivation comparable with netune's.
+        identity: netune_trace::ConnectionIdentity::default(),
+        schema_version: netune_trace::TRACE_SCHEMA_VERSION,
         fidelity: netune_trace::Fidelity::l0(),
         log,
     };
     derive(&trace)
+}
+
+/// A `DerivedTimings` whose TCP phase is the wall-clock span of a whole dial.
+///
+/// Used only when a collector recorded no `Dispatch` event. `DerivedTimings` cannot be built
+/// field-by-field honestly without a log, so a two-event synthetic trace keeps the reported
+/// shape identical to netune's own derivation. The value is explicitly a fallback, not a
+/// measurement of a TCP handshake.
+fn wall_clock_timings(micros: u64) -> DerivedTimings {
+    let mut log = EventLog::with_capacity(4);
+    log.push_at(0, EventKind::Dispatch, 0, 0);
+    log.push_at(0, EventKind::TcpStart, 0, 0);
+    // The derivation reads the log; nanoseconds are what the events carry.
+    log.push_at(micros.saturating_mul(1_000), EventKind::TcpEnd, 0, 0);
+    trace_timings(log)
 }
 
 #[cfg(test)]
@@ -262,10 +287,29 @@ mod tests {
 
     #[test]
     fn the_wall_clock_timings_carry_the_span_they_were_built_from() {
-        // The number a health check reads: one total, derived through netune's own function so
-        // the type's meaning cannot drift from netune's.
+        // The fallback number a health check reads: one total, derived through netune's own
+        // function so the type's meaning cannot drift from netune's.
         let timings = wall_clock_timings(5_000);
         assert_eq!(timings.tcp_us.value(), Some(5_000));
+    }
+
+    #[test]
+    fn recorded_phases_are_derived_without_inventing_the_absent_ones() {
+        // Positive control: the marks that were recorded become measured phases.
+        let mut log = EventLog::with_capacity(8);
+        log.push_at(0, EventKind::Dispatch, 0, 0);
+        log.push_at(1_000, EventKind::DnsStart, 0, 0);
+        log.push_at(3_000, EventKind::DnsEnd, 0, 0);
+        log.push_at(3_000, EventKind::TcpStart, 0, 0);
+        log.push_at(8_000, EventKind::TcpEnd, 0, 0);
+        let timings = trace_timings(log);
+
+        assert_eq!(timings.dns_us.value(), Some(2));
+        assert_eq!(timings.tcp_us.value(), Some(5));
+
+        // Negative control: no TLS marks means the TLS phase is absent, not 0 µs. A
+        // synthetic zero would make a TLS dial look free and a non-TLS dial look measured.
+        assert_eq!(timings.tls_us.value(), None);
     }
 
     #[test]
@@ -317,6 +361,7 @@ mod tests {
 
         let event = Event {
             at_ns: 1234,
+            stream: 0,
             kind: netune_trace::EventKind::TcpStart,
             a: 0,
             b: 0,

@@ -7,7 +7,7 @@
 //!
 //! | Where | Shape | Example |
 //! | --- | --- | --- |
-//! | `routing.rules` | `predicate && … -> outbound` | `domain(suffix: a.com) && port(443) -> proxy` |
+//! | `routing.rules` | `predicate && … -> outbound` | `domain(a.com) && port(443) -> proxy` |
 //! | `group.filters` | `predicate && …` | `subtag(sub) && !name(keyword: 'ExpireAt:')` |
 //! | `group.policy`, `dns.*.fallback` | name or call | `fixed(0)`, `min-moving-avg` |
 //!

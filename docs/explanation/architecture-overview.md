@@ -43,6 +43,8 @@
    - Traffic requiring proxying is redirected to the transparent proxy port.
 2. **Userspace Data Path (`daer-relay`) and Decision Plane (`daer-control`)**:
    `daer-relay` listens on the transparent port with `IP_TRANSPARENT`, recovers original destination IPs via `getsockopt(SO_ORIGINAL_DST)`, sniffs early domain names from TLS ClientHello or HTTP headers, and relays payload streams via zero-copy `splice(2)`. It decides nothing: `daer-control` resolves each flow to an outbound (a rule, a group and a node) and hands back the other leg (ADR-0018).
+3. **Private ingress namespace (`daer0ns`, ADR-0038)**:
+   `daer0peer`, the transparent listeners, table 2023 and the peer sysctls live in a private network namespace. The host keeps `daer0`, forwarding and the redirect hooks. A redirected packet crosses the namespace boundary before `bpf_sk_assign`; without that context the transport stack can return `NO_SOCKET` even when the helper succeeded. Listener replies use the peer's return route and are marked so the host treats them as daer's own egress.
 
 ---
 

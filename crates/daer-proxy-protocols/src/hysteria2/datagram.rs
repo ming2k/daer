@@ -28,12 +28,12 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use bytes::Bytes;
 use netune::{DatagramConnector, DatagramTransport, EstablishedDatagrams, NetError};
-use netune_trace::Recorder;
+use netune_quic::owned::Connection as QuicConnection;
+use netune_trace::TraceCollector;
 
 use crate::hysteria2::connector::Hysteria2Connector;
 use crate::hysteria2::varint::{decode_varint_slice, encode_varint};
@@ -78,20 +78,19 @@ impl DatagramConnector for Hysteria2DatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<std::sync::Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 
 /// A connected UDP session over a Hysteria 2 node's QUIC connection.
 pub struct Hysteria2DatagramSession {
-    connection: quinn::Connection,
+    connection: QuicConnection,
     authority: String,
     session_id: u32,
     packet_id: AtomicU16,
@@ -109,7 +108,7 @@ impl std::fmt::Debug for Hysteria2DatagramSession {
 impl Hysteria2DatagramSession {
     /// Constructs a session with a freshly allocated id.
     #[must_use]
-    pub fn new(connection: quinn::Connection, authority: String) -> Self {
+    pub fn new(connection: QuicConnection, authority: String) -> Self {
         Self {
             connection,
             authority,
@@ -202,6 +201,7 @@ impl DatagramTransport for Hysteria2DatagramSession {
                 packet.extend_from_slice(fragment);
                 self.connection
                     .send_datagram(Bytes::from(packet))
+                    .await
                     .map_err(|error| io::Error::other(format!("send datagram failed: {error}")))?;
                 offset = end;
             }
@@ -221,7 +221,7 @@ impl DatagramTransport for Hysteria2DatagramSession {
             let mut assembler = FragmentAssembler::default();
             loop {
                 let datagram =
-                    self.connection.read_datagram().await.map_err(|error| {
+                    self.connection.recv_datagram().await.map_err(|error| {
                         io::Error::other(format!("read datagram failed: {error}"))
                     })?;
                 let Some(fragment) = parse_message(&datagram) else {

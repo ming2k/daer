@@ -25,12 +25,10 @@
 //! changes the wire behaviour: a "close enough" value makes the two implementations disagree
 //! about the send rate, and the disagreement shows up as packet loss rather than as an error.
 
-use std::any::Any;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use quinn_proto::RttEstimator;
-use quinn_proto::congestion::{Controller, ControllerFactory};
+use netune_quic::{CongestionController, CongestionControllerFactory};
 
 /// How many one-second slots the ACK rate is measured over (`pktInfoSlotCount`).
 const SLOT_COUNT: usize = 5;
@@ -89,8 +87,8 @@ impl BrutalConfig {
     }
 }
 
-impl ControllerFactory for BrutalConfig {
-    fn build(self: Arc<Self>, _now: std::time::Instant, current_mtu: u16) -> Box<dyn Controller> {
+impl CongestionControllerFactory for BrutalConfig {
+    fn build(&self, _now: std::time::Instant, current_mtu: u16) -> Box<dyn CongestionController> {
         // Before the first ACK there is no measured RTT, so the reference's `10240` floor
         // applies and `brutal_window` returns it. No loss compensation can have been measured
         // yet either, so the ACK rate is exactly 1.0.
@@ -167,28 +165,17 @@ impl Brutal {
     }
 }
 
-impl Controller for Brutal {
-    fn on_ack(
-        &mut self,
-        _now: std::time::Instant,
-        _sent: Instant,
-        bytes: u64,
-        _app_limited: bool,
-        rtt: &RttEstimator,
-    ) {
-        self.smoothed_rtt = rtt.get();
+impl CongestionController for Brutal {
+    fn on_ack(&mut self, bytes: u64, _now: Instant, rtt: Option<Duration>) {
+        if let Some(rtt) = rtt {
+            self.smoothed_rtt = rtt;
+        }
         let seconds = epoch().elapsed().as_secs();
         self.record(seconds, bytes, 0);
         self.refresh_window();
     }
 
-    fn on_congestion_event(
-        &mut self,
-        _now: std::time::Instant,
-        _sent: Instant,
-        _is_persistent_congestion: bool,
-        lost_bytes: u64,
-    ) {
+    fn on_loss(&mut self, _now: Instant, lost_bytes: u64) {
         // Brutal does not shrink on a loss: that is the point. It only *measures* the loss so
         // the rate it pins can be divided by the ACK rate.
         let seconds = epoch().elapsed().as_secs();
@@ -196,39 +183,18 @@ impl Controller for Brutal {
         self.refresh_window();
     }
 
-    fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.max_datagram_size = new_mtu;
-        self.refresh_window();
+    fn on_pto(&mut self, _now: Instant) {
+        // A probe timeout is not a loss signal for a rate-pinned controller.
     }
 
     fn window(&self) -> u64 {
         self.window
     }
-
-    fn initial_window(&self) -> u64 {
-        INITIAL_WINDOW
-    }
-
-    fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(Self {
-            bytes_per_second: self.bytes_per_second,
-            disable_loss_compensation: self.disable_loss_compensation,
-            slots: self.slots,
-            ack_rate: self.ack_rate,
-            max_datagram_size: self.max_datagram_size,
-            smoothed_rtt: self.smoothed_rtt,
-            window: self.window,
-        })
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
 }
 
 /// The window Brutal pins for a measured RTT: `bps × srtt × 2 / ack_rate`.
 ///
-/// Separated from [`Controller::window`] so the formula is testable without a Quinn
+/// Separated from [`CongestionController::window`] so the formula is testable without a
 /// connection, and so the reference's numbers can be asserted directly.
 #[must_use]
 pub fn brutal_window(bytes_per_second: u64, smoothed_rtt: Duration, ack_rate: f64) -> u64 {
@@ -296,16 +262,12 @@ mod tests {
     }
 
     #[test]
-    fn the_ack_rate_needs_the_references_minimum_sample_count_before_it_is_believed() {
-        // A controller built without traffic reports a full rate: fifty samples is the
-        // reference's floor, and below it the estimate would be noise.
-        let factory = Arc::new(BrutalConfig::from_bits_per_second(80_000_000));
-        let controller = factory.build(Instant::now(), 1200);
-        let boxed = controller.into_any();
-        let brutal = boxed
-            .downcast::<Brutal>()
-            .expect("the factory builds a Brutal");
-        assert_eq!(brutal.ack_rate, 1.0);
-        assert!(brutal.window > 0);
+    fn the_factory_builds_a_controller_with_the_reference_initial_window() {
+        // A controller built without traffic reports the reference's 10240-byte floor: fifty
+        // samples is the floor before the ACK-rate estimate is believed, and below it the
+        // estimate would be noise.
+        let config = BrutalConfig::from_bits_per_second(1);
+        let controller = config.build(Instant::now(), 1200);
+        assert_eq!(controller.window(), INITIAL_WINDOW);
     }
 }

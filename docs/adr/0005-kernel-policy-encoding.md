@@ -112,7 +112,7 @@ The daemon logs which tier it is in, once, with the reason:
 ```text
 INFO datapath policy published slot=1 entries=42 equivalent=true tier=split
 WARN datapath policy published slot=1 entries=1 equivalent=false tier=defer
-     because=rule 3 uses domain(suffix:…) and domain_routing_map is not maintained
+     because=rule 3 uses domain(…) and domain_routing_map is not maintained
 ```
 
 ### 4. Equivalence is asserted by a test, against the object's real layout

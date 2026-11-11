@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-11-06
 - Refines: [ADR-0007](0007-verification.md)
-- Enforced by: [INV-PREFLIGHT-01](../../dev/standards/invariants.md)
+- Enforced by: [INV-PREFLIGHT-01](../dev/standards/invariants.md)
 
 ## Context
 
@@ -12,13 +12,14 @@ different privilege requirements and different reversibility:
 
 1. **Pure computation** — load the configuration, build a generation, lower every rule,
    decide whether the kernel policy is provably equivalent or must defer.
-2. **System resource acquisition** — bind the transparent port, create the
-   `daer0`/`daer0peer` pair, read its MAC and ifindex, write sysctls, install the `fwmark`
-   policy route.
+2. **System resource acquisition** — create the private ingress namespace, create and move
+   the `daer0`/`daer0peer` pair, bind the transparent listeners inside the namespace, read
+   its MAC and ifindex, write sysctls, and install the namespace-local policy route.
 3. **Kernel attachment** — load the object, attach 23 programs to `clsact` and cgroup hooks.
 
-Step 1 needs nothing. Step 2 needs `CAP_NET_ADMIN` and mutates the box. Step 3 needs
-`CAP_BPF` in addition.
+Step 1 needs nothing. Step 2 needs `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` and mutates the box.
+Step 3 needs `CAP_BPF` in addition, plus `CAP_PERFMON` for the verifier's `allow_ptr_leaks`
+(the fast parser advances a packet pointer by header lengths read at runtime).
 
 `daer run --dry-run` was documented as a preflight and implemented as "do all three, then
 exit". That is not a dry run. It binds a port, creates a veth pair, writes
@@ -50,11 +51,11 @@ packaging script can run against the artifact they are about to install.
    | --- | --- | --- |
    | `daer check` | configuration, rule lowering, kernel-policy equivalence, **object against the ABI** | nothing |
    | `daer run --dry-run` | the above, plus interface resolution, the runtime parameter that *would* be published, and a capability report | nothing |
-   | `daer run` | all of the above, then port bind, device pair, sysctls, routes, BPF load, tc attach | `CAP_BPF` + `CAP_NET_ADMIN` |
+   | `daer run` | all of the above, then namespace creation, port bind inside it, device pair, sysctls, routes, BPF load, tc attach | `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
 
 2. **`--dry-run` changes nothing, and that is enforced by construction rather than by
-   discipline.** The mutation calls (`Daemon::bind`, `ensure_device_pair`, `Sysctl::apply`,
-   `RouteTable::install`, `datapath::attach`) are all downstream of a single
+   discipline.** The mutation calls (`PreparedIngress::prepare`, `Daemon::bind_in`,
+   `Sysctl::apply`, `RouteTable::install`, `datapath::attach`) are all downstream of a single
    `Preflight::plan()` call, and `run` returns immediately after printing the plan when
    `--dry-run` is set. There is no ordering in which a dry run can reach a mutating call,
    because the dry-run branch precedes every one of them.
@@ -93,9 +94,11 @@ packaging script can run against the artifact they are about to install.
    capability requirement is a property of the *check*, not of the project.
 
 6. **A capability failure is named where it is detected.** `Preflight` reports
-   `CAP_BPF`/`CAP_NET_ADMIN` by reading `CapEff` from `/proc/self/status` (a read-only
-   check) and states plainly which gate cannot run here — instead of letting the attachment
-   code discover it as `failed to create map 'daer_ifindex_map'`.
+   `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_SYS_ADMIN` by reading `CapEff` from
+   `/proc/self/status` (a read-only check) and states plainly which gate cannot run here —
+   instead of letting the attachment code discover it as
+   `failed to create map 'daer_ifindex_map'` or a verifier rejection. `CAP_SYS_ADMIN` is
+   required by the private ingress namespace (ADR-0038), not by configuration loading.
 
 ## Consequences
 
@@ -141,3 +144,15 @@ staging time.
 Verified by construction, not by inspection: swapping the packaged object for the one that
 caused the production outage makes the staging command exit 1 with
 `invalid program section 'tc/lan_egress_l2'`.
+
+## Addendum — the private namespace joins the privileged gate (ADR-0038)
+
+`daer run` now creates `daer0ns`, moves `daer0peer` into it, and binds the transparent
+listeners there. Creation, link movement, `setns(2)` and the `/run/netns` mount all require
+`CAP_SYS_ADMIN`; the shipped unit carries it and `RuntimeDirectory=netns`/`ReadWritePaths`
+make the mount point writable under `ProtectSystem=strict`.
+
+The unprivileged gate is unchanged: `daer check` and `daer run --dry-run` still perform no
+namespace creation. The preflight reports `CAP_SYS_ADMIN` alongside the three datapath
+capabilities, and the dry-run mutation boundary now begins at `PreparedIngress::prepare`
+rather than at `Daemon::bind`.

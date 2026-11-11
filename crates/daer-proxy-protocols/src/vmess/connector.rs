@@ -27,14 +27,14 @@
 //! connector says so rather than sending a request the node answers with a mux handshake this
 //! side cannot parse.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
     Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target,
     TcpConnector, Transport,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::ProxyProtocolError;
@@ -171,7 +171,7 @@ impl VmessConnector {
     pub async fn connect(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         let (stream, session, local_port) = self.open(authority, Command::Tcp, recorder).await?;
         // The response header is consumed on the first read, not here: the node buffers it until
@@ -207,7 +207,7 @@ impl VmessConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let (stream, session, local_port) = self
             .open(authority, Command::Udp, recorder)
@@ -233,7 +233,7 @@ impl VmessConnector {
         &self,
         authority: &str,
         command: Command,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<(BoundedStream, Session, Option<u16>), ProxyProtocolError> {
         let session = Session::new();
         let security = match self.cipher {
@@ -273,7 +273,7 @@ impl VmessConnector {
     /// Dials, upgrades the transport, and applies the security layer.
     async fn open_stream(
         &self,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
         let target = Target::plain(self.server.clone());
         let established = self
@@ -369,14 +369,13 @@ impl DatagramConnector for VmessDatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 

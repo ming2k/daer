@@ -185,6 +185,7 @@ impl ProbeInstruments {
         check: &daer_config::HealthCheck,
         interval: Duration,
         method: daer_outbound::HttpMethod,
+        socket_config: daer_outbound::SocketConfig,
     ) -> Self {
         let timeout = probe_timeout(interval);
 
@@ -197,7 +198,11 @@ impl ProbeInstruments {
             if entry.contains("://") {
                 match CheckUrl::parse(entry) {
                     Ok(url) => {
-                        http = Some((HttpChecker::new(method, timeout), url));
+                        http = Some((
+                            HttpChecker::new(method, timeout)
+                                .with_socket_config(socket_config.clone()),
+                            url,
+                        ));
                         tcp_url_seen = true;
                         break;
                     }
@@ -222,8 +227,13 @@ impl ProbeInstruments {
         let mut udp_dns = Vec::new();
         let mut unresolved_udp = Vec::new();
         for entry in &check.udp_dns {
-            // `host:port` or `ip:port`. An IP is used directly; a name is reported, because
-            // resolving it here would be a second, silent DNS decision.
+            // `host:port`, `ip:port`, or a bare IP whose conventional DNS port is 53.
+            // A name is reported rather than resolved here: resolving it would be a second,
+            // silent DNS decision, and the node's own proxy port is not a DNS server.
+            if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
+                udp_dns.push(SocketAddr::new(ip, 53));
+                continue;
+            }
             match split_host_port(entry) {
                 Some((host, port)) => match host.parse::<std::net::IpAddr>() {
                     Ok(ip) => udp_dns.push(SocketAddr::new(ip, port)),
@@ -235,9 +245,9 @@ impl ProbeInstruments {
 
         Self {
             http,
-            tcp: TcpChecker::new(timeout),
+            tcp: TcpChecker::new(timeout).with_socket_config(socket_config.clone()),
             udp_dns,
-            udp: UdpDnsChecker::new(timeout),
+            udp: UdpDnsChecker::new(timeout).with_socket_config(socket_config),
             unresolved_udp,
         }
     }
@@ -561,7 +571,11 @@ pub fn spawn(
         );
         daer_outbound::HttpMethod::Head
     });
-    let instruments = ProbeInstruments::from_config(check, interval, method);
+    let socket_config = daer_outbound::SocketConfig {
+        mark: router.socket_mark(),
+        ..daer_outbound::SocketConfig::default()
+    };
+    let instruments = ProbeInstruments::from_config(check, interval, method, socket_config);
     if !instruments.unresolved_udp.is_empty() {
         tracing::debug!(
             entries = ?instruments.unresolved_udp,
@@ -735,6 +749,37 @@ mod tests {
         assert!(
             router.has_selection("g"),
             "a measured node must be selectable"
+        );
+    }
+
+    #[test]
+    fn a_bare_udp_dns_address_uses_the_conventional_port() {
+        let check = daer_config::HealthCheck::default();
+        let instruments = ProbeInstruments::from_config(
+            &check,
+            Duration::from_secs(30),
+            daer_outbound::HttpMethod::Head,
+            daer_outbound::SocketConfig::default(),
+        );
+        assert!(
+            instruments
+                .udp_dns
+                .contains(&"8.8.8.8:53".parse().expect("addr")),
+            "{:?}",
+            instruments.udp_dns
+        );
+        assert!(
+            instruments.udp_dns.len() >= 2,
+            "both literal defaults must be usable: {:?}",
+            instruments.udp_dns
+        );
+        assert!(
+            instruments
+                .unresolved_udp
+                .iter()
+                .any(|entry| entry.starts_with("dns.google")),
+            "a name is reported, never silently resolved: {:?}",
+            instruments.unresolved_udp
         );
     }
 

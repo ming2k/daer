@@ -26,14 +26,14 @@
 //! Vision UDP flow into XUDP instead. daer takes the first branch — a Vision node's UDP is
 //! refused with that reason rather than silently sent in a shape the node will drop.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
     Connector, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError,
     Target, TcpConnector, Transport,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::error::ProxyProtocolError;
@@ -155,7 +155,7 @@ impl VlessConnector {
     pub async fn connect(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         let header = encode_request(&Request {
             uuid: self.parsed_uuid,
@@ -224,7 +224,7 @@ impl VlessConnector {
     /// Dials, upgrades the transport, and applies the security layer.
     async fn open_stream(
         &self,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
         let target = Target::plain(self.server.clone());
         let established = self
@@ -292,7 +292,7 @@ impl VlessConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         if self.flow.is_vision() {
             return Err(NetError::Protocol(format!(
@@ -378,14 +378,13 @@ impl DatagramConnector for VlessDatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daer_config::{Config, ProviderFormat, ProviderType};
+use daer_config::{Config, ProviderFormat, ProviderType, RuleProvider};
 use daer_routing::{DrbSet, RuleProviderPool};
 
 /// How long one rule provider fetch may take.
@@ -126,6 +126,104 @@ impl RuleProviderResolution {
     }
 }
 
+/// The declared background-refresh cadence of every HTTP provider (ADR-0014, ADR-0037).
+///
+/// # Why this type exists
+///
+/// `interval` is a **per-provider** contract: `docs/how-to/rule-providers.md` says a provider
+/// that declares an interval is "periodically checked for updates in the background". The
+/// reference configuration does declare different values (`24h` next to `168h`), so a single
+/// global cadence would fetch the weekly provider seven times more often than asked.
+///
+/// This type is the only place that reads
+/// [`RuleProvider::interval`](daer_config::RuleProvider::interval) for scheduling, which is
+/// what keeps the key wired rather than merely parsed (ADR-0006).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSchedule {
+    entries: Vec<ProviderScheduleEntry>,
+}
+
+/// One scheduled provider: its tag and how often it may be re-fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderScheduleEntry {
+    /// The `tag` that identifies the provider in the pool and in logs.
+    pub tag: String,
+    /// The declared cadence, always strictly positive.
+    pub interval: Duration,
+}
+
+impl ProviderSchedule {
+    /// Builds the schedule from a configuration, ignoring providers without a usable interval.
+    ///
+    /// A file provider never appears here: it has no background checks, and
+    /// [`validate`](daer_config) rejects an `interval` on it rather than silently ignoring it.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let entries = config
+            .rule_provider
+            .iter()
+            .filter(|provider| provider.provider_type == ProviderType::Http)
+            .filter_map(|provider| {
+                let interval = provider.interval?.as_std()?;
+                (!interval.is_zero()).then(|| ProviderScheduleEntry {
+                    tag: provider.tag.clone(),
+                    interval,
+                })
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// The scheduled providers, in declaration order.
+    #[must_use]
+    pub fn entries(&self) -> &[ProviderScheduleEntry] {
+        &self.entries
+    }
+
+    /// Whether any provider asked for background checks at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The shortest cadence, if any provider declared one.
+    ///
+    /// The supervisor sleeps for this long between wake-ups: waking on the shortest interval is
+    /// the only cadence that lets every provider be checked *no later than* it asked for.
+    /// [`ProviderSchedule::due`] then decides which providers the wake-up actually serves.
+    #[must_use]
+    pub fn min_interval(&self) -> Option<Duration> {
+        self.entries.iter().map(|entry| entry.interval).min()
+    }
+
+    /// The providers that are due at `now`, for a generation that has waited since `last_seen`.
+    ///
+    /// `last_seen` reports how long ago each tag was last refreshed. A provider is due when
+    /// it has never been refreshed, or when it has waited at least its own declared interval.
+    /// This is the per-provider rule the single global ticker replaced.
+    #[must_use]
+    pub fn due(&self, last_seen: impl Fn(&str) -> Option<Duration>) -> Vec<&ProviderScheduleEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| match last_seen(&entry.tag) {
+                None => true,
+                Some(elapsed) => elapsed >= entry.interval,
+            })
+            .collect()
+    }
+}
+
+/// Why one provider was refreshed, so the caller can tell a real change from a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The provider answered with new content; the rule set did change.
+    Changed,
+    /// The content was byte-for-byte the set already in use.
+    Unchanged,
+    /// The provider could not be fetched and no cache could stand in for it.
+    Failed,
+}
+
 /// Resolves all `[[rule-provider]]` declarations in `config`.
 pub async fn resolve_rule_providers(
     config: &Config,
@@ -154,7 +252,10 @@ pub async fn resolve_rule_providers_with(
         let tag = provider.tag.clone();
         let provider_type = provider.provider_type;
         let format = provider.format;
-        let _interval = provider.interval; // Access interval to honour ADR-0006 invariant
+        // `provider.interval` is intentionally absent here: background refresh cadence is a
+        // scheduling concern owned by `ProviderSchedule`, which reads the key for real
+        // (ADR-0006, ADR-0037). Naming it here only to satisfy a lint would be the dead
+        // binding that made the key look wired while it was not.
 
         match provider_type {
             ProviderType::File => {
@@ -342,6 +443,95 @@ async fn fetch_http_provider(
     }
 }
 
+/// One provider re-fetched outside the load path, with the decision the caller needs.
+#[derive(Debug)]
+pub struct RefreshedProvider {
+    /// The provider's tag, echoed so a caller can report without re-reading the config.
+    pub tag: String,
+    /// Whether the fetched rule set differs from the one already in use.
+    pub outcome: RefreshOutcome,
+    /// The freshly fetched set, present whenever the fetch succeeded.
+    ///
+    /// This is returned even when the content is unchanged so the caller can insert it and
+    /// keep the pool's copy authoritative, but it must not trigger a generation swap.
+    pub set: Option<DrbSet>,
+    /// The fetch error, present only for [`RefreshOutcome::Failed`].
+    pub error: Option<String>,
+}
+
+impl RefreshedProvider {
+    /// Whether this refresh should cause a routing generation swap.
+    #[must_use]
+    pub fn requires_swap(&self) -> bool {
+        self.outcome == RefreshOutcome::Changed
+    }
+}
+
+/// Re-fetches one provider and compares the result with the set already in use.
+///
+/// # Why the comparison happens here
+///
+/// An HTTP provider that answers `304 Not Modified` yields the *same* rule set that is
+/// already loaded. Rebuilding the routing generation for it would discard every measured
+/// node latency and restart health probes for no reason (ADR-0037), so "did the content
+/// change" has to be a first-class answer rather than an assumption.
+pub async fn refresh_rule_provider(
+    provider: &RuleProvider,
+    config_directory: &Path,
+    current: Option<&DrbSet>,
+    timeout: Duration,
+) -> RefreshedProvider {
+    let tag = provider.tag.clone();
+    let format = provider.format;
+
+    let fetched = match provider.provider_type {
+        ProviderType::File => match &provider.path {
+            Some(raw) => {
+                let path = Path::new(raw);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    config_directory.join(path)
+                };
+                load_file_provider(&path, &tag, format)
+            }
+            None => Err("missing path for file provider".to_owned()),
+        },
+        ProviderType::Http => match &provider.url {
+            Some(url) => {
+                let cache_file = cache_directory(config_directory).join(format!("{tag}.drb"));
+                let _ = fs::create_dir_all(cache_directory(config_directory));
+                fetch_http_provider(url, &cache_file, &tag, format, timeout)
+                    .await
+                    .map(|(set, _from_cache)| set)
+            }
+            None => Err("missing url for http provider".to_owned()),
+        },
+    };
+
+    match fetched {
+        Ok(set) => {
+            let outcome = if current.is_some_and(|known| known == &set) {
+                RefreshOutcome::Unchanged
+            } else {
+                RefreshOutcome::Changed
+            };
+            RefreshedProvider {
+                tag,
+                outcome,
+                set: Some(set),
+                error: None,
+            }
+        }
+        Err(error) => RefreshedProvider {
+            tag,
+            outcome: RefreshOutcome::Failed,
+            set: None,
+            error: Some(error),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +542,7 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("daer-rule-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp);
         let text_path = temp.join("direct.txt");
-        fs::write(&text_path, "ip: 10.0.0.0/8\nsuffix: corp.lan\n").unwrap();
+        fs::write(&text_path, "ip: 10.0.0.0/8\ncorp.lan\n").unwrap();
 
         let mut config = Config::default();
         config.rule_provider.push(RuleProvider {
@@ -373,5 +563,147 @@ mod tests {
         assert_eq!(set.domain_patterns(), 1);
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn a_relative_file_provider_refreshes_from_the_config_directory() {
+        let temp = std::env::temp_dir().join(format!("daer-refresh-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp);
+        fs::write(temp.join("direct.txt"), "ip: 10.0.0.0/8\ncorp.lan\n").unwrap();
+        let provider = RuleProvider {
+            tag: "corp".to_owned(),
+            provider_type: ProviderType::File,
+            url: None,
+            path: Some("direct.txt".to_owned()),
+            format: ProviderFormat::Text,
+            interval: None,
+        };
+
+        let refreshed = refresh_rule_provider(&provider, &temp, None, Duration::from_secs(1)).await;
+        assert_eq!(refreshed.outcome, RefreshOutcome::Changed);
+        let set = refreshed.set.expect("the relative path was resolved");
+        assert_eq!(set.v4_intervals.len(), 1);
+        assert_eq!(set.domain_patterns(), 1);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// Falsifier for the global-cadence defect (ADR-0037): with a `1h` and a `7h` provider, a
+    /// single global ticker would mark the `7h` provider due after one hour. It must not be due.
+    ///
+    /// Negative control: the same query at `7h` *must* return it, so a `due` that never fires
+    /// cannot pass this test.
+    #[test]
+    fn schedule_honours_each_provider_interval() {
+        let mut config = Config::default();
+        for (tag, seconds) in [("fast", 3600), ("slow", 7 * 3600)] {
+            config.rule_provider.push(RuleProvider {
+                tag: tag.to_owned(),
+                provider_type: ProviderType::Http,
+                url: Some(format!("https://example.invalid/{tag}.txt")),
+                path: None,
+                format: ProviderFormat::Text,
+                interval: Some(TimeSpan::from_secs(seconds)),
+            });
+        }
+
+        let schedule = ProviderSchedule::from_config(&config);
+        assert_eq!(schedule.entries().len(), 2, "both providers scheduled");
+        // Waking on the shortest cadence is what lets each provider be served on time.
+        assert_eq!(schedule.min_interval(), Some(Duration::from_secs(3600)));
+
+        // After one hour only the short provider is due.
+        let due = schedule.due(|_| Some(Duration::from_secs(3600)));
+        let tags: Vec<&str> = due.iter().map(|entry| entry.tag.as_str()).collect();
+        assert_eq!(tags, ["fast"], "the 7h provider must not be fetched hourly");
+
+        // Negative control: at seven hours both are due, so the filter is discriminating.
+        let due = schedule.due(|_| Some(Duration::from_secs(7 * 3600)));
+        assert_eq!(
+            due.len(),
+            2,
+            "a due check that never fires cannot pass the case above"
+        );
+
+        // A provider never refreshed is always due, whatever its interval.
+        let due = schedule.due(|_| None);
+        assert_eq!(due.len(), 2);
+    }
+
+    /// A file provider has no background checks. It must not enter the schedule, and the
+    /// validation layer rejects an `interval` on it instead of silently ignoring the key.
+    #[test]
+    fn schedule_ignores_file_providers_and_zero_intervals() {
+        let mut config = Config::default();
+        config.rule_provider.push(RuleProvider {
+            tag: "f".to_owned(),
+            provider_type: ProviderType::File,
+            url: None,
+            path: Some("/tmp/rules.txt".to_owned()),
+            format: ProviderFormat::Text,
+            interval: Some(TimeSpan::from_secs(60)),
+        });
+        config.rule_provider.push(RuleProvider {
+            tag: "zero".to_owned(),
+            provider_type: ProviderType::Http,
+            url: Some("https://example.invalid/z.txt".to_owned()),
+            path: None,
+            format: ProviderFormat::Text,
+            interval: Some(TimeSpan::ZERO),
+        });
+        config.rule_provider.push(RuleProvider {
+            tag: "unset".to_owned(),
+            provider_type: ProviderType::Http,
+            url: Some("https://example.invalid/u.txt".to_owned()),
+            path: None,
+            format: ProviderFormat::Text,
+            interval: None,
+        });
+
+        let schedule = ProviderSchedule::from_config(&config);
+        assert!(
+            schedule.is_empty(),
+            "no usable HTTP interval: {:?}",
+            schedule
+        );
+        assert_eq!(schedule.min_interval(), None);
+    }
+
+    /// The content gate: an unchanged rule set must not require a generation swap, while a
+    /// changed one must. Without the negative control the first half would be vacuous.
+    #[test]
+    fn unchanged_content_does_not_require_a_swap() {
+        let unchanged = RefreshedProvider {
+            tag: "p".to_owned(),
+            outcome: RefreshOutcome::Unchanged,
+            set: Some(DrbSet::default()),
+            error: None,
+        };
+        assert!(
+            !unchanged.requires_swap(),
+            "a 304 must not restart the world"
+        );
+
+        let changed = RefreshedProvider {
+            tag: "p".to_owned(),
+            outcome: RefreshOutcome::Changed,
+            set: Some(DrbSet::default()),
+            error: None,
+        };
+        assert!(
+            changed.requires_swap(),
+            "real content must reach the data path"
+        );
+
+        let failed = RefreshedProvider {
+            tag: "p".to_owned(),
+            outcome: RefreshOutcome::Failed,
+            set: None,
+            error: Some("boom".to_owned()),
+        };
+        assert!(
+            !failed.requires_swap(),
+            "a failure keeps the running rule set"
+        );
     }
 }

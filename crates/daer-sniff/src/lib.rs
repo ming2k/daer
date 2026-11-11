@@ -6,7 +6,7 @@
 //!
 //! `dial-mode = "domain"` routes by the name in the TLS ClientHello or the HTTP
 //! `Host` header rather than by the destination IP, so a rule can say
-//! `domain(suffix: example.com)` and mean the name the client actually used, even when
+//! `domain(example.com)` and mean the name the client actually used, even when
 //! the IP is a shared CDN address. The name is in the first few hundred bytes and
 //! nowhere else.
 //!

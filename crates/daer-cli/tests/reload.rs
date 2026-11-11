@@ -217,5 +217,45 @@ fn the_daemon_survives_a_hangup_and_publishes_a_new_generation() {
         log.join("\n")
     );
 
+    // A typo on the next SIGHUP must be rejected without stopping the daemon. The cadence
+    // rebuild reads the file a second time; an error there must not propagate out of the
+    // signal handler (the previous implementation did exactly that).
+    std::fs::write(&config_path, "schema = 1\n[global]\nwan-interface = []\n")
+        .expect("writes the invalid configuration");
+    hang_up(pid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = daemon.child.try_wait() {
+            panic!(
+                "the daemon exited with {status} after an invalid SIGHUP — a bad reload must \
+                 not stop a working proxy; log:\n{}",
+                log.join("\n")
+            );
+        }
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                let rejected_here = line.contains("reload rejected");
+                log.push(line);
+                if rejected_here {
+                    rejected = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        rejected,
+        "an invalid configuration did not report a rejected reload; log:\n{}",
+        log.join("\n")
+    );
+    assert!(
+        daemon.child.try_wait().ok().flatten().is_none(),
+        "the daemon is gone after an invalid SIGHUP; log:\n{}",
+        log.join("\n")
+    );
+
     let _ = std::fs::remove_dir_all(&directory);
 }

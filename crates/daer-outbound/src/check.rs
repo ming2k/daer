@@ -15,15 +15,15 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use daer_config::TimeSpan;
 use netune::{
     Client, ClientConfig, Connector, DatagramConnector, Established, Method, Pool, RequestHead,
-    Target, TcpConnector, TlsRouterConnector, UdpConnector,
+    SocketConfig, Target, TcpConnector, TlsRouterConnector, UdpConnector,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +239,28 @@ impl fmt::Debug for HttpChecker {
 }
 
 impl HttpChecker {
+    /// Applies daer's socket options (notably `SO_MARK`) to the probe sockets.
+    #[must_use]
+    pub fn with_socket_config(self, config: SocketConfig) -> Self {
+        let connector = TcpConnector::new()
+            .with_socket_config(config)
+            .with_connect_timeout(Some(self.timeout));
+        let connector = TlsRouterConnector::new(connector);
+        let client = Client::new(
+            connector,
+            Pool::default(),
+            ClientConfig {
+                max_redirects: 0,
+                ..ClientConfig::default()
+            },
+        );
+        Self {
+            client,
+            method: self.method,
+            timeout: self.timeout,
+        }
+    }
+
     pub fn new(method: HttpMethod, timeout: Duration) -> Self {
         let connector = TcpConnector::new().with_connect_timeout(Some(timeout));
         let connector = TlsRouterConnector::new(connector);
@@ -350,7 +372,7 @@ impl Connector for TunnelConnector {
     async fn connect(
         &self,
         _target: &Target,
-        _recorder: &Arc<Mutex<Recorder>>,
+        _recorder: &TraceCollector,
     ) -> Result<Established, netune::NetError> {
         self.established
             .lock()
@@ -379,6 +401,13 @@ impl fmt::Debug for TcpChecker {
 }
 
 impl TcpChecker {
+    /// Applies daer's socket options (notably `SO_MARK`) to the probe socket.
+    #[must_use]
+    pub fn with_socket_config(mut self, config: SocketConfig) -> Self {
+        self.connector = self.connector.with_socket_config(config);
+        self
+    }
+
     pub fn new(timeout: Duration) -> Self {
         Self {
             connector: TcpConnector::new().with_connect_timeout(Some(timeout)),
@@ -388,7 +417,7 @@ impl TcpChecker {
 
     pub async fn check(&self, addr: SocketAddr) -> Result<TimeSpan, CheckError> {
         let target = Target::plain(addr.to_string());
-        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
+        let recorder = TraceCollector::disabled();
 
         let started = Instant::now();
         let established =
@@ -425,6 +454,13 @@ impl fmt::Debug for UdpDnsChecker {
 }
 
 impl UdpDnsChecker {
+    /// Applies daer's socket options (notably `SO_MARK`) to the probe socket.
+    #[must_use]
+    pub fn with_socket_config(mut self, config: SocketConfig) -> Self {
+        self.connector = self.connector.with_socket_config(config);
+        self
+    }
+
     pub fn new(timeout: Duration) -> Self {
         Self {
             connector: UdpConnector::new().with_connect_timeout(Some(timeout)),
@@ -447,7 +483,7 @@ impl UdpDnsChecker {
     /// [`CheckError::Request`] when the transport fails or the peer answers
     /// something that cannot be a DNS response.
     pub async fn check(&self, addr: SocketAddr) -> Result<TimeSpan, CheckError> {
-        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
+        let recorder = TraceCollector::disabled();
         let started = Instant::now();
 
         let session = timeout(

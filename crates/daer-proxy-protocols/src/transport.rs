@@ -31,12 +31,11 @@
 //! each is refused by name at load time rather than silently treated as TCP. A node that connects
 //! and then sends nonsense costs more to diagnose than one that refuses to load.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use netune::{Transport, WsHandshake, WsStream};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::ProxyProtocolError;
@@ -100,7 +99,7 @@ impl TransportLayer {
         stream: Box<dyn Transport>,
         node_host: &str,
         sni: Option<&str>,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
         timeout: Duration,
     ) -> Result<Box<dyn Transport>, ProxyProtocolError> {
         match self {
@@ -123,7 +122,7 @@ async fn upgrade<S>(
     mut stream: S,
     params: &WsParams,
     host: &str,
-    _recorder: &Arc<Mutex<Recorder>>,
+    _recorder: &TraceCollector,
     timeout: Duration,
 ) -> Result<WsByteStream<S>, ProxyProtocolError>
 where

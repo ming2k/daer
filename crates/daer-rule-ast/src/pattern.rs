@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Domain pattern representation for Canonical Rule Source (CRS v1).
+//! Domain pattern representation for Canonical Rule Source (CRS v2, ADR-0036).
 //!
-//! Under ADR-0031, domain routing patterns are strictly hierarchical:
-//! * `Suffix(SelfAndSubdomains)`: matches `example.com` and `*.example.com`.
-//! * `Suffix(SubdomainsOnly)`: matches `*.example.com` only (written as `suffix: .example.com`).
-//! * `Full`: matches `example.com` exactly.
+//! Under ADR-0031, ADR-0033, and ADR-0036, domain routing patterns are strictly hierarchical:
+//! * `Suffix(SelfAndSubdomains)`: matches `example.com` and `*.example.com` (written as `example.com`).
+//! * `Suffix(SubdomainsOnly)`: matches `*.example.com` only (written as `.example.com`).
+//! * `Full`: matches `example.com` exactly (written as `=example.com`).
 //!
 //! Keyword and Regex matching are removed from the core specification: routing decisions
 //! on the line-rate hot path require reverse label walk without the negative lookup fallacy.
@@ -63,19 +63,23 @@ impl DomainPattern {
         }
     }
 
-    /// The directive keyword.
+    /// The directive keyword or symbolic prefix.
     #[must_use]
     pub fn keyword(&self) -> &'static str {
         match self {
             Self::Suffix(..) => "suffix",
-            Self::Full(..) => "full",
+            Self::Full(..) => "=",
         }
     }
 
     /// Validates and lowercases the domain pattern.
     pub fn canonical(self) -> Result<Self, AstError> {
         match self {
-            Self::Full(val) => Ok(Self::Full(fold_domain(val, "full")?)),
+            Self::Full(val) => {
+                let trimmed = val.trim();
+                let bare = trimmed.strip_prefix('=').unwrap_or(trimmed).trim();
+                Ok(Self::Full(fold_domain(bare, "exact")?))
+            }
             Self::Suffix(val, scope) => {
                 let trimmed = val.trim();
                 let (bare, effective_scope) = match trimmed.strip_prefix('.') {
@@ -92,7 +96,10 @@ impl DomainPattern {
         let kind = kind.strip_prefix("domain:").unwrap_or(kind);
         let value = value.trim();
         match kind {
-            "full" => Ok(Self::Full(value.to_owned())),
+            "=" | "full" | "exact" => {
+                let stripped = value.strip_prefix('=').unwrap_or(value).trim();
+                Ok(Self::Full(stripped.to_owned()))
+            }
             "suffix" | "domain" => {
                 let (scope, rest) = match value.strip_prefix('.') {
                     Some(rest) if !rest.starts_with('.') => (SuffixScope::SubdomainsOnly, rest),
@@ -102,10 +109,10 @@ impl DomainPattern {
                 Ok(Self::Suffix(rest.trim().to_owned(), scope))
             }
             "keyword" | "regex" => Err(AstError::new(format!(
-                "'{kind}:' is removed (ADR-0031, ADR-0033); write explicit 'suffix:' or 'full:' patterns."
+                "'{kind}:' is removed (ADR-0031, ADR-0033); write explicit '=domain' or suffix patterns."
             ))),
             other => Err(AstError::new(format!(
-                "unknown domain rule kind {other:?}; expected 'suffix' or 'full'"
+                "unknown domain rule kind {other:?}; expected '=domain' or suffix"
             ))),
         }
     }
@@ -132,8 +139,8 @@ pub fn is_valid_domain_char(ch: char) -> bool {
 impl fmt::Display for DomainPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(val) => write!(f, "full: {val}"),
-            Self::Suffix(val, scope) => write!(f, "suffix: {}{val}", scope.marker()),
+            Self::Full(val) => write!(f, "={val}"),
+            Self::Suffix(val, scope) => write!(f, "{}{val}", scope.marker()),
         }
     }
 }
@@ -142,12 +149,36 @@ impl FromStr for DomainPattern {
     type Err = AstError;
 
     fn from_str(line: &str) -> Result<Self, Self::Err> {
-        let Some((key, value)) = line.split_once(':') else {
-            return Err(AstError::new(format!(
-                "{line:?} is not a domain rule: missing 'suffix:' or 'full:' prefix"
-            )));
-        };
-        Self::from_kind(key.trim(), value)
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix('=') {
+            return Self::from_kind("=", rest);
+        }
+        if let Some((key, _)) = trimmed.split_once(':') {
+            let k = key.trim();
+            if k == "full" {
+                return Err(AstError::new(
+                    "'full:' is retired (ADR-0036); write '=domain' for exact full match",
+                ));
+            }
+            if k == "suffix" || k == "domain" {
+                return Err(AstError::new(format!(
+                    "'{k}:' is retired (ADR-0036); write bare 'domain' or '.domain' for suffix match",
+                )));
+            }
+            return Self::from_kind(k, trimmed);
+        }
+        if let Some(sub) = trimmed.strip_prefix('.')
+            && !sub.starts_with('.')
+        {
+            return Ok(Self::Suffix(
+                sub.trim().to_owned(),
+                SuffixScope::SubdomainsOnly,
+            ));
+        }
+        Ok(Self::Suffix(
+            trimmed.to_owned(),
+            SuffixScope::SelfAndSubdomains,
+        ))
     }
 }
 
@@ -158,18 +189,32 @@ mod tests {
     #[test]
     fn parses_suffixes_with_scopes() {
         assert_eq!(
-            "suffix: example.com".parse::<DomainPattern>().unwrap(),
+            "example.com".parse::<DomainPattern>().unwrap(),
             DomainPattern::Suffix("example.com".into(), SuffixScope::SelfAndSubdomains)
         );
         assert_eq!(
-            "suffix: .example.com".parse::<DomainPattern>().unwrap(),
+            ".example.com".parse::<DomainPattern>().unwrap(),
             DomainPattern::Suffix("example.com".into(), SuffixScope::SubdomainsOnly)
         );
     }
 
     #[test]
-    fn rejects_keyword_and_regex() {
+    fn parses_exact_patterns_with_equals() {
+        assert_eq!(
+            "=example.com".parse::<DomainPattern>().unwrap(),
+            DomainPattern::Full("example.com".into())
+        );
+        assert_eq!(
+            DomainPattern::Full("example.com".into()).to_string(),
+            "=example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_keyword_and_regex_and_retired_prefixes() {
         assert!("keyword: google".parse::<DomainPattern>().is_err());
         assert!("regex: ^.*\\.com$".parse::<DomainPattern>().is_err());
+        assert!("suffix: example.com".parse::<DomainPattern>().is_err());
+        assert!("full: example.com".parse::<DomainPattern>().is_err());
     }
 }

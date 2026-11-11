@@ -244,7 +244,7 @@ mod tests {
         let rules_file = dir.join("test.rules");
         fs::write(
             &rules_file,
-            "name: my-rules\nip: 192.168.1.0/24\nsuffix: example.com\nfull: auth.corp.internal\n",
+            "name: my-rules\nip: 192.168.1.0/24\nexample.com\n=auth.corp.internal\n",
         )
         .unwrap();
 
@@ -254,8 +254,7 @@ mod tests {
         let summary = DrbSet::inspect_bytes(&fs::read(&drb_file).unwrap()).unwrap();
         assert_eq!(summary.name, "my-rules");
         assert_eq!(summary.v4_intervals, 1);
-        // Two patterns: `suffix: example.com` and `full: auth.corp.internal`. The `full` under
-        // `example.com` in the fixture would be pruned if it existed; here nothing is covered.
+        // Two patterns: `example.com` and `=auth.corp.internal`.
         assert_eq!(summary.domain_patterns, 2);
 
         test(&drb_file, "192.168.1.100").unwrap();
@@ -277,7 +276,7 @@ mod tests {
         let rules_file = dir.join("test.rules");
         fs::write(
             &rules_file,
-            "name: filter-rules\nsuffix: allowed.com @cn\nsuffix: tracking.com @ads\n",
+            "name: filter-rules\nallowed.com @cn\ntracking.com @ads\n",
         )
         .unwrap();
 

@@ -54,7 +54,7 @@ pub use netune::{
     DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, Preset, SocketConfig,
     UdpConnector,
 };
-pub use netune_trace::{Recorder, TraceSink};
+pub use netune_trace::{TraceCollector, TraceSink};
 pub use observe::{
     DialId, DialObserver, DialObserverSink, LogObserver, ObservedDialer, ObserverSlot,
 };

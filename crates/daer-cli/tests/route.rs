@@ -38,7 +38,7 @@ fn route_cli_resolves_domain_and_ip() {
     let toml = r#"
 [routing]
 rules = [
-    "domain(suffix: 'bilibili.com') -> direct",
+    "domain(bilibili.com) -> direct",
     "ip(1.1.1.1) -> direct",
     "dport(443) -> block",
 ]
@@ -53,7 +53,7 @@ fallback = "direct"
         .expect("runs daer route domain");
     assert!(out.status.success(), "daer route bilibili.com must succeed");
     let out_str = String::from_utf8(out.stdout).unwrap();
-    assert!(out_str.contains("decided by : domain(suffix: bilibili.com) -> direct"));
+    assert!(out_str.contains("decided by : domain(bilibili.com) -> direct"));
     assert!(out_str.contains("outbound   : direct"));
 
     // 2. Single IP argument: daer route 1.1.1.1
@@ -423,4 +423,48 @@ fn base64(text: &str) -> String {
         });
     }
     out
+}
+
+#[test]
+fn route_supports_symbolic_exact_domain_match() {
+    let temp_dir = TempDir::new("route-symbolic-test");
+    let config_path = temp_dir.path().join("config.toml");
+
+    let toml = r#"
+[routing]
+rules = [
+    "domain(=auth.example.com) -> direct",
+    "domain(example.com) -> block",
+]
+fallback = "direct"
+"#;
+    fs::write(&config_path, toml).expect("writes config.toml");
+
+    let out_exact = daer_cmd()
+        .args([
+            "route",
+            "auth.example.com",
+            "-c",
+            config_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("runs daer route auth.example.com");
+    assert!(out_exact.status.success());
+    let str_exact = String::from_utf8(out_exact.stdout).unwrap();
+    assert!(str_exact.contains("outbound   : direct"));
+
+    // `=auth.example.com` must NOT match a subdomain; it falls through to `example.com`
+    // suffix -> block, which is a non-actionable verdict (exit 1).
+    let out_other = daer_cmd()
+        .args([
+            "route",
+            "sub.auth.example.com",
+            "-c",
+            config_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("runs daer route sub.auth.example.com");
+    assert!(!out_other.status.success(), "blocked flows exit 1");
+    let str_other = String::from_utf8(out_other.stdout).unwrap();
+    assert!(str_other.contains("outbound   : block"));
 }

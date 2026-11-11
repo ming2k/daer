@@ -127,7 +127,7 @@ sniffing-timeout = "200ms"
 [routing]
 rules = [
     "dip(10.0.0.0/8) -> block",
-    "domain(suffix: sniffed.example) -> direct",
+    "domain(sniffed.example) -> direct",
 ]
 fallback = "block"
 "#;
@@ -157,7 +157,7 @@ async fn without_a_matching_domain_the_fallback_applies() {
 sniffing-timeout = "200ms"
 
 [routing]
-rules = ["domain(suffix: sniffed.example) -> direct"]
+rules = ["domain(sniffed.example) -> direct"]
 fallback = "block"
 "#;
     let (address, supervisor) = start(config, origin).await;

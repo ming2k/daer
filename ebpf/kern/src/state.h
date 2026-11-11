@@ -8,7 +8,7 @@
 struct {
 	__uint(type, BPF_MAP_TYPE_SOCKMAP);
 	__type(key, __u32); // 0 is tcp4, 1 is udp, 2 is tcp6.
-	__type(value, __u64); // fd of socket.
+	__type(value, __u32); // fd of socket; SOCKMAP values are `int`, not `u64`.
 	__uint(max_entries, 3);
 } listen_socket_map SEC(".maps");
 
@@ -449,7 +449,15 @@ enum bpf_stats_key {
 	// re-created from the current generation instead of being locked, so a
 	// connection that outlives a reload ends up on the current rules.
 	BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE = 12,
-	BPF_STATS_MAX = 13,
+	// key=13: packets that reached the daer0peer ingress hook after a redirect.
+	BPF_STATS_PEER_INGRESS = 13,
+	// key=14: such a packet lost the TPROXY_MARK control-buffer handshake.
+	BPF_STATS_PEER_INGRESS_UNMARKED = 14,
+	// key=15: assign_listener could not find or assign the listener socket.
+	BPF_STATS_LISTENER_ASSIGN_FAILED = 15,
+	// key=16: a redirected packet reached daer0peer without an L4 tag.
+	BPF_STATS_PEER_INGRESS_NO_L4 = 16,
+	BPF_STATS_MAX = 17,
 };
 
 // Per-packet datapath counters, indexed by enum bpf_stats_key. Userspace reads

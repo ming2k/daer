@@ -44,29 +44,30 @@ Three more gaps of the same kind:
    field with `parse_host_port` and rejects the list.
 
 The common cause is a design one: the QUIC endpoint is built inline in a constructor
-(`make_endpoint`), so there is no place to insert anything between the socket and Quinn, and
-no seam a test can exercise without a live server.
+(`make_endpoint`), so there is no place to insert anything between the socket and the QUIC
+engine, and no seam a test can exercise without a live server.
 
 ## Decision
 
-**1. The datagram plane is an explicit stack of `AsyncUdpSocket` layers.**
+**1. The datagram plane is an explicit stack of `QuicUdpSocket` layers.**
 
 ```text
-  quinn::Endpoint
+  netune_quic::QuicConnector
         ▲
-        │  AsyncUdpSocket
+        │  QuicUdpSocket
   ┌─────┴──────────────────────────────┐
-  │ hop    (rotate local socket+port)  │  optional
   │ obfs   (salamander → gecko)        │  optional
+  │ hop    (rotate local socket+port)  │  optional
   │ socket (tokio UdpSocket, SO_MARK)  │  always
   └────────────────────────────────────┘
 ```
 
-Each layer implements `quinn::AsyncUdpSocket` (or wraps the one below) and is composed in
-`hysteria2/socket.rs`. No layer knows about QUIC framing, and Quinn does not know any layer
-exists. The endpoint is created with
-`quinn::Endpoint::new_with_abstract_socket`, which is the only constructor that accepts a
-layer — `Endpoint::new` is not used at all, so a socket wrapper cannot be forgotten again.
+Each layer implements `netune_quic::QuicUdpSocket` (or wraps the one below). No layer knows
+about QUIC framing, and the QUIC engine does not know any layer exists. The stack is created by
+a `QuicUdpSocketFactory` installed with `QuicConnector::with_socket_factory`; netune invokes it
+once per connection, after egress confinement and before the first Initial packet, so a wrapper
+cannot be forgotten again. The factory receives the connector's `QuicSocketConfig` and applies
+it to the base socket, which is where `SO_MARK` reaches the kernel before `bind`.
 
 **2. `obfs` is either implemented or rejected — and it is implemented.**
 
@@ -88,9 +89,9 @@ A configuration naming an obfuscation daer does not implement is a load-time err
 
 **4. Congestion control is the node's choice; Brutal pins the window to `up-mbps`.**
 
-`congestion = "bbr" | "cubic" | "new_reno" | "brutal"`, mapped onto
-`quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig}` and a daer `BrutalConfig`
-implementing `quinn_proto::congestion::ControllerFactory`. Brutal is the reference's
+`congestion = "bbr" | "cubic" | "new_reno" | "brutal"`. The first three select
+`netune_quic::CongestionAlgorithm`; Brutal is a daer `BrutalConfig` implementing
+`netune_quic::CongestionControllerFactory`. Brutal is the reference's
 throughput-preserving controller: it pins the window to `bps × srtt × 2 / ack_rate`, with
 `ack_rate` measured over a 5-second window and clamped to `>= 0.8`.
 
@@ -109,8 +110,9 @@ if actualTx == 0 || actualTx > MaxTx { actualTx = MaxTx }   // MaxTx = up-mbps
 congestion.UseBrutal(conn, actualTx, DisableLossCompensation)
 ```
 
-Quinn fixes its controller in `TransportConfig`, which is consumed when the endpoint dials — there
-is no post-handshake hook, and adding one means reaching into `quinn-proto`'s private state. So:
+netune selects its controller once, when the connection is created — there is no post-handshake
+hook, and adding one would make a live connection's congestion policy mutable outside its owner.
+So:
 
 | Reference behaviour | daer |
 | --- | --- |
@@ -127,17 +129,18 @@ ours.
 **6. Port hopping rotates the *source* port; the destination stays where the dial put it.**
 
 `hysteria2://…@host:443,8443-8445` resolves to a port set, and the hop layer rotates the local
-socket on an interval drawn from `[hop-min, hop-max]` via `Endpoint::rebind_abstract`, keeping the
-previous socket open for a grace period so the server's acknowledgement is not lost. QUIC
-connection migration is not used and is not enabled: the local port is what changes, and that
-changes nothing the server's connection id has to validate.
+socket on an interval drawn from `[hop-min, hop-max]` by switching which bound socket the
+`HopSocket` wrapper sends from, keeping the previous socket open for a grace period so the
+server's acknowledgement is not lost. QUIC connection migration is not used and is not enabled:
+the local port is what changes, and that changes nothing the server's connection id has to
+validate.
 
 The reference's `udpHopPacketConn` also rotates the **destination** across the set. That is not
-reproduced: in quinn the destination is fixed by `connect_with`, and rotating it per packet needs
-an `AsyncUdpSocket` that rewrites `Transmit::destination` — a layer this crate does not have. The
-port set therefore decides the *initial* dial and nothing more. This is recorded rather than
-half-implemented, which is what the previous version of this ADR did: it declared the rotation and
-then dropped the value on the floor with a comment claiming the endpoint would honour it.
+reproduced: netune fixes the destination at connect time, and rotating it per packet needs a
+layer that rewrites the peer address this crate does not have. The port set therefore decides the
+*initial* dial and nothing more. This is recorded rather than half-implemented, which is what the
+previous version of this ADR did: it declared the rotation and then dropped the value on the floor
+with a comment claiming the endpoint would honour it.
 
 ## Consequences
 

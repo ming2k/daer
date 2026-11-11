@@ -79,8 +79,7 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 		return TC_ACT_SHOT;
 	}
 
-	skb->cb[0] = TPROXY_MARK;
-	skb->cb[1] = pkt->listener_l4proto;
+	set_tproxy_cb(skb, pkt->listener_l4proto);
 
 	if (pkt->handoff_required) {
 		struct routing_handoff_entry handoff = {};

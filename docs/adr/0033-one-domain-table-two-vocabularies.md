@@ -22,7 +22,7 @@ That bridge was the last place the retired design survived, and it had three cos
    generation rebuilt a `DomainIndex` from it — 38 ms for `geosite:cn`, allocating a `HashSet`,
    a `HashMap`, and ~110,000 `Box<str>`. The table existed only to be thrown away.
 2. **`DomainKey` forced the wrong shape on every caller.** `DomainIndex::new(key, values, …)`
-   split a rule into a key and a value, so a caller holding `domain(suffix: a, full: b)` had to
+   split a rule into a key and a value, so a caller holding a mixed spelling had to
    group values by key and construct one index per key — and then ask each of them. Four engines,
    four call sites.
 3. **The engines were dead weight on the routing path.** `aho-corasick` and `regex` were linked
@@ -39,15 +39,18 @@ into one. `DrbSet::domains()` returns `&DomainTable`, so nothing rebuilds anythi
 
 ### 2. Routing accepts two pattern kinds, spelled the same everywhere
 
+> **Amended by [ADR-0036](0036-canonical-rule-source-v2-and-symbolic-syntax.md):** the
+> `full:`/`suffix:` spellings below were replaced by the symbolic forms `=name`, `name` and
+> `.name`. The structural decision — two kinds, one table, one vocabulary everywhere — stands.
+
 | written | matches |
 | --- | --- |
-| `full: name` | exactly `name` |
-| `suffix: name` | `name` and every subdomain |
-| `suffix: .name` | subdomains only |
-| `name` (bare) | the same as `suffix: name` |
+| `=name` | exactly `name` |
+| `name` | `name` and every subdomain |
+| `.name` | subdomains only |
 
 A bare name is a suffix **in a config rule and in a `.rules` file alike**. Previously
-`domain(example.com)` was an error demanding `domain(suffix: example.com)`, while the same text
+`domain(example.com)` was an error demanding a keyed spelling, while the same text
 in a rule file meant a suffix — one spelling, two meanings. There is now one vocabulary.
 
 `keyword:` and `regex:` are refused *by name* with a message saying to expand them upstream.

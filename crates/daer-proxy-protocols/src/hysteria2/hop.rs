@@ -2,18 +2,17 @@
 
 //! Port hopping: rotating the *local* port under a live QUIC connection (ADR-0029).
 //!
-//! # Why hop the local port, and why rebind rather than re-dial
+//! # Why hop the local port, and why rotate the socket rather than re-dial
 //!
 //! A censor that throttles a QUIC flow has to key on something, and a five-tuple is the
 //! cheapest key it has. The server's side of that tuple cannot change; the client's source
 //! port can, and the reference rotates it every 30 seconds by default. A new source port means
 //! a new five-tuple and a new throttle decision.
 //!
-//! Re-dialling would lose the connection. `quinn::Endpoint::rebind_abstract` is the sanctioned
-//! way to swap the socket underneath a live endpoint: it re-registers the new socket with the
-//! endpoint's driver and keeps every connection id intact. The reference achieves the same
-//! thing by replacing its `net.PacketConn` and keeping a receive loop on the old one; here the
-//! endpoint does it, which is why this is a task and not a socket layer.
+//! Re-dialling would lose the connection. netune's endpoint polls the stack once, so the
+//! `HopSocket` wrapper keeps a small set of bound sockets and switches which one sends; the
+//! endpoint's connection ids are untouched. The reference replaces its `net.PacketConn` and
+//! keeps a receive loop on the old one; this wrapper does the same below the QUIC engine.
 //!
 //! # The grace period
 //!
@@ -27,12 +26,14 @@
 //! socket without it would be redirected back into daer, and the loop would look like an
 //! authentication failure.
 
+use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use quinn::{AsyncUdpSocket, Runtime as _};
-use socket2::{Domain, Protocol, Socket, Type};
+use netune_quic::{QuicSocketConfig, QuicUdpSocket, QuicUdpSocketFactory};
 
 use crate::error::ProxyProtocolError;
 use crate::hysteria2::obfs::{Obfs, ObfsSocket};
@@ -106,67 +107,215 @@ impl HopSchedule {
     }
 }
 
-/// Binds the bottom socket of the stack: a UDP socket with `SO_MARK` applied before `bind`, so
-/// the kernel's route decision for the socket's own traffic sees it.
+/// The socket stack handed to the QUIC connector.
 ///
-/// Returns a `std::net::UdpSocket` because Quinn's runtime registration
-/// (`Runtime::wrap_udp_socket`) takes one.
+/// The `hop` handle is kept separately so a rotation task can add sockets while the
+/// obfuscation wrapper (when configured) sits above the same stack.
+pub struct SocketStack {
+    socket: Arc<dyn QuicUdpSocket>,
+    hop: Arc<HopSocket>,
+    target: SocketAddr,
+    config: QuicSocketConfig,
+}
+
+impl std::fmt::Debug for SocketStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketStack")
+            .field("local_addr", &self.hop.local)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SocketStack {
+    /// The abstract socket the QUIC endpoint should use.
+    #[must_use]
+    pub fn socket(&self) -> Arc<dyn QuicUdpSocket> {
+        Arc::clone(&self.socket)
+    }
+
+    /// Starts source-port hopping on this stack, if the node configured it.
+    #[must_use]
+    pub fn start_hopper(&self, schedule: HopSchedule) -> PortHopper {
+        PortHopper::start(
+            Arc::clone(&self.hop),
+            schedule,
+            self.target,
+            self.config.clone(),
+        )
+    }
+}
+
+/// Builds one socket stack for each QUIC connection netune opens.
+///
+/// netune calls [`QuicUdpSocketFactory::create`] after egress confinement and before the first
+/// Initial packet, and passes the connector's [`QuicSocketConfig`]. Retaining the stack here is
+/// what lets [`Hysteria2Connector`](super::connector::Hysteria2Connector) start port hopping only
+/// after the handshake succeeds: a failed dial drops the stack and spawns no rotation task.
+pub struct SocketStackFactory {
+    obfs: Option<Obfs>,
+    stack: Mutex<Option<SocketStack>>,
+}
+
+impl std::fmt::Debug for SocketStackFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketStackFactory")
+            .field("obfs", &self.obfs.as_ref().map(Obfs::kind))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SocketStackFactory {
+    /// Creates a factory for one Hysteria 2 dial.
+    #[must_use]
+    pub fn new(obfs: Option<Obfs>) -> Self {
+        Self {
+            obfs,
+            stack: Mutex::new(None),
+        }
+    }
+
+    /// Takes the stack the factory built for the connection that just completed.
+    ///
+    /// `None` means netune completed a handshake without asking for a socket, which would be a
+    /// connector bug rather than a recoverable dial failure.
+    #[must_use]
+    pub fn take(&self) -> Option<SocketStack> {
+        self.stack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+impl QuicUdpSocketFactory for SocketStackFactory {
+    fn create(
+        &self,
+        target: SocketAddr,
+        config: &QuicSocketConfig,
+    ) -> io::Result<Arc<dyn QuicUdpSocket>> {
+        let stack = build_stack(target, config, self.obfs.as_ref())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let socket = stack.socket();
+        *self.stack.lock().unwrap_or_else(|error| error.into_inner()) = Some(stack);
+        Ok(socket)
+    }
+}
+
+/// The rotating base layer: one datagram socket at a time, with the previous one
+/// retained for the acknowledgement that may still arrive on it.
+#[derive(Debug)]
+pub struct HopSocket {
+    sockets: Mutex<Vec<Arc<tokio::net::UdpSocket>>>,
+    current: AtomicUsize,
+    local: SocketAddr,
+}
+
+impl HopSocket {
+    fn new(socket: tokio::net::UdpSocket) -> io::Result<Self> {
+        let local = socket.local_addr()?;
+        Ok(Self {
+            sockets: Mutex::new(vec![Arc::new(socket)]),
+            current: AtomicUsize::new(0),
+            local,
+        })
+    }
+
+    fn add(&self, socket: tokio::net::UdpSocket) {
+        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        sockets.push(Arc::new(socket));
+        // The peer acknowledges the switch on the old path. Keeping one previous socket
+        // covers that race without accumulating one socket per hop forever.
+        while sockets.len() > 2 {
+            sockets.remove(0);
+        }
+        self.current.store(sockets.len() - 1, Ordering::Release);
+    }
+}
+
+impl QuicUdpSocket for HopSocket {
+    fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        if sockets.is_empty() {
+            return Poll::Pending;
+        }
+        let start = self.current.load(Ordering::Acquire).min(sockets.len() - 1);
+        for offset in 0..sockets.len() {
+            let index = (start + offset) % sockets.len();
+            match QuicUdpSocket::poll_recv_from(sockets[index].as_ref(), cx, buf) {
+                Poll::Pending => continue,
+                ready => return ready,
+            }
+        }
+        Poll::Pending
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let socket = {
+            let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+            let index = self.current.load(Ordering::Acquire).min(sockets.len() - 1);
+            Arc::clone(&sockets[index])
+        };
+        QuicUdpSocket::poll_send_to(socket.as_ref(), cx, buf, target)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+}
+
+/// Binds the bottom socket of the stack.
+///
+/// netune's [`QuicSocketConfig`] is applied here, including `SO_MARK` before `bind`/`connect`, so
+/// the kernel's route decision for the socket's own traffic sees the mark.
 ///
 /// # Errors
 ///
-/// Returns a message naming the step that failed: creating, marking, binding or making the
-/// socket non-blocking.
+/// Returns a message naming the target when any configured socket option or the bind fails.
 pub fn base_socket(
-    is_ipv6: bool,
-    so_mark: Option<u32>,
-) -> Result<std::net::UdpSocket, ProxyProtocolError> {
-    let socket = Socket::new(
-        if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 },
-        Type::DGRAM,
-        Some(Protocol::UDP),
-    )
-    .map_err(|error| ProxyProtocolError::Connect(format!("create udp socket: {error}")))?;
-
-    if let Some(mark) = so_mark {
-        socket
-            .set_mark(mark)
-            .map_err(|error| ProxyProtocolError::Connect(format!("set so_mark {mark}: {error}")))?;
-    }
-
-    let bind_addr: SocketAddr = if is_ipv6 {
-        "[::]:0".parse().expect("a literal address")
-    } else {
-        "0.0.0.0:0".parse().expect("a literal address")
-    };
-    socket
-        .bind(&bind_addr.into())
-        .map_err(|error| ProxyProtocolError::Connect(format!("bind udp socket: {error}")))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|error| ProxyProtocolError::Connect(format!("set nonblocking: {error}")))?;
-    Ok(socket.into())
+    target: SocketAddr,
+    config: &QuicSocketConfig,
+) -> Result<tokio::net::UdpSocket, ProxyProtocolError> {
+    config.create_tokio_socket(target).map_err(|error| {
+        ProxyProtocolError::Connect(format!("create udp socket for {target}: {error}"))
+    })
 }
 
-/// Builds the whole socket stack for one endpoint: the marked base socket, the obfuscation
-/// layer if the node configured one.
+/// Builds the whole socket stack for one connection: the marked base socket, the hop layer, and
+/// the obfuscation layer if the node configured one.
 ///
 /// # Errors
 ///
 /// Returns a message when a socket cannot be created or registered.
 pub fn build_stack(
-    is_ipv6: bool,
-    so_mark: Option<u32>,
+    target: SocketAddr,
+    config: &QuicSocketConfig,
     obfs: Option<&Obfs>,
-) -> Result<Arc<dyn AsyncUdpSocket>, ProxyProtocolError> {
-    let base = base_socket(is_ipv6, so_mark)?;
-    let socket: Arc<dyn AsyncUdpSocket> = quinn::TokioRuntime
-        .wrap_udp_socket(base)
-        .map_err(|error| ProxyProtocolError::Connect(format!("register udp socket: {error}")))?;
+) -> Result<SocketStack, ProxyProtocolError> {
+    let base = base_socket(target, config)?;
+    let hop =
+        Arc::new(HopSocket::new(base).map_err(|error| {
+            ProxyProtocolError::Connect(format!("inspect udp socket: {error}"))
+        })?);
     // Obfuscation sits directly above the socket: one salt per datagram, so it must be the
     // last thing that touches the bytes before `sendmsg`.
-    Ok(match obfs {
-        Some(obfs) => Arc::new(ObfsSocket::new(socket, obfs.clone())),
-        None => socket,
+    let socket: Arc<dyn QuicUdpSocket> = match obfs {
+        Some(obfs) => Arc::new(ObfsSocket::new(hop.clone(), obfs.clone())),
+        None => hop.clone(),
+    };
+    Ok(SocketStack {
+        socket,
+        hop,
+        target,
+        config: config.clone(),
     })
 }
 
@@ -193,57 +342,37 @@ impl Drop for PortHopper {
 }
 
 impl PortHopper {
-    /// Starts hopping `endpoint`'s socket on `schedule`.
+    /// Starts hopping the local source port on `schedule`.
     ///
-    /// `target` is the destination the node was resolved to; the hop layer also rotates the
-    /// *destination* port across `ports`, which is what the reference's `udpHopPacketConn`
-    /// does: one refused port must not strand the connection.
+    /// Only the *source* port rotates. Hysteria 2's `udpHopPacketConn` rotates the destination
+    /// too, but it owns the dial; in netune the destination is fixed by the connection, so a
+    /// node that publishes several destination ports is still reached because the *initial*
+    /// dial samples from the `ports` set (`Hysteria2Connector::resolve`). ADR-0029 records the
+    /// gap.
     #[must_use]
     pub fn start(
-        endpoint: quinn::Endpoint,
-        target: SocketAddr,
-        _ports: PortSet,
+        hop: Arc<HopSocket>,
         schedule: HopSchedule,
-        so_mark: Option<u32>,
-        obfs: Option<Obfs>,
+        target: SocketAddr,
+        config: QuicSocketConfig,
     ) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = tokio::spawn(async move {
-            // The previous stack is retained for one interval: the server's acknowledgement of
-            // the switch arrives on the old path.
-            let mut previous: Option<Arc<dyn AsyncUdpSocket>> = None;
             loop {
                 let interval = schedule.next();
                 tokio::time::sleep(interval).await;
                 if flag.load(std::sync::atomic::Ordering::Acquire) {
                     return;
                 }
-                let fresh = match build_stack(target.is_ipv6(), so_mark, obfs.as_ref()) {
+                let fresh = match base_socket(target, &config) {
                     Ok(fresh) => fresh,
                     // A transient bind failure is not fatal: the reference skips the hop
                     // ("Could be temporary, just skip this hop") rather than dropping the
                     // connection.
                     Err(_) => continue,
                 };
-                // Only the *source* port rotates. Hysteria 2's `udpHopPacketConn` rotates the
-                // destination too, but it owns the dial; in quinn the destination is fixed by
-                // `connect_with`, and `rebind_abstract` changes only the local socket. Rotating it
-                // would need an `AsyncUdpSocket` that rewrites `Transmit::destination` per packet —
-                // a layer this crate does not have, so it is not claimed. A node that publishes
-                // several destination ports is still reached: the *initial* dial samples from the
-                // `ports` set (`Hysteria2Connector::resolve`). ADR-0029 records the gap.
-                if endpoint.rebind_abstract(Arc::clone(&fresh)).is_ok() {
-                    // Drop the socket the endpoint just left — after one interval, so its
-                    // in-flight acknowledgement is still received.
-                    let old = previous.replace(fresh);
-                    if let Some(old) = old {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(interval).await;
-                            drop(old);
-                        });
-                    }
-                }
+                hop.add(fresh);
             }
         });
         Self { stop, handle }
@@ -302,11 +431,13 @@ mod tests {
         assert_eq!(exact.next(), Duration::from_secs(30));
     }
 
-    #[test]
-    fn the_base_socket_carries_the_mark_and_is_bound_to_an_ephemeral_port() {
-        // A hopped socket without the mark would be redirected back into daer by its own
-        // eBPF rule, and the loop would look like an authentication failure.
-        let socket = base_socket(false, None).expect("binds");
+    #[tokio::test]
+    async fn the_base_socket_is_bound_to_an_ephemeral_port_of_the_target_family() {
+        // A hopped socket without the connector's mark would be redirected back into daer by
+        // its own eBPF rule; `QuicSocketConfig::create_tokio_socket` is where that mark is
+        // applied, before the bind.
+        let target: SocketAddr = "127.0.0.1:443".parse().expect("literal");
+        let socket = base_socket(target, &QuicSocketConfig::default()).expect("binds");
         let address = socket.local_addr().expect("has an address");
         assert_ne!(
             address.port(),
@@ -314,5 +445,26 @@ mod tests {
             "an ephemeral port is assigned by the kernel"
         );
         assert!(address.ip().is_unspecified());
+        assert!(address.is_ipv4());
+
+        // The control: the family follows the target rather than a node-wide switch.
+        let target: SocketAddr = "[::1]:443".parse().expect("literal");
+        let socket = base_socket(target, &QuicSocketConfig::default()).expect("binds");
+        assert!(socket.local_addr().expect("has an address").is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn the_factory_hands_out_one_stack_and_retains_it_for_the_hopper() {
+        let factory = SocketStackFactory::new(None);
+        let target: SocketAddr = "127.0.0.1:443".parse().expect("literal");
+        let socket = factory
+            .create(target, &QuicSocketConfig::default())
+            .expect("creates a stack");
+        assert_ne!(socket.local_addr().expect("bound").port(), 0);
+        assert!(factory.take().is_some(), "the hopper needs the hop handle");
+        assert!(
+            factory.take().is_none(),
+            "one connection owns exactly one stack"
+        );
     }
 }

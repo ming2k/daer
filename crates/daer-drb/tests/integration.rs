@@ -46,9 +46,9 @@ ip: 10.0.0.0/8
 ip: 172.16.1.10 - 172.16.1.20
 
 # Domain patterns
-full: login.example.com
-suffix: example.com
-suffix: .sub.corp.local
+=login.example.com
+example.com
+.sub.corp.local
 "#;
 
     fs::write(&rules_path, rule_content).expect("rules written");
@@ -162,7 +162,7 @@ suffix: .sub.corp.local
     let filter_drb = temp_dir.path().join("filter.drb");
     fs::write(
         &filter_rules,
-        "name: filter-test\nsuffix: allowed.org @ok\nsuffix: blocked.org @ads\n",
+        "name: filter-test\nallowed.org @ok\nblocked.org @ads\n",
     )
     .expect("filter rules written");
 

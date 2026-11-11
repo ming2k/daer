@@ -269,17 +269,29 @@ fn write_quoted(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::parse_rule;
 
     #[test]
     fn renders_rules_back_into_parseable_text() {
         let rule = RoutingRule {
             and_functions: vec![Function::with_params(
                 "domain",
-                vec![Param::literal("suffix", "example.com")],
+                vec![Param::bare("example.com")],
             )],
             outbound: Function::new("direct"),
         };
-        assert_eq!(rule.to_string(), "domain(suffix: example.com) -> direct");
+        assert_eq!(rule.to_string(), "domain(example.com) -> direct");
+    }
+
+    #[test]
+    fn parses_bare_domain_as_positional_param_like_the_go_walker() {
+        let rule = parse_rule("domain(auth.example.com) -> direct").unwrap();
+        assert_eq!(rule.and_functions[0].params[0].key, "");
+        assert_eq!(
+            rule.and_functions[0].params[0].value,
+            ParamValue::Literal("auth.example.com".to_owned())
+        );
+        assert_eq!(rule.to_string(), "domain(auth.example.com) -> direct");
     }
 
     #[test]

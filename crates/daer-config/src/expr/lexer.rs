@@ -88,7 +88,7 @@ fn is_id_head(b: u8) -> bool {
 }
 
 fn is_non_id_head(b: u8) -> bool {
-    b.is_ascii_digit() || matches!(b, b'.' | b'*' | b'+' | b'-' | b'\\' | b'^')
+    b.is_ascii_digit() || matches!(b, b'.' | b'*' | b'+' | b'-' | b'\\' | b'^' | b'=')
 }
 
 fn is_safe_char(b: u8) -> bool {
@@ -118,7 +118,7 @@ fn is_hex(b: u8) -> bool {
 
 /// True when `src[..end]` followed by `:` starts an **address literal**, not a parameter key.
 ///
-/// The grammar has a genuine ambiguity: `domain(suffix:example.com)` is a key and a value, while
+/// The grammar has a genuine ambiguity: `qname(keyword:ads)` is a key and a value, while
 /// `mac(aa:bb:cc:dd:ee:ff)` and `dip(2001:db8::1)` are single addresses whose colons are part of
 /// the value. A lexer that treated every colon as a separator made those two rules **unwritable**
 /// (the parser reported "expected ')' to close the parameter list"), which is how this was found.
@@ -126,7 +126,7 @@ fn is_hex(b: u8) -> bool {
 /// The disambiguation is decidable without knowing the grammar, because the two shapes cannot
 /// overlap: an address literal's colon-separated segments are **all hex digits** (possibly
 /// empty, for `::`), and every parameter key in the language is a word that is not
-/// (`suffix`, `keyword`, `regex`, `full`, `prefix`, …). `suffix:abc.example` is therefore a key,
+/// (`keyword`, `regex`, `provider`, `mark`, …). `keyword:abc.example` is therefore a key,
 /// `aa:bb` is an address, and the rule is a property of the bytes rather than of a keyword list
 /// that would rot.
 fn starts_address_literal(bytes: &[u8], start: usize) -> bool {
@@ -399,16 +399,10 @@ mod tests {
         // The other half of the ambiguity: every key in the language is a word whose colon
         // follows a non-hex run, so the address rule must not swallow it.
         for (src, key, value, kind) in [
-            ("suffix:example.com", "suffix", "example.com", TokenKind::Id),
             ("keyword:example", "keyword", "example", TokenKind::Id),
             // A regex starts with `^`, which is a non-identifier literal head.
             ("regex:^a.*b$", "regex", "^a.*b$", TokenKind::NonId),
-            (
-                "full:www.example.com",
-                "full",
-                "www.example.com",
-                TokenKind::Id,
-            ),
+            ("provider:cn", "provider", "cn", TokenKind::Id),
         ] {
             assert_eq!(
                 kinds(src),

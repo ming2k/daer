@@ -6,7 +6,7 @@ This document specifies the style guide, markdown conventions, and hyperlink sta
 
 ## 1. Hyperlink Standards
 
-1. **Relative Paths**: All cross-references between documentation files must use explicit relative paths (e.g. `[Deployment Guide](../how-to/deployment.md)`).
+1. **Relative Paths**: All cross-references between documentation files must use explicit relative paths (e.g. `[Deployment Guide](../../how-to/deployment.md)`).
 2. **Never Use Absolute Locators**: Never write hardcoded local paths (e.g. `/home/...` or `file://...`) or absolute repo URLs that break across forks or offline workflows.
 3. **Target Existence**: Every relative link must resolve to a valid file on disk. Dead links or broken targets degrade epistemic trust and fail validation.
 4. **Anchor Hygiene**: When linking to section headers, use clean kebab-case anchors matching the heading text.

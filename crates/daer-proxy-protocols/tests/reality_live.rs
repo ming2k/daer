@@ -36,6 +36,7 @@
 use std::time::Duration;
 
 use daer_proxy_protocols::{DialerOptions, ProxyDialer};
+use netune_trace::TraceCollector;
 
 /// The node, from the environment so no credential is in the repository.
 fn link() -> String {
@@ -110,7 +111,7 @@ async fn a_reality_node_carries_udp_datagrams() {
         .datagram_connector()
         .expect("reality node must support datagrams");
 
-    let recorder = std::sync::Arc::new(std::sync::Mutex::new(netune_trace::Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     let established = tokio::time::timeout(
         Duration::from_secs(20),
         datagram_connector.connect("8.8.8.8:53", &recorder),

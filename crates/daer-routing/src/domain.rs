@@ -6,8 +6,8 @@
 //!
 //! Two pattern kinds, because they are the two questions a routing rule can ask:
 //!
-//! * `full: name`   — does this exact name appear?
-//! * `suffix: name` — is this name, or any name under it, listed? A leading dot
+//! * `=name`   — does this exact name appear?
+//! * `name`    — is this name, or any name under it, listed? A leading dot
 //!   (`.name`) narrows that to subdomains only.
 //!
 //! `keyword:` and `regex:` were removed (ADR-0032, ADR-0033). They existed because the V2Ray
@@ -107,29 +107,43 @@ impl DomainTable {
                 warnings.push("domain matcher: skipped an empty pattern".to_owned());
                 continue;
             }
-            let (kind, value) = match text.split_once(':') {
-                Some((kind, value)) => (kind.trim(), value.trim()),
-                None => ("suffix", text),
-            };
-            let value = value.trim_start_matches('+');
-
-            let (bare, flag) = match kind {
-                "full" => (value, flags::FULL),
-                "suffix" | "domain" | "root_domain" => {
-                    // `.example.com` and `example.com` are one key with two scopes; the leading
-                    // dot is the only thing that distinguishes them.
-                    match value.strip_prefix('.') {
-                        Some(bare) if !bare.starts_with('.') => (bare, flags::SUFFIX_SUB_ONLY),
-                        _ => (value, flags::SUFFIX_SELF_AND_SUB),
-                    }
-                }
-                other => {
+            let (bare, flag) = if let Some(exact) = text.strip_prefix('=') {
+                (exact.trim(), flags::FULL)
+            } else if let Some(sub) = text.strip_prefix('.') {
+                if sub.starts_with('.') {
                     warnings.push(format!(
-                        "domain matcher: skipped \"{pattern}\": `{other}:` is not a routing \
-                         predicate (ADR-0033 accepts `full:` and `suffix:`); expand it into \
-                         concrete patterns upstream"
+                        "domain matcher: skipped invalid pattern \"{pattern}\" (multiple leading dots)"
                     ));
                     continue;
+                }
+                (sub.trim(), flags::SUFFIX_SUB_ONLY)
+            } else {
+                // A bare name is a suffix (ADR-0036). A retired `full:`/`suffix:`/`domain:` key
+                // is refused by name so a migrated configuration is told where the spelling went,
+                // and a `keyword:`/`regex:` key is refused because the routing path has no engine
+                // for it (ADR-0031, ADR-0033).
+                let (kind, value) = match text.split_once(':') {
+                    Some((kind, value)) => (kind.trim(), value.trim()),
+                    None => ("", text),
+                };
+                match kind {
+                    "" => (value, flags::SUFFIX_SELF_AND_SUB),
+                    "full" | "suffix" | "domain" | "root_domain" | "=" | "exact" => {
+                        warnings.push(format!(
+                            "domain matcher: skipped \"{pattern}\": the `{kind}:` spelling is \
+                             retired (ADR-0036); write a bare name (suffix), `.name` (subdomains \
+                             only), or `=name` (exact)"
+                        ));
+                        continue;
+                    }
+                    _ => {
+                        warnings.push(format!(
+                            "domain matcher: skipped \"{pattern}\": `{kind}:` is not a routing \
+                             predicate (ADR-0031, ADR-0033 accepts bare/`.name`/`=name`); expand \
+                             it into concrete patterns upstream"
+                        ));
+                        continue;
+                    }
                 }
             };
 
@@ -149,6 +163,19 @@ impl DomainTable {
             ..Self::default()
         };
         table.build(accepted);
+        // Derive the diagnostic spelling from the built table rather than from the input, so a
+        // table spells rules canonically (bare / `.suffix` / `=exact`) no matter how they were
+        // written, and equals the one `decode` reconstructs from its own bytes (ADR-0036).
+        table.patterns = table
+            .iter_rules()
+            .map(|(value, scope)| {
+                let spelling = match scope {
+                    None => format!("={value}"),
+                    Some(scope) => format!("{}{value}", scope.marker()),
+                };
+                spelling.into_boxed_str()
+            })
+            .collect();
         table
     }
 
@@ -164,8 +191,8 @@ impl DomainTable {
             .iter_rules()
             .map(|(value, scope)| {
                 let spelling = match scope {
-                    None => format!("full: {value}"),
-                    Some(scope) => format!("suffix: {}{value}", scope.marker()),
+                    None => format!("={value}"),
+                    Some(scope) => format!("{}{value}", scope.marker()),
                 };
                 spelling.into_boxed_str()
             })
@@ -416,8 +443,8 @@ impl DomainTable {
             .iter_rules()
             .map(|(value, scope)| {
                 let spelling = match scope {
-                    None => format!("full: {value}"),
-                    Some(scope) => format!("suffix: {}{value}", scope.marker()),
+                    None => format!("={value}"),
+                    Some(scope) => format!("{}{value}", scope.marker()),
                 };
                 spelling.into_boxed_str()
             })
@@ -478,14 +505,22 @@ mod tests {
 
     #[test]
     fn full_and_suffix_answer_the_questions_a_rule_asks() {
-        let t = table(&["suffix: example.com", "full: api.other.com"]);
+        let t = table(&["example.com", "=api.other.com"]);
         assert!(t.matches("example.com"), "suffix includes the bare name");
         assert!(t.matches("www.example.com"));
         assert!(t.matches("a.b.example.com"));
         assert!(t.matches("api.other.com"));
-        assert!(!t.matches("other.com"), "full is exact");
+        assert!(!t.matches("other.com"), "= is exact");
         assert!(!t.matches("abcexample.com"), "a label boundary is required");
         assert!(!t.matches("elsewhere.com"));
+    }
+
+    #[test]
+    fn equals_prefix_compiles_as_exact_match() {
+        let t = table(&["=exact.example.com"]);
+        assert!(t.matches("exact.example.com"));
+        assert!(!t.matches("sub.exact.example.com"));
+        assert!(!t.matches("example.com"));
     }
 
     #[test]
@@ -495,7 +530,7 @@ mod tests {
 
     #[test]
     fn a_leading_dot_narrows_to_subdomains_only() {
-        let t = table(&["suffix: .corp.example"]);
+        let t = table(&[".corp.example"]);
         assert!(t.matches("a.corp.example"));
         assert!(
             !t.matches("corp.example"),
@@ -505,43 +540,40 @@ mod tests {
 
     #[test]
     fn a_broader_suffix_absorbs_the_patterns_under_it() {
-        let t = table(&[
-            "suffix: example.com",
-            "full: a.example.com",
-            "suffix: b.example.com",
-        ]);
+        let t = table(&["example.com", "=a.example.com", "b.example.com"]);
         assert_eq!(t.len(), 1, "covered records must be pruned: {t:?}");
         assert!(t.matches("a.example.com"));
         assert!(t.matches("b.example.com"));
     }
 
     #[test]
-    fn keyword_and_regex_are_refused_by_name() {
+    fn keyword_and_regex_and_retired_keys_are_refused_by_name() {
         let mut warnings = Vec::new();
-        DomainTable::compile(&["keyword: ads", "regex: ^a.*z$"], &mut warnings);
-        assert_eq!(warnings.len(), 2);
+        DomainTable::compile(
+            &["keyword: ads", "regex: ^a.*z$", "suffix: example.com"],
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 3);
         assert!(
             warnings[0].contains("not a routing predicate"),
             "{warnings:?}"
         );
         assert!(warnings[0].contains("expand it"), "{warnings:?}");
+        assert!(warnings[2].contains("retired"), "{warnings:?}");
+        assert!(warnings[2].contains("ADR-0036"), "{warnings:?}");
     }
 
     #[test]
     fn invalid_characters_are_refused_with_the_offending_character() {
         let mut warnings = Vec::new();
-        DomainTable::compile(&["suffix: bad domain"], &mut warnings);
+        DomainTable::compile(&["bad domain"], &mut warnings);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains('\''), "{warnings:?}");
     }
 
     #[test]
     fn round_trips_through_the_encoded_record_stream() {
-        let t = table(&[
-            "suffix: example.com",
-            "full: api.example.com",
-            "suffix: .sub.other.org",
-        ]);
+        let t = table(&["example.com", "=api.example.com", ".sub.other.org"]);
         let (bytes, count) = t.encode_records();
         let decoded = DomainTable::decode_records(&bytes, count as usize).expect("decodes");
         assert_eq!(decoded.len(), t.len());
@@ -557,7 +589,7 @@ mod tests {
 
     #[test]
     fn a_key_that_prefixes_another_survives_front_coding() {
-        let t = table(&["full: a.com", "full: ab.com", "full: abc.com"]);
+        let t = table(&["=a.com", "=ab.com", "=abc.com"]);
         let (bytes, count) = t.encode_records();
         let decoded = DomainTable::decode_records(&bytes, count as usize).expect("decodes");
         for name in ["a.com", "ab.com", "abc.com"] {
@@ -568,7 +600,7 @@ mod tests {
 
     #[test]
     fn iter_rules_reports_both_predicates_when_a_key_serves_both() {
-        let t = table(&["full: example.com", "suffix: example.com"]);
+        let t = table(&["=example.com", "example.com"]);
         let rules: Vec<_> = t.iter_rules().collect();
         assert_eq!(rules.len(), 2, "{rules:?}");
         assert!(rules.contains(&("example.com".to_owned(), None)));
@@ -580,7 +612,7 @@ mod tests {
 
     #[test]
     fn an_over_long_name_is_refused_rather_than_truncated() {
-        let t = table(&["suffix: example.com"]);
+        let t = table(&["example.com"]);
         let long = format!("{}.example.com", "a".repeat(600));
         assert!(!t.matches(&long));
     }

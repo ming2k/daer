@@ -7,6 +7,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-11-11
+
+### Changed
+
+- **Canonical Rule Source v2 ([ADR-0036](docs/adr/0036-canonical-rule-source-v2-and-symbolic-syntax.md)).**
+  Domain rules use symbolic syntax: `example.com` is a suffix, `.example.com` matches
+  subdomains only, and `=example.com` is exact. The `full:`/`suffix:` spellings are retired and
+  produce a named migration warning; `.rules` rendering and `daer-drb decompile` emit the
+  canonical symbolic form. Decompile→compile remains byte-identical on a 120,000-pattern
+  corpus.
+- **Per-provider rule refresh ([ADR-0037](docs/adr/0037-per-provider-refresh-cadence.md)).**
+  HTTP providers are checked on their own declared `interval`; the daemon wakes on the shortest
+  cadence and skips providers that are not due. A `304 Not Modified` or byte-identical response
+  keeps the running generation (and its measured node latency); only changed content is
+  republished, and a failed refresh keeps the current rules.
+- **netune 0.0.24: owned QUIC and HTTP/3.** `daer` now pins the `v0.0.24` release.
+  netune owns the RFC 9000/9221 QUIC engine and the RFC 9114/9204 HTTP/3 + QPACK stack,
+  so `quinn`, `quinn-proto`, `h3`, `h3-quinn` and the vendored fork disappear from the
+  production graph ([ADR-0035](docs/adr/0035-quic-and-http3-in-netune.md)). The bump also
+  carries netune's bounded TLS/HTTP2/QUIC parsing, DPLPMTUD and per-connection QUIC
+  lifecycle fixes.
+- **Hysteria 2 keeps its product semantics through generic netune seams.**
+  Salamander/Gecko and source-port hopping implement `netune_quic::QuicUdpSocket` and are
+  built by a per-connection `QuicUdpSocketFactory`; Brutal implements
+  `netune_quic::CongestionControllerFactory`; `pin-sha256` reads
+  `Connection::peer_certificates`; keep-alives use `QuicProfile.keep_alive`.
+  `disable-path-mtu-discovery` maps to `QuicProfile.path_mtu_discovery`, so the owned
+  engine's DPLPMTUD probes are disabled rather than silently ignored. Hysteria 2 streams
+  are bridged from netune's raw QUIC halves to `AsyncRead + AsyncWrite` locally, so no
+  third-party QUIC stream wrapper returns.
+- **Typed observation.** A dial nobody observes uses `TraceCollector::disabled()` (no event
+  recorded, no sink, no ring filled); an observed dial installs one `DialObserverSink`
+  before connecting, so netune's DNS/TCP/TLS marks stream to the observer and the final
+  phases are derived from the actual event log. Hysteria 2 passes the collector into
+  `netune-quic` and `netune-http3`, so its QUIC/H3 handshake is no longer outside the trace.
+
+### Fixed
+
+- **Transparent ingress lives in the private `daer0ns` network namespace.**
+  A redirected host flow and its listener shared the host namespace; `bpf_sk_assign` returned
+  success, but the transport stack still dropped the assigned packet with
+  `tcp_v4_rcv … NO_SOCKET`. `daer0peer`, the TCP/UDP transparent listeners, table 2023 and the
+  peer sysctls now live in `daer0ns`; the host keeps `daer0`, forwarding, and the redirect
+  source. Policy routing is keyed by `iif daer0peer`, not fwmark, because listener replies are
+  deliberately marked and must leave through the peer instead of looping to `lo`. The peer
+  gets a return address/default route/permanent neighbor so listener replies can cross back to
+  the host. The unit and preflight add `CAP_SYS_ADMIN`; a stale host table-2023 rule from an
+  earlier run is removed at startup. See [ADR-0038](docs/adr/0038-private-ingress-network-namespace.md).
+- **The datapath attaches with classic `cls_bpf`, not TCX.** Aya prefers TCX on
+  kernels >= 6.6, but `bpf_sk_assign` is the classic tc-ingress helper the datapath was
+  written against. Under TCX it returned success while the assigned packet never reached
+  the listener's accept queue. `attach_tc` now uses the netlink/cls_bpf path explicitly,
+  matching the reference implementation; `tc filter show` reports the programs again.
+- **The datagram relay runs in its own task, and health probes carry the daer mark.**
+  The TCP accept loop and the UDP relay previously shared one `tokio::join!` task, so a
+  blocking or slow datagram operation could stop `accept(2)` from being polled. They are now
+  independent tasks. Health probes use the same `so-mark` as every other daer socket instead
+  of being recaptured by daer's own WAN hook, and a bare UDP DNS probe address uses port 53
+  rather than falling back to the node's proxy port.
+- **UDP replies attempt the syscall before reporting WouldBlock.** The reply path used
+  Tokio's `try_send_to`; on a freshly created namespace socket its readiness state could still
+  be empty, so every DNS reply failed with `operation would block` without a packet leaving.
+  Reply sockets are now std nonblocking sockets whose reply path calls `send_to` directly,
+  bypassing Tokio readiness, and the namespace factory creates them inside `daer0ns`.
+- **UDP listeners and reply sockets carry daer's socket mark and live in the ingress
+  namespace.** The TCP listener already did; the UDP wildcard listeners, every cached reply
+  socket, and the namespace reply-socket factory now apply the same mark, so replies are not
+  treated as new client flows and redirected again. Reply sockets are created through the
+  relay's `ReplySocketFactory` seam, which `daer-control` implements with `daer0ns`.
+- **The transparent listener carries daer's socket mark.** The listener's SYN-ACK is
+  generated by the kernel, so it never went through a daer dialer and had mark 0. The
+  datapath's own-traffic test then treated the reply as a new client flow and routed it
+  again, leaving the client with retransmitted SYNs and an empty accept queue. The listener
+  now applies the same `SO_MARK` as `PARAM.socket_mark`; the direct-listener test still
+  accepts and rejects a self-connect as designed.
+- **The v6 transparent listener is `IPV6_V6ONLY`.** Removing reuseport exposed a missing
+  `set_only_v6`: Linux's `bindv6only=0` default made the `::` bind collide with the
+  `0.0.0.0` listener and the daemon failed with `Address already in use`. The v6 socket is
+  now explicitly v6-only, so both families bind the same port without reuseport.
+- **The transparent listener is not a reuseport socket.** `bpf_sk_assign` names the exact
+  listener that must receive the packet; `SO_REUSEPORT` let the stack run reuseport selection
+  again, so the assigned connection never reached the accept queue even though the helper
+  returned success. The production listener now sets `SO_REUSEADDR` only;
+  `bind_shared` keeps reuseport for the handover test.
+- **Redirected packets route locally even without their mark.** `RouteTable` installs
+  `iif daer0peer table 2023` (v4 and v6) inside the ingress namespace. `daer0peer` is private
+  to the datapath, so an arriving packet is ours by construction; this removes the
+  mark-preservation assumption from the local-delivery path. There is deliberately no
+  mark-keyed rule in the namespace: the listener's marked replies must leave through the
+  peer, and a mark rule would send them back to `lo`.
+- **The listener assignment survives the redirect.** The L4 protocol was carried only in
+  `skb->cb[1]`; the veth redirect on this kernel preserves `cb[0]` but clobbers `cb[1]`, so
+  `daer0peer_ingress` skipped `assign_listener` and the flow never reached the transparent
+  listener. The tag now carries the listener kind in the high nibble of `cb[0]` as well, and
+  a missing tag is counted (`BPF_STATS_PEER_INGRESS_NO_L4`) instead of disappearing.
+- **A restarted daemon no longer inherits the previous run's connection state.**
+  `conn_state_map` is pinned across restarts, while `datapath_generation` was the constant
+  `1`; an old ACTIVE entry was therefore treated as belonging to the current run, and a
+  reused five-tuple was refused as a mid-stream SYN rebind (`BPF_STATS_SYN_REBIND_REJECTED`)
+  and then passed through without routing. Each start now uses a fresh generation.
+- **Host-generated flows are accepted on `daer0peer`.** A flow the box itself opens has a
+  source address that is local on `wlan0`; arriving on `daer0peer`, the kernel treated it as a
+  martian source and dropped it before `bpf_sk_assign`, so local DNS and TCP timed out while
+  the daemon and the node were both healthy. `datapath::Sysctl` now applies the reference's
+  host-veth sysctls to both ends of the pair (`accept_local=1`, `rp_filter=0`,
+  `arp_filter=0`, plus the `all` forms) and restores them on exit.
+- **The redirect target is published into `daer_ifindex_map`.** The loader carried the
+  `daer0` ifindex in `PARAM` and exposed `set_device_ifindex`, but `attach` never called it.
+  The map therefore read zero, `bpf_redirect(0, 0)` failed, and every flow handed to the
+  control plane was dropped before reaching the listener: the daemon attached and listened
+  cleanly while DNS and TCP simply timed out. The C fallback now also treats a zero map
+  entry as absent, so an old object cannot repeat the silent drop.
+- **`listen_socket_map` is a real `SOCKMAP`.** Its value was declared as `__u64` while the
+  kernel and `aya` require a 32-bit socket fd, so attaching failed with
+  `listen_socket_map is not a SOCKMAP: invalid value size 4, expected 8`. The map is now
+  `__u32`, pinned by the object test `the_listener_map_is_a_sockmap_with_fd_sized_values`.
+- **The policy-route installer invokes `ip`.** The `ip rule`/`ip route` argument vectors began
+  with the family selector, so the daemon tried to execute `-4` as a program and failed with
+  `` `-4` is not installed `` before it reached the policy routing. All four forms now start
+  with `ip`, pinned by a unit test.
+- **The datapath loads under the shipped unit's capability set.** The fast packet parser
+  advances a pointer by header lengths read at runtime (IPv4 IHL, IPv6 extension headers),
+  which this kernel's verifier only permits with `CAP_PERFMON` (`allow_ptr_leaks`). The unit,
+  deployment guide and `Preflight` capability report now name `CAP_PERFMON`; without it the
+  load stopped at `tproxy_wan_ingress_l2` with `pointer arithmetic ... prohibited for !root`.
+- **A rejected provider refresh cannot strand new rules.** Refreshes are staged in a copy of
+  the provider pool and installed only after `daemon.reload` accepts them; the previous code
+  mutated the live pool first, so a failed generation build made the next tick see the new
+  rules as "unchanged" and never publish them.
+- **An invalid `SIGHUP` no longer stops the daemon.** The provider-cadence rebuild reads the
+  configuration a second time; a failed reload now keeps both the running generation and the
+  previous schedule instead of propagating the load error out of the signal handler. The
+  reload test now sends a second, invalid configuration and asserts the process survives.
+- **Packaging plan is valid TOML again.** `packaging/daer.plan.toml` had an unterminated
+  staging script, so a package build could not read its own plan; the plan now parses and the
+  staging script is closed before the output hooks.
+- **Malformed DRB headers are rejected, not indexed.** Every offset and interval count in a
+  downloaded `.drb` header is bounds-checked before it becomes a slice index; a corrupt
+  provider artifact now returns `DrbError` instead of panicking the daemon.
+- **DoT/DoH trust-store failure is a configuration error.** A host without a platform trust
+  store now makes the upstream fail with `UpstreamError::Failed` during load/check instead of
+  aborting on an `expect` in the constructor.
+- **Supply-chain advisory RUSTSEC-2026-0383.** `webpki-root-certs` is updated to 1.0.11,
+  removing the distrusted emSign root. `deny.toml` now gates advisories, licenses, sources and
+  the single-crypto-provider policy in CI.
+- Unused direct dependencies were removed from `daer-cli`, `daer-dns`, `daer-sniff` and
+  `daer-proxy-protocols`; `xtask` now inherits the workspace version and license.
+
 ## [0.0.8] - 2026-11-07
 
 Release 0.0.8 introduces Shadowsocks 2022 (SIP022) with a dual-stack modular architecture,

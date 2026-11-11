@@ -32,6 +32,11 @@ Before any change is merged or released, it must clear the verification gates th
 └─────────────────────────────────────────────────────────────┘
 ```
 
+CI additionally runs `cargo deny check` against `deny.toml` in the `supply-chain` job:
+advisories, license expressions, source registries and the single-crypto-provider policy. It is
+kept out of `cargo xtask ci` so a developer without `cargo-deny` still has the fast local gate,
+but a release must have it green.
+
 ### What the test gate needs on the machine
 
 Two suites are *fixtures* rather than dependencies: they start what they need and **skip with a
@@ -43,6 +48,7 @@ stated reason** when it is absent (ADR-0007 — a skip that says why is a fact).
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/vision_tls_inside.rs` | the only coverage of Vision's **raw-copy** path. Plaintext through the tunnel does not exercise it, so a client that cannot carry a TLS stream passes every plaintext test — that is how the `Direct` defect shipped, with `curl https://…` failing on every request while the suite was green |
 | `xray` on `PATH` or `$XRAY_BIN` | `daer-proxy-protocols/tests/{layer_matrix,vmess_live,hysteria2_live}.rs` | the layer matrix, VMess AEAD and the complete Hysteria 2 stack lose their only real-peer coverage (ADR-0028, ADR-0029, ADR-0030) |
 | `nftables` + `CAP_NET_ADMIN` | `daer-control/tests/transparent.rs` | the user-space data path is not exercised; `scripts/e2e-check.sh` runs it with the capability |
+| `CAP_SYS_ADMIN` + writable `/run/netns` + `DAER_NETNS_TEST=1` | `daer-control/tests/netns_lifecycle.rs` | the namespace guard, peer move, `iif` rule and return route lose their real-kernel falsifier; run it in a disposable `unshare -Urnm` (ADR-0038) |
 | `nftables` + `CAP_NET_ADMIN` | `daer-cli/tests/reload.rs` | the `SIGHUP` test needs the transparent port, so it skips with a reason; `scripts/e2e-check.sh` section 4 runs it |
 
 A release should not be cut from a run where the interop suite skipped: the `✅` in

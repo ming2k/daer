@@ -27,8 +27,9 @@
 
 use std::io;
 use std::mem;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -152,6 +153,21 @@ impl DatagramIngress for TransparentDatagramListener {
 
 /// A bound transparent UDP ingress.
 ///
+/// Where reply sockets are created.
+///
+/// The relay must not know that daer's ingress lives in a private network namespace. The
+/// control plane supplies this seam so a reply socket can be born in the same namespace as
+/// the listener that owns the original destination; the default implementation creates it
+/// in the caller's namespace for the host-only tests.
+pub trait ReplySocketFactory: std::fmt::Debug + Send + Sync {
+    /// Binds a transparent reply socket that owns `source`.
+    ///
+    /// The socket is nonblocking, but it is a `std` socket: the reply path calls
+    /// `send_to` directly, so Tokio's readiness state cannot turn the first send into a
+    /// spurious `WouldBlock`.
+    fn bind(&self, source: SocketAddr) -> io::Result<StdUdpSocket>;
+}
+
 /// Dropping it closes the sockets. Like the TCP listener, both address families get
 /// their own socket on the same port, because a transparent v4 socket cannot serve a v6
 /// flow.
@@ -160,6 +176,12 @@ pub struct TransparentDatagramListener {
     v4: UdpSocket,
     v6: UdpSocket,
     port: u16,
+    /// The daemon's socket mark, applied to the listeners and every reply socket.
+    ///
+    /// A reply socket that owns an original destination must be excluded from the
+    /// datapath's own-egress capture. Without the mark, the reply is seen as a new flow and
+    /// redirected again, which is a loop even though every individual `sendto` succeeds.
+    socket_mark: Option<u32>,
     /// One transparent socket per original destination, for the reply direction.
     ///
     /// Keyed by the destination a client sent to, because that is the source address its
@@ -174,6 +196,9 @@ pub struct TransparentDatagramListener {
     /// An evicted destination is re-bound on its next reply, which costs one `socket(2)` —
     /// far cheaper than an `EMFILE` that stops every flow.
     sources: std::sync::Mutex<ReplySockets>,
+    /// The namespace the reply sockets must be created in, when the listener itself lives in
+    /// a private ingress namespace. `None` means the caller's namespace (host tests).
+    reply_factory: Option<Arc<dyn ReplySocketFactory>>,
 }
 
 /// How many reply sockets one ingress keeps.
@@ -191,15 +216,23 @@ pub const REPLY_SOCKET_CACHE: usize = 512;
 /// maintains.
 #[derive(Debug, Default)]
 struct ReplySockets {
-    sockets: std::collections::HashMap<SocketAddr, UdpSocket>,
+    sockets: std::collections::HashMap<SocketAddr, StdUdpSocket>,
     /// Most-recently-used last.
     order: std::collections::VecDeque<SocketAddr>,
 }
 
 impl ReplySockets {
     /// Returns the socket for `source`, binding it when absent and evicting when full.
-    fn get_or_insert(&mut self, source: SocketAddr) -> io::Result<&UdpSocket> {
-        self.get_or_insert_with(source, bind_source)
+    fn get_or_insert(
+        &mut self,
+        source: SocketAddr,
+        socket_mark: Option<u32>,
+        factory: Option<&Arc<dyn ReplySocketFactory>>,
+    ) -> io::Result<&StdUdpSocket> {
+        self.get_or_insert_with(source, |domain, source| match factory {
+            Some(factory) => factory.bind(source),
+            None => bind_source(domain, source, socket_mark),
+        })
     }
 
     /// [`Self::get_or_insert`] with the socket builder injected.
@@ -210,8 +243,8 @@ impl ReplySockets {
     fn get_or_insert_with(
         &mut self,
         source: SocketAddr,
-        bind: impl FnOnce(Domain, SocketAddr) -> io::Result<UdpSocket>,
-    ) -> io::Result<&UdpSocket> {
+        bind: impl FnOnce(Domain, SocketAddr) -> io::Result<StdUdpSocket>,
+    ) -> io::Result<&StdUdpSocket> {
         if self.sockets.contains_key(&source) {
             // Touch: move to the back so it is the last candidate for eviction.
             self.order.retain(|key| *key != source);
@@ -252,15 +285,52 @@ impl TransparentDatagramListener {
     /// Returns [`RelayError::Socket`] when a socket cannot be created, configured or
     /// bound — most commonly `EPERM` without `CAP_NET_ADMIN`/`CAP_NET_RAW`.
     pub fn bind(listen_ip: Ipv4Addr, port: u16) -> Result<Self, RelayError> {
-        let v4 = bind_family(Domain::IPV4, IpAddr::V4(listen_ip), port)?;
+        Self::bind_with_options(listen_ip, port, None)
+    }
+
+    /// Binds the transparent datagram port with the daemon's socket mark.
+    ///
+    /// The mark is applied to the wildcard listeners and to every reply socket bound by
+    /// [`Self::try_send_from`]. It is not decoration: the datapath treats its own marked
+    /// egress as bypass, and an unmarked reply socket would send a reply that the datapath
+    /// then tries to proxy again.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::bind`], plus `SO_MARK`'s `EPERM` without `CAP_NET_ADMIN`.
+    pub fn bind_with_options(
+        listen_ip: Ipv4Addr,
+        port: u16,
+        socket_mark: Option<u32>,
+    ) -> Result<Self, RelayError> {
+        let v4 = bind_family(Domain::IPV4, IpAddr::V4(listen_ip), port, socket_mark)?;
         let port = v4.local_addr().map_err(RelayError::Socket)?.port();
-        let v6 = bind_family(Domain::IPV6, IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
+        let v6 = bind_family(
+            Domain::IPV6,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            port,
+            socket_mark,
+        )?;
         Ok(Self {
             v4,
             v6,
             port,
+            socket_mark,
             sources: std::sync::Mutex::new(ReplySockets::default()),
+            reply_factory: None,
         })
+    }
+
+    /// Creates reply sockets in the ingress namespace instead of the caller's.
+    ///
+    /// The UDP outbound leg lives in the host namespace, but the reply must leave from the
+    /// original destination and cross the same namespace boundary as a TCP listener reply.
+    /// Keeping this as a constructor seam lets `daer-relay` stay independent of
+    /// `daer-control` while the daemon supplies the namespace.
+    #[must_use]
+    pub fn with_reply_factory(mut self, factory: Arc<dyn ReplySocketFactory>) -> Self {
+        self.reply_factory = Some(factory);
+        self
     }
 
     /// The port both families are bound to.
@@ -374,7 +444,21 @@ impl TransparentDatagramListener {
         peer: SocketAddr,
     ) -> io::Result<usize> {
         let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
-        sources.get_or_insert(source)?.try_send_to(payload, peer)
+        let socket =
+            sources.get_or_insert(source, self.socket_mark, self.reply_factory.as_ref())?;
+        // A std nonblocking `send_to` executes the syscall; the only `WouldBlock` left is a
+        // genuinely transient one (for example the first packet resolving the veth neighbour).
+        // Retry a few times without occupying a runtime worker for long.
+        for attempt in 0..5 {
+            match socket.send_to(payload, peer) {
+                Ok(sent) => return Ok(sent),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
     /// Turns a decoded datagram into a [`Datagram`], applying the self-connect rule.
@@ -505,12 +589,35 @@ fn socket_addr_from(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
 }
 
 /// Binds one family's transparent datagram socket with original-destination reporting.
-fn bind_family(domain: Domain, ip: IpAddr, port: u16) -> Result<UdpSocket, RelayError> {
+fn bind_family(
+    domain: Domain,
+    ip: IpAddr,
+    port: u16,
+    socket_mark: Option<u32>,
+) -> Result<UdpSocket, RelayError> {
     let socket =
         Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(RelayError::Socket)?;
     socket.set_reuse_address(true).map_err(RelayError::Socket)?;
-    socket.set_reuse_port(true).map_err(RelayError::Socket)?;
+    // No SO_REUSEPORT: a redirected datagram is assigned to this exact socket by
+    // `bpf_sk_assign`, and reuseport selection can pick a different socket from the
+    // assigned one. For the same reason the v6 wildcard is v6-only, otherwise it would
+    // collide with the v4 wildcard without reuseport.
+    if domain == Domain::IPV6 {
+        socket.set_only_v6(true).map_err(RelayError::Socket)?;
+    }
     socket.set_nonblocking(true).map_err(RelayError::Socket)?;
+    if let Some(mark) = socket_mark {
+        #[cfg(target_os = "linux")]
+        socket.set_mark(mark).map_err(RelayError::Socket)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = mark;
+            return Err(RelayError::Socket(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SO_MARK is only supported on Linux",
+            )));
+        }
+    }
     let fd = socket.as_raw_fd();
     set_transparent(fd, domain).map_err(RelayError::Socket)?;
     set_recv_original_destination(fd, domain).map_err(RelayError::Socket)?;
@@ -533,14 +640,50 @@ fn bind_family(domain: Domain, ip: IpAddr, port: u16) -> Result<UdpSocket, Relay
 /// `(address, port)` pairs, so `SO_REUSEADDR` is what makes a second bind of the same
 /// *port* on a different address legal). `SO_REUSEPORT` would additionally allow two
 /// sockets on the *same* address and port, which is never what the reply path wants.
-fn bind_source(domain: Domain, source: SocketAddr) -> io::Result<UdpSocket> {
+/// Binds a transparent reply socket for `source` in the caller's current namespace.
+///
+/// Public so a [`ReplySocketFactory`] implementation can create the socket on a thread that
+/// has entered the private ingress namespace, then return it to the relay.
+///
+/// # Errors
+///
+/// Returns the socket creation, `IP_TRANSPARENT`, address-in-use, or binding error.
+pub fn bind_reply_socket(source: SocketAddr, socket_mark: Option<u32>) -> io::Result<StdUdpSocket> {
+    let domain = if source.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    bind_source(domain, source, socket_mark)
+}
+
+fn bind_source(
+    domain: Domain,
+    source: SocketAddr,
+    socket_mark: Option<u32>,
+) -> io::Result<StdUdpSocket> {
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    if let Some(mark) = socket_mark {
+        #[cfg(target_os = "linux")]
+        socket.set_mark(mark)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = mark;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SO_MARK is only supported on Linux",
+            ));
+        }
+    }
     let fd = socket.as_raw_fd();
     set_transparent(fd, domain)?;
     socket.bind(&source.into())?;
-    UdpSocket::from_std(socket.into())
+    // This is a std nonblocking socket, not a Tokio socket: the reply path calls the syscall
+    // directly, so a first send cannot be lost to an unprimed readiness state. It also avoids
+    // blocking a runtime worker while the route/neighbour is resolved.
+    Ok(socket.into())
 }
 
 /// Enables `IP_TRANSPARENT` (`IPV6_TRANSPARENT`) so the socket may own a redirected
@@ -615,11 +758,10 @@ mod tests {
         //
         // `bind_source` sets `IP_TRANSPARENT`, which needs `CAP_NET_ADMIN`; the eviction
         // bookkeeping is what this asserts, so the socket builder is a plain loopback bind.
-        let plain = |domain: Domain, address: SocketAddr| -> io::Result<UdpSocket> {
+        let plain = |domain: Domain, address: SocketAddr| -> io::Result<StdUdpSocket> {
             let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.set_nonblocking(true)?;
             socket.bind(&address.into())?;
-            UdpSocket::from_std(socket.into())
+            Ok(socket.into())
         };
         let mut cache = ReplySockets::default();
         for port in 0..(REPLY_SOCKET_CACHE + 8) {

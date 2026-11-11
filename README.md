@@ -57,7 +57,8 @@ We believe that system-level network tools should be lightweight, reliable, and 
 ### Prerequisites
 
 - Linux operating system (kernel 5.17 or newer)
-- Root privileges or network administration capabilities (`CAP_NET_ADMIN`, `CAP_BPF`)
+- Root privileges or the `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_PERFMON` and `CAP_SYS_ADMIN`
+  capabilities (`CAP_SYS_ADMIN` creates the private `daer0ns` ingress namespace)
 - Rust toolchain (1.95+) and Clang / LLVM
 
 ### Build & Run

@@ -52,7 +52,7 @@ so it was removed from this table rather than left as a trap.
 | :--- | :--- | :--- | :--- |
 | `tcp-url` | list of string | Cloudflare's two addresses | URL first, then optional direct IPs so the probe does not depend on DNS. |
 | `tcp-method` | string | `"HEAD"` | HTTP method for the TCP/HTTP probe. |
-| `udp-dns` | list of string | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Hosts probed over UDP DNS. |
+| `udp-dns` | list of string | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | Hosts probed over UDP DNS. A bare IP uses port 53; a name is reported and skipped rather than resolved silently. |
 | `interval` | duration | `"30s"` | Probe interval; `0s` disables probing. |
 | `tolerance` | duration | `"0s"` | Shifts the switching threshold of moving averages; may be negative. |
 
@@ -223,8 +223,7 @@ Defines flow matching rules and default verdicts.
 - `sip(cidr)` — Match source IP.
 - `dport(port_range)` — Match destination port.
 - `sport(port_range)` — Match source port.
-- `domain(suffix|full: pattern)` — Match the sniffed domain by kind. A bare name is a
-  suffix. `keyword:` and `regex:` were removed (ADR-0033); expand them into concrete patterns.
+- `domain(pattern)` — Match the sniffed domain (ADR-0036): a bare name (`example.com`) is a suffix matching the domain and all subdomains; `.example.com` matches subdomains only; `=example.com` matches the exact name only. `keyword:` and `regex:` are removed (ADR-0033); expand them into concrete patterns.
 - `provider(tag)` / `rule-set(tag)` — Match IP intervals or domains from a declared `[[rule-provider]]`.
 - `dip(provider:tag)` / `ip(provider:tag)` — Match only IP intervals from a declared rule provider.
 - `domain(provider:tag)` — Match only domains from a declared rule provider.
@@ -258,7 +257,7 @@ Configures the built-in DNS server, caching, and upstream transports.
 | `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Enabling it also starts the DNS server. |
 | `inet` | string | `"198.18.0.0/15"` | The pool's prefix. |
 | `pool-size` | integer | `65535` | Number of synthetic addresses. |
-| `exclude` | list of string | `[]` | Domains that must never get a synthetic address. |
+| `exclude` | list of string | `[]` | Domains that must never get a synthetic address. Each entry is a domain pattern: a bare name (suffix), `.name` (subdomains only), or `=name` (exact); `keyword:`/`regex:` are also accepted here (ADR-0033, ADR-0036). |
 
 ---
 
@@ -293,6 +292,9 @@ the reference cannot carry is a load-time error that names the layer:
 (`bbr`, `cubic`, `new-reno`, `brutal`), `hop-interval`/`hop-min-interval`/`hop-max-interval`,
 `pin-sha256` and a `[node.quic]` table. `brutal` needs `up-mbps` or `down-mbps`; a hop
 interval shorter than 5 s is refused; and `[node.quic].max-stream-receive-window` /
-`max-conn-receive-window` are refused rather than ignored, because quinn's flow control has no
-growing window — set the `init-*-receive-window` keys instead.
+`max-conn-receive-window` are refused rather than ignored, because netune's flow control has no
+growing window — set the `init-*-receive-window` keys instead. netune probes the path with
+DPLPMTUD by default; `disable-path-mtu-discovery = true` turns that off and keeps datagrams at
+the 1200-byte QUIC floor. The owned engine has no GSO, so `disable-segmentation-offload` is
+already satisfied and is accepted for reference compatibility.
 

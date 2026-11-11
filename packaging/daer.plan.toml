@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.0.8"
+version = "0.0.11"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"
@@ -116,7 +116,7 @@ install -Dm644 daer.schema.json ${STAGING_DIR}/usr/share/daer/daer.schema.json
 # place the packaged artifact is checked before it reaches a machine.
 ${STAGING_DIR}/usr/bin/daer check \
     --config ${STAGING_DIR}/etc/daer/config.toml \
-    --object ${STAGING_DIR}/usr/lib/daer/datapath.o''
+    --object ${STAGING_DIR}/usr/lib/daer/datapath.o'''
 
 [[output]]
 backup = ["/etc/daer/config.toml"]

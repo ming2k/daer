@@ -35,7 +35,7 @@ use daer_relay::relay::datagram::{
 };
 use daer_relay::{
     DatagramIngress, Decide, FlowFacts, RelayError, ServeStats, Supervisor,
-    TransparentDatagramListener, TransparentListener, serve_ingress as serve_loop,
+    TransparentDatagramListener, TransparentListener, serve_parallel,
 };
 
 use crate::decide::{Router, RouterOptions};
@@ -101,6 +101,14 @@ pub struct Daemon {
     /// `WARN`: a client that believes its UDP is tunnelled and gets silence instead has been
     /// lied to, which is worse than a refusal it can see (ADR-0006).
     pub datagrams: Option<Arc<dyn DatagramIngress>>,
+    /// The private ingress and its host-side facts, when the listeners were bound inside it.
+    ///
+    /// This field owns the guard and is declared **after every socket**: Rust drops fields in
+    /// declaration order, so the namespace is removed only after the listening sockets are
+    /// closed. Keeping the whole [`crate::netns::PreparedIngress`] here, rather than only the
+    /// namespace, means the attach step cannot use a different topology from the one the
+    /// listeners were bound in.
+    ingress: Option<crate::netns::PreparedIngress>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -109,6 +117,33 @@ impl std::fmt::Debug for Daemon {
             .field("port", &self.port)
             .field("datapath", &self.datapath)
             .finish_non_exhaustive()
+    }
+}
+
+/// Creates UDP reply sockets on the ingress side of the namespace boundary.
+///
+/// The UDP outbound leg lives in the host, but the reply must be born where the original
+/// destination is owned and must leave through `daer0peer`, exactly like a TCP listener
+/// reply. `ReplySocketFactory` is the relay's seam for that; this type is the control
+/// plane's implementation.
+#[derive(Debug)]
+struct IngressReplySockets {
+    namespace: Arc<crate::netns::IngressNamespace>,
+    socket_mark: Option<u32>,
+}
+
+impl daer_relay::inbound::ReplySocketFactory for IngressReplySockets {
+    fn bind(&self, source: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+        let namespace = Arc::clone(&self.namespace);
+        let name = namespace.name().to_owned();
+        let socket_mark = self.socket_mark;
+        namespace
+            .with(move || daer_relay::inbound::bind_reply_socket(source, socket_mark))
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "cannot enter {name} to bind a reply socket: {error}"
+                ))
+            })?
     }
 }
 
@@ -121,23 +156,102 @@ impl Daemon {
     /// `IP_TRANSPARENT`, so this is where a missing capability shows up first), and a
     /// [`ReloadError`] when the configuration does not compile.
     pub fn bind(config: &Config, options: &RouterOptions) -> Result<Self, BindError> {
+        Self::bind_in(config, options, None)
+    }
+
+    /// Binds the transparent port inside `ingress`, if one is supplied.
+    ///
+    /// The ingress is the private namespace from [`crate::netns::PreparedIngress`]. The
+    /// listener must be created there: a socket belongs to the network namespace that was
+    /// current when it was created, and `bpf_sk_assign` can only hand a packet to a socket
+    /// in the namespace the packet is delivered in. The daemon takes ownership of the
+    /// ingress so the topology used for binding and the topology used for attachment are
+    /// the same value.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::bind`]. A failure to enter the namespace is reported as a listener
+    /// bind error, because from the caller's point of view the port could not be bound
+    /// where it needs to live.
+    pub fn bind_in(
+        config: &Config,
+        options: &RouterOptions,
+        ingress: Option<crate::netns::PreparedIngress>,
+    ) -> Result<Self, BindError> {
+        let namespace = ingress
+            .as_ref()
+            .map(|ingress| Arc::clone(&ingress.namespace));
         let port = config.global.tproxy_port;
+        let protect = config.global.tproxy_port_protect;
+        let socket_mark = match options.so_mark {
+            Some(mark) => mark,
+            None => config.global.so_mark,
+        };
         // Bound before the object is loaded: the port is part of `PARAM`, so it has to be
         // known first. Binding does not accept, so no flow is served before the datapath
         // exists.
-        let listener = TransparentListener::bind_with_protection(
-            Ipv4Addr::UNSPECIFIED,
-            port,
-            config.global.tproxy_port_protect,
-        )
-        .map_err(BindError::Ingress)?;
+        let listener = match &namespace {
+            Some(namespace) => {
+                let handle = tokio::runtime::Handle::current();
+                namespace
+                    .with(move || {
+                        let _entered = handle.enter();
+                        TransparentListener::bind_with_options(
+                            Ipv4Addr::UNSPECIFIED,
+                            port,
+                            protect,
+                            socket_mark,
+                        )
+                    })
+                    .map_err(|error| BindError::Ingress(RelayError::Socket(error)))?
+                    .map_err(BindError::Ingress)?
+            }
+            None => TransparentListener::bind_with_options(
+                Ipv4Addr::UNSPECIFIED,
+                port,
+                protect,
+                socket_mark,
+            )
+            .map_err(BindError::Ingress)?,
+        };
         let port = listener.port();
         let generations = Generations::new(config, options).map_err(BindError::Config)?;
         // The datagram half. A failure here is not fatal: the box can still proxy TCP, and a
         // daemon that refuses to start because UDP could not bind would take a working proxy
         // down over a secondary transport.
-        let datagrams = match TransparentDatagramListener::bind(Ipv4Addr::UNSPECIFIED, port) {
-            Ok(listener) => Some(Arc::new(listener) as Arc<dyn DatagramIngress>),
+        let datagrams = match &namespace {
+            Some(namespace) => {
+                let handle = tokio::runtime::Handle::current();
+                namespace
+                    .with(move || {
+                        let _entered = handle.enter();
+                        TransparentDatagramListener::bind_with_options(
+                            Ipv4Addr::UNSPECIFIED,
+                            port,
+                            socket_mark,
+                        )
+                    })
+                    .map_err(|error| BindError::Ingress(RelayError::Socket(error)))?
+                    .map_err(BindError::Ingress)
+            }
+            None => TransparentDatagramListener::bind_with_options(
+                Ipv4Addr::UNSPECIFIED,
+                port,
+                socket_mark,
+            )
+            .map_err(BindError::Ingress),
+        };
+        let datagrams = match datagrams {
+            Ok(listener) => {
+                let listener = match &namespace {
+                    Some(namespace) => listener.with_reply_factory(Arc::new(IngressReplySockets {
+                        namespace: Arc::clone(namespace),
+                        socket_mark,
+                    })),
+                    None => listener,
+                };
+                Some(Arc::new(listener) as Arc<dyn DatagramIngress>)
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -156,6 +270,7 @@ impl Daemon {
             datapath: DatapathStatus::default(),
             datagrams: datagrams.clone(),
             datagram_stats: datagrams.map(|_| Arc::new(DatagramCounters::default())),
+            ingress,
         })
     }
 
@@ -182,6 +297,15 @@ impl Daemon {
     #[must_use]
     pub fn datagram_stats(&self) -> Option<Arc<DatagramCounters>> {
         self.datagram_stats.as_ref().map(Arc::clone)
+    }
+
+    /// The private ingress this daemon's listeners were bound in, if any.
+    ///
+    /// The attach step reads the peer MAC, ifindex and namespace from this value. It is the
+    /// same value the bind used, so a caller cannot accidentally attach a different pair.
+    #[must_use]
+    pub fn ingress(&self) -> Option<&crate::netns::PreparedIngress> {
+        self.ingress.as_ref()
     }
 
     /// The three fds the datapath may assign a redirected flow to.
@@ -240,12 +364,12 @@ impl Daemon {
         // The generation is re-read per flow, so a reload is visible to the next flow
         // without restarting the loop.
         let supervisor = self.supervisor.clone();
-        let loop_router = RouterForGeneration {
+        let loop_router = Arc::new(RouterForGeneration {
             generations: Arc::clone(&self.generations),
-        };
+        });
         let Some(ingress) = self.datagrams.as_ref() else {
             // No datagram socket: TCP only, which is what `Daemon::bind` reported at `WARN`.
-            serve_loop(&self.listener, &loop_router, &supervisor, shutdown).await?;
+            serve_parallel(&self.listener, loop_router, &supervisor, shutdown).await?;
             return Ok(());
         };
 
@@ -273,28 +397,43 @@ impl Daemon {
             let signal = Arc::clone(&signal);
             async move { signal.notified().await }
         };
+        // The datagram relay runs in its own task, not inside the `join!` that drives the TCP
+        // accept loop. The two services share a runtime but must not share a task: a slow or
+        // blocking UDP operation must never stop the accept loop from polling `accept(2)`.
+        // TCP is the service that must remain responsive; UDP has its own lifecycle.
         let udp = {
             let signal = Arc::clone(&signal);
-            async move { signal.notified().await }
+            signal.notified_owned()
         };
-        let (stopped, datagrams, ()) = tokio::join!(
-            serve_loop(&self.listener, &loop_router, &supervisor, tcp),
-            daer_relay::relay::serve_datagrams(
-                Arc::clone(&service.ingress),
-                Arc::clone(&service.router),
+        let udp_task = tokio::spawn(async move {
+            let result = daer_relay::relay::serve_datagrams(
+                service.ingress,
+                service.router,
                 service.options,
-                Arc::clone(&service.stats),
+                service.stats,
                 udp,
-            ),
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "the datagram relay stopped");
+            }
+        });
+        let (stopped, ()) = tokio::join!(
+            serve_parallel(&self.listener, Arc::clone(&loop_router), &supervisor, tcp),
             trigger,
         );
-        // `serve_datagrams` returns `Err` only for a fatal ingress failure; the TCP result is the
-        // one the caller acts on, and a datagram failure is reported rather than returned so a
-        // misbehaving UDP socket cannot silence HTTP.
-        if let Err(error) = datagrams {
-            tracing::warn!(%error, "the datagram relay stopped");
-        }
+        // The UDP task observes the same notification. Stop it explicitly so an in-flight
+        // datagram operation cannot outlive the daemon's ingress.
+        udp_task.abort();
+        let _ = udp_task.await;
         stopped?;
+        let stats = self.stats();
+        tracing::info!(
+            accepted = stats.accepted,
+            rejected = stats.rejected,
+            failed = stats.failed,
+            "relay accept loop stopped"
+        );
         Ok(())
     }
 

@@ -1,59 +1,63 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! QUIC bidirectional stream wrapper implementing [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
+//! QUIC bidirectional stream wrapper implementing [`tokio::io::AsyncRead`] and
+//! [`tokio::io::AsyncWrite`].
 
-use std::fmt;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use netune_quic::owned::{RecvStream, SendStream};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+/// The application-facing end of one Hysteria 2 bidirectional QUIC stream.
+///
+/// The owned QUIC engine exposes raw `SendStream`/`RecvStream` halves rather than an
+/// `AsyncRead + AsyncWrite` adapter. Two pump tasks bridge them to a duplex pipe, which is
+/// the shape every protocol layer above (and netune's `Transport` blanket impl) expects.
+/// The pump keeps one buffer per direction and never buffers a whole tunnel.
+pub type QuicBiStream = tokio::io::DuplexStream;
 
-/// A bidirectional QUIC stream unified into a single transport stream.
-pub struct QuicBiStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-}
+/// Wraps a QUIC stream pair as a byte stream.
+///
+/// The returned value owns the application side. Dropping it closes the pipe; the outbound
+/// pump then finishes the QUIC send side.
+#[must_use]
+pub fn wrap(send: SendStream, recv: RecvStream) -> QuicBiStream {
+    const BUFFER: usize = 64 * 1024;
+    let (application, tunnel) = tokio::io::duplex(BUFFER);
+    let (mut plaintext, mut ciphertext) = tokio::io::split(tunnel);
 
-impl QuicBiStream {
-    /// Constructs a new unified bidirectional QUIC stream.
-    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
-    }
-}
+    // Application → QUIC.
+    tokio::spawn(async move {
+        let mut send = send;
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match plaintext.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if send.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = send.finish().await;
+    });
 
-impl fmt::Debug for QuicBiStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QuicBiStream")
-            .field("stream_id", &self.send.id().index())
-            .finish()
-    }
-}
+    // QUIC → application.
+    tokio::spawn(async move {
+        let mut recv = recv;
+        loop {
+            match recv.read(16 * 1024).await {
+                Ok(Some(bytes)) => {
+                    if ciphertext.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    let _ = ciphertext.shutdown().await;
+                    break;
+                }
+            }
+        }
+    });
 
-impl AsyncRead for QuicBiStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf)
-    }
-}
-
-impl AsyncWrite for QuicBiStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
-    }
+    application
 }

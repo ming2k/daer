@@ -495,7 +495,7 @@ mod tests {
 upstream = ["local:tcp://127.0.0.1:1"]
 
 [dns.request]
-rules = ["qname(suffix: asis) -> asis", "qname(suffix: reject) -> reject"]
+rules = ["qname(asis) -> asis", "qname(reject) -> reject"]
 fallback = "local"
 "#,
         )

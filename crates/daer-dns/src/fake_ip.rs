@@ -93,11 +93,10 @@ impl FakeIpPool {
 
     /// Whether a domain is excluded from Fake-IP synthesis.
     ///
-    /// The pattern syntax is the one ADR-0012 documents (`suffix:`/`full:`/`keyword:`/
-    /// `regex:`, and a bare name as a suffix). The matcher itself is
-    /// [`crate::routing::NameMatch`], shared with the DNS router, so `keyword:` and `regex:`
-    /// mean here exactly what they mean in a `[routing]` rule — while routing's own compiled
-    /// artifacts stay limited to `full:`/`suffix:` (ADR-0033).
+    /// The pattern syntax is one language (ADR-0036): a bare name (suffix), `.name`
+    /// (subdomains only), `=name` (exact), plus the DNS-only `keyword:`/`regex:` (ADR-0033 §3).
+    /// The matcher itself is [`crate::routing::NameMatch`], shared with the DNS router, so these
+    /// mean here exactly what they mean in a `qname(...)` selector.
     #[must_use]
     pub fn is_excluded(&self, domain: &str) -> bool {
         if self.exclude.is_empty() {
@@ -266,18 +265,18 @@ mod tests {
 
     #[test]
     fn the_exclusion_list_understands_the_documented_pattern_syntax() {
-        // The old matcher compared strings with `ends_with`, so `suffix:local` only matched a
-        // domain literally ending in `.suffix:local` — the exclusion the operator wrote was
+        // The old matcher compared strings with `ends_with`, so a pattern the operator wrote was
         // inert and every excluded name got a synthetic address. This is the falsifier: each
-        // accepted form must match the names it is supposed to.
+        // accepted form (bare suffix, subdomains-only, exact, keyword, regex) must match the
+        // names it is supposed to.
         let config = FakeIpConfig {
             enabled: true,
             inet: "198.18.0.0/15".to_owned(),
             pool_size: 100,
             exclude: vec![
-                "suffix:local".to_owned(),
-                "corp.internal".to_owned(),
-                "full:only.example".to_owned(),
+                "local".to_owned(),
+                ".corp.internal".to_owned(),
+                "=only.example".to_owned(),
                 "keyword:ads".to_owned(),
                 "regex:^track[0-9]+\\.".to_owned(),
             ],
@@ -293,7 +292,12 @@ mod tests {
         ] {
             assert!(pool.is_excluded(excluded), "{excluded} must be excluded");
         }
-        for included in ["example.com", "notonly.example", "example.org"] {
+        for included in [
+            "example.com",
+            "notonly.example",
+            "example.org",
+            "corp.internal",
+        ] {
             assert!(
                 !pool.is_excluded(included),
                 "{included} must not be excluded"

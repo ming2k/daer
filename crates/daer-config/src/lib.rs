@@ -35,7 +35,7 @@ pub use model::{
     WsTransport, parse_filter_expr, parse_rule_expr, parse_value_expr, render_functions,
 };
 pub use scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration, parse_integer};
-pub use toml_config::Loaded;
+pub use toml_config::{Loaded, load, load_str};
 pub use validate::{ConfigError, normalize};
 
 /// Default configuration directory.

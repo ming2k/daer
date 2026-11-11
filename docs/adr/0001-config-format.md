@@ -63,7 +63,7 @@ Three things are text parsed by `daer-config::expr` rather than TOML data:
 
 | Where | Example |
 | --- | --- |
-| `routing.rules` | `domain(suffix: a.com) && port(443) -> proxy` |
+| `routing.rules` | `domain(a.com) && port(443) -> proxy` |
 | `group.filters` | `subtag(sub) && !name(keyword: 'ExpireAt:')` |
 | `group.policy`, `dns.*.fallback` | `fixed(0)`, `min-moving-avg` |
 

@@ -1,8 +1,9 @@
 [package]
 name = "xtask"
-version = "0.0.8"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
+license.workspace = true
 
 [dependencies]
 # `abi.toml` is deserialised with the same stack the rest of the workspace uses.

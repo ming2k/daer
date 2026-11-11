@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn identical_policies_hash_identically() {
-        let left = program("routing { dport(443) && domain(suffix:a.com) -> direct }");
-        let right = program("routing { dport(443) && domain(suffix:a.com) -> direct }");
+        let left = program("routing { dport(443) && domain(a.com) -> direct }");
+        let right = program("routing { dport(443) && domain(a.com) -> direct }");
         assert_eq!(
             hash_normalized_program(&left).unwrap(),
             hash_normalized_program(&right).unwrap()

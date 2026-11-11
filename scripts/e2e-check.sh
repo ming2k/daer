@@ -109,8 +109,10 @@ build_one() {
 }
 
 binary_transparent=""
+binary_netns=""
 binary_reload=""
 build_one daer-control transparent binary_transparent
+build_one daer-control netns_lifecycle binary_netns
 build_one daer-cli reload binary_reload
 
 section "3. the transparent data path (a real tproxy redirect into a real origin)"
@@ -140,6 +142,26 @@ else
     else
         bad "the transparent data path failed; see $logs/transparent.log"
         perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent.log" 2>/dev/null \
+            | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
+    fi
+fi
+
+section "3a. the private ingress namespace"
+# This owns daer0ns and daer0/daer0peer for the duration of one test. It proves the namespace
+# is created, the peer moves, the policy is ingress-keyed, the return route exists, and drop
+# removes both the namespace and the host end. A running daer service must be stopped first.
+if [[ -z "$binary_netns" ]]; then
+    skip "3-netns" "no netns_lifecycle test binary; the build failed above"
+elif systemctl is-active --quiet daer 2>/dev/null; then
+    skip "3-netns" "the daer service is running and owns daer0ns; stop it before this check"
+else
+    if DAER_NETNS_TEST=1 "$binary_netns" --nocapture --test-threads=1 \
+            >"$logs/netns.log" 2>&1 && grep -q "test result: ok" "$logs/netns.log"; then
+        ok "daer0ns, the peer move, iif policy, return route, and teardown all hold"
+        grep -E "^test " "$logs/netns.log" | sed 's/^/       /'
+    else
+        bad "the private ingress lifecycle failed; see $logs/netns.log"
+        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/netns.log" 2>/dev/null \
             | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
     fi
 fi

@@ -91,7 +91,7 @@ We reject splitting DRB into payload-specific file extensions (such as `.dib` fo
   ```text
   # company.rules -> compiled to company.drb
   ip: 10.0.0.0/8
-  suffix: corp.internal
+  corp.internal
   ```
   Lowering automatically connects the resulting `IpIndex` and `DomainIndex` via `LogicalOr` into a single `provider(company) -> direct` rule. Splitting extensions would destroy atomic composite rule deployment.
 

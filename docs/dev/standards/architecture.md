@@ -66,7 +66,11 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 - **Red-Line**: `daer-relay` decides nothing. It must not depend on `daer-config`, `daer-outbound`, `daer-routing` or `daer-proxy-protocols`, and its public seam must not name a routing concept (ADR-0018).
 - **Enforcement**: The seam is `daer_relay::Decide` (a stream per accepted flow) and `daer_relay::DatagramRouter` (a `DatagramLeg` per datagram flow). A `Verdict`, a group or a policy appearing in either signature is a red-line breach: it would make every new selection concept a change to the code that forwards bytes, and it would put the accept loop's failure modes behind a routing configuration instead of a test double.
 
-### 2.7 Proxy Protocols Are Not Re-Exported ([INV-PROTO-01])
+### 2.7 The Transparent Ingress Has One Namespace Boundary ([INV-DATAPATH-01])
+- **Red-Line**: `daer0peer`, the transparent listeners, and table 2023 live in the private `daer0ns` namespace (ADR-0038). The host keeps `daer0`, the forwarding path, and the redirect source. There is no same-namespace fallback.
+- **Enforcement**: `daer-control::netns::PreparedIngress` creates the namespace before `Daemon::bind_in`; `IngressNamespace::with` binds and attaches on a thread that has entered it; `RouteTable` installs `iif daer0peer`, never a mark-keyed rule, which would loop the listener's marked replies.
+
+### 2.8 Proxy Protocols Are Not Re-Exported ([INV-PROTO-01])
 - **Red-Line**: `daer-outbound` owns outbound governance, not protocol implementations, and does not re-export the latter's types (ADR-0017). The only exception is `daer_outbound::fragment`, which `DialerOptions` carries as a value.
 - **Enforcement**: `cargo tree -p daer-outbound --depth 1` must show no `quinn`, `h3`, `rustls`, `x25519-dalek`, `ml-kem` or AEAD crate. A protocol type reachable through the governance crate's root would announce a boundary it does not own, and would let a future selection feature reach a handshake without naming `daer-proxy-protocols`.
 

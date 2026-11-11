@@ -20,7 +20,6 @@ daer-control.workspace = true
 daer-dns.workspace = true
 daer-config = { workspace = true, features = ["schema"] }
 daer-ebpf.workspace = true
-aya.workspace = true
 daer-outbound.workspace = true
 daer-routing.workspace = true
 tokio.workspace = true

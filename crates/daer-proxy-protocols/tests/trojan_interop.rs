@@ -26,7 +26,7 @@ fn certificate() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn acceptor() -> TlsAcceptor {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let (cert, key) = certificate();
     let certs = vec![rustls::pki_types::CertificateDer::from(cert)];
     let key =

@@ -80,7 +80,7 @@ daer route 192.168.1.10:41234 93.184.216.34:443 -c config.toml
 
 ```
 192.168.1.10:41234 → 93.184.216.34:443  [gen1]
-  decided by : !domain(suffix: internal.example) && port(443) -> proxy
+  decided by : !domain(internal.example) && port(443) -> proxy
   outbound   : proxy (mark 0)
 ```
 
@@ -119,14 +119,14 @@ daer route 192.168.1.10:41234 93.184.216.34:443 --why -c config.toml
 
 ```
 192.168.1.10:41234 → 93.184.216.34:443  [gen1]
-  decided by : !domain(suffix: internal.example) && port(443) -> proxy
+  decided by : !domain(internal.example) && port(443) -> proxy
   outbound   : proxy (mark 0)
 
 rule 0 [skipped]
   x dip(10.0.0.0/8)
   -> dip(10.0.0.0/8) did not match
 rule 1 [fired]
-  v !domain(suffix: internal.example)
+  v !domain(internal.example)
   v port(443)
 ```
 
@@ -204,6 +204,29 @@ let stats = metrics.snapshot();
 
 `failed` includes both "no selectable node" and "dial failed"; the log line tells
 them apart.
+
+### "The listener accepts a direct connection but redirected flows time out"
+
+This is the namespace boundary, not a routing rule. Check the topology from the host:
+
+```sh
+ip netns list                         # daer0ns must exist while daer runs
+ip netns exec daer0ns ip link show daer0peer
+ip netns exec daer0ns ip rule show    # iif daer0peer -> table 2023
+ip netns exec daer0ns ip route show table 2023
+ip netns exec daer0ns ip route        # default via 169.254.0.1 dev daer0peer
+sudo bpftool map dump name listen_socket_map   # keys 0, 1, 2 must be present
+```
+
+A `bpf_sk_assign` that returns success and a `tcp_v4_rcv ... NO_SOCKET` trace means the
+listener is not in the packet's namespace. `daer0peer` must be inside `daer0ns`, and the
+listener must have been created there (the startup line names the namespace). The policy
+rule must be `iif daer0peer`, not a mark-keyed rule: the listener replies are marked so the
+host does not recapture them, and a mark rule in the ingress namespace would send them back
+to `lo`.
+
+Also check the return path: a missing `169.254.0.11/32` address, default route, or permanent
+neighbor on the peer makes the listener's SYN-ACK vanish after it was accepted.
 
 ## 5. "The configuration is wrong."
 

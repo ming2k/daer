@@ -84,8 +84,8 @@ upstream = ["origin:tcp://{origin}"]
 
 [dns.request]
 rules = [
-    "qname(suffix: blocked.example) -> reject",
-    "qname(suffix: local.example) -> asis",
+    "qname(blocked.example) -> reject",
+    "qname(local.example) -> asis",
 ]
 fallback = "origin"
 "#
@@ -312,7 +312,7 @@ upstream = ["origin:tcp://{origin}"]
 enabled = true
 inet = "198.18.0.0/15"
 pool-size = 256
-exclude = ["suffix:local.example"]
+exclude = ["local.example"]
 
 [dns.request]
 fallback = "origin"
@@ -403,7 +403,7 @@ async fn fake_ip_suppresses_aaaa_so_a_dual_stack_client_cannot_bypass_the_pool()
 
 #[tokio::test]
 async fn an_excluded_name_keeps_its_real_address() {
-    // `exclude = ["suffix:local.example"]`: a name the operator excluded must be resolved
+    // `exclude = ["local.example"]`: a name the operator excluded must be resolved
     // normally, or the box cannot reach its own services through the pool.
     let (origin_address, origin_calls) = origin().await;
     let (address, _resolver) = fake_ip_server(origin_address).await;

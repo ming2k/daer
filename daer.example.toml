@@ -54,6 +54,7 @@ fragment-interval = "10-20"
 # URL first, then optional direct IPs so the probe does not depend on DNS.
 tcp-url = ["http://cp.cloudflare.com", "1.1.1.1", "2606:4700:4700::1111"]
 tcp-method = "HEAD"
+# Bare IPs mean port 53; a name is reported and skipped, never silently resolved.
 udp-dns = ["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]
 interval = "30s"
 # Shifts the switching threshold of moving averages; may be negative.

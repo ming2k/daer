@@ -10,7 +10,7 @@ use netune::{
     Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, SocketConfig,
     Target, TcpConnector, TlsConnector,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::sync::Mutex;
 
 use crate::anytls::auth::send_authentication;
@@ -126,7 +126,7 @@ impl AnyTlsConnector {
     /// Retrieves an active session from the pool or establishes a new authenticated session.
     pub async fn get_or_dial_session(
         &self,
-        recorder: &Arc<std::sync::Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Arc<AnyTlsSession>, ProxyProtocolError> {
         let mut pool = self.sessions.lock().await;
 
@@ -167,7 +167,7 @@ impl AnyTlsConnector {
     pub async fn connect(
         &self,
         authority: &str,
-        recorder: &Arc<std::sync::Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         let session = self.get_or_dial_session(recorder).await?;
         let virtual_stream = session.open_stream(authority).await?;
@@ -184,7 +184,7 @@ impl AnyTlsConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        recorder: &Arc<std::sync::Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let session = self
             .get_or_dial_session(recorder)

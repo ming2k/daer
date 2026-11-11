@@ -151,5 +151,5 @@ impl Security {
 /// A shared, lazily built rustls provider, so every TLS security layer in the process
 /// handshakes with the same crypto backend.
 pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }

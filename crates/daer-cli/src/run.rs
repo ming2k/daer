@@ -6,16 +6,21 @@
 //!
 //! 1. loads and validates the configuration (a bad file must fail before any kernel state
 //!    is touched);
-//! 2. binds the transparent port (`IP_TRANSPARENT`, so this is the first capability check);
-//! 3. prepares the device pair and attaches the datapath;
+//! 2. creates the private ingress namespace, moves the peer into it, and binds the
+//!    transparent port inside it (`IP_TRANSPARENT`; `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`);
+//! 3. attaches the datapath, including the peer hook inside the namespace;
 //! 4. serves until `SIGINT`/`SIGTERM` or a reload.
 //!
 //! # Why `--no-datapath`
 //!
-//! Attaching needs `CAP_BPF` and `CAP_NET_ADMIN`. Without them the accept/relay path is
+//! Attaching needs `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (the verifier's
+//! `allow_ptr_leaks` gate for variable-offset packet parsing) and `CAP_SYS_ADMIN` (the
+//! private ingress namespace). Without them the accept/relay path is
 //! still exercisable — a flow that reaches the transparent port is routed and relayed
 //! exactly as it would be — but **nothing is redirected into it**, so it is a
-//! development and container probe, not a proxy. Starting without saying so would be the
+//! development and container probe, not a proxy. The listener itself still binds with
+//! `IP_TRANSPARENT`, so `--no-datapath` removes the `CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_ADMIN`
+//! requirements, not `CAP_NET_ADMIN`. Starting without saying so would be the
 //! worst outcome: a running daemon that silently forwards nothing.
 //!
 //! # Reload
@@ -24,14 +29,20 @@
 //! fails to build publishes nothing, so a typo cannot stop a working proxy.
 
 use crate::preflight;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use daer_control::daemon::{Daemon, resolve_interfaces};
 use daer_control::datapath;
 use daer_control::datapath::{DEVICE, PEER};
 use daer_control::decide::RouterOptions;
+use daer_control::rule_provider::{
+    DEFAULT_TIMEOUT as DEFAULT_REFRESH_TIMEOUT, ProviderSchedule, RefreshOutcome,
+    refresh_rule_provider,
+};
+use daer_routing::RuleProviderPool;
 
 /// How the daemon was asked to run.
 #[derive(Debug, Clone)]
@@ -45,8 +56,9 @@ pub struct RunOptions {
     /// Report what would happen and change nothing.
     ///
     /// A dry run builds the generation, validates the object and reads the capabilities, then
-    /// exits — before the port is bound, before the device pair is created, before any sysctl
-    /// or policy route is written, and before `bpf()`. It needs no capability (ADR-0029).
+    /// exits — before the port is bound, before the device pair or ingress namespace is
+    /// created, before any sysctl or policy route is written, and before `bpf()`. It needs no
+    /// capability (ADR-0029).
     pub dry_run: bool,
 }
 
@@ -86,19 +98,20 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     tracing::info!(?lan, ?wan, "interfaces resolved");
 
     // ADR-0029: the dry run ends here. Everything above this line reads the box; everything
-    // below it mutates the box (bind, veth pair, sysctls, policy route) or the kernel (BPF
-    // load, tc attach). Returning before the first mutation is what makes "--dry-run" mean
-    // "changed nothing" rather than "did everything, then exited".
+    // below it mutates the box (namespace, bind, veth pair, sysctls, policy route) or the
+    // kernel (BPF load, tc attach). Returning before the first mutation is what makes
+    // "--dry-run" mean "changed nothing" rather than "did everything, then exited".
     if options.dry_run {
         return report_plan(&loaded, &options, &lan, &wan).await;
     }
 
     // The socket mark, decided once for the whole run.
     //
-    // Three consumers have to agree or the proxy captures its own traffic and loops: the
-    // generation's dialers (`ROUTER_OPTIONS`), the datapath's `PARAM.socket_mark`, and the
-    // operator's nftables exclusion. `--no-datapath` deliberately gets `None`: without
-    // `CAP_NET_ADMIN` a marked dial fails outright, and nothing is redirected anyway.
+    // Every socket consumer has to agree or the proxy captures its own traffic and loops:
+    // the generation's dialers, the transparent listeners (including their replies), and
+    // the datapath's `PARAM.socket_mark`. `--no-datapath` deliberately gets `None`: nothing
+    // is redirected, so there is no capture loop to evade; the listener still needs
+    // `CAP_NET_ADMIN` for `IP_TRANSPARENT`.
     let so_mark = if options.no_datapath {
         None
     } else {
@@ -120,11 +133,29 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         // exactly the state the daemon was in before the observer existed.
         .with_dial_observer(Some(std::sync::Arc::new(daer_outbound::LogObserver)))
         .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
-    let daemon =
-        Daemon::bind(&loaded, &base_options).map_err(|error| anyhow::anyhow!("{error}"))?;
+    // The ingress namespace is created before the listeners: a socket belongs to the
+    // network namespace that was current when it was created, and `bpf_sk_assign` can only
+    // hand a redirected packet to a listener in the packet's namespace. `--no-datapath`
+    // has no redirect and therefore no namespace.
+    let ingress = if options.no_datapath {
+        None
+    } else {
+        Some(
+            daer_control::PreparedIngress::prepare()
+                .map_err(|error| anyhow::anyhow!("cannot prepare the private ingress: {error}"))?,
+        )
+    };
+    let daemon = match ingress {
+        Some(ingress) => Daemon::bind_in(&loaded, &base_options, Some(ingress)),
+        None => Daemon::bind(&loaded, &base_options),
+    }
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     tracing::info!(
         port = daemon.port,
         so_mark = ?so_mark,
+        namespace = daemon
+            .ingress()
+            .map(|ingress| ingress.namespace.name()),
         generation = %daemon.generation().describe(),
         "listening for redirected flows"
     );
@@ -184,12 +215,17 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         &options_router,
         ebpf.as_ref(),
         &mut health,
+        &resolved.rule_providers.pool,
     )
     .await;
     health.stop();
     if let Some(dns) = dns {
         dns.stop().await;
     }
+    // `Attached`'s drop detaches the peer link on a thread inside `daer0ns` before dropping
+    // the object. Normal field drop order does the rest: the datapath guards remove their
+    // routes and sysctls, `Daemon` closes the listeners, and `IngressNamespace` deletes the
+    // namespace. There is no explicit teardown path for a caller to forget.
     result
 }
 
@@ -396,8 +432,8 @@ async fn report_plan(
     }
 
     let (device, peer) = preflight::device_pair_present();
-    let pair_state = if device && peer {
-        "the device pair exists and would be reused"
+    let pair_state = if device || peer {
+        "an existing device pair would be removed and a fresh pair created"
     } else {
         "the device pair would be created"
     };
@@ -414,7 +450,26 @@ async fn report_plan(
     Ok(())
 }
 
-/// Prepares the device pair and attaches the datapath.
+/// A generation value that is fresh for every daemon start.
+///
+/// The datapath stores it in every `conn_state` entry and compares it before inheriting a
+/// cached routing decision. The map is pinned by name, so a constant value would let an
+/// entry from a previous process survive a restart and reject the next connection on the
+/// same five-tuple as a mid-stream SYN.
+fn fresh_datapath_generation() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    datapath_generation_from(std::process::id(), nanos)
+}
+
+/// The pure half of [`fresh_datapath_generation`], so the zero sentinel is testable.
+fn datapath_generation_from(pid: u32, nanos: u32) -> u16 {
+    (((pid ^ nanos) & 0xffff) as u16).max(1)
+}
+
+/// Attaches the datapath to the ingress prepared before the listeners were bound.
 async fn attach(
     daemon: &Daemon,
     options: &RunOptions,
@@ -422,6 +477,9 @@ async fn attach(
     wan: &[String],
     so_mark: Option<u32>,
 ) -> anyhow::Result<daer_control::datapath::Attached> {
+    let ingress = daemon
+        .ingress()
+        .ok_or_else(|| anyhow::anyhow!("the datapath has no private ingress to attach to"))?;
     let object_path = resolve_object_path(&options.object);
     if !object_path.exists() {
         return Err(anyhow::anyhow!(
@@ -431,27 +489,24 @@ async fn attach(
         ));
     }
 
-    datapath::ensure_device_pair()
-        .map_err(|error| anyhow::anyhow!("cannot prepare {DEVICE}/{PEER}: {error}"))?;
-    let peer_mac = datapath::peer_mac()
-        .map_err(|error| anyhow::anyhow!("cannot read the peer MAC: {error}"))?;
-    let device_ifindex = datapath::ifindex(DEVICE)
-        .map_err(|error| anyhow::anyhow!("cannot read the {DEVICE} ifindex: {error}"))?;
-
     let param = daer_ebpf::RuntimeParam {
         tproxy_port: u32::from(daemon.port),
         // The datapath checks this pid to tell its own traffic from a client's; a wrong
         // value makes daer proxy itself. `std::process::id` is the running pid.
         control_plane_pid: std::process::id(),
-        device_ifindex,
+        device_ifindex: ingress.device_ifindex,
         netns_id: 0,
-        peer_mac,
+        peer_mac: ingress.peer_mac,
         padding_after_mac: [0, 0],
         // `redirect_peer` needs a kernel new enough to have `bpf_redirect_peer`; the object
         // carries a probe for it, and leaving it off is the safe default that still works.
         use_redirect_peer: false,
         has_bpf_get_current_task: true,
-        datapath_generation: 1,
+        // `conn_state_map` is pinned across daemon restarts. A constant generation made
+        // every previous run's ACTIVE entries look like they belonged to this run, so a
+        // reused five-tuple was refused as a mid-stream SYN rebind (and then passed
+        // through without routing) forever. A fresh value per start invalidates them.
+        datapath_generation: fresh_datapath_generation(),
         // The same value the generation's dialers carry: the datapath compares this against
         // `skb->mark` to recognise daer's own traffic, so a mismatch makes daer proxy itself.
         socket_mark: so_mark.unwrap_or(0),
@@ -470,10 +525,12 @@ async fn attach(
         wan,
         listeners,
         &daemon.generation().router().kernel_policy(),
+        ingress,
     )
     .map_err(|error| anyhow::anyhow!("cannot attach the datapath: {error}"))?;
     tracing::info!(
         port = daemon.port,
+        namespace = ingress.namespace.name(),
         device = DEVICE,
         peer = PEER,
         ?lan,
@@ -540,6 +597,7 @@ async fn serve_until_signal(
     router_options: &RouterOptions,
     ebpf: Option<&daer_control::datapath::Attached>,
     health: &mut HealthScheduler,
+    resolved_pool: &RuleProviderPool,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut hangup = {
@@ -563,14 +621,16 @@ async fn serve_until_signal(
     });
     tokio::pin!(serve);
 
-    let provider_refresh_interval = config
-        .rule_provider
-        .iter()
-        .filter_map(|p| p.interval)
-        .filter_map(|span| span.as_std())
-        .filter(|d| !d.is_zero())
-        .min();
-    let mut provider_ticker = provider_refresh_interval.map(tokio::time::interval);
+    // The pool the refresh path mutates. It starts as the pool the loader produced, so a
+    // provider refreshed before any change is compared against the rules actually in use.
+    let mut provider_pool = resolved_pool.clone();
+
+    // The wake-up cadence is the *shortest* declared interval, because waking less often would
+    // make a provider miss its own deadline (ADR-0037). Which providers a wake-up actually
+    // serves is decided per provider by `ProviderSchedule::due`, not by this timer.
+    let mut schedule = ProviderSchedule::from_config(config);
+    let mut last_refresh: HashMap<String, Instant> = HashMap::new();
+    let mut provider_ticker = schedule.min_interval().map(tokio::time::interval);
     if let Some(ticker) = &mut provider_ticker {
         ticker.reset();
     }
@@ -593,7 +653,33 @@ async fn serve_until_signal(
                 return Ok(());
             }
             _ = hangup.recv() => {
-                reload(daemon, options, router_options, ebpf, health).await;
+                if let Some(reloaded_pool) =
+                    reload(daemon, options, router_options, ebpf, health).await
+                {
+                    provider_pool = reloaded_pool;
+                    // SIGHUP may have changed `[[rule-provider]]`, so the cadence is rebuilt
+                    // from the configuration that was just reloaded. Keeping the startup
+                    // ticker would leave a changed `interval` silently ignored for the
+                    // daemon's lifetime.
+                    match daer_config::load(&options.config) {
+                        Ok(reloaded) => {
+                            schedule = ProviderSchedule::from_config(&reloaded.config);
+                            provider_ticker = schedule.min_interval().map(tokio::time::interval);
+                            if let Some(ticker) = &mut provider_ticker {
+                                ticker.reset();
+                            }
+                            last_refresh.clear();
+                        }
+                        Err(error) => {
+                            // The full reload succeeded, so this is a file change racing the
+                            // second read. Keep the previous cadence rather than stopping the
+                            // daemon over a value it already knows how to run with.
+                            tracing::warn!(%error, "could not re-read the provider cadence; keeping the previous schedule");
+                        }
+                    }
+                }
+                // A rejected reload leaves both the running generation and the cadence
+                // untouched: a typo must not stop a working proxy.
             }
             _ = async {
                 match &mut provider_ticker {
@@ -601,8 +687,19 @@ async fn serve_until_signal(
                     None => std::future::pending().await,
                 }
             } => {
-                tracing::info!("rule provider refresh interval elapsed; refreshing rule providers");
-                reload(daemon, options, router_options, ebpf, health).await;
+                refresh_due_providers(
+                    &schedule,
+                    &mut last_refresh,
+                    &mut provider_pool,
+                    ProviderRefreshContext {
+                        options,
+                        router_options,
+                        daemon,
+                        ebpf,
+                        health,
+                    },
+                )
+                .await;
             }
         }
         #[cfg(not(unix))]
@@ -611,6 +708,158 @@ async fn serve_until_signal(
             result.map_err(|error| anyhow::anyhow!("the accept loop stopped: {error}"))?;
             return Ok(());
         }
+    }
+}
+
+/// Refreshes only the providers whose own interval has elapsed, and rebuilds the routing
+/// generation only when their rule content actually changed (ADR-0037).
+///
+/// # Why this is not just `reload()`
+///
+/// `reload()` re-resolves everything, including node subscriptions, and unconditionally swaps
+/// the routing generation. Doing that on a timer re-fetched node subscriptions that declare no
+/// cadence of their own, and discarded every measured node latency — plus restarted health
+/// probes — for providers that answered `304 Not Modified`. This path keeps the running
+/// generation when the content is identical and never touches subscriptions.
+/// The daemon state a provider refresh publishes into.
+///
+/// Grouped rather than passed one by one: the refresh path and `reload` must hand the same
+/// objects to `publish_generation`/`health.restart`, and a separate argument list is where a
+/// future call site would silently pass a stale generation.
+struct ProviderRefreshContext<'a> {
+    options: &'a RunOptions,
+    router_options: &'a RouterOptions,
+    daemon: &'a Daemon,
+    ebpf: Option<&'a daer_control::datapath::Attached>,
+    health: &'a mut HealthScheduler,
+}
+
+async fn refresh_due_providers(
+    schedule: &ProviderSchedule,
+    last_refresh: &mut HashMap<String, Instant>,
+    pool: &mut RuleProviderPool,
+    context: ProviderRefreshContext<'_>,
+) {
+    let ProviderRefreshContext {
+        options,
+        router_options,
+        daemon,
+        ebpf,
+        health,
+    } = context;
+    let due: Vec<String> = schedule
+        .due(|tag| last_refresh.get(tag).map(Instant::elapsed))
+        .iter()
+        .map(|entry| entry.tag.clone())
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+
+    // Read the declarations from disk without the network: a provider refresh must not turn
+    // into a subscription fetch just because it needed to know a URL.
+    let config = match daer_config::load(&options.config) {
+        Ok(loaded) => loaded.config,
+        Err(error) => {
+            tracing::error!(%error, "rule provider refresh skipped: the configuration does not load");
+            return;
+        }
+    };
+    let directory = options
+        .config
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+
+    let mut changed = false;
+    // Refresh into a copy. The running generation must keep routing with the pool it was
+    // built from until `daemon.reload` accepts the new one; mutating `pool` first would make
+    // a rejected refresh look "unchanged" on the next tick and strand the new rules forever.
+    let mut staged = pool.clone();
+    for tag in due {
+        last_refresh.insert(tag.clone(), Instant::now());
+        let Some(provider) = config
+            .rule_provider
+            .iter()
+            .find(|provider| provider.tag == tag)
+        else {
+            // The tag vanished from the configuration; SIGHUP owns that transition.
+            tracing::debug!(%tag, "rule provider no longer declared; nothing to refresh");
+            continue;
+        };
+
+        let current = staged.get(&tag).map(std::sync::Arc::as_ref);
+        let refreshed =
+            refresh_rule_provider(provider, &directory, current, DEFAULT_REFRESH_TIMEOUT).await;
+        match refreshed.outcome {
+            RefreshOutcome::Changed => {
+                if let Some(set) = refreshed.set {
+                    staged.insert(tag.clone(), set);
+                    changed = true;
+                }
+                tracing::info!(%tag, "rule provider updated");
+            }
+            RefreshOutcome::Unchanged => {
+                // The provider answered 304: its rules are what is already loaded. Touching the
+                // generation here is what used to reset measured latency for no reason.
+                tracing::debug!(%tag, "rule provider unchanged");
+            }
+            RefreshOutcome::Failed => {
+                tracing::warn!(
+                    %tag,
+                    error = refreshed.error.as_deref().unwrap_or("unknown"),
+                    "rule provider refresh failed; keeping the running rule set"
+                );
+            }
+        }
+    }
+
+    if !changed {
+        return;
+    }
+
+    // Only a real content change reaches the data path, and it goes through the same
+    // load-then-swap shape as a reload so a failure cannot leave a half-published policy.
+    let republished_options = router_options
+        .clone()
+        .with_rule_providers(Some(std::sync::Arc::new(staged.clone())));
+    match daemon.reload(&config, &republished_options) {
+        Ok(()) => {
+            *pool = staged;
+            publish_generation(daemon, ebpf);
+            health.restart(daemon);
+            tracing::info!(
+                providers = pool.len(),
+                "rule provider refresh published a new generation"
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "refresh rejected; the running generation is unchanged");
+        }
+    }
+}
+
+/// Publishes the current generation to the kernel datapath, when one is attached.
+///
+/// Shared by `reload` and the provider refresh so the two paths cannot disagree about what
+/// "publishing a policy" means.
+fn publish_generation(daemon: &Daemon, ebpf: Option<&daer_control::datapath::Attached>) {
+    let Some(attached) = ebpf else {
+        return;
+    };
+    let generation = daemon.generation();
+    let router = generation.router();
+    let gen_id = u16::try_from(generation.id().get()).unwrap_or(u16::MAX);
+    // The publish runs inside the observer's own lock: `AyaWriter` needs `&mut Ebpf`, which
+    // only the owner of the object can hand out.
+    let published = attached
+        .with_ebpf(|object| datapath::republish_policy(object, gen_id, &router.kernel_policy()));
+    match published {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
+            %error,
+            "republishing kernel policy failed; kernel will use previous slot"
+        ),
+        Err(reason) => tracing::error!(%reason, "cannot reach the datapath object"),
     }
 }
 
@@ -785,7 +1034,7 @@ async fn reload(
     router_options: &RouterOptions,
     ebpf: Option<&daer_control::datapath::Attached>,
     health: &mut HealthScheduler,
-) {
+) -> Option<RuleProviderPool> {
     let started = std::time::Instant::now();
     let loaded = match daer_control::load_resolved(&options.config).await {
         Ok(loaded) => loaded,
@@ -793,43 +1042,36 @@ async fn reload(
             // A file that no longer parses is the common reload failure; the running policy
             // is untouched, which is the whole point of building before swapping.
             tracing::error!(%error, "reload rejected; the running generation is unchanged");
-            return;
+            return None;
         }
     };
+    let reloaded_pool = loaded.rule_providers.pool.clone();
     let reloaded_options = router_options
         .clone()
         .with_rule_providers(Some(loaded.rule_providers.pool.clone()));
     match daemon.reload(&loaded.config, &reloaded_options) {
         Ok(()) => {
-            let generation = daemon.generation();
-            let router = generation.router();
-            if let Some(attached) = ebpf.as_ref() {
-                let gen_id = u16::try_from(generation.id().get()).unwrap_or(u16::MAX);
-                // The publish runs inside the observer's own lock: `AyaWriter` needs
-                // `&mut Ebpf`, which only the owner of the object can hand out.
-                let published = attached.with_ebpf(|object| {
-                    datapath::republish_policy(object, gen_id, &router.kernel_policy())
-                });
-                match published {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::error!(
-                        %error,
-                        "republishing kernel policy failed; kernel will use previous slot"
-                    ),
-                    Err(reason) => tracing::error!(%reason, "cannot reach the datapath object"),
-                }
-            }
+            publish_generation(daemon, ebpf);
             // The scheduler holds the router it probes, so it has to be handed the new
             // generation; leaving it running would measure a policy nothing routes to.
             health.restart(daemon);
+            let generation = daemon.generation();
             tracing::info!(
                 generation = %generation.describe(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "reloaded"
             );
+            // The caller's refresh pool must be the one the new generation routes with,
+            // otherwise the next timer tick would re-fetch against rules that are no longer
+            // in use and report every provider as changed.
+            Some(
+                std::sync::Arc::try_unwrap(reloaded_pool)
+                    .unwrap_or_else(|shared| (*shared).clone()),
+            )
         }
         Err(error) => {
             tracing::error!(%error, "reload rejected; the running generation is unchanged");
+            None
         }
     }
 }
@@ -853,6 +1095,14 @@ pub async fn drain(daemon: &Daemon, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_datapath_generation_is_never_the_zero_sentinel() {
+        // Zero is the map's uninitialized default and must not be a valid generation.
+        assert_eq!(datapath_generation_from(0x1_0000, 0), 1);
+        assert_ne!(datapath_generation_from(0x1234, 0x5678), 0);
+        assert_ne!(datapath_generation_from(0x1234, 0x5678), 1);
+    }
 
     #[test]
     fn resolve_object_path_returns_existing_path() {

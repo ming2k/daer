@@ -122,6 +122,8 @@ pub enum RoutingError {
     UnsupportedFunction { block: &'static str, name: String },
     /// A domain key that is not `full`, `suffix`, `keyword` or `regex`.
     UnknownDomainKey(String),
+    /// A retired `full:`/`suffix:` key, refused with a pointer to the symbolic spelling.
+    RetiredDomainKey(String),
     /// A parameter given to a function that takes bare values only.
     UnexpectedParameter { function: String, key: String },
     /// A regular expression that does not compile.
@@ -152,7 +154,13 @@ impl fmt::Display for RoutingError {
             }
             Self::UnknownDomainKey(key) => write!(
                 f,
-                "unsupported qname key {key:?}; use full, suffix, keyword or regex"
+                "unsupported qname key {key:?}; use a bare domain (suffix), `.name` \
+                 (subdomains only), `=name` (exact), `keyword:` or `regex:`"
+            ),
+            Self::RetiredDomainKey(key) => write!(
+                f,
+                "'{key}:' is retired (ADR-0036); spell the pattern directly — a bare name is a \
+                 suffix, `.name` is subdomains only, `=name` is an exact match"
             ),
             Self::UnexpectedParameter { function, key } => write!(
                 f,
@@ -175,47 +183,59 @@ impl std::error::Error for RoutingError {}
 ///
 /// No `PartialEq`: `regex::Regex` has none, and comparing compiled matchers has no
 /// caller that needs it. Two routers are compared by what they decide, in tests.
+///
+/// The domain spellings are the routing vocabulary (ADR-0036): a bare name is a suffix
+/// (self and subdomains), a leading dot narrows to subdomains only, and a leading `=`
+/// pins the exact name. `keyword:` and `regex:` are `daer-dns` additions the routing
+/// path refuses (ADR-0033 §3).
 #[derive(Debug, Clone)]
 pub(crate) enum NameMatch {
     Full(Name),
     Suffix(Name),
+    SubdomainsOnly(Name),
     Keyword(String),
     Regex(Regex),
 }
 
 impl NameMatch {
-    /// Builds a matcher from a `kind:value` spelling.
+    /// Builds a matcher from one domain pattern spelling.
     ///
-    /// This is the one place `full`/`suffix`/`keyword`/`regex` are turned into a matcher in this
-    /// crate. `dns.fake-ip.exclude` reuses it rather than parsing a second grammar: two owners of
-    /// "what does `suffix:` mean" is how the exclusion list and the routing rule end up
-    /// disagreeing (ADR-0023).
-    pub(crate) fn parse_kind(kind: &str, value: &str) -> Result<Self, RoutingError> {
-        let value = value.trim();
-        match kind {
-            "full" => Ok(Self::Full(Name::parse(value).map_err(|error| {
-                RoutingError::BadRegex {
-                    pattern: value.to_owned(),
-                    message: error.to_string(),
-                }
-            })?)),
-            "suffix" | "domain" => Ok(Self::Suffix(
-                Name::parse(value.trim_start_matches('.').trim_start_matches('+')).map_err(
-                    |error| RoutingError::BadRegex {
+    /// This is the one place `=name`/`.name`/`name`/`keyword:`/`regex:` are turned into a
+    /// matcher in this crate. `dns.fake-ip.exclude` reuses it rather than parsing a second
+    /// grammar: two owners of "what does a suffix mean" is how the exclusion list and the
+    /// routing rule end up disagreeing (ADR-0023).
+    pub(crate) fn parse_pattern(pattern: &str) -> Result<Self, RoutingError> {
+        let text = pattern.trim();
+        if text.is_empty() {
+            return Err(RoutingError::UnknownDomainKey(String::new()));
+        }
+        if let Some(exact) = text.strip_prefix('=') {
+            return Ok(Self::Full(parse_name(exact.trim())?));
+        }
+        if let Some(rest) = text.strip_prefix('.') {
+            if rest.starts_with('.') {
+                return Err(RoutingError::UnknownDomainKey(text.to_owned()));
+            }
+            return Ok(Self::SubdomainsOnly(parse_name(rest.trim())?));
+        }
+        if let Some((kind, value)) = text.split_once(':') {
+            let kind = kind.trim();
+            let value = value.trim();
+            return match kind {
+                "keyword" => Ok(Self::Keyword(value.to_lowercase())),
+                "regex" => Ok(Self::Regex(Regex::new(value).map_err(|error| {
+                    RoutingError::BadRegex {
                         pattern: value.to_owned(),
                         message: error.to_string(),
-                    },
-                )?,
-            )),
-            "keyword" => Ok(Self::Keyword(value.to_lowercase())),
-            "regex" => Ok(Self::Regex(Regex::new(value).map_err(|error| {
-                RoutingError::BadRegex {
-                    pattern: value.to_owned(),
-                    message: error.to_string(),
+                    }
+                })?)),
+                "full" | "suffix" | "domain" => {
+                    Err(RoutingError::RetiredDomainKey(kind.to_owned()))
                 }
-            })?)),
-            other => Err(RoutingError::UnknownDomainKey(other.to_owned())),
+                other => Err(RoutingError::UnknownDomainKey(other.to_owned())),
+            };
         }
+        Ok(Self::Suffix(parse_name(text)?))
     }
 
     /// Whether `name` matches, taking a text name.
@@ -230,10 +250,19 @@ impl NameMatch {
         match self {
             Self::Full(expected) => name.eq_ignore_case(expected),
             Self::Suffix(suffix) => name.ends_with(suffix),
+            Self::SubdomainsOnly(suffix) => name.ends_with(suffix) && !name.eq_ignore_case(suffix),
             Self::Keyword(needle) => name.to_text().to_lowercase().contains(needle),
             Self::Regex(regex) => regex.is_match(&name.to_text()),
         }
     }
+}
+
+/// Parses a domain name for a matcher, reporting a positioned error on failure.
+fn parse_name(text: &str) -> Result<Name, RoutingError> {
+    Name::parse(text).map_err(|error| RoutingError::BadRegex {
+        pattern: text.to_owned(),
+        message: error.to_string(),
+    })
 }
 
 /// What a request selector looks at.
@@ -565,32 +594,15 @@ fn compile_response_selector(
 fn compile_name_matchers(function: &Function) -> Result<Vec<NameMatch>, RoutingError> {
     let mut matchers = Vec::new();
     for param in &function.params {
-        if param.key.is_empty() {
-            return Err(RoutingError::UnknownDomainKey(String::new()));
-        }
-        let value = param.value.to_string();
-        matchers.push(match param.key.as_str() {
-            "full" => {
-                NameMatch::Full(Name::parse(&value).map_err(|error| RoutingError::BadRegex {
-                    pattern: value.clone(),
-                    message: error.to_string(),
-                })?)
-            }
-            "suffix" => {
-                NameMatch::Suffix(Name::parse(&value).map_err(|error| RoutingError::BadRegex {
-                    pattern: value.clone(),
-                    message: error.to_string(),
-                })?)
-            }
-            "keyword" => NameMatch::Keyword(value.to_lowercase()),
-            "regex" => {
-                NameMatch::Regex(Regex::new(&value).map_err(|error| RoutingError::BadRegex {
-                    pattern: value,
-                    message: error.to_string(),
-                })?)
-            }
-            other => return Err(RoutingError::UnknownDomainKey(other.to_owned())),
-        });
+        // Reconstruct the source spelling: a keyed param is `key: value` (`keyword: ads`,
+        // `regex: …`), a bare param is the domain pattern itself (`example.com`, `.corp`,
+        // `=host.example`). One parser classifies both.
+        let pattern = if param.key.is_empty() {
+            param.value.to_string()
+        } else {
+            format!("{}: {}", param.key, param.value)
+        };
+        matchers.push(NameMatch::parse_pattern(&pattern)?);
     }
     if matchers.is_empty() {
         return Err(RoutingError::EmptyRule);
@@ -726,7 +738,7 @@ upstream = ["local:udp://223.5.5.5:53", "remote:tcp+udp://8.8.8.8:53"]
 [dns.request]
 rules = [
     "qname(keyword: ads) -> reject",
-    "qname(suffix: cn) -> local",
+    "qname(cn) -> local",
     "qtype(AAAA) -> reject",
 ]
 fallback = "remote"
@@ -759,7 +771,7 @@ fallback = "remote"
         let router = RequestRouter::compile(&config(&format!(
             r#"{UPSTREAMS}
 [dns.request]
-rules = ["qname(suffix: lan) -> asis"]
+rules = ["qname(lan) -> asis"]
 fallback = "remote"
 "#
         )))
@@ -777,7 +789,7 @@ fallback = "remote"
         let error = RequestRouter::compile(&config(&format!(
             r#"{UPSTREAMS}
 [dns.request]
-rules = ["qname(suffix: a) -> remtoe"]
+rules = ["qname(a) -> remtoe"]
 fallback = "remote"
 "#
         )))
@@ -826,7 +838,7 @@ fallback = "remote"
         let router = RequestRouter::compile(&config(&format!(
             r#"{UPSTREAMS}
 [dns.request]
-rules = ["qname(suffix: example.com) -> reject"]
+rules = ["qname(example.com) -> reject"]
 fallback = "remote"
 "#
         )))
@@ -865,7 +877,7 @@ fallback = "remote"
 [dns.response]
 rules = [
     "ip(10.0.0.0/8) -> reject",
-    "upstream(local) && qname(suffix: example.com) -> remote",
+    "upstream(local) && qname(example.com) -> remote",
 ]
 fallback = "accept"
 "#

@@ -6,7 +6,7 @@
 //! `cargo xtask ebpf`; this module does not compile it, so building daer
 //! never needs a clang toolchain or the kernel headers.
 //!
-//! Attachment needs `CAP_BPF`/`CAP_NET_ADMIN`, so the tests that attach are
+//! Attachment needs `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`, so the tests that attach are
 //! `#[ignore]`d. The name/ABI checks in `tests/object.rs` run unprivileged.
 
 use std::fmt;
@@ -17,8 +17,10 @@ use aya::EbpfLoader;
 use aya::maps::Array;
 use aya::maps::MapError;
 use aya::programs::ProgramError;
+use aya::programs::tc::NlOptions;
 use aya::programs::tc::SchedClassifier;
 use aya::programs::tc::SchedClassifierLinkId;
+use aya::programs::tc::TcAttachOptions;
 use aya::programs::tc::TcAttachType;
 use aya::programs::tc::TcError;
 use aya::programs::tc::qdisc_add_clsact;
@@ -241,8 +243,16 @@ pub fn attach_tc(
     let classifier: &mut SchedClassifier = program.try_into().map_err(LoadError::Program)?;
     classifier.load().map_err(LoadError::Program)?;
     let _ = qdisc_add_clsact(interface);
+    // Force the classic cls_bpf path. Aya's `attach` prefers TCX on kernels >= 6.6,
+    // but `bpf_sk_assign` is a classic TC-ingress helper on this data path; the
+    // reference implementation attaches the same programs with `tc`, and TCX left
+    // the assigned packet without ever reaching the listener's accept queue.
     classifier
-        .attach(interface, direction)
+        .attach_with_options(
+            interface,
+            direction,
+            TcAttachOptions::Netlink(NlOptions::default()),
+        )
         .map_err(LoadError::Program)
 }
 

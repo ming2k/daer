@@ -9,10 +9,10 @@
 //! socket wrapper — is reachable only from a parsed node, which is what keeps a configuration
 //! from reaching a layer it did not ask for.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use netune::{DatagramConnector, Established};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 
 use crate::ProxyProtocol;
 use crate::anytls::AnyTlsConnector;
@@ -177,25 +177,28 @@ impl ProxyDialer {
         }
     }
 
-    /// Connects to `authority` (`host:port`) using a throwaway recorder.
+    /// Connects to `authority` (`host:port`) without observing the attempt.
+    ///
+    /// A protocol dial that nobody measures uses netune's disabled collector:
+    /// no event ring, no sink, no clock beyond what the transport itself needs.
     pub async fn connect(&self, authority: &str) -> Result<Established, ProxyProtocolError> {
-        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
-        self.connect_with_recorder(authority, &recorder).await
+        self.connect_with_collector(authority, &TraceCollector::disabled())
+            .await
     }
 
-    /// Connects to `authority` (`host:port`) with the given trace recorder.
-    pub async fn connect_with_recorder(
+    /// Connects to `authority` (`host:port`) with the given trace collector.
+    pub async fn connect_with_collector(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        collector: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         match self {
-            Self::ShadowSocks(c) => c.connect(authority, recorder).await,
-            Self::Trojan(c) => c.connect(authority, recorder).await,
-            Self::AnyTls(c) => c.connect(authority, recorder).await,
-            Self::Hysteria2(c) => c.connect(authority, recorder).await,
-            Self::Vless(c) => c.connect(authority, recorder).await,
-            Self::Vmess(c) => c.connect(authority, recorder).await,
+            Self::ShadowSocks(c) => c.connect(authority, collector).await,
+            Self::Trojan(c) => c.connect(authority, collector).await,
+            Self::AnyTls(c) => c.connect(authority, collector).await,
+            Self::Hysteria2(c) => c.connect(authority, collector).await,
+            Self::Vless(c) => c.connect(authority, collector).await,
+            Self::Vmess(c) => c.connect(authority, collector).await,
         }
     }
 

@@ -9,9 +9,13 @@ repository.workspace = true
 description = "Proxy protocol implementations (Shadowsocks, Trojan, REALITY, Hysteria 2, AnyTLS) for daer"
 autotests = false
 
+# The package is `md-5`; the crate it exposes is `md5`, which is what the
+# Shadowsocks/VMess code imports. cargo-machete cannot see through the rename.
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
+
 [dependencies]
 bytes.workspace = true
-daer-common.workspace = true
 daer-config.workspace = true
 libc.workspace = true
 aes.workspace = true
@@ -30,24 +34,18 @@ getrandom.workspace = true
 netune.workspace = true
 netune-trace.workspace = true
 netune-ws.workspace = true
-regex.workspace = true
+netune-quic.workspace = true
+netune-http3.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
-quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
 http = "1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-platform-verifier = "0.6"
-tokio-rustls = "0.26"
-socket2.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 ml-kem.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
 blake2.workspace = true
 sha3.workspace = true
-tokio-util = "0.7"
 
 # `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
 # targets explicitly is what keeps cargo from compiling it as a binary of its own.
@@ -101,5 +99,6 @@ workspace = true
 [dev-dependencies]
 # A real TLS server for the Trojan interop test: a certificate has to come from somewhere, and
 # a hard-coded one would expire.
-rcgen = "0.14"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }

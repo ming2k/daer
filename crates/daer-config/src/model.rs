@@ -1272,10 +1272,11 @@ impl PortSet {
 
 /// Hysteria 2's QUIC tuning (ADR-0029).
 ///
-/// Every field maps onto a `quinn::TransportConfig`/`EndpointConfig` knob, so a value
-/// here either changes the connection or is not in the model. The defaults are quinn's
-/// own, not the reference's, because a daer deployment shares one daemon across many
-/// nodes and a buffer sized for one node's 500 Mbit link would be wrong everywhere else.
+/// Every field maps onto a `netune_quic::QuicProfile`/`QuicTransportParameters` knob, so a
+/// value here either changes the connection or is not in the model. The defaults are netune's
+/// (30 s idle timeout, 10 MB connection window); they are daer's own, not the reference's,
+/// because a daer deployment shares one daemon across many nodes and a buffer sized for one
+/// node's 500 Mbit link would be wrong everywhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
@@ -1288,19 +1289,19 @@ pub struct Hysteria2Quic {
     pub init_conn_receive_window: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub max_conn_receive_window: u64,
-    /// Connection idle timeout in milliseconds. `0` keeps quinn's default.
+    /// Connection idle timeout in milliseconds. `0` keeps netune's default.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub max_idle_timeout_ms: u64,
-    /// Keep-alive period in milliseconds. `0` disables keep-alives.
+    /// Keep-alive period in milliseconds. `0` keeps daer's 10 s default.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub keep_alive_period_ms: u64,
-    /// Send at the largest size the path allows even when it wastes a little
-    /// bandwidth, instead of coalescing: what Hysteria 2 does, and what makes a
-    /// fixed-size packet pattern less visible.
+    /// Disable netune's DPLPMTUD probing and keep datagrams at the QUIC
+    /// 1200-byte floor, matching the reference's `disablePathMTUDiscovery`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_path_mtu_discovery: bool,
-    /// Skip GSO. Off by default because segmentation offload is the difference
-    /// between one `sendmsg` and thirty.
+    /// Skip GSO. The owned QUIC engine performs no segmentation offload, so
+    /// this key is already satisfied; it is accepted for reference
+    /// compatibility and read by the connector rather than silently dropped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_segmentation_offload: bool,
 }
@@ -1310,7 +1311,7 @@ pub struct Hysteria2Quic {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Hysteria2Congestion {
-    /// quinn's BBRv2 implementation.
+    /// netune's BBR model window.
     #[default]
     Bbr,
     Cubic,
@@ -3472,7 +3473,7 @@ mod tests {
     #[test]
     fn rules_are_parsed_from_expressions() {
         let parsed = config(
-            "[routing]\nrules = [\"domain(suffix: a.com) && port(443) -> proxy\"]\nfallback = \"direct\"\n",
+            "[routing]\nrules = [\"domain(a.com) && port(443) -> proxy\"]\nfallback = \"direct\"\n",
         );
         let rule = &parsed.routing.rules[0];
         assert_eq!(rule.and_functions.len(), 2);

@@ -165,14 +165,14 @@ def parse_geosite_entry(
                 skipped_count += 1
                 continue
 
-            # In CRS v1 (ADR-0031, ADR-0033):
-            # 2: RootDomain -> suffix: <domain>
-            # 3: Full -> full: <domain>
+            # In CRS v2 (ADR-0031, ADR-0033, ADR-0036):
+            # 2: RootDomain -> bare suffix: <domain>
+            # 3: Full -> exact match: =<domain>
             # 0: Plain, 1: Regex -> not supported as routing predicates
             if d_type == 2:
                 rules.append(("suffix", d_val, attrs))
             elif d_type == 3:
-                rules.append(("full", d_val, attrs))
+                rules.append(("=", d_val, attrs))
             else:
                 skipped_count += 1
 
@@ -314,7 +314,7 @@ def main():
 
         if skipped > 0:
             sys.stderr.write(
-                f"note: skipped {skipped} plain/regex pattern(s) in '{code}' (ADR-0031/ADR-0033: domain routing accepts suffix: and full: only)\n"
+                f"note: skipped {skipped} plain/regex pattern(s) in '{code}' (ADR-0036: domain routing accepts bare suffix, .subdomain, and =exact only)\n"
             )
 
         lines.append(f"name: geosite-{code}")
@@ -323,7 +323,12 @@ def main():
             attr_suffix = (
                 (" " + " ".join(f"@{a.lower()}" for a in attrs)) if attrs else ""
             )
-            lines.append(f"{kind}: {pattern}{attr_suffix}")
+            if kind == "=":
+                lines.append(f"={pattern}{attr_suffix}")
+            elif kind == "suffix":
+                lines.append(f"{pattern}{attr_suffix}")
+            else:
+                lines.append(f"{kind}: {pattern}{attr_suffix}")
 
     content = "\n".join(lines) + "\n"
     if args.output == "-" or not args.output:

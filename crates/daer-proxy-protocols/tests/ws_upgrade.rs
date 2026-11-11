@@ -15,7 +15,7 @@ use std::time::Duration;
 use daer_proxy_protocols::transport::{TransportLayer, WsParams};
 use netune::Connector as _;
 use netune::{Target, TcpConnector};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Starts a server that reads until it sees `\r\n\r\n`, records the bytes, and answers `101`.
@@ -69,7 +69,7 @@ async fn recording_server() -> (std::net::SocketAddr, Arc<Mutex<Vec<u8>>>) {
 async fn the_upgrade_request_carries_the_reference_fields() {
     let (address, observed) = recording_server().await;
     let tcp = TcpConnector::new();
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     let established = tcp
         .connect(&Target::plain(address.to_string()), &recorder)
         .await

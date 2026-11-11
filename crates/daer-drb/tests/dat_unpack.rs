@@ -212,8 +212,8 @@ fn test_dat_to_rules_and_compile_pipeline() {
 
     let site_text = fs::read_to_string(&cn_rules).unwrap();
     assert!(site_text.contains("name: geosite-cn"));
-    assert!(site_text.contains("suffix: baidu.com @cn"));
-    assert!(site_text.contains("full: login.qq.com"));
+    assert!(site_text.contains("baidu.com @cn"));
+    assert!(site_text.contains("=login.qq.com"));
 
     // Compile unpacked geosite rules with daer-drb
     let cn_drb = temp.path().join("geosite-cn.drb");

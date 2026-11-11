@@ -76,9 +76,10 @@ difference decides how both projects evolve.
      exception is recorded: REALITY is blocked at the TLS-stack level, not here
      (see Decision 1's note and netune ADR-0009).
 4. **The upstream dependency is locked.** `Cargo.toml` specifies the exact
-   release tag (`tag = "v0.0.5"`), and `Cargo.lock` records the exact Git commit SHA.
-   CI verifies the lock file using `--locked`. Local co-development can override
-   this cleanly using `.cargo/config.toml` (git-ignored) with `[patch]` or `paths`.
+   release tag (`tag = "v0.0.24"`), and `Cargo.lock` records the exact Git commit SHA.
+   CI verifies the lock file using `--locked`. Local co-development may point the
+   same package names at a sibling working tree with a `[patch]`; that override is
+   development scaffolding and must not decide the released combination.
 5. **Where netune must change, the change is upstreamed and documented.** The
    `SO_MARK`-before-connect gap was closed in netune (`SocketConfig::mark`:
    manual socket, `SO_MARK`, non-blocking connect, wait-for-writable,

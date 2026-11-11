@@ -4,7 +4,7 @@ Network capabilities live in [`netune`](../../../netune). `daer` does not
 reimplement them, and does not work around their absence: a gap here is a gap in
 `daer`, tracked as work on netune.
 
-The boundary is [ADR-0002](./adr/0002-netune-boundary.md): netune owns everything
+The boundary is [ADR-0002](../adr/0002-netune-boundary.md): netune owns everything
 above the socket — transport, TLS identity, HTTP framing, DNS *resolution*, proxy
 handshakes, socket options, timing, and datagrams. `daer` owns what is specific to
 being the *end* of a transparent connection: the tproxy accept path, eBPF maps, the
@@ -32,7 +32,7 @@ looked" is not a blocker.
 
 ## 1. UDP — delivered in netune; consumed on the daer side ✅
 
-netune gained a datagram path in [ADR-0008](../../netune/docs/adr/0008-datagram-transport-and-socks5-udp-association.md):
+netune gained a datagram path in [ADR-0008](../../../netune/docs/adr/0008-datagram-transport-and-socks5-udp-association.md):
 `UdpConnector` (the datagram twin of `TcpConnector` — same `DnsResolver`, same
 `EgressConfinement`, same `SocketConfig`, `SO_MARK` applied before `connect`),
 `DatagramConnector`/`DatagramTransport` with **per-peer connected sessions**, and
@@ -50,16 +50,21 @@ own demultiplexing where the wire format already requires it.
 | DNS upstream over UDP (direct) | `daer-dns::transport` | ✅ plain `UdpSocket`, **does not use netune** |
 | `udp_check_dns` health probe | `daer-outbound` health check | ✅ `UdpDnsChecker` |
 | SOCKS5 UDP associate | proxy protocol support | ✅ via `Socks5DatagramConnector` (literal IP destinations) |
-| QUIC-based protocols (`hysteria2`, `tuic`) | outbound protocols | ⬜ still blocked: datagrams exist, **QUIC does not** |
+| QUIC-based protocols (`hysteria2`, `tuic`) | outbound protocols | ✅ QUIC/H3 delivered in netune; `hysteria2` consumes `netune-quic`/`netune-http3` (ADR-0035) |
 
-Two limits are deliberate and named rather than latent:
+One limit is deliberate and named rather than latent:
 
 - **SOCKS5 UDP destinations are literal IP addresses only.** A domain destination
   would need `Target` to carry a second address channel that TLS verification and
   the pool key both ignore — a `Target` redesign with its own ADR.
-- **QUIC is not implied.** `hysteria2`/`tuic` need a QUIC stack (and, for
-  `hysteria2`, a pluggable congestion controller that stock implementations do not
-  expose). That remains a dependency decision worth its own record.
+
+QUIC is no longer a gap: netune ADR-0016 delivered `netune-quic` (RFC 9000,
+RFC 9221) and `netune-http3` (RFC 9114) under `aws-lc-rs`, and netune 0.0.24 owns their
+state machines (netune ADR-0027, ADR-0028); daer ADR-0035 removes the direct `quinn`,
+`h3`, `h3-quinn` and `ring` dependencies. Hysteria 2 still owns its product-specific
+socket layers (Salamander/Gecko, port hopping, Brutal), but they implement netune's
+`QuicUdpSocket`/`CongestionControllerFactory` seams rather than constructing a QUIC
+endpoint themselves.
 
 ## 2. `Preset` vocabulary — daer's problem, not netune's
 
@@ -82,9 +87,11 @@ These seams are exactly right and `daer` depends on them:
   resolver — including a "return exactly this cached address" implementation for
   `dial_mode = "ip"`.
 - `Connector` is a public trait returning `Established { stream: Box<dyn Transport> }`
-  (`connect.rs:138`), so daer's protocol implementations (shadowsocks, vmess,
-  vless, trojan, REALITY) compose as connectors over a raw stream instead of
-  needing a netune change per protocol. Chained proxies (`a -> b`) nest the same way.
+  and taking a `&TraceCollector`, so daer's protocol implementations (shadowsocks,
+  vmess, vless, trojan, REALITY) compose as connectors over a raw stream instead of
+  needing a netune change per protocol. A dial nobody observes passes
+  `TraceCollector::disabled()`; an observed dial installs a sink before connecting.
+  Chained proxies (`a -> b`) nest the same way.
 - **`Transport` is a public blanket trait** (`connect.rs:23`: `pub trait Transport`
   with `impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T`). This is
   the seam that makes a REALITY client possible **without any netune change**: a
@@ -98,6 +105,14 @@ These seams are exactly right and `daer` depends on them:
 - `Client::request(target, head, Option<Bytes>)` (`client.rs:115`) is what the DoH
   upstream and the subscription fetcher use; `TlsConnector` is what the DoT upstream
   uses.
+- `QuicUdpSocketFactory` builds one socket stack per connection after egress
+  confinement and before the first Initial packet, and receives the connector's
+  `QuicSocketConfig`. Hysteria 2 applies that config (including `SO_MARK`) to the
+  base socket, so the seam cannot silently skip a pre-connect option.
+- `QuicProfile.path_mtu_discovery` (netune 0.0.24) makes DPLPMTUD policy explicit.
+  daer's `disable-path-mtu-discovery` maps to it instead of being listed as an
+  engine property that happened to be true; disabling advertises the 1200-byte
+  QUIC floor so the probe ceiling cannot grow.
 
 ## 4. REALITY — daer's, and netune must not grow it
 
@@ -140,10 +155,9 @@ as `Established`.
 
 ## 5. Deferred, not requested
 
-- **QUIC stack** for `hysteria2` / `tuic`. A dependency decision, not a netune gap:
-  whichever library is chosen would sit beside netune, not inside it, because it is
-  a transport *below* the HTTP layer netune owns.
-- **DoQ** (DNS over QUIC, RFC 9250). Same reason.
+- **DoQ** (DNS over QUIC, RFC 9250). netune now owns a QUIC client transport
+  (`netune-quic`), so this is no longer blocked by a missing stack; it is a daer
+  DNS-transport feature that nobody has asked for yet.
 
 ## 6. Non-blocking observations
 

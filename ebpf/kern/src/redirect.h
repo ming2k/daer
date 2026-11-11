@@ -4,6 +4,18 @@
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
 
+/* The L4 protocol rides in the high nibble of cb[0] as well as in cb[1].
+ * The redirect path on some kernels preserves cb[0] but clobbers cb[1], and
+ * losing the protocol makes the peer-ingress hook skip assign_listener. */
+static __always_inline void set_tproxy_cb(struct __sk_buff *skb, __u8 l4proto)
+{
+	// 1 = TCP, 2 = UDP. IPPROTO_UDP is 17 and does not fit in the nibble, so
+	// the tag carries the listener *kind*, not the raw protocol number.
+	__u32 kind = l4proto == IPPROTO_TCP ? 1 : (l4proto == IPPROTO_UDP ? 2 : 0);
+	skb->cb[0] = TPROXY_MARK | (kind << 28);
+	skb->cb[1] = l4proto;
+}
+
 static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
 {
 
@@ -16,12 +28,16 @@ static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
 
 	sk = bpf_map_lookup_elem(&listen_socket_map, key);
 
-	if (!sk)
+	if (!sk) {
+		bump_stat(BPF_STATS_LISTENER_ASSIGN_FAILED);
 		return -1;
+	}
 
 	int ret = bpf_sk_assign(skb, sk, 0);
 
 	bpf_sk_release(sk);
+	if (ret)
+		bump_stat(BPF_STATS_LISTENER_ASSIGN_FAILED);
 	return ret;
 }
 
@@ -34,7 +50,9 @@ static __always_inline __u32 get_daer0_ifindex(void)
 	__u32 key = 0;
 	__u32 *val = bpf_map_lookup_elem(&daer_ifindex_map, &key);
 
-	if (val)
+	// zero is not a valid interface index: it is the map's default before the loader
+	// publishes the real one, so treat it as absent and use the parameter fallback.
+	if (val && *val)
 		return *val;
 	return PARAM.device_ifindex;
 }

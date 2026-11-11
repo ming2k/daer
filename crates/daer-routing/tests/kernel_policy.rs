@@ -439,7 +439,7 @@ fn the_kernel_and_userspace_agree_on_every_representable_rule_set() {
 /// A rule the kernel cannot represent defers the *whole* program, with a reason that names it.
 #[test]
 fn a_domain_rule_defers_and_says_why() {
-    let (_sets, _fallback, compiled) = compile(&["domain(suffix:example.com) -> direct"], "proxy");
+    let (_sets, _fallback, compiled) = compile(&["domain(example.com) -> direct"], "proxy");
     let policy = &compiled.policy;
     assert!(!policy.equivalent);
     assert_eq!(
@@ -626,7 +626,7 @@ fn a_partitioned_policy_executes_prefix_in_kernel_and_defers_suffix() {
     let rules = &[
         "dport(22) -> direct",
         "dip(192.168.0.0/16) -> direct",
-        "domain(suffix: example.com) -> proxy",
+        "domain(example.com) -> proxy",
         "dip(10.0.0.0/8) -> block",
     ];
     let (_sets, _fallback, compiled) = compile(rules, "proxy");

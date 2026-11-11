@@ -15,23 +15,20 @@
 //! (`hysteria/extras/obfs/salamander.go`, `gecko.go`), and both are implemented here byte for
 //! byte, because a different scheme simply does not interoperate.
 //!
-//! # Why they are `AsyncUdpSocket` layers
+//! # Why they are `QuicUdpSocket` layers
 //!
-//! Quinn takes its socket once, at endpoint construction. Everything that has to touch a
-//! datagram — obfuscation, fragmentation, port hopping — therefore has to sit *between* the
-//! socket and Quinn, and `quinn::AsyncUdpSocket` is the only seam that allows it
-//! (`Endpoint::new_with_abstract_socket`). That also means each layer is testable without a
-//! server: feed it bytes, compare with the reference's vectors.
+//! netune takes its socket from a per-connection factory at endpoint construction. Everything
+//! that has to touch a datagram — obfuscation, fragmentation, port hopping — therefore sits
+//! *between* the socket and the QUIC engine, and `netune_quic::QuicUdpSocket` is the seam that
+//! allows it. That also means each layer is testable without a server: feed it bytes, compare
+//! with the reference's vectors.
 
 use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use netune_trace::Recorder;
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
-use std::sync::Mutex;
+use netune_quic::QuicUdpSocket;
 
 /// The pre-shared-key minimum, from the reference (`smPSKMinLen`).
 pub const PSK_MIN_LEN: usize = 4;
@@ -165,13 +162,15 @@ pub fn deobfuscate_salamander(password: &[u8], datagram: &[u8]) -> Option<Vec<u8
     Some(out)
 }
 
-/// A Quinn socket that applies Hysteria 2's obfuscation.
+/// A socket layer that applies Hysteria 2's obfuscation.
 ///
-/// Wraps another `AsyncUdpSocket` so the port-hop layer can sit underneath it and the plain
+/// Wraps another [`QuicUdpSocket`] so the port-hop layer can sit underneath it and the plain
 /// socket underneath that.
 pub struct ObfsSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
+    inner: Arc<dyn QuicUdpSocket>,
     obfs: Obfs,
+    /// The encoded datagram waiting for the inner socket to become writable.
+    pending: Mutex<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for ObfsSocket {
@@ -185,8 +184,12 @@ impl std::fmt::Debug for ObfsSocket {
 impl ObfsSocket {
     /// Wraps `inner` in `obfs`.
     #[must_use]
-    pub fn new(inner: Arc<dyn AsyncUdpSocket>, obfs: Obfs) -> Self {
-        Self { inner, obfs }
+    pub fn new(inner: Arc<dyn QuicUdpSocket>, obfs: Obfs) -> Self {
+        Self {
+            inner,
+            obfs,
+            pending: Mutex::new(None),
+        }
     }
 
     /// The pre-shared key.
@@ -197,54 +200,51 @@ impl ObfsSocket {
     }
 }
 
-impl AsyncUdpSocket for ObfsSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Arc::clone(&self.inner).create_io_poller()
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let payload = match &self.obfs {
-            Obfs::Salamander { .. } => obfuscate_salamander(self.password(), transmit.contents),
-            Obfs::Gecko {
-                min_packet_size,
-                max_packet_size,
-                ..
-            } => gecko_encode(
-                self.password(),
-                transmit.contents,
-                *min_packet_size,
-                *max_packet_size,
-            ),
-        };
-        self.inner.try_send(&Transmit {
-            destination: transmit.destination,
-            ecn: transmit.ecn,
-            contents: &payload,
-            // Segmentation offload cannot survive the transform: each segment became its own
-            // datagram with its own salt.
-            segment_size: None,
-            src_ip: transmit.src_ip,
-        })
-    }
-
-    fn poll_recv(
+impl QuicUdpSocket for ObfsSocket {
+    fn poll_send_to(
         &self,
         cx: &mut Context<'_>,
-        bufs: &mut [std::io::IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
+        buf: &[u8],
+        target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        // One datagram at a time: the deobfuscated length is not the received length, so
-        // filling several `bufs` from one `poll_recv` would have to copy into them and lose
-        // track of which `RecvMeta` each belongs to.
-        let mut raw = vec![0u8; gecko_buffer()];
-        let mut raw_meta = [RecvMeta::default()];
-        let mut raw_bufs = [std::io::IoSliceMut::new(&mut raw)];
-        match self.inner.poll_recv(cx, &mut raw_bufs, &mut raw_meta) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.is_none() {
+            let payload = match &self.obfs {
+                Obfs::Salamander { .. } => obfuscate_salamander(self.password(), buf),
+                Obfs::Gecko {
+                    min_packet_size,
+                    max_packet_size,
+                    ..
+                } => gecko_encode(self.password(), buf, *min_packet_size, *max_packet_size),
+            };
+            *pending = Some(payload);
+        }
+        let payload = pending.as_ref().expect("just populated");
+        match self.inner.poll_send_to(cx, payload, target) {
+            Poll::Ready(Ok(_)) => {
+                *pending = None;
+                // Report the plaintext length: the QUIC engine accounts for the bytes it
+                // handed down, not for the obfuscation overhead.
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(error)) => {
+                *pending = None;
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        let mut raw = [0u8; GECKO_BUFFER];
+        match self.inner.poll_recv_from(cx, &mut raw) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
-            Poll::Ready(Ok(count)) => {
-                let received = raw_meta[0].len.min(raw.len());
+            Poll::Ready(Ok((received, address))) => {
                 let decoded = match &self.obfs {
                     Obfs::Salamander { .. } => {
                         deobfuscate_salamander(self.password(), &raw[..received])
@@ -257,38 +257,20 @@ impl AsyncUdpSocket for ObfsSocket {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 };
-                let available = bufs[0].len();
-                let take = decoded.len().min(available);
-                bufs[0][..take].copy_from_slice(&decoded[..take]);
-                meta[0] = RecvMeta {
-                    addr: raw_meta[0].addr,
-                    len: take,
-                    // The transform destroyed any GRO grouping.
-                    stride: take,
-                    ecn: raw_meta[0].ecn,
-                    dst_ip: raw_meta[0].dst_ip,
-                };
-                let _ = count;
-                Poll::Ready(Ok(1))
+                let take = decoded.len().min(buf.len());
+                buf[..take].copy_from_slice(&decoded[..take]);
+                Poll::Ready(Ok((take, address)))
             }
         }
     }
 
-    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
-    }
-
-    fn may_fragment(&self) -> bool {
-        // The obfuscated packet is larger than the plaintext, so the datagram has to fit;
-        // letting the kernel fragment it would break the salt-prefixed framing.
-        false
     }
 }
 
 /// The receive buffer Gecko needs: its own maximum packet size plus Salamander's salt.
-fn gecko_buffer() -> usize {
-    usize::from(Obfs::GECKO_MAX_PACKET) + SALT_LEN
-}
+const GECKO_BUFFER: usize = Obfs::GECKO_MAX_PACKET as usize + SALT_LEN;
 
 /// Gecko's frame header, `after Salamander decryption`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,10 +411,6 @@ impl GeckoReassembler {
         Some(assembled)
     }
 }
-
-/// Keeps the trace recorder type reachable from this module, so a future layer can record
-/// datagram counts without adding an import that only one call site uses.
-pub type RecorderRef = Arc<Mutex<Recorder>>;
 
 #[cfg(test)]
 mod tests {
@@ -584,5 +562,37 @@ mod tests {
         })
         .expect("defaults");
         assert_eq!(ok.kind(), "gecko");
+    }
+
+    #[tokio::test]
+    async fn the_obfuscation_layer_round_trips_a_datagram_on_the_wire() {
+        // Positive control: two sockets behind the same layer must exchange plaintext, which
+        // proves the transform is applied on send and reversed on receive. A layer that only
+        // encoded would leave the receiver with a salt-prefixed datagram, and one that only
+        // decoded would never produce a frame the peer can parse.
+        let first = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let second = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let target = second.local_addr().expect("address");
+        let obfs = Obfs::Salamander {
+            password: b"cry_me_a_r1ver".to_vec(),
+        };
+        let sender = ObfsSocket::new(Arc::new(first), obfs.clone());
+        let receiver = ObfsSocket::new(Arc::new(second), obfs);
+
+        let sent = std::future::poll_fn(|cx| sender.poll_send_to(cx, b"quic-initial", target))
+            .await
+            .expect("sends");
+        assert_eq!(sent, b"quic-initial".len());
+
+        let mut buffer = [0u8; 64];
+        let (received, peer) = std::future::poll_fn(|cx| receiver.poll_recv_from(cx, &mut buffer))
+            .await
+            .expect("receives");
+        assert_eq!(&buffer[..received], b"quic-initial");
+        assert_eq!(peer, sender.local_addr().expect("local address"));
     }
 }

@@ -19,7 +19,7 @@ rules = [
     "pname(NetworkManager) -> direct",
     "dip(224.0.0.0/3, 'ff00::/8') -> direct",
     "l4proto(udp) && dport(443) -> block",
-    "domain(suffix:example.com) -> proxy(must, mark: 0x10)",
+    "domain(example.com) -> proxy(must, mark: 0x10)",
 ]
 fallback = "my_group"
 "#;

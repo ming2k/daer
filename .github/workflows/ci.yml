@@ -30,6 +30,15 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # Advisory, license, source and duplicate-version policy in `deny.toml`.
+  # A lockfile update is the usual way a vulnerable or non-permissive dependency
+  # arrives, so this gate belongs on every push, not only on release.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   # `docs/dev/standards/workflow.md` says the kernel datapath and the REALITY interop are
   # fixtures CI exercises, and until this job existed that sentence was false: `cargo test
   # --workspace` runs `tests/transparent.rs` on a stock runner where it skips itself (no
@@ -128,3 +137,8 @@ jobs:
         run: cargo xtask ebpf
       - name: Check the ABI against it
         run: cargo test -p daer-ebpf --test object
+      # The same unprivileged gate the package build runs: the object this job
+      # just built must be one `daer check` accepts, not merely one whose
+      # section names match at compile time.
+      - name: Unprivileged preflight
+        run: cargo xtask preflight

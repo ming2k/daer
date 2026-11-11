@@ -9,7 +9,6 @@ repository.workspace = true
 description = "TLS and HTTP domain sniffing for daer"
 
 [dependencies]
-daer-common.workspace = true
 aes.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true

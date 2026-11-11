@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use daer_sniff::{Sniffed, sniff};
 use netune::{DatagramConnector, DatagramTransport};
+use netune_trace::TraceCollector;
 use tokio::sync::Mutex;
 
 use crate::error::{DialFailure, RelayError};
@@ -456,7 +457,7 @@ async fn peer_for(
         }
     };
 
-    let recorder = Arc::new(std::sync::Mutex::new(netune_trace::Recorder::start(16)));
+    let recorder = TraceCollector::disabled();
     let established = match leg.connector.connect(&leg.target, &recorder).await {
         Ok(established) => established,
         Err(error) => {

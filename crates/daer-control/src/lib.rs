@@ -42,13 +42,13 @@
 //! it started are owned by a [`daer_relay::Supervisor`], not by the accept loop. A reload:
 //!
 //! 1. builds and validates the next generation (a failure publishes nothing),
-//! 2. binds the new listener **while the old one is still accepting**
-//!    (`SO_REUSEPORT`, see [`daer_relay::inbound::bind_shared`]),
-//! 3. starts the new accept loop, then stops the old one,
-//! 4. leaves every live flow relaying on the generation it arrived under.
+//! 2. swaps the generation behind the already-bound listener,
+//! 3. leaves every live flow relaying on the generation it arrived under.
 //!
-//! `tests/handover.rs` asserts each of those, including one connection crossing eight
-//! generations and the port never going unbound.
+//! The production listener is deliberately not reusable (`SO_REUSEPORT` would let the
+//! kernel choose a different socket than the one `bpf_sk_assign` named); the separate
+//! `bind_shared` helper and `tests/handover.rs` exercise the accept-loop handover shape on
+//! a plain socket.
 //!
 //! # Reporting
 //!
@@ -71,6 +71,7 @@ pub mod decide;
 pub mod generation;
 pub mod health;
 pub mod load;
+pub mod netns;
 pub mod rule_provider;
 pub mod sniff;
 pub mod subscription;
@@ -79,7 +80,7 @@ pub use daemon::{
     BindError, Daemon, DatapathSettings, DatapathStatus, detect_wan_interface, listen_address,
     resolve_interfaces,
 };
-pub use datapath::{DEVICE, DatapathError, PEER, ensure_device_pair, peer_mac};
+pub use datapath::{DEVICE, DatapathError, PEER, peer_mac};
 pub use decide::{Explanation, NodeIdentity, Router, RouterOptions, Verdict};
 pub use generation::{Generation, GenerationId, Generations, ReloadError, ReloadReport};
 pub use health::{
@@ -89,8 +90,10 @@ pub use health::{
 pub use load::{
     Resolved, group_mentions_node, load_resolved, load_resolved_with, warn_about_empty_groups,
 };
+pub use netns::{INGRESS_NETNS, IngressNamespace, PreparedIngress};
 pub use rule_provider::{
-    ResolvedRuleProvider, RuleProviderResolution, resolve_rule_providers,
+    ProviderSchedule, ProviderScheduleEntry, RefreshOutcome, RefreshedProvider,
+    ResolvedRuleProvider, RuleProviderResolution, refresh_rule_provider, resolve_rule_providers,
     resolve_rule_providers_with,
 };
 pub use sniff::{Outcome, Unnamed, sniff_stream};

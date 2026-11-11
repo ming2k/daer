@@ -12,12 +12,11 @@ mod server;
 #[path = "shadowsocks_2022_server.rs"]
 mod server2022;
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use daer_proxy_protocols::shadowsocks::ShadowSocksConnector;
 use daer_proxy_protocols::{DialerOptions, ProxyDialer, ProxyProtocol};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn options() -> DialerOptions {
@@ -30,7 +29,7 @@ async fn a_client_interoperates_with_an_independent_server() {
     let link = server::link("aes-256-gcm", "correct horse", address);
 
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     let established = connector
         .connect("example.com:443", &recorder)
         .await
@@ -65,7 +64,7 @@ async fn every_supported_cipher_interoperates() {
         let (address, observed) = server::serve(method, "pw").await;
         let link = server::link(name, "pw", address);
         let connector = ShadowSocksConnector::from_link(&link, options()).expect("parses");
-        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+        let recorder = TraceCollector::start(16);
         let established = connector
             .connect("1.2.3.4:8388", &recorder)
             .await
@@ -107,7 +106,7 @@ async fn an_ipv6_target_is_encoded_and_accepted() {
     let (address, observed) = server::serve(server::Method::Aes256Gcm, "pw").await;
     let link = server::link("aes-256-gcm", "pw", address);
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     connector
         .connect("[2001:db8::1]:53", &recorder)
         .await
@@ -124,7 +123,7 @@ async fn a_wrong_password_fails_the_handshake() {
     let link = server::link("aes-256-gcm", "client-password", address);
 
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     // The client's own writes succeed; the failure appears when the server's salt never
     // arrives, because the server cannot decrypt the address frame and therefore closes.
     let result = connector.connect("example.com:443", &recorder).await;
@@ -169,7 +168,7 @@ async fn several_payloads_in_sequence_stay_in_sync() {
     let (address, _observed) = server::serve(server::Method::ChaCha20Poly1305, "pw").await;
     let link = server::link("chacha20-ietf-poly1305", "pw", address);
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     let established = connector
         .connect("example.com:443", &recorder)
         .await
@@ -222,7 +221,7 @@ async fn ss2022_all_ciphers_interoperate_with_echo() {
 
         let link = format!("ss://{method_name}:{b64_key}@{server_addr}#test22");
         let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
-        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+        let recorder = TraceCollector::start(16);
 
         let established = connector
             .connect("example.com:443", &recorder)
@@ -276,7 +275,7 @@ async fn ss2022_clock_skew_is_rejected() {
 
     let link = format!("ss://2022-blake3-aes-128-gcm:{key16}@{server_addr}");
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
 
     let mut established = connector
         .connect("example.com:443", &recorder)
@@ -308,7 +307,7 @@ async fn ss2022_salt_mismatch_is_rejected() {
 
     let link = format!("ss://2022-blake3-aes-128-gcm:{key16}@{server_addr}");
     let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
-    let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
 
     let mut established = connector
         .connect("example.com:443", &recorder)
@@ -374,7 +373,7 @@ async fn ss2022_udp_datagram_echo_round_trip() {
 
         let link = format!("ss://{method_name}:{b64_key}@{server_addr}");
         let connector = ShadowSocksConnector::from_link(&link, options()).expect("link parses");
-        let recorder = Arc::new(Mutex::new(Recorder::start(16)));
+        let recorder = TraceCollector::start(16);
 
         let established = connector
             .connect_datagram("1.2.3.4:443", &recorder)

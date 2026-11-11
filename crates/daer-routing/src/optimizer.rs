@@ -46,15 +46,6 @@ impl RulesOptimizer for AliasOptimizer {
                         param.key = "provider".to_owned();
                     }
                 }
-                if function.name == "domain" {
-                    for param in &mut function.params {
-                        match param.key.as_str() {
-                            "" | "domain" => param.key = "suffix".to_owned(),
-                            "contains" => param.key = "keyword".to_owned(),
-                            _ => {}
-                        }
-                    }
-                }
             }
         }
         Ok(rules)
@@ -166,21 +157,20 @@ mod tests {
     }
 
     #[test]
-    fn alias_rewrites_functions_and_domain_keys() {
+    fn alias_rewrites_function_names() {
         let rules = rules(
-            "routing {\n    dip(1.1.1.1) -> direct\n    dport(80) -> direct\n    domain(example.com) -> direct\n    domain(contains:ad) -> direct\n}",
+            "routing {\n    dip(1.1.1.1) -> direct\n    dport(80) -> direct\n    rule-set(corp) -> direct\n}",
         );
         let rules = AliasOptimizer.optimize(rules).unwrap();
         assert_eq!(rules[0].and_functions[0].name, "ip");
         assert_eq!(rules[1].and_functions[0].name, "port");
-        assert_eq!(rules[2].and_functions[0].params[0].key, "suffix");
-        assert_eq!(rules[3].and_functions[0].params[0].key, "keyword");
+        assert_eq!(rules[2].and_functions[0].name, "provider");
     }
 
     #[test]
     fn merges_adjacent_positive_singleton_rules() {
         let rules = rules(
-            "routing {\n    domain(suffix:a.com) -> direct\n    domain(suffix:b.com) -> direct\n    domain(suffix:c.com) -> block\n}",
+            "routing {\n    domain(a.com) -> direct\n    domain(b.com) -> direct\n    domain(c.com) -> block\n}",
         );
         let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
         assert_eq!(rules.len(), 2);
@@ -192,9 +182,8 @@ mod tests {
 
     #[test]
     fn does_not_merge_negated_rules() {
-        let rules = rules(
-            "routing {\n    !domain(suffix:a.com) -> direct\n    !domain(suffix:b.com) -> direct\n}",
-        );
+        let rules =
+            rules("routing {\n    !domain(a.com) -> direct\n    !domain(b.com) -> direct\n}");
         let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
         assert_eq!(rules.len(), 2);
     }
@@ -202,7 +191,7 @@ mod tests {
     #[test]
     fn does_not_merge_different_outbounds() {
         let rules = rules(
-            "routing {\n    domain(suffix:a.com) -> direct\n    domain(suffix:b.com) -> direct(mark: 1)\n}",
+            "routing {\n    domain(a.com) -> direct\n    domain(b.com) -> direct(mark: 1)\n}",
         );
         let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
         assert_eq!(rules.len(), 2);
@@ -210,7 +199,7 @@ mod tests {
 
     #[test]
     fn sorts_functions_and_params() {
-        let rules = rules("routing { port(443) && domain(suffix:b.com, suffix:a.com) -> direct }");
+        let rules = rules("routing { port(443) && domain(b.com, a.com) -> direct }");
         let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
         assert_eq!(rules[0].and_functions[0].name, "domain");
         assert_eq!(rules[0].and_functions[1].name, "port");
@@ -224,7 +213,7 @@ mod tests {
 
     #[test]
     fn deduplicates_params() {
-        let rules = rules("routing { domain(suffix:a.com, suffix:a.com, suffix:b.com) -> direct }");
+        let rules = rules("routing { domain(a.com, a.com, b.com) -> direct }");
         let rules = DeduplicateParamsOptimizer.optimize(rules).unwrap();
         assert_eq!(rules[0].and_functions[0].params.len(), 2);
     }

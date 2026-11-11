@@ -35,8 +35,10 @@ pub struct Exclusions {
 impl Exclusions {
     /// Compiles the configured patterns.
     ///
-    /// Accepted spellings: `full:`, `suffix:`, `keyword:`, `regex:`, and a bare name read as a
-    /// suffix — the same vocabulary `[routing]` uses, so an operator learns it once.
+    /// Accepted spellings: a bare domain (suffix), `.name` (subdomains only), `=name` (exact),
+    /// plus `keyword:` and `regex:` — the domain spellings match `[routing]` (ADR-0036), and
+    /// the two extras are `daer-dns`-only (ADR-0033 §3), so an operator learns the shared half
+    /// once.
     ///
     /// # Errors
     ///
@@ -50,22 +52,19 @@ impl Exclusions {
             if trimmed.is_empty() {
                 continue;
             }
-            let (kind, value) = match trimmed.split_once(':') {
-                Some((kind, value)) => (kind.trim(), value.trim()),
-                // A bare name is a suffix, matching `[routing]`'s default.
-                None => ("suffix", trimmed),
-            };
-            if matches!(kind, "geosite" | "geoip" | "ext") {
+            if let Some((kind, _)) = trimmed.split_once(':')
+                && matches!(kind.trim(), "geosite" | "geoip" | "ext")
+            {
                 return Err(format!(
                     "dns.fake-ip.exclude: {trimmed:?} names a Protobuf .dat category, which this \
-                     build no longer reads (ADR-0031); write the domains as patterns \
-                     (suffix:/full:/keyword:/regex:) instead"
+                     build no longer reads (ADR-0031); write the domains as domain patterns \
+                     (bare/.name/=name) or `keyword:`/`regex:` instead"
                 ));
             }
-            let matcher = NameMatch::parse_kind(kind, value).map_err(|err| {
+            let matcher = NameMatch::parse_pattern(trimmed).map_err(|err| {
                 format!(
                     "dns.fake-ip.exclude: {trimmed:?} is not a domain matcher \
-                     (expected full, suffix, keyword, or regex): {err}"
+                     (expected a bare domain, `.name`, `=name`, `keyword:`, or `regex:`): {err}"
                 )
             })?;
             matchers.push(matcher);
@@ -119,6 +118,14 @@ mod tests {
             !e.matches("notcorp.internal"),
             "a label boundary is required, or `notcorp.internal` would be excluded by `corp.internal`"
         );
+    }
+
+    #[test]
+    fn an_equals_prefix_matches_exact_name_only() {
+        let e = compile(&["=exact.corp.internal"]);
+        assert!(e.matches("exact.corp.internal"));
+        assert!(!e.matches("sub.exact.corp.internal"));
+        assert!(!e.matches("corp.internal"));
     }
 
     #[test]

@@ -199,7 +199,7 @@ fn a_dry_run_reports_the_object_and_the_privilege_boundary() {
     }
 }
 
-/// Whether this process lacks `CAP_BPF`, read the same way the preflight reads it.
+/// Whether this process lacks a capability the preflight requires.
 fn daer_ebpf_capabilities_missing() -> bool {
     let effective = std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -210,7 +210,9 @@ fn daer_ebpf_capabilities_missing() -> bool {
                 .and_then(|line| line["CapEff:".len()..].trim().parse::<u64>().ok())
         })
         .unwrap_or(0);
-    effective & (1 << 39) == 0
+    let required = (1 << 39) | (1 << 38) | (1 << 21) | (1 << 12);
+    // CAP_BPF | CAP_PERFMON | CAP_SYS_ADMIN | CAP_NET_ADMIN
+    effective & required != required
 }
 
 #[test]

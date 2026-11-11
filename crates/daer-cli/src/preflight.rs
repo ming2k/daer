@@ -57,6 +57,12 @@ pub struct ObjectReport {
 pub struct Capabilities {
     pub bpf: bool,
     pub net_admin: bool,
+    /// `CAP_PERFMON` enables the verifier's `allow_ptr_leaks`, which the
+    /// variable-offset packet parser needs (IPv4 IHL, IPv6 extension headers).
+    pub perfmon: bool,
+    /// `CAP_SYS_ADMIN` creates the private ingress namespace and enters it to bind the
+    /// transparent listeners and attach the peer program.
+    pub sys_admin: bool,
 }
 
 impl Capabilities {
@@ -64,7 +70,8 @@ impl Capabilities {
     ///
     /// A read-only probe: it does not attempt a `bpf()` call to find out, because a refused
     /// syscall cannot distinguish "no capability" from "`unprivileged_bpf_disabled`" and the
-    /// two need different fixes. Bit 39 is `CAP_BPF`, bit 12 is `CAP_NET_ADMIN`
+    /// two need different fixes. Bit 39 is `CAP_BPF`, bit 38 is
+    /// `CAP_PERFMON`, bit 21 is `CAP_SYS_ADMIN`, bit 12 is `CAP_NET_ADMIN`
     /// (`include/uapi/linux/capability.h`).
     #[must_use]
     pub fn detect() -> Self {
@@ -80,13 +87,15 @@ impl Capabilities {
         Self {
             bpf: effective & (1 << 39) != 0,
             net_admin: effective & (1 << 12) != 0,
+            perfmon: effective & (1 << 38) != 0,
+            sys_admin: effective & (1 << 21) != 0,
         }
     }
 
     /// True when the kernel datapath can be loaded and attached here.
     #[must_use]
     pub const fn can_attach_datapath(self) -> bool {
-        self.bpf && self.net_admin
+        self.bpf && self.net_admin && self.perfmon && self.sys_admin
     }
 }
 
@@ -188,12 +197,14 @@ pub fn planned_param(port: u16, socket_mark: Option<u32>) -> daer_ebpf::RuntimeP
 
 /// Whether the device pair already exists, reported as a fact.
 ///
-/// Reading `/sys/class/net` is a filesystem query, not a mutation, so a preflight may answer
-/// it. It does not create anything: that is `ensure_device_pair`, which only `run` calls.
+/// This is a read-only `ip link show`, not a mutation, so a preflight may answer it. It does
+/// not create anything: that is `PreparedIngress::prepare`, which only `run` calls.
 #[must_use]
 pub fn device_pair_present() -> (bool, bool) {
-    let exists = |name: &str| std::path::Path::new(&format!("/sys/class/net/{name}")).exists();
-    (exists(daer_control::DEVICE), exists(daer_control::PEER))
+    (
+        daer_control::datapath::interface_exists(daer_control::DEVICE),
+        daer_control::datapath::interface_exists(daer_control::PEER),
+    )
 }
 
 /// Names why the privileged phase cannot run here, if it cannot.
@@ -208,6 +219,12 @@ pub fn privileged_blocker(capabilities: Capabilities) -> Option<String> {
     }
     if !capabilities.net_admin {
         missing.push("CAP_NET_ADMIN");
+    }
+    if !capabilities.perfmon {
+        missing.push("CAP_PERFMON");
+    }
+    if !capabilities.sys_admin {
+        missing.push("CAP_SYS_ADMIN");
     }
     Some(format!(
         "the kernel datapath cannot be attached here: {} not in the effective capability set \

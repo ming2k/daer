@@ -15,7 +15,9 @@ supersedes: []
 - Amends: [ADR-0002](0002-netune-boundary.md),
   [ADR-0017](0017-proxy-protocols-crate-boundary.md),
   [ADR-0029](0029-hysteria2-socket-stack.md)
-- Related: [netune ADR-0016](../../../netune/docs/adr/0016-quic-and-http3-transport.md)
+- Related: [netune ADR-0016](../../../netune/docs/adr/0016-quic-and-http3-transport.md),
+  [netune ADR-0027](../../../netune/docs/adr/0027-owned-h3-qpack.md),
+  [netune ADR-0028](../../../netune/docs/adr/0028-owned-quic.md)
 
 ---
 
@@ -34,26 +36,46 @@ With `netune ADR-0016` ratifying first-class QUIC and HTTP/3 client capabilities
 
 ## Decision
 
-### 1. `daer` Drops All Direct QUIC, HTTP/3, and `ring` Dependencies
+### 1. `daer` Drops Direct QUIC/HTTP-3 Runtimes and `ring`
 `crates/daer-proxy-protocols` deletes direct dependencies on:
 * `quinn`
 * `quinn-proto`
 * `h3`
 * `h3-quinn`
-* `rustls` (compiled with `ring`)
-* `tokio-rustls`
+* any `rustls` compiled with `ring`
 
 All QUIC and HTTP/3 transport facilities are consumed exclusively from `netune::quic` (`netune-quic`) and `netune::http3` (`netune-http3`).
 
+`rustls` and `tokio-rustls` remain direct dependencies only where daer owns the
+handshake that netune cannot perform: the REALITY TLS 1.3 client (ADR-0010) and
+the product-specific TLS configuration Hysteria 2 hands to `netune-quic`. Both are
+built with `aws-lc-rs`; the point of this decision is one crypto provider and no
+second QUIC runtime, not the removal of a TLS type daer still needs.
+
 ### 2. Hysteria 2 Retains Only Product-Specific Semantics
-Hysteria 2 in `daer-proxy-protocols` is refactored to focus strictly on its proxy protocol responsibilities:
-* Authentication handshake headers (`auth.rs`).
-* Salamander and Gecko obfuscation layers (`obfs.rs`), which now implement `netune_quic::QuicUdpSocket`.
+Hysteria 2 in `daer-proxy-protocols` is refactored to focus strictly on its proxy protocol
+responsibilities:
+* Authentication handshake headers (`auth.rs`), sent through `netune_http3::H3Client`.
+* Salamander and Gecko obfuscation layers (`obfs.rs`), which implement `netune_quic::QuicUdpSocket`.
 * Port-hopping socket rotation (`hop.rs`), also implemented via `netune_quic::QuicUdpSocket`.
-* Brutal congestion control (`brutal.rs`), mapped to `netune_quic::quinn_proto::congestion::ControllerFactory`.
+* Brutal congestion control (`brutal.rs`), mapped to
+  `netune_quic::CongestionControllerFactory`.
 * Ingress/egress stream and UDP datagram framing.
 
-### 3. Unified Cryptographic Backend
+### 3. The Transport Seams Are netune's, Not daer's
+netune 0.0.24 owns QUIC and HTTP/3; `quinn`, `quinn-proto`, `h3` and `h3-quinn` are absent from
+the production graph. Three capabilities that a proxy needs are exposed as generic seams rather
+than product code in daer:
+
+* `QuicUdpSocket` / `QuicUdpSocketFactory`: an abstract datagram socket built once per
+  connection by `QuicConnector::with_socket_factory`. Hysteria 2's obfs and source-port rotation
+  wrap this trait, and the factory applies netune's `QuicSocketConfig` to the base socket.
+* `CongestionControllerFactory`: a per-connection controller passed to
+  `QuicConnector::with_congestion_factory`. Brutal implements it.
+* `QuicProfile.keep_alive` and `Connection::peer_certificates`: the NAT keep-alive and the
+  post-handshake `pin-sha256` check.
+
+### 4. Unified Cryptographic Backend
 `daer` now compiles against a single cryptographic provider (`aws-lc-rs`) across its entire dependency graph. `ring` is completely eliminated from the build graph.
 
 ---
@@ -63,3 +85,12 @@ Hysteria 2 in `daer-proxy-protocols` is refactored to focus strictly on its prox
 - Restores strict adherence to `[INV-NETUNE-01]`: generic QUIC and HTTP/3 transport live in `netune`.
 - `daer` binary size drops by ~18 MB, with significantly reduced link times.
 - QUIC dials and HTTP/3 client exchanges are fully visible to `netune-trace`.
+- Port hopping rotates the local socket selected by `HopSocket` and keeps the previous one for
+  one interval; the connection id space is untouched. Destination-port rotation remains the
+  recorded gap it was in ADR-0029.
+- The owned engine performs DPLPMTUD by default. `disable-path-mtu-discovery` maps to
+  `QuicProfile.path_mtu_discovery = false`, which advertises the 1200-byte QUIC floor so the
+  validated path cannot grow. The engine still has no GSO, so `disable-segmentation-offload` is
+  accepted because the requested state is already true; it is a documented engine property, not
+  a runtime switch.
+- `daer` does not depend on `netune-server`; HTTP/3 ingress remains an upstream-only capability.

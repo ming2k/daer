@@ -80,7 +80,7 @@ which is the property ADR-0031 wanted — reached by sorting rather than by addi
 
 ### 3. Records covered by a broader suffix are dropped at compile time
 
-If `suffix: example.com` exists, every `full:`/`suffix:` beneath `example.com` is dead weight:
+If `example.com` exists, every `.example.com`/`=sub.example.com` beneath `example.com` is dead weight:
 the broader rule already answers it. The compiler removes them. Subdomains-only rules are kept
 when they are not covered, because `.example.com` does *not* answer `example.com`.
 

@@ -38,14 +38,14 @@
 //! default.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
     Connector, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError,
     SocketConfig, Target, TcpConnector, TlsConnector,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -331,7 +331,7 @@ impl TrojanConnector {
     pub async fn connect(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<netune_trace::Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
         let header = request_header(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
         let credential = self.link.credential();
@@ -377,7 +377,7 @@ impl TrojanConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        recorder: &Arc<Mutex<Recorder>>,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let (host, port) = split_authority(authority).map_err(NetError::Protocol)?;
         let addr_bytes = encode_address(host, port).map_err(NetError::Protocol)?;
@@ -557,14 +557,13 @@ impl DatagramConnector for TrojanDatagramConnector {
     fn connect<'a>(
         &'a self,
         authority: &'a str,
-        recorder: &'a Arc<Mutex<Recorder>>,
+        recorder: &'a TraceCollector,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EstablishedDatagrams, NetError>> + Send + 'a>,
     > {
         let connector = self.connector.clone();
         let authority = authority.to_owned();
-        let recorder = Arc::clone(recorder);
-        Box::pin(async move { connector.connect_datagram(&authority, &recorder).await })
+        Box::pin(async move { connector.connect_datagram(&authority, recorder).await })
     }
 }
 

@@ -26,6 +26,7 @@
 //!   the loop and every in-flight flow, with nothing left running.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -130,7 +131,14 @@ where
             }
             accepted = ingress.accept() => accepted,
         } {
-            Ok(flow) => flow,
+            Ok(flow) => {
+                tracing::debug!(
+                    source = %flow.source,
+                    destination = %flow.destination,
+                    "accepted redirected flow"
+                );
+                flow
+            }
             Err(RelayError::Rejected(reject)) => {
                 metrics.rejected.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(%reject, "dropped a flow that was not redirected");
@@ -171,6 +179,98 @@ where
                 }
                 Err(error) => {
                     tracing::debug!(%error, destination = %flow.destination, "relay failed");
+                    Relayed::default()
+                }
+            }
+        });
+    }
+}
+
+/// Runs the accept loop with an owned decider, so the outbound decision and dial run in the
+/// flow's task rather than inline with `accept(2)`.
+///
+/// The difference is not cosmetic: `Decide::decide` may perform a DNS lookup and a connect to
+/// a node. Awaiting that in the accept loop stops every new client from being accepted for the
+/// duration of the dial, so one slow node becomes an outage for unrelated flows. The owned
+/// decider is cloned into each flow task; the accept loop only accepts and classifies.
+pub async fn serve_parallel<I, D>(
+    ingress: &I,
+    decide: Arc<D>,
+    supervisor: &Supervisor,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Stopped, RelayError>
+where
+    I: Ingress + Sync,
+    D: Decide + Sync + Send + 'static,
+{
+    let metrics = supervisor.metrics();
+    tokio::pin!(shutdown);
+
+    loop {
+        let flow = match tokio::select! {
+            () = &mut shutdown => {
+                let in_flight = supervisor.in_flight();
+                tracing::info!(
+                    in_flight,
+                    "stopped accepting; live flows keep relaying"
+                );
+                return Ok(Stopped::Accepting(ShutdownReason::Requested));
+            }
+            accepted = ingress.accept() => accepted,
+        } {
+            Ok(flow) => {
+                tracing::debug!(
+                    source = %flow.source,
+                    destination = %flow.destination,
+                    "accepted redirected flow"
+                );
+                flow
+            }
+            Err(RelayError::Rejected(reject)) => {
+                metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%reject, "dropped a flow that was not redirected");
+                continue;
+            }
+            Err(RelayError::Accept(error)) if is_resource_exhausted(&error) => {
+                metrics.exhausted.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, "accept failed on a resource limit; backing off");
+                tokio::time::sleep(EXHAUSTION_BACKOFF).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        metrics.accepted.fetch_add(1, Ordering::Relaxed);
+        let destination = flow.destination;
+        let decide = Arc::clone(&decide);
+        let task_supervisor = supervisor.handle();
+        // The supervisor owns the task, so a failed decision is accounted for and does
+        // not stall the loop. The relay itself is spawned only after the upstream exists.
+        supervisor.spawn(async move {
+            let upstream = match decide.decide(&flow).await {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    task_supervisor
+                        .metrics()
+                        .failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%error, %destination, "no outbound leg");
+                    return Relayed::default();
+                }
+            };
+            match splice(flow.stream, upstream).await {
+                Ok(relayed) => {
+                    tracing::debug!(
+                        destination = %destination,
+                        to_upstream = relayed.to_upstream,
+                        to_client = relayed.to_client,
+                        elapsed_ms = relayed.elapsed.as_millis(),
+                        "flow closed"
+                    );
+                    relayed
+                }
+                Err(error) => {
+                    tracing::debug!(%error, %destination, "relay failed");
                     Relayed::default()
                 }
             }

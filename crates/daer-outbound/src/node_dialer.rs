@@ -3,7 +3,7 @@
 //! Transport dialers for one node: direct, SOCKS5, HTTP CONNECT, or proxy protocols.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use daer_proxy_protocols::ProxyDialer;
@@ -12,7 +12,7 @@ use netune::{
     Connector, DatagramConnector, Established, Proxy, ProxyConnector, SocketConfig,
     Socks5DatagramConnector, Target, TcpConnector, UdpConnector,
 };
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 
 use crate::error::OutboundError;
 use crate::property::Protocol;
@@ -135,12 +135,32 @@ impl NodeDialer {
         Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
     }
 
-    /// Opens a TCP connection to `authority` (`host:port`).
+    /// Opens a TCP connection to `authority` (`host:port`) without observing it.
+    ///
+    /// `TraceCollector::disabled()` is the netune `Observation::Off` cold path:
+    /// no event is recorded and no sink is installed. A dial that nobody
+    /// measures must not fill an event ring nobody reads.
     pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
+        self.connect_with_collector(authority, &TraceCollector::disabled())
+            .await
+    }
+
+    /// Opens a TCP connection, recording the attempt into `collector`.
+    ///
+    /// This is the seam an observer uses: netune emits its DNS/TCP/TLS phases
+    /// into the collector, and the caller can derive them instead of timing the
+    /// whole dial with a wall clock.
+    pub async fn connect_with_collector(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+    ) -> Result<Established, OutboundError> {
         match self {
-            Self::Direct(dialer) => dialer.connect(authority).await,
-            Self::Proxy(dialer) => dialer.connect(authority).await,
-            Self::Protocol(dialer) => Ok(dialer.connect(authority).await?),
+            Self::Direct(dialer) => dialer.connect_with_collector(authority, collector).await,
+            Self::Proxy(dialer) => dialer.connect_with_collector(authority, collector).await,
+            Self::Protocol(dialer) => {
+                Ok(dialer.connect_with_collector(authority, collector).await?)
+            }
         }
     }
 
@@ -199,9 +219,17 @@ impl DirectTransport {
     }
 
     pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
+        self.connect_with_collector(authority, &TraceCollector::disabled())
+            .await
+    }
+
+    pub async fn connect_with_collector(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+    ) -> Result<Established, OutboundError> {
         let target = Target::plain(authority);
-        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
-        tokio::time::timeout(self.timeout, self.connector.connect(&target, &recorder))
+        tokio::time::timeout(self.timeout, self.connector.connect(&target, collector))
             .await
             .map_err(|_| OutboundError::Timeout)?
             .map_err(|error| OutboundError::Connect(error.to_string()))
@@ -267,9 +295,17 @@ impl ProxyTransport {
     }
 
     pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
+        self.connect_with_collector(authority, &TraceCollector::disabled())
+            .await
+    }
+
+    pub async fn connect_with_collector(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+    ) -> Result<Established, OutboundError> {
         let target = Target::plain(authority);
-        let recorder = Arc::new(Mutex::new(Recorder::start(128)));
-        tokio::time::timeout(self.timeout, self.connector.connect(&target, &recorder))
+        tokio::time::timeout(self.timeout, self.connector.connect(&target, collector))
             .await
             .map_err(|_| OutboundError::Timeout)?
             .map_err(|error| OutboundError::Connect(error.to_string()))

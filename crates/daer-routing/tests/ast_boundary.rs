@@ -115,9 +115,9 @@ fn text_and_programmatic_construction_produce_identical_bytes() {
 name: corp
 ip: 10.0.0.0/8
 ip: 192.168.1.0/24
-suffix: Example.COM
-suffix: .Sub.Example.COM
-full: API.Corp.Internal
+example.com
+.sub.example.com
+=api.corp.internal
 ";
     let from_text = RuleSet::parse(text).expect("parses");
 
@@ -150,8 +150,8 @@ full: API.Corp.Internal
 
 #[test]
 fn deterministic_builds_without_timestamp_divergence() {
-    let text1 = "name: set\nip: 1.1.1.0/24\nsuffix: a.com\n";
-    let text2 = "name: set\nsuffix: a.com\nip: 1.1.1.0/24\n";
+    let text1 = "name: set\nip: 1.1.1.0/24\na.com\n";
+    let text2 = "name: set\na.com\nip: 1.1.1.0/24\n";
 
     let drb1 = DrbSet::from_rule_set(&RuleSet::parse(text1).unwrap()).encode();
     let drb2 = DrbSet::from_rule_set(&RuleSet::parse(text2).unwrap()).encode();
@@ -165,7 +165,7 @@ fn deterministic_builds_without_timestamp_divergence() {
 #[test]
 fn an_artifact_round_trips_through_text() {
     let original = RuleSet::parse(
-        "name: rt\nip: 192.0.2.0/24\nsuffix: example.com\nsuffix: .sub.example.com\nfull: api.example.com\n",
+        "name: rt\nip: 192.0.2.0/24\nexample.com\n.sub.example.com\n=api.example.com\n",
     )
     .expect("parses");
 
@@ -181,7 +181,7 @@ fn an_artifact_round_trips_through_text() {
 
 #[test]
 fn attributes_can_be_filtered_before_encoding() {
-    let mut rules = RuleSet::parse("suffix: a.com @ads\nsuffix: b.com @cn\n").unwrap();
+    let mut rules = RuleSet::parse("a.com @ads\nb.com @cn\n").unwrap();
     assert_eq!(rules.drop_attribute("ads"), 1);
     assert_eq!(rules.domains().len(), 1);
     assert_eq!(rules.domains()[0].pattern.value(), "b.com");

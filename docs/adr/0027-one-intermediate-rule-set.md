@@ -81,7 +81,7 @@ rejects the mistake.
 ### 3. Attributes are part of the rule set
 
 `DomainRule` carries the source's attribute names. They are parsed, canonicalised, rendered in
-text (`suffix: x @cn @ads`), and filterable (`--without ads`). They are *not* encoded into DRB:
+text (`x.com @cn @ads`), and filterable (`--without ads`). They are *not* encoded into DRB:
 the format stores patterns, and inventing a section for provenance would be a format change
 justified by a producer's convenience. The consequence is stated in the type's documentation: a
 round trip through an artifact drops attributes, so filtering happens on the AST before encoding.
@@ -114,7 +114,7 @@ artifact byte for byte, and a test asserts it.
 `daer-control` accepts `format = "text"` providers and lowers them through
 `DrbSet::from_text`, which is now a thin wrapper over `RuleSet::parse`. So the daemon's text
 provider and the producer's text reader are the same parser, and cannot disagree about what
-`suffix:` means.
+a domain pattern means.
 
 This does not weaken ADR-0015. `daer-rule-ast` contains no Protobuf reader and no encoder; the
 dependency firewall still forbids `daer-geodata` in `daer-routing` and both `daer-geodata` and

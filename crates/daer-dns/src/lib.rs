@@ -37,7 +37,7 @@
 //! upstream = ["local:udp://223.5.5.5:53"]
 //!
 //! [dns.request]
-//! rules = ["qname(suffix: ads) -> reject"]
+//! rules = ["qname(ads) -> reject"]
 //! fallback = "local"
 //! "#,
 //! )

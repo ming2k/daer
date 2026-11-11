@@ -104,14 +104,6 @@ pub mod function {
     pub const UPSTREAM: &str = "upstream";
 }
 
-/// Domain matcher key prefixes (`domain(suffix:...)`, `domain(keyword:...)`).
-pub mod domain_key {
-    pub const FULL: &str = "full";
-    pub const KEYWORD: &str = "keyword";
-    pub const SUFFIX: &str = "suffix";
-    pub const REGEX: &str = "regex";
-}
-
 /// Outbound parameter keys.
 pub mod outbound_param {
     pub const MARK: &str = "mark";

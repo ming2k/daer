@@ -149,10 +149,10 @@ Real-world infrastructure frequently requires rules tied to a single organizatio
 In a unified DRB container, operators write a single plain text rule:
 ```text
 # corporate.rules
-ip: 10.0.0.0/8
-ip: 172.16.0.0/12
-suffix: corp.internal
-full: vpn.company.com
+10.0.0.0/8
+172.16.0.0/12
+corp.internal
+=vpn.company.com
 ```
 
 Compiled via `daer-drb compile corporate.rules -o corporate.drb`, this artifact loads into `daer` under one provider:

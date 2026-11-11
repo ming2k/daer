@@ -27,7 +27,7 @@ To enforce this, `daer-routing::kernel::compile` implemented an **all-or-nothing
 routing_map[slot*MAX + 0] = { type: Fallback, outbound: OUTBOUND_CONTROL_PLANE_ROUTING }
 ```
 
-In production configurations, virtually **every real-world rule set** contains domain rules (such as `geosite:cn -> direct` or `domain(suffix: example.com) -> proxy`). Consequently:
+In production configurations, virtually **every real-world rule set** contains domain rules (such as `geosite:cn -> direct` or `domain(example.com) -> proxy`). Consequently:
 
 1. **100% Kernel Fast-Path Invalidation**: Even if a configuration begins with dozens of deterministic L4/IP rules (e.g. `sip(192.168.0.0/16) -> direct`, `dip(10.0.0.0/8) -> direct`, `dport(22) -> direct`), the presence of a single downstream `domain(...)` rule causes the entire kernel policy to collapse into userspace deferral.
 2. **Userspace Relay Saturation**: High-bandwidth LAN-to-LAN, direct domestic traffic, and infrastructure management flows are unnecessarily subjected to `tc` redirect, userspace TPROXY socket accept, userspace relay, and socket re-dialing.
@@ -83,7 +83,7 @@ To eliminate the 1-RTT stream peeking penalty in Real-IP mode:
 - **All-or-Nothing Deferral (ADR-0005 status quo)**:
   Discarded as an over-simplification. While safe, it renders the kernel datapath useless in practice, treating an eBPF router as a glorified TPROXY packet redirector.
 - **Out-of-Order Rule Promotion (Reordering IP rules ahead of Domain rules)**:
-  Rejected. Reordering rules violates the user's explicit configuration semantics. If Rule 1 is `domain(suffix: a.com) -> proxy` and Rule 2 is `ip(any) -> direct`, hoisting Rule 2 would cause traffic intended for `a.com` to bypass the proxy. Partitioning must strictly respect lexical order.
+  Rejected. Reordering rules violates the user's explicit configuration semantics. If Rule 1 is `domain(a.com) -> proxy` and Rule 2 is `ip(any) -> direct`, hoisting Rule 2 would cause traffic intended for `a.com` to bypass the proxy. Partitioning must strictly respect lexical order.
 - **Hot-Path Synchronous Reverse DNS (PTR) Queries**:
   Rejected. Querying upstream DNS on intercepted TCP SYNs introduces high latency (50–300ms), creates recursive proxying deadlocks, and leaks traffic. DNS snooping is strictly observational and asynchronous.
 

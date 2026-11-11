@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Canonical Rule Source (CRS v1) intermediate representation and AST.
+//! Canonical Rule Source (CRS v2) intermediate representation and AST (ADR-0031, ADR-0036).
 //!
-//! Under ADR-0031, `RuleSet` is the single source of truth for routing rules:
+//! Under ADR-0031, ADR-0033, and ADR-0036, `RuleSet` is the single source of truth for routing rules:
 //! * **IP**: Normalized as mathematical disjoint closed intervals (`v4_intervals`, `v6_intervals`).
-//! * **Domain**: Normalized as hierarchical patterns (`Suffix` and `Full`).
+//! * **Domain**: Normalized as hierarchical patterns (`Suffix` and `Full`, rendered as `=domain`, `.domain`, `domain`).
 //! * **Attributes**: Preserved for pipeline filtering (`--without ads`), omitted from binary.
 
 mod error;
@@ -196,20 +196,30 @@ impl RuleSet {
         if let Some(rest) = line.strip_prefix("ip:") {
             return self.push_ip_directive(rest.trim());
         }
-        if let Some((kind, val)) = line.split_once(':') {
+        if let Some(rest) = line.strip_prefix('=') {
+            let (val_clean, attrs) = split_attributes(rest);
+            let pattern = DomainPattern::from_kind("=", val_clean)?;
+            self.domains.push(DomainRule {
+                pattern,
+                attributes: attrs,
+            });
+            return Ok(());
+        }
+        if let Some((kind, _val)) = line.split_once(':') {
             let k = kind.trim();
-            if k == "suffix" || k == "full" || k == "domain" {
-                let (val_clean, attrs) = split_attributes(val);
-                let pattern = DomainPattern::from_kind(k, val_clean)?;
-                self.domains.push(DomainRule {
-                    pattern,
-                    attributes: attrs,
-                });
-                return Ok(());
+            if k == "full" {
+                return Err(AstError::new(
+                    "'full:' is retired (ADR-0036); write '=domain' for exact full match",
+                ));
+            }
+            if k == "suffix" || k == "domain" {
+                return Err(AstError::new(format!(
+                    "'{k}:' is retired (ADR-0036); write bare 'domain' or '.domain' for suffix match"
+                )));
             }
             if k == "keyword" || k == "regex" {
                 return Err(AstError::new(format!(
-                    "'{k}:' directives are removed (ADR-0031, ADR-0033); write explicit 'suffix:' or 'full:' patterns, or expand them before compiling."
+                    "'{k}:' directives are removed (ADR-0031, ADR-0033); write explicit '=domain' or suffix patterns, or expand them before compiling."
                 )));
             }
         }
@@ -219,7 +229,11 @@ impl RuleSet {
             return Ok(());
         }
         let (val_clean, attrs) = split_attributes(line);
-        let pattern = DomainPattern::from_kind("suffix", val_clean)?;
+        let pattern = if let Some(rest) = val_clean.strip_prefix('=') {
+            DomainPattern::from_kind("=", rest)?
+        } else {
+            DomainPattern::from_kind("suffix", val_clean)?
+        };
         self.domains.push(DomainRule {
             pattern,
             attributes: attrs,
@@ -498,12 +512,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_domains_and_rejects_regex() {
-        let text = "suffix: example.com\nfull: api.example.com\n";
+    fn parses_domains_and_rejects_regex_and_retired_prefixes() {
+        let text = "example.com\n=api.example.com\n.corp.local\n";
         let set = RuleSet::parse(text).unwrap();
-        assert_eq!(set.domains().len(), 2);
+        assert_eq!(set.domains().len(), 3);
+        let rendered = set.render();
+        assert!(rendered.contains("=api.example.com"));
+        assert!(rendered.contains(".corp.local"));
+        assert!(rendered.contains("example.com"));
 
-        let err = RuleSet::parse("regex: ^.*$").unwrap_err();
-        assert!(err.to_string().contains("removed"), "{err}");
+        let err_regex = RuleSet::parse("regex: ^.*$").unwrap_err();
+        assert!(err_regex.to_string().contains("removed"), "{err_regex}");
+
+        let err_full = RuleSet::parse("full: api.example.com").unwrap_err();
+        assert!(err_full.to_string().contains("retired"), "{err_full}");
+
+        let err_suffix = RuleSet::parse("suffix: example.com").unwrap_err();
+        assert!(err_suffix.to_string().contains("retired"), "{err_suffix}");
     }
 }

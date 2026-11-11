@@ -8,11 +8,10 @@
 //! routed by its own rules.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use netune::{Connector, Established, SocketConfig, Target, TcpConnector};
-use netune_trace::Recorder;
+use netune_trace::TraceCollector;
 
 use crate::error::OutboundError;
 
@@ -46,7 +45,7 @@ impl DirectDialer {
     /// Opens a TCP connection to `authority` (`host:port`).
     pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
         let target = Target::plain(authority);
-        let recorder = Arc::new(Mutex::new(Recorder::start(64)));
+        let recorder = TraceCollector::disabled();
         tokio::time::timeout(self.timeout, self.connector.connect(&target, &recorder))
             .await
             .map_err(|_| OutboundError::Timeout)?

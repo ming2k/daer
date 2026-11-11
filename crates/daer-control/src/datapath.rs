@@ -4,35 +4,36 @@
 //!
 //! # What has to be true before this runs
 //!
-//! * a network device exists with the daer-side name (`daer0`) and its peer (`daer0peer`),
-//!   both up, the peer carrying the address the redirect targets;
-//! * the transparent listener is bound, because its port goes into `PARAM`;
-//! * the process holds `CAP_BPF` and `CAP_NET_ADMIN`.
+//! * the private ingress namespace exists, `daer0peer` has moved into it, and the host end
+//!   `daer0` is up; see [`crate::netns::PreparedIngress`];
+//! * the transparent listeners are bound **inside that namespace**, because their fds go into
+//!   `PARAM` and `listen_socket_map`;
+//! * the process holds `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (the verifier's
+//!   `allow_ptr_leaks` gate) and `CAP_SYS_ADMIN` (the namespace).
 //!
-//! # Why the device is created here
+//! # Why the pair crosses a namespace
 //!
-//! The datapath redirects a matching flow out of the stack onto `daer0`, and the listener
-//! is reachable through `daer0peer`. Both are plain veth ends: the kernel program matches on
-//! whichever interface the packet is about to leave through, so the pair is how "this flow
-//! is ours" is expressed. Creating it lazily keeps `daer run` from needing an external
-//! setup script, and reusing an existing pair keeps a restart from breaking live flows.
+//! The datapath redirects a matching flow onto `daer0`; its peer `daer0peer` is where the
+//! packet must be assigned to the listener. A host-generated packet and a listener in the
+//! same namespace can produce a successful `bpf_sk_assign` and still fail local delivery
+//! with `NO_SOCKET`. The namespace boundary is therefore part of the datapath, not a
+//! deployment preference (ADR-0038).
 //!
-//! # Why the policy routing is installed here too
+//! # Why the policy routing is namespace-local
 //!
-//! `daer0peer` delivers a redirected packet into the local stack with a **non-local**
-//! destination address and `fwmark = TPROXY_MARK`. The kernel only hands such a packet to
-//! the `bpf_sk_assign`-ed socket when a rule sends it to a `local` route, so the datapath is
-//! incomplete without:
+//! `daer0peer` delivers a redirected packet with a **non-local** destination address. The
+//! guest namespace only hands such a packet to the `bpf_sk_assign`-ed socket when a rule
+//! sends it to a `local` route:
 //!
 //! ```text
-//! ip rule  add fwmark 0x8000000/0x8000000 table 2023
+//! ip rule  add iif daer0peer table 2023
 //! ip route add local default dev lo table 2023
 //! ```
 //!
-//! and the same pair for IPv6. This used to be documentation-only, which made an attached
-//! datapath silently fail to deliver: the redirect happened, the packet reached
-//! `daer0peer`, and the stack routed it onward as a *forwarded* packet instead of a local
-//! one. [`RouteTable`] owns that state and removes it on drop.
+//! and the same pair for IPv6. The rule is keyed by the ingress interface, not by
+//! `fwmark`: listener replies also carry the datapath's mark so the host recognises them as
+//! daer's own egress, and a mark-keyed rule in this namespace would route those replies back
+//! to `lo`. [`RouteTable`] installs and removes the state inside the namespace.
 //!
 //! # Why the link layer type decides the program
 //!
@@ -52,10 +53,28 @@ pub const DEVICE: &str = "daer0";
 /// Its peer, which the transparent listener is reachable through.
 pub const PEER: &str = "daer0peer";
 
-/// The `fwmark` the datapath stamps on a redirected packet, and the routing table that
-/// sends it to `local`. Both are part of the kernel contract: `tproxy.c` sets
-/// `skb->mark = TPROXY_MARK` and documents this exact rule/route pair.
-pub const TPROXY_ROUTE_TABLE: u32 = 2023;
+/// Removes policy routing installed by earlier daer versions in the host namespace.
+///
+/// The current architecture installs the table and rules *inside* the private ingress
+/// namespace. A host rule left behind by an earlier run would capture the listener's marked
+/// replies and route them to `lo`; since a namespace replacement cannot remove host state,
+/// startup removes the old table explicitly. This is a migration, not a supported
+/// long-running mode: one daer instance owns the table and the private ingress.
+pub fn clear_host_policy_routing() {
+    let mark = daer_common::consts::TPROXY_MARK;
+    let mark_spec = format!("{mark:#x}/{mark:#x}");
+    for family in ["-4", "-6"] {
+        let _ = run(&[
+            "ip", family, "rule", "del", "fwmark", &mark_spec, "table", TABLE_SPEC,
+        ]);
+        let _ = run(&[
+            "ip", family, "rule", "del", "iif", PEER, "table", TABLE_SPEC,
+        ]);
+        let _ = run(&[
+            "ip", family, "route", "del", "local", "default", "dev", "lo", "table", TABLE_SPEC,
+        ]);
+    }
+}
 
 /// The ARPHRD type of an interface, which decides how many link-layer bytes precede the
 /// IP header.
@@ -156,19 +175,24 @@ impl std::error::Error for DatapathError {}
 
 /// The policy-routing state the datapath needs, installed once and removed on drop.
 ///
-/// Two families, each with one rule and one route. The guard is deliberately not
-/// `Clone`: the rules are box-global state, and two owners would remove them while the
-/// other was still redirecting.
+/// Two families, each with one `iif daer0peer` rule and one `local default` route, installed
+/// in the private ingress namespace. The guard is deliberately not `Clone`: two owners would
+/// remove the rules while the other was still redirecting. It holds an [`Arc`] to the
+/// namespace so removal cannot run after the namespace has been deleted.
 ///
 /// # Why removal is best effort
 ///
-/// `Drop` cannot report, and a failure to remove is not worth aborting a shutdown for: a
-/// stale `local default` rule is harmless when no datapath is attached (nothing sets the
-/// mark), and the next `daer run` re-installs it idempotently.
+/// `Drop` cannot report, and a failure to remove is not worth aborting a shutdown for: the
+/// next namespace is fresh, so a stale rule cannot survive a clean restart. A host-level
+/// table-2023 rule from a pre-namespace run is removed by
+/// [`clear_host_policy_routing`] before the next pair is created.
 #[derive(Debug)]
 pub struct RouteTable {
     /// The families actually installed, so a partial failure removes only what it added.
     installed: Vec<Family>,
+    /// The private ingress namespace whose table is owned. The guard keeps the namespace
+    /// alive until the routes have been removed on drop.
+    namespace: Arc<crate::netns::IngressNamespace>,
 }
 
 /// One address family's rule and route.
@@ -191,38 +215,14 @@ impl Family {
 /// The routing table number, as `ip` spells it.
 const TABLE_SPEC: &str = "2023";
 
-/// The `fwmark` selector `ip rule` takes, `0x8000000/0x8000000`, formatted from
-/// [`daer_common::consts::TPROXY_MARK`] so the mark the datapath stamps and the mark
-/// this rule matches cannot drift (ADR-0023).
-fn mark_spec() -> String {
-    let mark = daer_common::consts::TPROXY_MARK;
-    format!("{mark:#x}/{mark:#x}")
-}
-
 impl Family {
-    /// The full argument vector for `ip <flag> rule add ...`.
-    ///
-    /// The mark selector comes from [`mark_spec`], which formats
-    /// [`daer_common::consts::TPROXY_MARK`]: the mark the C stamps and the mark this
-    /// rule matches cannot drift (ADR-0023).
-    fn rule(self) -> Vec<String> {
-        vec![
-            self.flag().to_owned(),
-            "rule".to_owned(),
-            "add".to_owned(),
-            "fwmark".to_owned(),
-            mark_spec(),
-            "table".to_owned(),
-            TABLE_SPEC.to_owned(),
-        ]
-    }
-
     /// The full argument vector for `ip <flag> route add local default dev lo table 2023`.
     ///
     /// `dev lo` is required: the kernel rejects a `local` route with no output device, and
     /// `lo` is correct because a `local` route terminates in the host stack.
-    const fn route(self) -> [&'static str; 8] {
+    const fn route(self) -> [&'static str; 9] {
         [
+            "ip",
             self.flag(),
             "route",
             "add",
@@ -242,23 +242,37 @@ impl Family {
         route
     }
 
-    /// The deletion form of [`Self::rule`].
-    fn rule_del(self) -> Vec<String> {
+    /// The rule keyed by ingress interface rather than mark.
+    ///
+    /// Every packet arriving on `daer0peer` is a redirected one, and the mark would also
+    /// match daer's own listener replies: those replies are intentionally marked so the
+    /// host treats them as daer's egress, but in the ingress namespace a mark-keyed rule
+    /// would route them back to `lo` instead of out through the peer. The interface is the
+    /// property that distinguishes "came from the datapath" from "left the listener".
+    fn iif_rule(self) -> Vec<String> {
         vec![
+            "ip".to_owned(),
             self.flag().to_owned(),
             "rule".to_owned(),
-            "del".to_owned(),
-            "fwmark".to_owned(),
-            mark_spec(),
+            "add".to_owned(),
+            "iif".to_owned(),
+            PEER.to_owned(),
             "table".to_owned(),
             TABLE_SPEC.to_owned(),
         ]
     }
 
+    /// The deletion form of [`Self::iif_rule`].
+    fn iif_rule_del(self) -> Vec<String> {
+        let mut rule = self.iif_rule();
+        rule[3] = "del".to_owned();
+        rule
+    }
+
     /// The deletion form of [`Self::route`].
     fn route_del(self) -> Vec<&'static str> {
         let mut route = self.route().to_vec();
-        route[2] = "del";
+        route[3] = "del";
         route.push(TABLE_SPEC);
         route
     }
@@ -274,27 +288,41 @@ impl RouteTable {
     ///
     /// Returns [`DatapathError::Command`] naming the failing `ip` invocation. A family that
     /// fails removes the families that already succeeded before returning.
-    pub fn install() -> Result<Self, DatapathError> {
+    pub fn install(namespace: &Arc<crate::netns::IngressNamespace>) -> Result<Self, DatapathError> {
         let mut installed = Vec::with_capacity(2);
         for family in [Family::V4, Family::V6] {
-            if let Err(error) = install_family(family) {
+            if let Err(error) = install_family(namespace, family) {
+                if family == Family::V6 {
+                    // IPv6 is optional. An IPv4-only kernel has no `ip6tables` rules and no
+                    // IPv6 table; failing the whole datapath for it would make the IPv4
+                    // proxy unusable. The absence is logged, and IPv6 redirected traffic
+                    // cannot be delivered without it.
+                    tracing::warn!(%error, "IPv6 policy routing is unavailable; IPv4 continues");
+                    continue;
+                }
                 // Roll back what was installed: a half-configured table would send one
                 // family's redirected traffic into the forward path.
-                let guard = Self { installed };
+                let guard = Self {
+                    installed,
+                    namespace: Arc::clone(namespace),
+                };
                 drop(guard);
                 return Err(error);
             }
             installed.push(family);
         }
-        Ok(Self { installed })
+        Ok(Self {
+            installed,
+            namespace: Arc::clone(namespace),
+        })
     }
 
     fn remove(&self) -> Result<(), DatapathError> {
         for family in &self.installed {
             // A missing rule or route is the state being asked for, so a failure here is
             // not an error worth surfacing.
-            let _ = run(&family.rule_del());
-            let _ = run(&family.route_del());
+            let _ = run_ip_in(Some(self.namespace.name()), &family.iif_rule_del());
+            let _ = run_ip_in(Some(self.namespace.name()), &family.route_del());
         }
         Ok(())
     }
@@ -309,21 +337,37 @@ impl Drop for RouteTable {
 }
 
 /// Installs one family's rule and route, replacing whatever was there.
-fn install_family(family: Family) -> Result<(), DatapathError> {
+fn install_family(
+    namespace: &Arc<crate::netns::IngressNamespace>,
+    family: Family,
+) -> Result<(), DatapathError> {
+    let name = Some(namespace.name());
     // Delete first so both commands are idempotent: `ip rule add` tolerates a duplicate
     // (it creates a second identical rule), while `ip route add` fails with EEXIST.
-    let _ = run(&family.rule_del());
-    let _ = run(&family.route_del());
-    run(&family.rule())?;
-    run(&family.route_with_table())?;
+    let _ = run_ip_in(name, &family.iif_rule_del());
+    let _ = run_ip_in(name, &family.route_del());
+    run_ip_in(name, &family.iif_rule())?;
+    run_ip_in(name, &family.route_with_table())?;
     Ok(())
 }
 
 fn run<S: AsRef<std::ffi::OsStr>>(line: &[S]) -> Result<String, DatapathError> {
+    run_ip_in(None, line)
+}
+
+/// Runs an `ip` command in `namespace`, or in the current namespace when it is `None`.
+fn run_ip_in<S: AsRef<std::ffi::OsStr>>(
+    namespace: Option<&str>,
+    line: &[S],
+) -> Result<String, DatapathError> {
     let Some((program, arguments)) = line.split_first() else {
         return Err(DatapathError::Missing(String::new()));
     };
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    if let Some(namespace) = namespace {
+        command.args(["-n", namespace]);
+    }
+    let output = command
         .args(arguments)
         .output()
         .map_err(|_| DatapathError::Missing(program.as_ref().to_string_lossy().into_owned()))?;
@@ -341,39 +385,76 @@ fn run<S: AsRef<std::ffi::OsStr>>(line: &[S]) -> Result<String, DatapathError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// True when `interface` exists.
+/// True when `interface` exists in the current network namespace.
+///
+/// `/sys/class/net` is not namespace-aware on every kernel: a process that entered a netns
+/// can still see the host's devices there, which would make cleanup try to delete a host
+/// link from the wrong namespace. `ip link show` resolves the interface through the current
+/// netns, so the answer matches the commands that follow.
 #[must_use]
 pub fn interface_exists(interface: &str) -> bool {
-    std::path::Path::new(&format!("/sys/class/net/{interface}")).exists()
+    Command::new("ip")
+        .args(["link", "show", "dev", interface])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
-/// Creates the veth pair if it is not already there, and leaves both ends up.
+/// Creates a fresh veth pair after removing anything left by an earlier run.
+///
+/// The private ingress owns the pair exclusively. Reusing a pair is not just unnecessary;
+/// it is unsafe after a crash, because the peer may still be inside the old namespace and
+/// the host end may have no peer at all. Removing both ends and creating one pair is the
+/// only state with a single owner.
 ///
 /// # Errors
 ///
 /// Returns [`DatapathError`] naming the command that failed. `ip` is required; there is no
 /// netlink fallback because a partial implementation of "create a veth pair" is a much
 /// larger surface than one `ip` invocation.
-pub fn ensure_device_pair() -> Result<(), DatapathError> {
-    // Both ends are checked, not just one: a half-created pair (one end removed by hand, or
-    // a `veth` whose peer was renamed) would make `ip link add` fail with "File exists" on
-    // the end that is still there, and the daemon would refuse to start on a box that only
-    // needs the missing half recreated.
-    if !(interface_exists(PEER) && interface_exists(DEVICE)) {
-        if interface_exists(PEER) {
-            run(&["ip", "link", "del", PEER])?;
-        } else if interface_exists(DEVICE) {
-            run(&["ip", "link", "del", DEVICE])?;
-        }
-        run(&[
-            "ip", "link", "add", PEER, "type", "veth", "peer", "name", DEVICE,
-        ])?;
+pub fn reset_device_pair() -> Result<(), DatapathError> {
+    if interface_exists(PEER) || interface_exists(DEVICE) {
+        // Deleting either end deletes the pair. Prefer the host end: it is always present
+        // when a previous run failed before moving the peer, and it is the end that can
+        // still be deleted from the host namespace.
+        let interface = if interface_exists(DEVICE) {
+            DEVICE
+        } else {
+            PEER
+        };
+        run(&["ip", "link", "del", interface])?;
     }
-    // `up` is idempotent, so both ends are set every time: a reboot or a previous run may
-    // have left them down, and a down peer means the listener is unreachable.
-    run(&["ip", "link", "set", DEVICE, "up"])?;
-    run(&["ip", "link", "set", PEER, "up"])?;
-    Ok(())
+    run(&[
+        "ip", "link", "add", PEER, "type", "veth", "peer", "name", DEVICE,
+    ])
+    .map(|_| ())
+}
+
+/// Brings a host-visible link up.
+///
+/// # Errors
+///
+/// Returns [`DatapathError::Command`] naming the failing `ip` invocation.
+pub fn link_up(interface: &str) -> Result<(), DatapathError> {
+    run(&["ip", "link", "set", interface, "up"]).map(|_| ())
+}
+
+/// Adds the host end's IPv6 link-local next-hop address.
+///
+/// The ingress namespace's IPv6 default route points at this address, exactly as its IPv4
+/// route points at [`crate::netns::HOST_IPV4`]. `nodad` is required: duplicate address
+/// detection would leave the address tentative and the route unusable for the first
+/// seconds of a run.
+///
+/// # Errors
+///
+/// Returns [`DatapathError::Command`] when the address cannot be added. IPv6 is optional at
+/// the caller; IPv4 proxying must not depend on a kernel built without it.
+pub fn add_ipv6_link_local(interface: &str) -> Result<(), DatapathError> {
+    let address = format!("{}/128", crate::netns::HOST_IPV6);
+    run(&[
+        "ip", "-6", "addr", "add", &address, "dev", interface, "nodad",
+    ])
+    .map(|_| ())
 }
 
 /// The peer's MAC, which the datapath writes into replies.
@@ -382,36 +463,66 @@ pub fn ensure_device_pair() -> Result<(), DatapathError> {
 ///
 /// Returns [`DatapathError`] when the peer does not exist or has no address.
 pub fn peer_mac() -> Result<[u8; 6], DatapathError> {
-    let path = format!("/sys/class/net/{PEER}/address");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| DatapathError::Device(format!("cannot read {path}: {error}")))?;
-    let mut mac = [0u8; 6];
-    let parts: Vec<&str> = text.trim().split(':').collect();
-    if parts.len() != 6 {
-        return Err(DatapathError::Device(format!(
-            "{path} is not a MAC address: {}",
-            text.trim()
-        )));
-    }
-    for (index, part) in parts.iter().enumerate() {
-        mac[index] = u8::from_str_radix(part, 16).map_err(|_| {
-            DatapathError::Device(format!("{path} is not a MAC address: {}", text.trim()))
-        })?;
-    }
-    Ok(mac)
+    link_mac(PEER)
 }
 
-/// The ifindex of `interface`.
+/// The MAC address of a link in the current network namespace.
 ///
 /// # Errors
 ///
-/// Returns [`DatapathError`] when the interface does not exist.
+/// Returns [`DatapathError::Device`] when the link does not exist, cannot be queried, or
+/// does not report a six-octet Ethernet address.
+pub fn link_mac(interface: &str) -> Result<[u8; 6], DatapathError> {
+    let line = link_line(interface)?;
+    let mac = line
+        .split("link/ether ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .ok_or_else(|| {
+            DatapathError::Device(format!(
+                "`ip link show {interface}` has no MAC address: {line}"
+            ))
+        })?;
+    let parts: Vec<&str> = mac.split(':').collect();
+    if parts.len() != 6 {
+        return Err(DatapathError::Device(format!(
+            "{interface} is not an Ethernet address: {mac}"
+        )));
+    }
+    let mut octets = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        octets[index] = u8::from_str_radix(part, 16).map_err(|_| {
+            DatapathError::Device(format!("{interface} is not an Ethernet address: {mac}"))
+        })?;
+    }
+    Ok(octets)
+}
+
+/// The ifindex of a link in the current network namespace.
+///
+/// # Errors
+///
+/// Returns [`DatapathError`] when the link does not exist or its ifindex is not a number.
 pub fn ifindex(interface: &str) -> Result<u32, DatapathError> {
-    std::fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))
-        .map_err(|error| DatapathError::Device(format!("{interface}: {error}")))?
-        .trim()
-        .parse()
-        .map_err(|_| DatapathError::Device(format!("{interface}: ifindex is not a number")))
+    let line = link_line(interface)?;
+    line.split(':')
+        .next()
+        .and_then(|index| index.trim().parse().ok())
+        .ok_or_else(|| {
+            DatapathError::Device(format!("`ip link show {interface}` has no ifindex: {line}"))
+        })
+}
+
+/// One `ip -o link show dev <interface>` line, resolved in the current netns.
+///
+/// One command rather than two: the peer is moved between namespaces, and a second lookup
+/// after a move would resolve a different netns's device. The caller queries while the
+/// link is still where it intends to use it.
+fn link_line(interface: &str) -> Result<String, DatapathError> {
+    let output = run(&["ip", "-o", "link", "show", "dev", interface])?;
+    output.lines().next().map(str::to_owned).ok_or_else(|| {
+        DatapathError::Device(format!("`ip link show {interface}` returned no link"))
+    })
 }
 
 /// Loads the object, attaches every program, and returns the handle.
@@ -430,12 +541,20 @@ pub fn attach(
     wan: &[String],
     listeners: Listeners,
     policy: &daer_routing::Policy,
+    ingress: &crate::netns::PreparedIngress,
 ) -> Result<Attached, DatapathError> {
     use aya::programs::tc::TcAttachType;
     use daer_ebpf::loader::attach_tc;
     use daer_ebpf::names::program;
 
     let mut ebpf = loader::load_path(object, param).map_err(DatapathError::Object)?;
+
+    // The map is the runtime source of truth for the redirect target. Leaving it at its
+    // zero default makes `bpf_redirect(0, 0)` fail, and every control-plane flow is
+    // dropped without a packet ever reaching the listener — the exact symptom of a
+    // datapath that attaches cleanly but proxies nothing.
+    daer_ebpf::set_device_ifindex(&mut ebpf, param.device_ifindex)
+        .map_err(DatapathError::Object)?;
 
     // Resolved before anything is attached: a device with no parser must stop the run
     // rather than leave half the interfaces hooked and the rest silently direct.
@@ -481,21 +600,22 @@ pub fn attach(
         .map_err(DatapathError::Object)?;
     }
 
-    // The local device pair. `daer0peer` is where a redirected packet is assigned to the
-    // transparent listener; `daer0` is the return path of the listener's replies.
-    for (interface, direction, name) in [
-        (DEVICE, TcAttachType::Ingress, program::DEVICE_INGRESS),
-        (PEER, TcAttachType::Ingress, program::PEER_INGRESS),
-    ] {
-        attach_tc(&mut ebpf, name, interface, direction).map_err(DatapathError::Object)?;
-    }
-
+    // The local device pair is split across two namespaces. `daer0` is the return path for
+    // listener replies and stays in the host namespace; `daer0peer` and its ingress program
+    // live in the private ingress namespace, where redirected packets are assigned.
+    attach_tc(
+        &mut ebpf,
+        program::DEVICE_INGRESS,
+        DEVICE,
+        TcAttachType::Ingress,
+    )
+    .map_err(DatapathError::Object)?;
     // A redirected packet arrives on `daer0peer` with a non-local source *and*
     // destination, so reverse-path filtering would drop it before `bpf_sk_assign` could
-    // matter. Both sysctls and the `fwmark` table are box-global state owned by the
-    // returned guard.
-    let sysctls = Sysctl::apply()?;
-    let routes = RouteTable::install()?;
+    // matter. The peer's knobs and the `fwmark` table are namespace-scoped state owned by
+    // the returned guards.
+    let sysctls = Sysctl::apply(&ingress.namespace)?;
+    let routes = RouteTable::install(&ingress.namespace)?;
 
     republish_policy(&mut ebpf, param.datapath_generation, policy)?;
     // Without this the datapath decides "proxy" and then has nowhere to send the packet:
@@ -503,10 +623,37 @@ pub fn attach(
     // empty, so the flow dies with no diagnostic on either side.
     daer_ebpf::publish_listeners(&mut ebpf, listeners)
         .map_err(|error| DatapathError::Device(format!("cannot publish the listeners: {error}")))?;
+
+    // The peer hook is attached last on purpose. Aya's classic `cls_bpf` link is detached by
+    // ifindex in the namespace that is current at drop time; if anything after this point
+    // failed, `Ebpf` would drop in the host namespace and could detach a different device
+    // that happens to have the same ifindex. Everything that can fail is therefore done
+    // before the peer gets a link. Namespace deletion is still the backstop for a process
+    // that dies without unwinding.
+    let peer_link = ingress
+        .namespace
+        .with(|| {
+            attach_tc(
+                &mut ebpf,
+                program::PEER_INGRESS,
+                PEER,
+                TcAttachType::Ingress,
+            )
+        })
+        .map_err(|error| {
+            DatapathError::Device(format!(
+                "cannot enter {}: {error}",
+                ingress.namespace.name()
+            ))
+        })?
+        .map_err(DatapathError::Object)?;
+
     Ok(Attached {
         ebpf: std::sync::Arc::new(crate::decide::HandoffObserver::new(ebpf)),
+        peer_link: Some(peer_link),
         _routes: routes,
         _sysctls: sysctls,
+        namespace: Arc::clone(&ingress.namespace),
     })
 }
 
@@ -523,10 +670,59 @@ pub struct Attached {
     /// `routing_handoff_map` out of this object, and republishing the policy on reload writes
     /// into it.
     ebpf: Arc<crate::decide::HandoffObserver>,
-    /// The `fwmark` policy routing.
+    /// The peer ingress link, detached explicitly inside the namespace before the object
+    /// drops. Aya's classic `cls_bpf` link detaches by ifindex in the *current* namespace,
+    /// and the peer's ifindex is not meaningful in the host.
+    peer_link: Option<aya::programs::tc::SchedClassifierLinkId>,
+    /// The `iif daer0peer` policy routing and local route.
     _routes: RouteTable,
-    /// The per-interface sysctls.
+    /// The host and ingress sysctls.
     _sysctls: Sysctl,
+    /// The namespace that owns the peer link and policy. Held past every guard that uses it.
+    namespace: Arc<crate::netns::IngressNamespace>,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let Some(link) = self.peer_link.take() else {
+            return;
+        };
+        let namespace = Arc::clone(&self.namespace);
+        let result = namespace.with(move || {
+            self.ebpf
+                .with_ebpf(|ebpf| {
+                    let Some(program) = ebpf.program_mut(daer_ebpf::names::program::PEER_INGRESS)
+                    else {
+                        return Err(
+                            "the peer ingress program is no longer in the object".to_owned()
+                        );
+                    };
+                    let classifier: &mut aya::programs::tc::SchedClassifier =
+                        program.try_into().map_err(|error| {
+                            format!("the peer ingress program is not a tc classifier: {error}")
+                        })?;
+                    classifier
+                        .detach(link)
+                        .map_err(|error| format!("cannot detach the peer ingress link: {error}"))
+                })
+                .map_err(|error| format!("cannot access the datapath object: {error}"))?
+        });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    "could not detach the peer ingress link inside the namespace"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "could not enter the ingress namespace to detach the peer link"
+                );
+            }
+        }
+    }
 }
 
 impl Attached {
@@ -557,10 +753,19 @@ fn kinds(interfaces: &[String]) -> Result<Vec<(&str, LinkKind)>, DatapathError> 
 }
 
 /// The per-interface sysctls the datapath needs, restored on drop.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Sysctl {
-    /// `(path, previous contents)` for every value written.
-    written: Vec<(String, Option<String>)>,
+    /// `(path, previous contents, namespace)` for every value written. `path` is relative
+    /// to `/proc/sys/net`; the namespace field says which `/proc/sys/net` it belongs to.
+    written: Vec<(String, Option<String>, Scope)>,
+    /// The private ingress namespace. The guard keeps it alive until restoration.
+    namespace: Arc<crate::netns::IngressNamespace>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    Host,
+    Ingress,
 }
 
 impl Sysctl {
@@ -569,39 +774,107 @@ impl Sysctl {
     /// `net.ipv4.conf.daer0peer.rp_filter = 0` is what lets a packet with a non-local
     /// source address be delivered locally; without it the redirect is dropped by the
     /// stack with an `rp_filter` counter and no other trace.
-    fn apply() -> Result<Self, DatapathError> {
-        let mut guard = Self::default();
-        for (path, value) in [
-            ("net/ipv4/conf/daer0peer/rp_filter", "0"),
-            ("net/ipv4/conf/daer0peer/forwarding", "1"),
-            ("net/ipv4/conf/all/forwarding", "1"),
+    ///
+    /// The peer and the `all` knobs live in the private ingress namespace. `daer0` stays in
+    /// the host namespace, so its knobs are written there. This split is deliberate: the
+    /// namespace boundary is the reason a host-generated packet can be assigned to a
+    /// listener in the first place, and writing the peer's knobs in the host namespace
+    /// would configure a device that is no longer there.
+    fn apply(namespace: &Arc<crate::netns::IngressNamespace>) -> Result<Self, DatapathError> {
+        let mut guard = Self {
+            written: Vec::new(),
+            namespace: Arc::clone(namespace),
+        };
+        for (scope, path, value) in [
+            // Host: the peer is in the ingress namespace, but the reply crosses back through
+            // `daer0` and is forwarded to the client by the host stack. Without host
+            // forwarding and the all-interface martian check disabled, the reply is dropped
+            // before it reaches `wlan0`.
+            (Scope::Host, "net/ipv4/ip_forward", "1"),
+            (Scope::Host, "net/ipv4/conf/all/forwarding", "1"),
+            (Scope::Host, "net/ipv4/conf/all/rp_filter", "0"),
+            (Scope::Host, "net/ipv4/conf/all/arp_filter", "0"),
+            (Scope::Host, "net/ipv4/conf/daer0/rp_filter", "0"),
+            (Scope::Host, "net/ipv4/conf/daer0/accept_local", "1"),
+            (Scope::Host, "net/ipv4/conf/daer0/arp_filter", "0"),
+            (Scope::Host, "net/ipv4/conf/daer0/forwarding", "1"),
+            (Scope::Host, "net/ipv6/conf/all/forwarding", "1"),
+            (Scope::Host, "net/ipv6/conf/daer0/disable_ipv6", "0"),
+            (Scope::Host, "net/ipv6/conf/daer0/forwarding", "1"),
+            // Ingress: a redirected packet arrives with a non-local source and destination.
+            // `accept_local` is what lets the host-generated source survive the martian
+            // check; `rp_filter` would drop the packet before `bpf_sk_assign` runs.
+            (Scope::Ingress, "net/ipv4/conf/all/rp_filter", "0"),
+            (Scope::Ingress, "net/ipv4/conf/all/arp_filter", "0"),
+            (Scope::Ingress, "net/ipv4/conf/daer0peer/rp_filter", "0"),
+            (Scope::Ingress, "net/ipv4/conf/daer0peer/accept_local", "1"),
+            (Scope::Ingress, "net/ipv4/conf/daer0peer/arp_filter", "0"),
+            (Scope::Ingress, "net/ipv4/conf/daer0peer/forwarding", "1"),
+            (Scope::Ingress, "net/ipv6/conf/daer0peer/disable_ipv6", "0"),
+            (Scope::Ingress, "net/ipv6/conf/daer0peer/forwarding", "1"),
         ] {
-            guard.write(path, value)?;
+            if path.starts_with("net/ipv6/") {
+                // IPv6 is optional for a box that only proxies IPv4. A kernel built without
+                // IPv6 has no /proc/sys/net/ipv6 tree; refusing to attach would turn a
+                // working IPv4 proxy into a startup failure.
+                if let Err(error) = guard.write(path, value, scope) {
+                    tracing::warn!(%error, "IPv6 sysctl is unavailable; continuing with IPv4");
+                }
+                continue;
+            }
+            guard.write(path, value, scope)?;
         }
         Ok(guard)
     }
 
-    fn write(&mut self, path: &str, value: &str) -> Result<(), DatapathError> {
-        let full = format!("/proc/sys/{path}");
-        let previous = std::fs::read_to_string(&full).ok();
-        if previous.as_deref().map(str::trim) == Some(value) {
-            // Already correct: record nothing, so drop does not restore a value it did
-            // not change.
-            return Ok(());
-        }
-        std::fs::write(&full, value).map_err(|error| {
-            DatapathError::Device(format!("cannot write {full} = {value}: {error}"))
-        })?;
-        self.written.push((full, previous));
+    fn write(&mut self, path: &str, value: &str, scope: Scope) -> Result<(), DatapathError> {
+        let previous = match scope {
+            Scope::Host => {
+                let full = format!("/proc/sys/{path}");
+                let previous = std::fs::read_to_string(&full).ok();
+                if previous.as_deref().map(str::trim) == Some(value) {
+                    // Already correct: record nothing, so drop does not restore a value it
+                    // did not change.
+                    return Ok(());
+                }
+                std::fs::write(&full, value).map_err(|error| {
+                    DatapathError::Device(format!("cannot write {full} = {value}: {error}"))
+                })?;
+                previous
+            }
+            Scope::Ingress => {
+                let key = path.strip_prefix("net/").unwrap_or(path);
+                let previous = self.namespace.write_sysctl(key, value).map_err(|error| {
+                    DatapathError::Device(format!(
+                        "cannot write net/{key} = {value} in {}: {error}",
+                        self.namespace.name()
+                    ))
+                })?;
+                if previous.as_deref().map(str::trim) == Some(value) {
+                    return Ok(());
+                }
+                previous
+            }
+        };
+        self.written.push((path.to_owned(), previous, scope));
         Ok(())
     }
 }
 
 impl Drop for Sysctl {
     fn drop(&mut self) {
-        for (path, previous) in self.written.drain(..).rev() {
-            if let Some(value) = previous {
-                let _ = std::fs::write(&path, value.trim());
+        for (path, previous, scope) in self.written.drain(..).rev() {
+            let Some(value) = previous else {
+                continue;
+            };
+            match scope {
+                Scope::Host => {
+                    let _ = std::fs::write(format!("/proc/sys/{path}"), value.trim());
+                }
+                Scope::Ingress => {
+                    let key = path.strip_prefix("net/").unwrap_or(&path);
+                    let _ = self.namespace.write_sysctl(key, value.trim());
+                }
             }
         }
     }
@@ -723,6 +996,45 @@ mod tests {
     }
 
     #[test]
+    fn every_policy_route_command_invokes_ip_first() {
+        // The failure this pins: the vectors used to start with the family selector,
+        // so `run` executed `-4` as a program and the daemon reported
+        // "`-4` is not installed" before it ever tried `ip`.
+        for family in [Family::V4, Family::V6] {
+            for command in [family.iif_rule(), family.iif_rule_del()] {
+                assert_eq!(
+                    command.first().map(String::as_str),
+                    Some("ip"),
+                    "{command:?}"
+                );
+            }
+            for command in [
+                family.route().to_vec(),
+                family.route_with_table(),
+                family.route_del(),
+            ] {
+                assert_eq!(command.first().copied(), Some("ip"), "{command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_policy_rule_is_keyed_by_ingress_not_by_mark() {
+        // The falsifier for the listener-reply loop: a mark-keyed rule would also match
+        // daer's own marked replies, which are routed back through `daer0peer`. The ingress
+        // interface is the only property that distinguishes a redirected packet from a
+        // listener reply.
+        for family in [Family::V4, Family::V6] {
+            let rule = family.iif_rule();
+            assert!(rule.iter().any(|part| part == "iif"), "{rule:?}");
+            assert!(rule.iter().any(|part| part == PEER), "{rule:?}");
+            assert!(!rule.iter().any(|part| part == "fwmark"), "{rule:?}");
+            let delete = family.iif_rule_del();
+            assert!(delete.iter().any(|part| part == "del"), "{delete:?}");
+        }
+    }
+
+    #[test]
     fn a_failing_command_carries_its_stderr() {
         // `false` exits 1 without output; the point is that the error is a `Command`, not a
         // panic and not a swallowed success.
@@ -744,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mac_address_is_read_or_the_error_names_the_path() {
+    fn a_mac_address_is_read_or_the_error_names_the_interface() {
         let result = peer_mac();
         match result {
             Ok(mac) => assert_eq!(mac.len(), 6),

@@ -38,26 +38,35 @@ TimeoutStopSec=30
 
 # Capability bounding and ambient capabilities:
 # - CAP_BPF & CAP_NET_ADMIN for loading and attaching the eBPF datapath and tproxy
+# - CAP_PERFMON for the verifier's allow_ptr_leaks: the fast parser advances a
+#   packet pointer by the IPv4 IHL and IPv6 extension-header lengths, which this
+#   kernel only permits for a process holding CAP_PERFMON (or full root)
+# - CAP_SYS_ADMIN creates the private ingress network namespace (`daer0ns`), moves
+#   `daer0peer` into it, enters it to bind the transparent listeners and attach the
+#   peer program, and removes it on shutdown
 # - CAP_NET_BIND_SERVICE for binding to privileged ports (< 1024, such as DNS port 53)
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 
 # Security sandboxing
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
-# ProtectKernelTunables must remain false: daer needs to tune sysctls on its peer
-# devices (/proc/sys/net/ipv4/conf/daer0peer) and pin eBPF maps to /sys/fs/bpf.
+# ProtectKernelTunables must remain false: daer tunes sysctls on the host end
+# (daer0) and, through daer0ns, on the peer, and pins eBPF maps to /sys/fs/bpf.
 ProtectKernelTunables=false
 LockPersonality=true
 RestrictRealtime=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# Configuration directory, BPF filesystem, and write access for subscription persistence
+# Configuration directory, BPF filesystem, and write access for subscription persistence.
+# `/run/netns` is the mount point `ip netns add` uses for the private ingress namespace; it
+# must exist and be writable for CAP_SYS_ADMIN to bind the namespace mount.
 ConfigurationDirectory=daer
-ReadWritePaths=/etc/daer /sys/fs/bpf
+RuntimeDirectory=netns
+ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
 
 # Where downloaded rule sets are cached (ADR-0014). The default is `$XDG_CACHE_HOME` or
 # `$HOME/.cache`, and `ProtectHome=true` above makes that unwritable — the fallback write is

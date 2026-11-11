@@ -136,7 +136,7 @@ fn spawn_xray(
 /// certificate, because the question is whether the *bytes* survive the tunnel and not whether a
 /// throwaway fixture is trusted.
 fn tls_origin() -> u16 {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["tls-inside.test".to_owned()])
         .expect("generates a certificate");
     let certs = vec![rustls::pki_types::CertificateDer::from(

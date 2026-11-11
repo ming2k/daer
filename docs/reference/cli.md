@@ -33,8 +33,8 @@ daer run [OPTIONS]
 | :--- | :--- | :--- |
 | `-c`, `--config <PATH>` | `/etc/daer/config.toml` | Path to the configuration file. |
 | `--object <PATH>` | `target/ebpf/datapath.o` | Compiled eBPF datapath object. |
-| `--no-datapath` | `false` | Serve without attaching the kernel program, for unprivileged development and testing. No traffic is redirected, so nothing is proxied. |
-| `--dry-run` | `false` | Report what the daemon would do and **change nothing**: no port bind, no device pair, no sysctl, no policy route, no `bpf()`. Needs no capability. |
+| `--no-datapath` | `false` | Serve without attaching the kernel program; removes the `CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_ADMIN` requirements, but the transparent listener still needs `CAP_NET_ADMIN`. No traffic is redirected, so nothing is proxied. |
+| `--dry-run` | `false` | Report what the daemon would do and **change nothing**: no port bind, no device pair, no private ingress namespace, no sysctl, no policy route, no `bpf()`. Needs no capability. |
 
 Reloads on `SIGHUP`, and refreshes `[[rule-provider]]` entries on their configured `interval`.
 
@@ -164,6 +164,7 @@ daer version
 
 `daer-drb` is the DRB producer: it compiles Canonical Rule Source (`.rules`) into DRB v2
 (`.drb`), decompiles an artifact back to that text, inspects it, and tests a target against it.
+Under ADR-0036, rule syntax is symbolic (`=domain` for exact match, `domain` for suffix, `.domain` for subdomains only).
 It links no Protobuf reader and no `.dat` converter (ADR-0031).
 
 ```bash

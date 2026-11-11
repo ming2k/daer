@@ -14,7 +14,7 @@
 //!
 //! | obfs | congestion | what it proves |
 //! | --- | --- | --- |
-//! | none | `bbr` (quinn default) | the QUIC + H3 auth path, `0x401` TCP framing |
+//! | none | `bbr` (netune default) | the QUIC + H3 auth path, `0x401` TCP framing |
 //! | salamander | `bbr` | the obfuscation layer is on the datagram path |
 //! | salamander | `brutal` | Brutal's window is accepted by a sizing-aware server |
 //! | none, multi-port | `bbr` | the port set reaches the hop layer |
@@ -31,6 +31,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use daer_proxy_protocols::{DialerOptions, ProxyDialer};
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The `hysteria` binary, or `None` when the machine has none.
@@ -392,7 +393,7 @@ async fn a_udp_flow_carries_datagrams_both_ways() {
     let dialer = ProxyDialer::from_link(&link, DialerOptions::new(None, Duration::from_secs(10)))
         .expect("the link is well formed");
     let connector = dialer.datagram_connector().expect("hysteria2 carries UDP");
-    let recorder = std::sync::Arc::new(std::sync::Mutex::new(netune_trace::Recorder::start(16)));
+    let recorder = TraceCollector::start(16);
     let established = connector
         .connect(&format!("{echo}"), &recorder)
         .await
@@ -433,10 +434,7 @@ async fn the_servers_own_answer_says_udp_is_available() {
     // A datagram session is only created when the server said UDP is available; a refusal here is
     // the server's own answer, and the message names it.
     let datagrams = connector
-        .connect_datagram(
-            &format!("{echo}"),
-            &std::sync::Arc::new(std::sync::Mutex::new(netune_trace::Recorder::start(16))),
-        )
+        .connect_datagram(&format!("{echo}"), &TraceCollector::start(16))
         .await
         .expect("the fixture enables udp, so the answer must be true");
     drop(datagrams);
