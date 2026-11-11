@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-11-11
+
+### Changed
+
+- Documentation now distinguishes verified IPv6 UDP `tproxy` coverage from the still-unproven
+  IPv4 fixture in the roadmap and deployment guide.
+
 ## [0.0.12] - 2026-11-11
 
 ### Added

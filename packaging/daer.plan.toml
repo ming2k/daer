@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.0.12"
+version = "0.0.13"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"

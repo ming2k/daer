@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -562,11 +562,11 @@ dependencies = [
 
 [[package]]
 name = "daer-common"
-version = "0.0.12"
+version = "0.0.13"
 
 [[package]]
 name = "daer-config"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "daer-common",
  "glob",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "bytes",
  "daer-config",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "daer-drb"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "aya",
  "aya-obj",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "daer-observe"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "fastrand",
  "tracing",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "daer-outbound"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "daer-common",
  "daer-config",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "daer-relay"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "daer-observe",
  "daer-sniff",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "daer-routing"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "aya-obj",
  "daer-common",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "serde",
  "toml",
