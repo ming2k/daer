@@ -228,6 +228,12 @@ to `lo`.
 Also check the return path: a missing `169.254.0.11/32` address, default route, or permanent
 neighbor on the peer makes the listener's SYN-ACK vanish after it was accepted.
 
+If the topology is correct and `ss -ltn` shows connections waiting on the listener, but the
+log has no `accepted redirected flow`, the accept loop is starved or blocked, not the
+namespace. A slow UDP operation must not share the TCP accept task, and a node dial must not
+run inline with `accept(2)`; both are protected by the `serve_parallel` and independent
+datagram-task design. Compare `accepted` in the shutdown line with the client count.
+
 ## 5. "The configuration is wrong."
 
 The configuration layer reports before anything runs:

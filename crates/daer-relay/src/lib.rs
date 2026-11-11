@@ -79,6 +79,6 @@ pub use relay::datagram::{
 pub use relay::stream::{Relayed, splice};
 pub use serve::{
     Decide, Ingress, Metrics, ServeStats, ShutdownReason, Stopped, is_resource_exhausted,
-    serve as serve_ingress, serve_parallel, serve_with_datagrams,
+    serve as serve_ingress, serve_parallel,
 };
 pub use supervise::Supervisor;

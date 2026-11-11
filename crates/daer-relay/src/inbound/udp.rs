@@ -793,6 +793,44 @@ mod tests {
     }
 
     #[test]
+    fn the_reply_socket_factory_is_the_socket_that_sends() {
+        // The namespace factory is the seam that keeps reply sockets in `daer0ns`. A
+        // regression that bypassed it would call `bind_source` here, which sets
+        // `IP_TRANSPARENT` and fails without `CAP_NET_ADMIN`; a factory that returns a plain
+        // loopback socket proves the seam is actually used. The send is a direct std syscall,
+        // so it is not subject to Tokio's unprimed readiness state.
+        #[derive(Debug)]
+        struct LoopbackFactory;
+        impl ReplySocketFactory for LoopbackFactory {
+            fn bind(&self, _source: SocketAddr) -> io::Result<StdUdpSocket> {
+                StdUdpSocket::bind(("127.0.0.1", 0))
+            }
+        }
+
+        let receiver = StdUdpSocket::bind(("127.0.0.1", 0)).expect("receiver binds");
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout");
+        let receiver_addr = receiver.local_addr().expect("receiver address");
+        let factory: Arc<dyn ReplySocketFactory> = Arc::new(LoopbackFactory);
+        let mut cache = ReplySockets::default();
+        let source: SocketAddr = "127.0.0.1:9".parse().expect("source");
+        let socket = cache
+            .get_or_insert(source, None, Some(&factory))
+            .expect("factory binds");
+
+        socket.send_to(b"reply", receiver_addr).expect("sends");
+        let mut payload = [0u8; 5];
+        let (received, from) = receiver.recv_from(&mut payload).expect("receives");
+        assert_eq!(&payload[..received], b"reply");
+        assert_ne!(
+            from.port(),
+            9,
+            "the factory socket, not the requested source"
+        );
+    }
+
+    #[test]
     fn only_ipv4_datagrams_are_deliverable_on_the_ebpf_path() {
         // The falsifier for "v6 UDP silently does not work". The C's `assign_listener` uses one
         // family-independent key for datagrams, so the map holds the v4 socket only; a v6

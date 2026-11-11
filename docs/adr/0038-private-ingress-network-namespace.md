@@ -136,6 +136,11 @@ context the packet has already lost.
 - A reload does not recreate the namespace or rebind the listeners: reload changes routing,
   not the ingress topology. A process restart creates a fresh namespace and pair, so stale
   per-interface sysctls and routes cannot survive a crash.
+- The incident record and the eight-point convergence checklist are in
+  [`docs/dev/transparent-ingress-incident.md`](../dev/transparent-ingress-incident.md). It
+  records the other failure classes found while proving this fix — reply-socket readiness,
+  accept-loop starvation, and unmarked health probes — so the next change to this area checks
+  the composition, not only the namespace.
 
 ## Evidence
 

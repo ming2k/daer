@@ -753,6 +753,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_group_has_nothing_to_probe() {
+        // `fixed(n)` is an operator choice, not a latency policy. Probing it would let an
+        // unrelated DNS endpoint failure rewrite that choice, and it made a fixed node look
+        // unhealthy in the incident logs.
+        let router = router(
+            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+             [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
+             [routing]\nrules = []\nfallback = \"g\"\n",
+        );
+        assert!(
+            router.probe_table().is_empty(),
+            "a fixed group must not contribute probe rows"
+        );
+        let scheduler = Scheduler::new(router, Duration::from_secs(30));
+        assert!(scheduler.targets().is_empty());
+    }
+
+    #[test]
     fn a_bare_udp_dns_address_uses_the_conventional_port() {
         let check = daer_config::HealthCheck::default();
         let instruments = ProbeInstruments::from_config(

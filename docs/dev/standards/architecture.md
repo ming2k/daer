@@ -64,7 +64,7 @@ This document codifies the workspace topology, subsystem boundaries, and non-neg
 
 ### 2.6 Data Path Stays Stable ([INV-RELAY-01])
 - **Red-Line**: `daer-relay` decides nothing. It must not depend on `daer-config`, `daer-outbound`, `daer-routing` or `daer-proxy-protocols`, and its public seam must not name a routing concept (ADR-0018).
-- **Enforcement**: The seam is `daer_relay::Decide` (a stream per accepted flow) and `daer_relay::DatagramRouter` (a `DatagramLeg` per datagram flow). A `Verdict`, a group or a policy appearing in either signature is a red-line breach: it would make every new selection concept a change to the code that forwards bytes, and it would put the accept loop's failure modes behind a routing configuration instead of a test double.
+- **Enforcement**: The seam is `daer_relay::Decide` (a stream per accepted flow) and `daer_relay::DatagramRouter` (a `DatagramLeg` per datagram flow). A `Verdict`, a group or a policy appearing in either signature is a red-line breach: it would make every new selection concept a change to the code that forwards bytes, and it would put the accept loop's failure modes behind a routing configuration instead of a test double. Liveness is separate from layering: the accept loop must not await a decision or a dial, and the datagram relay must not share its task; `serve::tests::a_slow_decision_does_not_block_accepting_the_next_flow` is the falsifier.
 
 ### 2.7 The Transparent Ingress Has One Namespace Boundary ([INV-DATAPATH-01])
 - **Red-Line**: `daer0peer`, the transparent listeners, and table 2023 live in the private `daer0ns` namespace (ADR-0038). The host keeps `daer0`, the forwarding path, and the redirect source. There is no same-namespace fallback.

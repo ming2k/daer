@@ -125,3 +125,18 @@ below are the ones daer actually uses". Every default is asserted against
   have a datagram transport. A REALITY node has none, so a UDP flow to it must be
   **blocked with a diagnostic**, never silently sent direct. Silence here is a
   leak: the client believes UDP is tunnelled when it is not.
+
+## Addendum — the datagram relay and accept-loop liveness
+
+The table above records the state at the time of the decision: the datagram relay was
+implemented and tested but not reached from `daer run`. It was subsequently wired through
+`Daemon::serve` (see ADR-0013 and ADR-0038), so the production path now runs both the TCP
+accept loop and the UDP relay.
+
+The incident record
+[`transparent-ingress-incident.md`](../dev/transparent-ingress-incident.md) explains why the
+composition matters as much as the individual adapters. The production TCP accept loop does
+not `await` a routing decision or a dial; each flow is decided in its own task. The UDP relay
+is a separate task as well, because sharing one `tokio::join!` task let a slow datagram
+operation starve `accept(2)`. The old `serve_with_datagrams` join composition remains a
+unit-test helper only and is no longer part of the public `daer-relay` surface.

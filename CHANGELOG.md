@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transparent-ingress incident record and convergence checklist.** The private-namespace
+  fix, reply-socket readiness, accept-loop liveness, and health-probe failures are documented
+  together in [`docs/dev/transparent-ingress-incident.md`](docs/dev/transparent-ingress-incident.md),
+  with the falsifier for each and an eight-point checklist for future changes.
+
+### Changed
+
+- **The TCP accept loop no longer shares a task with the datagram relay or a flow decision.**
+  `Daemon::serve` uses `serve_parallel`; the join-based `serve_with_datagrams` composition is
+  private to the relay's tests instead of part of the public surface.
+- **Fixed groups are absent from the health-probe table.** A `fixed(n)` policy is explicit
+  operator intent and is not rewritten by probes.
+- **Health probes and reply sockets are included in `INV-MARK-01`.** The invariant now names
+  every socket daer creates, not only outbound dials.
+
+### Tests
+
+- `serve::tests::a_slow_decision_does_not_block_accepting_the_next_flow` fails if the accept
+  loop awaits a flow decision.
+- `inbound::udp::tests::the_reply_socket_factory_is_the_socket_that_sends` fails if the reply
+  path bypasses the namespace factory.
+- `health::tests::a_fixed_group_has_nothing_to_probe` fails if a fixed group re-enters the
+  probe path.
+
 ## [0.0.11] - 2026-11-11
 
 ### Changed

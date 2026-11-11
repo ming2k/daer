@@ -34,7 +34,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Reject, RelayError};
 use crate::inbound::tcp::Accepted;
-use crate::relay::datagram::{DatagramService, serve_datagrams};
 use crate::relay::stream::{Relayed, splice};
 use crate::supervise::Supervisor;
 
@@ -334,22 +333,17 @@ pub struct ServeStats {
     pub panicked: u64,
 }
 
-/// Runs the TCP accept loop and a datagram relay together, until `shutdown` resolves.
+/// Test-only joined composition of the TCP loop and a datagram relay.
 ///
-/// The two halves have different lifetimes by design, so this is a `join` and not a
-/// merge: a TCP flow ends with its relay, a datagram session ends with its idle
-/// timeout, and neither may be bound to the other's shutdown. Both stop *accepting*
-/// together, which is all a reload needs.
-///
-/// A datagram relay that fails is reported and does not stop TCP: the two are
-/// independent services sharing a configuration generation, and silencing HTTP because
-/// a UDP socket misbehaved would be a worse failure than the one being reported.
-///
-/// # Errors
-///
-/// Returns the first TCP accept failure that is not resource exhaustion, per
-/// [`serve`]. A datagram failure is logged rather than returned.
-pub async fn serve_with_datagrams<I, D>(
+/// It is intentionally not public: the `join!` shape lets a slow datagram operation stop
+/// `accept(2)`, which is the production incident this module now guards against. Production
+/// uses `daer-control`'s `Daemon::serve`, which starts the datagram relay in its own task
+/// and runs [`serve_parallel`] for TCP.
+#[cfg(test)]
+use crate::relay::datagram::{DatagramService, serve_datagrams};
+
+#[cfg(test)]
+async fn serve_with_datagrams<I, D>(
     ingress: &I,
     decide: &D,
     supervisor: &Supervisor,
@@ -467,6 +461,98 @@ mod tests {
             .await
             .expect("reads the echo");
         received
+    }
+
+    struct GateDecide {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        upstream: SocketAddr,
+    }
+
+    impl Decide for GateDecide {
+        type Upstream = tokio::net::TcpStream;
+        type Future<'a>
+            =
+            std::pin::Pin<Box<dyn Future<Output = Result<Self::Upstream, RelayError>> + Send + 'a>>
+        where
+            Self: 'a;
+
+        fn decide<'a>(&'a self, _flow: &'a Accepted) -> Self::Future<'a> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                tokio::net::TcpStream::connect(self.upstream)
+                    .await
+                    .map_err(RelayError::Socket)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_decision_does_not_block_accepting_the_next_flow() {
+        // Falsifier for the accept-loop starvation defect: `serve_parallel` must accept the
+        // second flow while the first flow's decision is still parked in its dial. The old
+        // inline `serve` loop accepted once and then awaited `decide`, so `accepted` stayed at
+        // one until the first dial finished.
+        let upstream = echo_server().await;
+        let listener = PlainListener(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("binds"),
+        );
+        let ingress_addr = listener.0.local_addr().expect("addr");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let decide = Arc::new(GateDecide {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            upstream,
+        });
+        let supervisor = Supervisor::new();
+        let task_supervisor = supervisor.handle();
+        let loop_task = tokio::spawn(async move {
+            serve_parallel(
+                &listener,
+                decide,
+                &task_supervisor,
+                std::future::pending::<()>(),
+            )
+            .await
+        });
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(ingress_addr),
+        )
+        .await
+        .expect("the first client connects")
+        .expect("first connection");
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the first decision starts");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(ingress_addr),
+        )
+        .await
+        .expect("the second client connects")
+        .expect("second connection");
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if supervisor.metrics().snapshot().accepted >= 2 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        release.notify_waiters();
+        drop((first, second));
+        loop_task.abort();
+        let _ = loop_task.await;
+        accepted.expect("the accept loop must not wait for the first decision");
     }
 
     #[tokio::test]
