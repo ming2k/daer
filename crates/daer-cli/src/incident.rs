@@ -157,14 +157,12 @@ fn incident_root() -> Result<PathBuf, String> {
     if let Some(root) = std::env::var_os("DAER_INCIDENT_DIR") {
         return Ok(PathBuf::from(root));
     }
-    for candidate in [Path::new(INCIDENT_ROOT), Path::new("/run/daer/incidents")] {
-        if std::fs::create_dir_all(candidate).is_ok() {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-    Err(format!(
-        "cannot create an incident directory under {INCIDENT_ROOT} or /run/daer/incidents"
-    ))
+    // There is no tmpfs fallback: an incident that is copied later by a post-stop helper is
+    // not self-contained (ADR-0042). The systemd unit's `StateDirectory=daer` creates this
+    // tree; a foreground run must be able to write it.
+    std::fs::create_dir_all(INCIDENT_ROOT)
+        .map_err(|error| format!("cannot create {INCIDENT_ROOT}: {error}"))?;
+    Ok(PathBuf::from(INCIDENT_ROOT))
 }
 
 /// Copies at most `max_bytes` from the end of `source`.

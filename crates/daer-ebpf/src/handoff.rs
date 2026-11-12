@@ -167,7 +167,7 @@ mod tests {
         let entry = RoutingHandoff {
             last_seen_ns: 42,
             result: crate::abi::RoutingResult {
-                mark: 0x0dae,
+                mark: 0x64616572,
                 must: 1,
                 mac: [2, 0, 0, 0, 0, 1],
                 outbound: 3,

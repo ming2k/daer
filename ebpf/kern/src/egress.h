@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
@@ -65,7 +65,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &scratch_key);
 
 	if (!scratch)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	if (unlikely(tcp_state_syn)) {
 		__builtin_memset(scratch, 0, sizeof(*scratch));
@@ -76,7 +76,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			scratch->flag[1] = IpVersionType_6;
 		scratch->flag[6] = tuples->dscp;
 		if (pid_is_control_plane(skb, &pid_pname))
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 		if (pid_pname)
 			__builtin_memcpy(&scratch->flag[2], pid_pname->pname,
 					 TASK_COMM_LEN);
@@ -97,7 +97,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 				      scratch->mac_be);
 
 		if (s64_ret < 0) {
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		outbound = s64_ret & 0xff;
@@ -135,8 +135,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (!tcp_conn) {
 			if (outbound == OUTBOUND_DIRECT && mark == 0)
-				return DAE_TC_CONTINUE;
-			return TC_ACT_SHOT;
+				return DAER_TC_CONTINUE;
+			return DAER_TC_DROP;
 		}
 
 	} else {
@@ -154,10 +154,10 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			 * warning, for the same reason as the LAN-ingress twin
 			 * above. */
 			bump_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 		}
 		if (!tcp_conn->meta.data.has_routing)
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 
 		outbound = tcp_conn->meta.data.outbound;
 		mark = tcp_conn->meta.data.mark;
@@ -173,15 +173,15 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 	if (!wan_egress_needs_control_plane(outbound, mark)) {
 		skb->mark = mark;
-		return DAE_TC_CONTINUE;
+		return DAER_TC_CONTINUE;
 	} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (tcp_state_syn &&
 	    !wan_outbound_is_alive(skb, outbound, IPPROTO_TCP,
 				   tuples->five.dport))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct routing_result routing_result = {};
 
@@ -199,7 +199,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	 */
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	set_tproxy_cb(skb, tcp_listener_l4proto(tcph));
 	return redirect_to_control_plane_egress();
 }
@@ -226,7 +226,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	struct wan_egress_route_scratch *scratch =
 		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &scratch_key);
 	if (!scratch)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	__builtin_memset(scratch, 0, sizeof(*scratch));
 	scratch->flag[0] = L4ProtoType_UDP;
@@ -236,14 +236,14 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 		scratch->flag[1] = IpVersionType_6;
 	scratch->flag[6] = tuples->dscp;
 	if (pid_is_control_plane(skb, &pid_pname))
-		return DAE_TC_CONTINUE;
+		return DAER_TC_CONTINUE;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen_with_status(
 			&tuples->five, false, NULL, NULL, NULL, NULL,
 			0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN, &udp_state_status);
 		if (udp_conn_state && udp_conn_state->is_wan_ingress_direction)
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 
 		if (udp_conn_state && udp_conn_state->meta.data.has_routing) {
 			outbound = udp_conn_state->meta.data.outbound;
@@ -284,7 +284,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 			      scratch->mac_be);
 
 	if (s64_ret < 0) {
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	outbound = s64_ret & 0xff;
@@ -317,14 +317,14 @@ fast_path_skip_routing:
 
 
 	if (!wan_egress_needs_control_plane(outbound, mark))
-		return DAE_TC_CONTINUE;
+		return DAER_TC_CONTINUE;
 	else if (unlikely(outbound == OUTBOUND_BLOCK))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	if (!cached_routing &&
 	    !wan_outbound_is_alive(skb, outbound, IPPROTO_UDP,
 				   tuples->five.dport))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct routing_result routing_result = {};
 	bool handoff_mandatory =
@@ -336,25 +336,25 @@ fast_path_skip_routing:
 			    routing_epoch_slot, datapath_generation);
 	if (handoff_mandatory &&
 	    publish_routing_handoff(&tuples->five, &routing_result))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	set_tproxy_cb(skb, IPPROTO_UDP);
 	return redirect_to_control_plane_egress();
 }
 
 // Per-CPU scratch to stay under 512-byte stack limit across the call chain.
 //
-// Pass-through returns DAE_TC_CONTINUE, not TC_ACT_OK, so later programs see
-// the packet under both classic cls_bpf and TCX multiprogram attachment.
+// Pass-through returns DAER_TC_CONTINUE (TCX_NEXT), not DAER_TC_PASS, so later TCX programs
+// see the packet instead of the chain terminating at this one.
 static __noinline int
 do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len,
 		     struct parsed_packet *provided_pkt)
 {
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return DAE_TC_CONTINUE;
+		return DAER_TC_CONTINUE;
 
 	__u32 scratch_key = 0;
 	struct parsed_packet *pkt = provided_pkt;
@@ -362,7 +362,7 @@ do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len,
 	if (!pkt) {
 		pkt = bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
 		if (!pkt)
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 
 		/* Zero-init for verifier. */
 		__builtin_memset(pkt, 0, sizeof(*pkt));
@@ -370,10 +370,10 @@ do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (ret) {
 			if (ret < 0) {
-				return TC_ACT_SHOT;
+				return DAER_TC_DROP;
 			}
 			report_parse_passthrough(ret);
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 		}
 	}
 
@@ -388,7 +388,7 @@ do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len,
 	 * LAN role's NDP handling, so report that equivalent classification here. */
 	if (pkt->l4proto == IPPROTO_ICMPV6)
 		report_parse_passthrough(PARSE_UNSUPPORTED_L4);
-	return DAE_TC_CONTINUE;
+	return DAER_TC_CONTINUE;
 }
 
 SEC("classifier/wan_egress_l2")
@@ -411,11 +411,11 @@ do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
 
 	if (!pkt)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	int ret = do_tproxy_lan_egress(skb, link_h_len, pkt);
 
-	if (ret != DAE_TC_CONTINUE)
+	if (ret != DAER_TC_CONTINUE)
 		return ret;
 	return do_tproxy_wan_egress(skb, link_h_len, pkt);
 }
@@ -443,7 +443,7 @@ int tproxy_daer0peer_ingress(struct __sk_buff *skb)
 	__u32 cb0 = skb->cb[0];
 	if ((cb0 & 0x0fffffff) != TPROXY_MARK) {
 		bump_stat(BPF_STATS_PEER_INGRESS_UNMARKED);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	/* ip rule add fwmark 0x8000000/0x8000000 table 2023
@@ -465,7 +465,7 @@ int tproxy_daer0peer_ingress(struct __sk_buff *skb)
 		assign_listener(skb, l4proto);
 	else
 		bump_stat(BPF_STATS_PEER_INGRESS_NO_L4);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 // load_redirect_tuple_fast returns this code when it cannot safely parse via
@@ -610,12 +610,12 @@ int tproxy_daer0_ingress(struct __sk_buff *skb)
 
 	ret = load_redirect_tuple(skb, &redirect_tuple);
 	if (ret)
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 	struct redirect_entry *redirect_entry =
 		bpf_map_lookup_elem(&redirect_track, &redirect_tuple);
 
 	if (!redirect_entry)
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 
 	/* Only the publisher of the binding may extend its lease. Refreshing
 	 * last_seen_ns for every packet that matched the tuple let a rejected

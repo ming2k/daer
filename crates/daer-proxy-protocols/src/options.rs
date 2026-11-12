@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{Preset, SocketConfig};
 
 use crate::error::ProxyProtocolError;
 use crate::fragment::Fragment;
+use crate::server::{DirectServerDialer, ServerDialer};
 
 /// Socket options and deadlines shared by every node dialer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DialerOptions {
     /// `SO_MARK`, applied before `connect(2)`.
     pub so_mark: Option<u32>,
@@ -27,6 +29,9 @@ pub struct DialerOptions {
     /// `[global.tls] fragment`: slice a handshake daer owns. Only a REALITY session qualifies,
     /// because a `trojan://` node's ClientHello is written by netune inside its own connector.
     pub fragment: Option<Fragment>,
+    /// The stream to the node's own server. `None`-free by construction: the default is the
+    /// direct transport, and an outbound chain replaces it (ADR-0044).
+    base: Arc<dyn ServerDialer>,
 }
 
 impl DialerOptions {
@@ -36,7 +41,27 @@ impl DialerOptions {
             timeout,
             tls_profile: None,
             fragment: None,
+            base: Arc::new(DirectServerDialer::new(so_mark, timeout)),
         }
+    }
+
+    /// Replaces the server leg with another outbound.
+    #[must_use]
+    pub fn with_base(mut self, base: Arc<dyn ServerDialer>) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// The dialer every protocol must use for its own server address.
+    #[must_use]
+    pub fn base(&self) -> &Arc<dyn ServerDialer> {
+        &self.base
+    }
+
+    /// Whether this node's server leg is carried by another outbound.
+    #[must_use]
+    pub fn is_detoured(&self) -> bool {
+        !self.base.is_direct()
     }
 
     /// Sets the ClientHello fragmentation plan.
@@ -71,7 +96,7 @@ impl DialerOptions {
     /// buffer size that applied to one transport and not the other would make the
     /// two legs of the same proxy behave differently.
     #[must_use]
-    pub fn socket_config(self) -> SocketConfig {
+    pub fn socket_config(&self) -> SocketConfig {
         match self.so_mark {
             Some(mark) => SocketConfig::default().with_mark(mark),
             None => SocketConfig::default(),

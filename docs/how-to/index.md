@@ -8,9 +8,10 @@ Task-oriented guides for operators and system administrators. Each guide assumes
 
 | Guide | Solves |
 | :--- | :--- |
-| **[Deploy Transparent Proxy](deployment.md)** | End-to-end production deployment: system requirements, nftables tproxy rules, socket mark loop evasion, and systemd service management. |
+| **[Deploy Transparent Proxy](deployment.md)** | End-to-end deployment: Linux 6.6+/TCX requirements, private ingress topology, socket mark loop evasion, and systemd service management. |
 | **[Diagnose Flows & Rules](diagnostics.md)** | Troubleshoot routing decisions, inspect unrouted flows, interpret logs, and debug why traffic is direct or proxied without modifying running config. |
 | **[Manage Rule Providers and DRB](rule-providers.md)** | Create, compile, and distribute `.drb` rule sets, configure local and remote HTTP rule providers with automated background updates. |
+| **[Install DRB Rule Sets Manually](drb-sets-manual-install.md)** | Build the `drb-sets` artifacts, verify them, install them under `/var/lib/daer/rules`, and declare file providers for offline or reproducible operation. |
 | **[Run Local Vision Lab](vision-lab.md)** | Stand up a local XTLS-Vision / REALITY test harness using xray to test outbound protocol implementations locally. |
 
 ---

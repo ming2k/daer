@@ -122,7 +122,7 @@ pub struct StructField {
 /// Turns a declared type into a C declaration.
 ///
 /// The declaration file uses Rust type spelling (`[u8; 6]`, `u32`) because the same string
-/// generates both sides. C needs `__u8 peer_mac[6]` and `__u32 tproxy_port`, so the array
+/// generates both sides. C needs `__u8 peer_mac[6]` and `__u32 so_mark`, so the array
 /// suffix is moved after the name and the integer widths are mapped to the kernel's
 /// `__u8`/`__u16`/`__u32`/`__u64`, which is what the datapath already uses.
 fn c_declaration(ty: &str, name: &str) -> (String, String) {
@@ -327,8 +327,8 @@ impl Abi {
     /// The C layout assertions, for a file that has already declared the structs.
     ///
     /// They cannot live in `daer_abi.h`: the structs they describe (`match_set`,
-    /// `routing_result`, …) are declared in `tproxy.c`, so the header would be asserting
-    /// properties of incomplete types. `tproxy.c` includes this block after its own
+    /// `routing_result`, …) are declared in `datapath.bpf.c`, so the header would be asserting
+    /// properties of incomplete types. `datapath.bpf.c` includes this block after its own
     /// declarations instead.
     pub fn render_c_assertions(&self) -> String {
         let mut out = String::new();

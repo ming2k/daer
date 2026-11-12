@@ -31,7 +31,6 @@
 //! * `Hysteria-CC-RX`: the rate the server will take, `0` for unlimited or `auto` for "use
 //!   congestion control". Brutal needs it; the loss-based controllers ignore it.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,6 +147,14 @@ impl Hysteria2Connector {
         params: Hysteria2Params<'_>,
         options: DialerOptions,
     ) -> Result<Self, ProxyProtocolError> {
+        if options.is_detoured() {
+            return Err(ProxyProtocolError::UnsupportedLink(
+                "hysteria2: a hysteria2 node cannot be the outer hop of a detour; its QUIC \
+                 socket stack has no datagram-under-proxy seam yet (ADR-0044). Use a \
+                 stream-based outer node, or make hysteria2 the inner hop."
+                    .to_owned(),
+            ));
+        }
         if params.ports.ranges.is_empty() {
             return Err(ProxyProtocolError::UnsupportedLink(
                 "hysteria2: the node names no ports".to_owned(),
@@ -251,6 +258,16 @@ impl Hysteria2Connector {
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// Hysteria 2 has no separate TCP server leg: its server is reached over QUIC.
+    ///
+    /// A caller that asks for a bare stream gets a named refusal rather than a fabricated
+    /// connection. Chain construction rejects a Hysteria 2 outer hop before this is reachable.
+    pub fn connect_server(&self) -> Result<Established, ProxyProtocolError> {
+        Err(ProxyProtocolError::UnsupportedLink(
+            "hysteria2 has no TCP server leg to probe; its server is reached over QUIC".to_owned(),
+        ))
     }
 
     /// Returns a shared datagram connector for this Hysteria 2 node.
@@ -359,18 +376,14 @@ impl Hysteria2Connector {
         Ok((transport, keep_alive))
     }
 
-    /// Resolves the node's first port.
-    async fn resolve(&self) -> Result<SocketAddr, ProxyProtocolError> {
+    /// The node's first port, as an authority the QUIC connector can resolve.
+    fn authority(&self) -> String {
         let port = self.ports.ranges.first().map(|(low, _)| *low).unwrap_or(0);
-        let authority = format!("{}:{}", self.server, port);
-        let addresses: Vec<SocketAddr> = tokio::net::lookup_host(&authority)
-            .await
-            .map_err(|error| ProxyProtocolError::Connect(format!("resolve {authority}: {error}")))?
-            .collect();
-        addresses
-            .first()
-            .copied()
-            .ok_or_else(|| ProxyProtocolError::Connect(format!("could not resolve {authority}")))
+        if self.server.contains(':') && !self.server.starts_with('[') {
+            format!("[{}]:{port}", self.server)
+        } else {
+            format!("{}:{port}", self.server)
+        }
     }
 
     /// Gets an authenticated connection or establishes one.
@@ -389,13 +402,13 @@ impl Hysteria2Connector {
             return Ok(connection.clone());
         }
 
-        let target = self.resolve().await?;
+        let authority = self.authority();
         let schedule =
             HopSchedule::from_ports(&self.ports).map_err(ProxyProtocolError::UnsupportedLink)?;
 
         let (connector, factory) = self.quic_connector()?;
         let trace = collector.is_enabled().then(|| collector.clone());
-        let connect_fut = connector.connect(target, &self.server_name, trace);
+        let connect_fut = connector.connect_authority(&authority, &self.server_name, trace);
         let quic = tokio::time::timeout(self.options.timeout, connect_fut)
             .await
             .map_err(|_| ProxyProtocolError::Timeout)?
@@ -451,6 +464,7 @@ impl Hysteria2Connector {
             local_port: None,
             socket: None,
             alpn: None,
+            alpn_protocol: None,
         })
     }
 

@@ -38,12 +38,14 @@ fn compile_inspect_decompile_and_test_workflow() {
     let decompile_path = temp_dir.path().join("decompiled.rules");
 
     let rule_content = r#"
+---
 name: my-test-rules
+---
 
 # IP directives
-ip: 192.168.1.0/24
-ip: 10.0.0.0/8
-ip: 172.16.1.10 - 172.16.1.20
+192.168.1.0/24
+10.0.0.0/8
+172.16.1.10..172.16.1.20
 
 # Domain patterns
 =login.example.com

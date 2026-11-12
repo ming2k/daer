@@ -13,7 +13,7 @@
 //!         ▼  Outbound { name, mark, must }
 //!   direct ──▶ DirectDialer
 //!   block  ──▶ the flow is dropped
-//!   group  ──▶ DialerGroup::select ──▶ NodeDialer for the chosen node
+//!   election ──▶ ElectionRuntime::select ──▶ NodeDialer for the elected node
 //!         │
 //!         ▼  Upstream stream, handed back to the relay
 //! ```
@@ -47,11 +47,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daer_common::net::MacAddr;
-use daer_config::{Config, FunctionOrString};
+use daer_config::{Config, ElectionKind, FunctionOrString, ProbeSettings};
 use daer_outbound::{
-    Dialer, DialerGroup, DialerId, DialerOptions, DirectDialer, FilterSet, NodeDialer,
-    NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
-    parse_group_policy,
+    Dialer, DialerId, DialerOptions, DirectDialer, ElectionRuntime, FilterSet, NodeDialer,
+    NodeGraph, NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
 };
 
 use daer_relay::relay::DatagramLeg;
@@ -63,6 +62,9 @@ use daer_routing::{
 };
 use daer_routing::{L4ProtoMask, ProcessName};
 
+use serde::Serialize;
+
+use crate::election::ElectionOverrides;
 use crate::generation::GenerationId;
 
 /// What the routing program decided for one flow.
@@ -87,33 +89,96 @@ impl Verdict {
 }
 
 /// One selectable node, described for a human.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeIdentity {
+    /// The resource pool this node belongs to. Empty for a node-only election.
     pub group: String,
+    /// The election that selected this node. Empty for a resource-catalog row.
+    pub election: String,
     pub node: String,
     pub protocol: Protocol,
     pub security: Security,
     /// Whether the node is used for UDP as well as TCP.
     pub udp: bool,
-    pub subscription_tag: String,
+    pub subscription_name: String,
+    /// The node that carries this node's server leg, when it is a detour hop.
+    pub detour: Option<String>,
+    /// The election that currently elects this node, when one does.
+    pub elected_by: Option<String>,
+    /// Cached health of this node from that election.
+    pub health: Option<ElectionHealth>,
+}
+
+/// One resource pool and the elections that consume it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GroupIdentity {
+    pub name: String,
+    pub candidates: Vec<String>,
+    pub elections: Vec<String>,
+}
+
+/// One election and its current result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ElectionIdentity {
+    pub name: String,
+    /// `group:<name>` or `node:<name>`.
+    pub input: String,
+    pub kind: ElectionKind,
+    pub probe: ProbeSettings,
+    pub candidates: usize,
+    /// The node pinned by `daer elect`, if any.
+    pub pinned: Option<String>,
+    /// The node the election would return for the next flow.
+    pub effective: Option<String>,
+    /// Cached health of the effective node, when it has been measured.
+    pub health: Option<ElectionHealth>,
+}
+
+/// The cached liveness of one elected node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ElectionHealth {
+    pub alive: bool,
+    pub latency_us: Option<u64>,
 }
 
 impl NodeIdentity {
+    /// Compatibility accessor for the subscription name.
+    #[must_use]
+    pub fn subscription_tag(&self) -> &str {
+        &self.subscription_name
+    }
+
+    /// The name of the subscription this node belongs to, or `""`.
+    #[must_use]
+    pub fn subscription_name(&self) -> &str {
+        &self.subscription_name
+    }
+
     /// A one-line description, safe to log: it names the cipher or the TLS name, never a secret.
     #[must_use]
     pub fn describe(&self) -> String {
+        let owner = if self.election.is_empty() {
+            self.group.clone()
+        } else if self.group.is_empty() {
+            self.election.clone()
+        } else {
+            format!("{}:{}", self.election, self.group)
+        };
         format!(
-            "{}: {} [{} | {}]{}{}",
-            self.group,
+            "{}: {} [{} | {}]{}{}{}",
+            owner,
             self.node,
             self.protocol.as_str(),
             self.security.describe(),
             if self.udp { " udp" } else { "" },
-            if self.subscription_tag.is_empty() {
+            if self.subscription_name.is_empty() {
                 String::new()
             } else {
-                format!(" subtag={}", self.subscription_tag)
-            }
+                format!(" sub={}", self.subscription_name)
+            },
+            self.detour
+                .as_ref()
+                .map_or_else(String::new, |detour| format!(" detour={detour}"))
         )
     }
 }
@@ -139,8 +204,8 @@ pub struct Explanation {
     /// never evaluated.
     pub rule_text: String,
     pub outbound: Outbound,
-    /// Outbounds the flow could have gone to, for a rule that did not match.
-    pub groups: Vec<String>,
+    /// Elections the flow could have gone to, for a rule that did not match.
+    pub elections: Vec<String>,
     /// Per-rule, per-predicate detail.
     ///
     /// Carried in the explanation rather than fetched separately: the two must
@@ -238,6 +303,8 @@ pub struct RouterOptions {
     pub dial_observer: daer_outbound::ObserverSlot,
     /// Pre-loaded rule provider pool (ADR-0014).
     pub rule_providers: Option<Arc<daer_routing::RuleProviderPool>>,
+    /// Runtime election overrides, shared by every generation.
+    pub overrides: Arc<ElectionOverrides>,
 }
 
 impl RouterOptions {
@@ -272,6 +339,13 @@ impl RouterOptions {
         providers: Option<Arc<daer_routing::RuleProviderPool>>,
     ) -> Self {
         self.rule_providers = providers;
+        self
+    }
+
+    /// Supplies the shared runtime election overrides.
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: Arc<ElectionOverrides>) -> Self {
+        self.overrides = overrides;
         self
     }
 
@@ -343,14 +417,18 @@ pub struct Router {
     /// The datagram twin of `direct`. Kept beside it so a UDP flow to a `direct`
     /// outbound does not have to build a connector per packet.
     datagram_direct: UdpConnector,
-    /// Groups live behind a lock, and only for one reason: a health check mutates a
-    /// node's measured state while flows read it to select. The alternative — an
-    /// `Arc<Router>` that can never record — would leave the probe results with nowhere
-    /// to land, which is exactly the state this tree was in before the scheduler existed.
-    ///
-    /// The read path takes a shared lock for the duration of a selection, never across an
-    /// await, so a flow still pays no lock on its data path.
-    groups: std::sync::RwLock<HashMap<String, GroupRoute>>,
+    /// Elections live behind a lock because a probe mutates a candidate's measured
+    /// state while flows read it to elect. A group is only a candidate set and is
+    /// immutable after the generation is built.
+    elections: std::sync::RwLock<HashMap<String, ElectionRoute>>,
+    /// Every resource pool, including pools no election consumes.
+    groups: HashMap<String, GroupResource>,
+    /// Node names, indexed like `config.node`.
+    node_names: Vec<String>,
+    /// Every node resource, grouped by the pools that contain it, for diagnostics.
+    node_catalog: Vec<NodeIdentity>,
+    /// Runtime `daer elect` overrides, shared across generations.
+    overrides: Arc<ElectionOverrides>,
     fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
     dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
     /// The datapath's per-flow facts, when one is attached.
@@ -377,6 +455,12 @@ impl Router {
         generation: GenerationId,
         options: &RouterOptions,
     ) -> Result<Self, RoutingError> {
+        // A detour is a DAG, not a runtime recursion. Validate it before anything lowers or
+        // builds; a diagnostic that skips the graph check would disagree with the daemon about
+        // whether the configuration is runnable (ADR-0006, ADR-0044).
+        daer_config::validate::validate_chain_graph(config)
+            .map_err(|error| RoutingError::new(error.to_string()))?;
+
         // `geoip:` / `geosite:` are gone with the Protobuf reader (ADR-0014/ADR-0015): a rule
         // names a `provider(...)`, and the provider is a compiled `.drb` set. There is no
         // optimizer here that could resurrect the retired format.
@@ -428,8 +512,14 @@ impl Router {
         } else {
             Duration::ZERO
         };
-        let groups = build_groups(config, &dialer_options)?;
-        let known: Vec<String> = groups.keys().cloned().collect();
+        let (groups, elections) = build_resources_and_elections(config, &dialer_options)?;
+        let node_names: Vec<String> = config
+            .node
+            .iter()
+            .map(|node| Property::from_node(node).name)
+            .collect();
+        let node_catalog = node_catalog(config, &groups);
+        let known: Vec<String> = elections.keys().cloned().collect();
 
         let mut sink = RecordingSink::default();
         let mut fallback = None;
@@ -476,6 +566,22 @@ impl Router {
             .dns_snooper
             .clone()
             .or_else(|| Some(Arc::new(daer_dns::DnsSnooper::default())));
+        let mut warnings = sink.warnings.clone();
+        let mut election_names: Vec<&String> = elections.keys().collect();
+        election_names.sort();
+        for name in election_names {
+            if let Some(route) = elections.get(name)
+                && route.runtime.is_empty()
+            {
+                warnings.push(format!(
+                    "election {name:?} has no candidates; flows routed to it will fail"
+                ));
+                daer_observe::warn!(daer_observe::EventCode::GenerationRuleWarning,
+                    warning = %format!("election {name:?} has no candidates; flows routed to it will fail"),
+                    "routing rule compiled with a warning"
+                );
+            }
+        }
 
         Ok(Self {
             generation,
@@ -489,13 +595,17 @@ impl Router {
                     DialerOptions::new(so_mark, DEFAULT_DIAL_TIMEOUT).socket_config(),
                 )
                 .with_connect_timeout(Some(DEFAULT_DIAL_TIMEOUT)),
-            groups: std::sync::RwLock::new(groups),
+            groups,
+            node_names,
+            node_catalog,
+            elections: std::sync::RwLock::new(elections),
+            overrides: Arc::clone(&options.overrides),
             fake_ip,
             dns_snooper,
             kernel_observer: options.kernel_observer.clone(),
             dial_observer: options.dial_observer.clone(),
             so_mark,
-            warnings: sink.warnings.clone(),
+            warnings,
         })
     }
 
@@ -666,7 +776,7 @@ impl Router {
                         daer_observe::EventCode::FlowDialFailed,
                         flow_id = %flow.flow_id,
                         destination = %flow.destination,
-                        group = "direct",
+                        election = "direct",
                         stage = %failure.stage,
                         error_code = %failure.code,
                         "flow dial failed"
@@ -686,28 +796,26 @@ impl Router {
         };
 
         let established = self
-            .connect_through_group(flow.flow_id, flow.destination, &outbound.name, &authority)
+            .connect_through_election(flow.flow_id, flow.destination, &outbound.name, &authority)
             .await?;
         Ok(established.stream)
     }
 
-    /// Opens a TCP leg through `group`, holding the group lock only for the selection.
-    async fn connect_through_group(
+    /// Opens a TCP leg through `election`, holding the election lock only for the
+    /// selection.
+    async fn connect_through_election(
         &self,
         flow_id: daer_observe::FlowId,
         destination: SocketAddr,
-        group: &str,
+        election: &str,
         authority: &str,
     ) -> Result<daer_outbound::Established, RelayError> {
-        let node = self.select_node(flow_id, destination, group)?;
-        // The dial is wrapped so its span reaches the observer when one is installed. A group
-        // whose dials are never measured is a group whose slowness has no explanation in any
-        // log: the transport's recorder is filled by netune and then dropped.
+        let node = self.select_node(flow_id, destination, election)?;
         let observed = daer_outbound::ObservedDialer::new(
             Arc::clone(&node),
             self.dial_observer.clone(),
             flow_id,
-            group,
+            election,
         );
         observed
             .connect(authority)
@@ -718,51 +826,53 @@ impl Router {
             })
     }
 
-    /// Selects the node a group would use for `destination`.
+    /// Selects the node an election would return for `destination`.
     ///
     /// The read lock is taken and released inside this function: selection is a pure
     /// read of measured state, and holding the guard across a dial would make every flow's
-    /// future non-`Send` (a `RwLockReadGuard` is not `Send`) — and would serialise every
-    /// dial behind the health checker's writes.
+    /// future non-`Send`.
     fn select_node(
         &self,
         flow_id: daer_observe::FlowId,
         destination: SocketAddr,
-        group: &str,
+        election: &str,
     ) -> Result<Arc<NodeDialer>, RelayError> {
-        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        let Some(route) = groups.get(group) else {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let Some(route) = elections.get(election) else {
             return Err(dial_error(
                 flow_id,
                 destination,
-                group,
-                OutboundError::UnknownGroup(group.to_owned()),
+                election,
+                OutboundError::UnknownElection(election.to_owned()),
             ));
         };
-        let dialer = route.group.select(None).ok_or_else(|| {
-            dial_error(
-                flow_id,
-                destination,
-                group,
-                OutboundError::NoAliveNode(group.to_owned()),
-            )
-        })?;
+        let dialer = route
+            .effective(&self.overrides, election)
+            .and_then(|id| route.runtime.dialer(id))
+            .ok_or_else(|| {
+                dial_error(
+                    flow_id,
+                    destination,
+                    election,
+                    OutboundError::NoElectableNode(election.to_owned()),
+                )
+            })?;
         let node = route.node(dialer.id()).map(Arc::clone).ok_or_else(|| {
             dial_error(
                 flow_id,
                 destination,
-                group,
-                OutboundError::NoAliveNode(group.to_owned()),
+                election,
+                OutboundError::NoElectableNode(election.to_owned()),
             )
         })?;
         let property = dialer.property();
         daer_observe::trace!(
             daer_observe::EventCode::FlowNodeSelected,
             flow_id = %flow_id,
-            group = %group,
+            election = %election,
             node = %property.name,
             protocol = %property.protocol.as_str(),
-            policy = ?route.group.policy(),
+            kind = ?route.kind,
             latency_us = ?dialer.last_latency().map(|latency| latency.as_nanos() / 1_000),
             "node selected"
         );
@@ -897,48 +1007,139 @@ impl Router {
         Ok(DatagramLeg { target, connector })
     }
 
-    /// What a group would select right now, for diagnostics.
-    ///
-    /// Reports the node's name, protocol and security identity. It answers "which node, and how
-    /// is that session protected" without opening a connection, which is the question a bug
-    /// report about a proxy actually asks.
+    /// What an election would return right now, for diagnostics.
     #[must_use]
-    pub fn node_identity(&self, group: &str) -> Option<NodeIdentity> {
-        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        let route = groups.get(group)?;
-        let dialer = route.group.select(None)?;
+    pub fn node_identity(&self, election: &str) -> Option<NodeIdentity> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let route = elections.get(election)?;
+        let id = route.effective(&self.overrides, election)?;
+        let dialer = route.runtime.dialer(id)?;
+        let node = route.node(id)?;
+        let property = dialer.property();
+        let health = route.runtime.is_alive(id).map(|alive| ElectionHealth {
+            alive,
+            latency_us: dialer
+                .last_latency()
+                .and_then(|latency| u64::try_from(latency.as_nanos() / 1_000).ok()),
+        });
         Some(NodeIdentity {
-            group: group.to_owned(),
-            node: dialer.property().name.clone(),
-            protocol: dialer.property().protocol.clone(),
-            security: dialer.property().security.clone(),
-            udp: dialer.property().udp,
-            subscription_tag: dialer.property().subscription_tag.clone(),
+            group: route
+                .input
+                .strip_prefix("group:")
+                .unwrap_or_default()
+                .to_owned(),
+            election: election.to_owned(),
+            node: property.name.clone(),
+            protocol: property.protocol.clone(),
+            security: property.security.clone(),
+            udp: property.udp,
+            subscription_name: property.subscription_name.clone(),
+            detour: node.detour().map(|inner| inner.label().to_owned()),
+            elected_by: Some(election.to_owned()),
+            health,
         })
     }
 
-    /// Every node of every group, sorted, for a listing.
+    /// Every node resource, grouped by resource pool, for a listing.
+    ///
+    /// The catalog is built once; this method overlays the current election result so a
+    /// `status --nodes` row says which election elects it and how its last probe went.
     #[must_use]
     pub fn nodes(&self) -> Vec<NodeIdentity> {
-        let mut out = Vec::new();
-        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        let mut names: Vec<&String> = groups.keys().collect();
+        let mut rows = self.node_catalog.clone();
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<&String> = elections.keys().collect();
         names.sort();
-        for group in names {
-            let Some(route) = groups.get(group) else {
+        for name in names {
+            let Some(route) = elections.get(name) else {
                 continue;
             };
-            for dialer in route.group.dialers() {
-                out.push(NodeIdentity {
-                    group: group.clone(),
-                    node: dialer.property().name.clone(),
-                    protocol: dialer.property().protocol.clone(),
-                    security: dialer.property().security.clone(),
-                    udp: dialer.property().udp,
-                    subscription_tag: dialer.property().subscription_tag.clone(),
-                });
+            let Some(id) = route.effective(&self.overrides, name) else {
+                continue;
+            };
+            let Some(dialer) = route.runtime.dialer(id) else {
+                continue;
+            };
+            let node = &dialer.property().name;
+            let health = route.runtime.is_alive(id).map(|alive| ElectionHealth {
+                alive,
+                latency_us: dialer
+                    .last_latency()
+                    .and_then(|latency| u64::try_from(latency.as_nanos() / 1_000).ok()),
+            });
+            for row in &mut rows {
+                if &row.node == node && row.elected_by.is_none() {
+                    row.elected_by = Some((*name).clone());
+                    row.health = health.clone();
+                }
             }
         }
+        rows
+    }
+
+    /// Every resource pool and the elections that consume it.
+    #[must_use]
+    pub fn groups(&self) -> Vec<GroupIdentity> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let mut names: Vec<&String> = self.groups.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(group) = self.groups.get(name) else {
+                continue;
+            };
+            let candidates = group
+                .members
+                .iter()
+                .filter_map(|(index, _)| self.node_names.get(*index).cloned())
+                .collect();
+            let mut consumers: Vec<String> = elections
+                .iter()
+                .filter(|(_, route)| route.input == format!("group:{name}"))
+                .map(|(election, _)| election.clone())
+                .collect();
+            consumers.sort();
+            out.push(GroupIdentity {
+                name: name.clone(),
+                candidates,
+                elections: consumers,
+            });
+        }
+        out
+    }
+
+    /// Every election, its input and its current result.
+    #[must_use]
+    pub fn elections(&self) -> Vec<ElectionIdentity> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (name, route) in elections.iter() {
+            let pinned = self.overrides.get(name);
+            let effective_id = route.effective(&self.overrides, name);
+            let dialer = effective_id.and_then(|id| route.runtime.dialer(id));
+            let effective = dialer.map(|dialer| dialer.property().name.clone());
+            let health = effective_id.and_then(|id| {
+                route.runtime.is_alive(id).map(|alive| ElectionHealth {
+                    alive,
+                    latency_us: route
+                        .runtime
+                        .dialer(id)
+                        .and_then(|dialer| dialer.last_latency())
+                        .and_then(|latency| u64::try_from(latency.as_nanos() / 1_000).ok()),
+                })
+            });
+            out.push(ElectionIdentity {
+                name: name.clone(),
+                input: route.input.clone(),
+                kind: route.kind,
+                probe: route.probe.clone(),
+                candidates: route.runtime.len(),
+                pinned,
+                effective,
+                health,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
@@ -981,9 +1182,9 @@ impl Router {
             ),
             None => format!("fallback -> {}", self.fallback.name),
         };
-        let locked = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        let mut groups: Vec<String> = locked.keys().cloned().collect();
-        groups.sort();
+        let locked = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let mut elections: Vec<String> = locked.keys().cloned().collect();
+        elections.sort();
         let selected = self.node_identity(&verdict.outbound.name);
         Explanation {
             source,
@@ -992,7 +1193,7 @@ impl Router {
             rule: verdict.rule,
             rule_text,
             outbound: verdict.outbound,
-            groups,
+            elections,
             trace: self.trace_with_domain(source, destination, domain),
             selected,
         }
@@ -1140,33 +1341,34 @@ impl Router {
         )
     }
 
-    /// Every group's nodes, in the shape a health probe needs.
+    /// Every election's candidates, in the shape a health probe needs.
     ///
     /// Returns owned rows rather than borrows: the caller probes across `await`s, and the
-    /// group lock must be released before that. A domain-named node reports `None` for its
-    /// address, because probing it would need its own resolution and a probe that resolved
-    /// differently from the data path would measure the wrong destination.
+    /// election lock must be released before that. A manual election is excluded because it
+    /// does not rank candidates; `daer probe` is the on-demand path for a pinned node.
     #[must_use]
-    pub fn groups_for_probes(&self) -> Vec<(String, Vec<ProbeRow>)> {
-        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::with_capacity(groups.len());
-        for (name, route) in groups.iter() {
-            // `fixed(n)` is explicit intent: probing it can only rewrite a choice the
-            // operator made, and it makes an external DNS endpoint look like a node
-            // property. Fixed groups are therefore absent from the probe table.
-            if !crate::health::policy_needs_measurement(route.group.policy()) {
+    pub fn elections_for_probes(&self) -> Vec<(String, Vec<ProbeRow>)> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(elections.len());
+        for (name, route) in elections.iter() {
+            if route.kind == ElectionKind::Manual {
                 continue;
             }
             let mut rows = Vec::new();
-            for dialer in route.group.dialers() {
+            for dialer in route.runtime.dialers() {
                 let property = dialer.property();
-                rows.push((
-                    dialer.id(),
-                    property.name.clone(),
-                    property.protocol.clone(),
-                    literal_address(&property.address),
-                    property.udp,
-                ));
+                let Some(node) = route.node(dialer.id()) else {
+                    continue;
+                };
+                rows.push(ProbeRow {
+                    dialer: dialer.id(),
+                    name: property.name.clone(),
+                    protocol: property.protocol.clone(),
+                    address: literal_address(&property.address),
+                    udp: property.udp,
+                    node: Arc::clone(node),
+                    probe: route.probe.clone(),
+                });
             }
             out.push((name.clone(), rows));
         }
@@ -1174,40 +1376,90 @@ impl Router {
         out
     }
 
-    /// Whether `group` would select a node right now.
-    ///
-    /// The question a health scheduler is judged by: recording a latency must make a node
-    /// selectable, and recording a failure must make it not.
+    /// Whether `election` would return a node right now.
     #[must_use]
-    pub fn has_selection(&self, group: &str) -> bool {
-        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-        groups
-            .get(group)
-            .is_some_and(|route| route.group.select(None).is_some())
+    pub fn has_selection(&self, election: &str) -> bool {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        elections
+            .get(election)
+            .is_some_and(|route| route.effective(&self.overrides, election).is_some())
     }
 
-    /// Records a health-check result for one node of one group.
+    /// Records a probe result for one candidate of one election.
     ///
     /// # Errors
     ///
-    /// Returns an error when the group or dialer is unknown to this generation.
+    /// Returns an error when the election or dialer is unknown to this generation.
     pub fn record(
         &self,
-        group: &str,
+        election: &str,
         dialer: DialerId,
         alive: bool,
         latency: Option<daer_config::TimeSpan>,
     ) -> Result<NotifyOutcome, OutboundError> {
-        let mut groups = self.groups.write().unwrap_or_else(|e| e.into_inner());
-        let Some(route) = groups.get_mut(group) else {
-            return Err(OutboundError::UnknownGroup(group.to_owned()));
+        let mut elections = self.elections.write().unwrap_or_else(|e| e.into_inner());
+        let Some(route) = elections.get_mut(election) else {
+            return Err(OutboundError::UnknownElection(election.to_owned()));
         };
-        route.group.record(dialer, alive, latency)
+        route.runtime.record(dialer, alive, latency)
+    }
+
+    /// Pins `election` to `node` and persists the override.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the election is unknown, the node is not one of its
+    /// candidates, or the state file cannot be written. The running election is
+    /// unchanged on every error.
+    pub fn elect(&self, election: &str, node: &str) -> Result<(), String> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        let Some(route) = elections.get(election) else {
+            return Err(format!("election {election:?} is not declared"));
+        };
+        if route.runtime.select_named(node).is_none() {
+            return Err(format!(
+                "node {node:?} is not a candidate of election {election:?}"
+            ));
+        }
+        drop(elections);
+        self.overrides.set(election, node)
+    }
+
+    /// Clears a runtime override; the election follows its configured rule again.
+    pub fn reset_election(&self, election: &str) -> Result<(), String> {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        if !elections.contains_key(election) {
+            return Err(format!("election {election:?} is not declared"));
+        }
+        drop(elections);
+        self.overrides.remove(election)
+    }
+
+    /// Drops overrides that this generation cannot honour and persists the result.
+    pub fn reconcile_overrides(&self) {
+        let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
+        self.overrides.retain_valid(|election, node| {
+            elections
+                .get(election)
+                .is_some_and(|route| route.runtime.select_named(node).is_some())
+        });
     }
 }
 
 /// A row of the probe table: what a health check needs about one node.
-pub type ProbeRow = (DialerId, String, Protocol, Option<SocketAddr>, bool);
+#[derive(Debug, Clone)]
+pub struct ProbeRow {
+    pub dialer: DialerId,
+    pub name: String,
+    pub protocol: Protocol,
+    pub address: Option<SocketAddr>,
+    /// Whether the node can carry datagrams.
+    pub udp: bool,
+    /// The live dialer, so a detoured probe can open the chain to the node's server.
+    pub node: Arc<NodeDialer>,
+    /// The election's effective probe settings.
+    pub probe: ProbeSettings,
+}
 
 /// Parses a node address as a literal `SocketAddr`, or `None` when it is a name.
 ///
@@ -1218,17 +1470,36 @@ fn literal_address(address: &str) -> Option<SocketAddr> {
     address.parse::<SocketAddr>().ok()
 }
 
-/// One group and the node dialers its selections point at.
-#[derive(Debug)]
-struct GroupRoute {
-    group: DialerGroup,
-    /// Indexed by [`DialerId`]: the same order as the filter survivors.
-    nodes: Vec<Arc<NodeDialer>>,
+/// A resource pool: membership only, including pools no election consumes.
+#[derive(Debug, Clone)]
+struct GroupResource {
+    /// Node indices plus the filter annotation's latency offset.
+    members: Vec<(usize, daer_config::TimeSpan)>,
 }
 
-impl GroupRoute {
+/// One election and the node dialers its result can name.
+#[derive(Debug)]
+struct ElectionRoute {
+    runtime: ElectionRuntime,
+    /// Indexed by [`DialerId`]: the same order as the candidate list.
+    nodes: Vec<Arc<NodeDialer>>,
+    input: String,
+    kind: ElectionKind,
+    probe: ProbeSettings,
+}
+
+impl ElectionRoute {
     fn node(&self, id: DialerId) -> Option<&Arc<NodeDialer>> {
         self.nodes.get(usize::try_from(id.0).ok()?)
+    }
+
+    fn effective(&self, overrides: &ElectionOverrides, election: &str) -> Option<DialerId> {
+        if let Some(node) = overrides.get(election)
+            && let Some(dialer) = self.runtime.select_named(&node)
+        {
+            return Some(dialer.id());
+        }
+        self.runtime.select(None).map(Dialer::id)
     }
 }
 
@@ -1391,12 +1662,6 @@ fn facts_with_kernel<'a>(
 /// not dials, and a dial that hangs must not hold an ingress slot forever.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The mark `docs/how-to/deployment.md` recommends, and what `daer run` applies to `PARAM`.
-///
-/// Not applied to sockets unless the configuration asks for it: `SO_MARK` needs
-/// `CAP_NET_ADMIN`, so a default would break every unprivileged run.
-pub const RECOMMENDED_SOCKET_MARK: u32 = 0x0dae;
-
 /// The cumulative match-set count after each rule.
 ///
 /// One set per `(function, parameter key)` group, which is exactly what
@@ -1427,31 +1692,20 @@ fn fallback_outbound(fallback: &FunctionOrString) -> Result<Outbound, RoutingErr
     parse_outbound(&function)
 }
 
-fn check_target(name: &str, groups: &[String]) -> Result<(), RoutingError> {
-    if is_builtin_outbound(name) || groups.iter().any(|group| group == name) {
+fn check_target(name: &str, elections: &[String]) -> Result<(), RoutingError> {
+    if is_builtin_outbound(name) || elections.iter().any(|election| election == name) {
         return Ok(());
     }
     Err(RoutingError::new(format!(
-        "outbound (group) {name:?} not found; please define it in a [[group]] table"
+        "outbound {name:?} is not an election; define it in an [[election]] table"
     )))
 }
 
-/// Builds every group from the node pool.
-///
-/// The pool is `[[node]]` plus every node a `[[subscription]]` resolved to. Both
-/// arrive in `config.node`: subscription resolution happens before a generation is
-/// built (see [`crate::subscription`]), so this function stays synchronous and a
-/// generation stays a pure function of the configuration it was given.
-///
-/// A node whose protocol this build cannot speak is skipped, never downgraded:
-/// treating an unknown scheme as `direct` would leak the flow outside the proxy.
-/// That skip is logged at `warn` with the reason, because a group that silently
-/// lost half its nodes is a configuration bug an operator must see.
 /// Builds a relay dial error and emits the one `warn` event that names its stage and code.
 fn dial_error(
     flow_id: daer_observe::FlowId,
     destination: SocketAddr,
-    group: &str,
+    election: &str,
     error: OutboundError,
 ) -> RelayError {
     let failure: daer_observe::DialFailure = error.into();
@@ -1459,7 +1713,7 @@ fn dial_error(
         daer_observe::EventCode::FlowDialFailed,
         flow_id = %flow_id,
         destination = %destination,
-        group = %group,
+        election = %election,
         stage = %failure.stage,
         error_code = %failure.code,
         "flow dial failed"
@@ -1470,13 +1724,92 @@ fn dial_error(
     }
 }
 
-fn build_groups(
+/// Builds the diagnostic node catalog: every node, once per resource pool it is in.
+///
+/// A declared node that no group selects is still a resource and appears with an empty
+/// group; otherwise `daer check --nodes` / `daer status --nodes` would hide exactly the
+/// node an operator is trying to understand.
+fn node_catalog(config: &Config, groups: &HashMap<String, GroupResource>) -> Vec<NodeIdentity> {
+    let mut rows = Vec::new();
+    let mut grouped = vec![false; config.node.len()];
+    let mut names: Vec<&String> = groups.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(group) = groups.get(name) else {
+            continue;
+        };
+        for (index, _) in &group.members {
+            let Some(node) = config.node.get(*index) else {
+                continue;
+            };
+            grouped[*index] = true;
+            let property = Property::from_node(node);
+            rows.push(NodeIdentity {
+                group: name.clone(),
+                election: String::new(),
+                node: property.name,
+                protocol: property.protocol,
+                security: property.security,
+                udp: property.udp,
+                subscription_name: property.subscription_name,
+                detour: node.detour.clone(),
+                elected_by: None,
+                health: None,
+            });
+        }
+    }
+    for (index, node) in config.node.iter().enumerate() {
+        if grouped[index] {
+            continue;
+        }
+        let property = Property::from_node(node);
+        rows.push(NodeIdentity {
+            group: String::new(),
+            election: String::new(),
+            node: property.name,
+            protocol: property.protocol,
+            security: property.security,
+            udp: property.udp,
+            subscription_name: property.subscription_name,
+            detour: node.detour.clone(),
+            elected_by: None,
+            health: None,
+        });
+    }
+    rows.sort_by(|a, b| (&a.group, &a.node).cmp(&(&b.group, &b.node)));
+    rows
+}
+
+/// A resource pool keyed by name.
+type ResourceMap = HashMap<String, GroupResource>;
+/// An election keyed by its routing-target name.
+type ElectionMap = HashMap<String, ElectionRoute>;
+
+fn build_resources_and_elections(
     config: &Config,
     dialer_options: &DialerOptions,
-) -> Result<HashMap<String, GroupRoute>, RoutingError> {
+) -> Result<(ResourceMap, ElectionMap), RoutingError> {
+    let mut graph = NodeGraph::new(&config.node, dialer_options.clone())
+        .map_err(|error| RoutingError::new(error.to_string()))?;
+
+    let mut node_by_name = HashMap::new();
+    for (index, node) in config.node.iter().enumerate() {
+        let property = Property::from_node(node);
+        if property.name.trim().is_empty() {
+            return Err(RoutingError::new(format!(
+                "node at index {index} has no name; an election cannot reference it"
+            )));
+        }
+        if node_by_name.insert(property.name.clone(), index).is_some() {
+            return Err(RoutingError::new(format!(
+                "duplicate node name {:?}",
+                property.name
+            )));
+        }
+    }
+
     let mut groups = HashMap::new();
     for group in &config.group {
-        let policy = parse_group_policy(&group.policy).map_err(RoutingError::new)?;
         let filters = FilterSet::compile(
             &group
                 .filters
@@ -1491,21 +1824,55 @@ fn build_groups(
         )
         .map_err(|error| RoutingError::new(format!("group {:?}: {error}", group.name)))?;
 
-        let mut dialers = Vec::new();
-        let mut nodes = Vec::new();
-        for node in &config.node {
+        let mut members = Vec::new();
+        for (index, node) in config.node.iter().enumerate() {
             let property = Property::from_node(node);
-            let Some(annotation) = filters.matches(&property.name, &property.subscription_tag)
+            let Some(annotation) = filters.matches(&property.name, &property.subscription_name)
             else {
                 continue;
             };
-            // A node whose protocol this build cannot speak is skipped, never
-            // downgraded: treating an unknown scheme as `direct` would leak the
-            // flow outside the proxy. Any other error is a configuration bug and
-            // fails the generation.
-            let node_dialer = match NodeDialer::from_node(node, *dialer_options) {
+            members.push((index, annotation.add_latency));
+        }
+        groups.insert(group.name.clone(), GroupResource { members });
+    }
+
+    let mut elections = HashMap::new();
+    for election in &config.election {
+        let (members, input): (Vec<(usize, daer_config::TimeSpan)>, String) =
+            if let Some(group_name) = &election.group {
+                let Some(group) = groups.get(group_name) else {
+                    return Err(RoutingError::new(format!(
+                        "election {:?} names unknown group {group_name:?}",
+                        election.name
+                    )));
+                };
+                (group.members.clone(), format!("group:{group_name}"))
+            } else if let Some(node_name) = &election.node {
+                let Some(index) = node_by_name.get(node_name).copied() else {
+                    return Err(RoutingError::new(format!(
+                        "election {:?} names unknown node {node_name:?}",
+                        election.name
+                    )));
+                };
+                (
+                    vec![(index, daer_config::TimeSpan::ZERO)],
+                    format!("node:{node_name}"),
+                )
+            } else {
+                return Err(RoutingError::new(format!(
+                    "election {:?} has no group or node input",
+                    election.name
+                )));
+            };
+
+        let mut dialers = Vec::new();
+        let mut nodes = Vec::new();
+        for (index, offset) in members {
+            let node = &config.node[index];
+            let property = Property::from_node(node);
+            let node_dialer = match graph.build(index) {
                 Ok(dialer) => dialer,
-                Err(OutboundError::UnsupportedLink(message)) => {
+                Err(OutboundError::UnsupportedLink(message)) if election.group.is_some() => {
                     daer_observe::warn!(daer_observe::EventCode::GenerationNodeUnselectable,
                         node = %property.name,
                         protocol = %property.protocol.as_str(),
@@ -1517,29 +1884,36 @@ fn build_groups(
                 }
                 Err(error) => {
                     return Err(RoutingError::new(format!(
-                        "node {:?}: {error}",
-                        property.name
+                        "election {:?}: node {:?}: {error}",
+                        election.name, property.name
                     )));
                 }
             };
             let id = DialerId(dialers.len() as u64);
-            nodes.push(Arc::new(node_dialer));
-            dialers.push(Dialer::new(id, property, annotation.add_latency));
+            nodes.push(node_dialer);
+            dialers.push(Dialer::new(id, property, offset));
         }
 
-        let tolerance = group
-            .health_check
-            .tolerance
-            .unwrap_or(config.global.health_check.tolerance);
-        groups.insert(
-            group.name.clone(),
-            GroupRoute {
-                group: DialerGroup::new(group.name.clone(), policy, tolerance, dialers),
+        let probe = election.resolved_probe(&config.global.probe);
+        let runtime = ElectionRuntime::new(
+            election.name.clone(),
+            election.kind.selection_policy(),
+            probe.tolerance,
+            dialers,
+        );
+        elections.insert(
+            election.name.clone(),
+            ElectionRoute {
+                runtime,
                 nodes,
+                input,
+                kind: election.kind,
+                probe,
             },
         );
     }
-    Ok(groups)
+
+    Ok((groups, elections))
 }
 
 impl daer_relay::Decide for Router {
@@ -1679,9 +2053,10 @@ type = "socks5"
 server = "127.0.0.1"
 port = 1080
 
-[[group]]
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "n1"
+type = "manual"
 
 [routing]
 rules = []
@@ -1690,7 +2065,7 @@ fallback = "proxy"
         );
         let (source, destination) = flow(80);
         let explanation = router.explain(source, destination);
-        assert_eq!(explanation.groups, ["proxy"]);
+        assert_eq!(explanation.elections, ["proxy"]);
         assert_eq!(&*explanation.outbound.name, "proxy");
     }
 
@@ -1802,9 +2177,14 @@ fallback = "direct"
         // the rule could never fire: a configuration that read "this device goes direct"
         // proxied it instead, with no warning and no log line.
         let source = r#"
-[[group]]
+[[node]]
+name = "n1"
+type = "direct"
+
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "n1"
+type = "manual"
 
 [routing]
 rules = ["mac(00:11:22:33:44:55) -> block"]
@@ -1843,9 +2223,14 @@ fallback = "proxy"
     #[test]
     fn a_pname_rule_matches_only_when_the_datapath_supplied_the_process() {
         let source = r#"
-[[group]]
+[[node]]
+name = "n1"
+type = "direct"
+
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "n1"
+type = "manual"
 
 [routing]
 rules = ["pname(curl) -> block"]
@@ -1904,5 +2289,60 @@ fallback = "proxy"
         // The MAC and DSCP are still real: they come from the packet, not from the hooks.
         assert_eq!(facts.mac, MacAddr([1, 2, 3, 4, 5, 6]));
         assert_eq!(facts.dscp, 46);
+    }
+
+    #[test]
+    fn a_runtime_election_overrides_the_configured_rule() {
+        let router = router(
+            "schema = 2\n\n\
+             [[node]]\nname = \"n1\"\ntype = \"direct\"\n\n\
+             [[node]]\nname = \"n2\"\ntype = \"direct\"\n\n\
+             [[group]]\nname = \"pool\"\n\n\
+             [[election]]\nname = \"proxy\"\ngroup = \"pool\"\ntype = \"min\"\n\n\
+             [routing]\nrules = []\nfallback = \"proxy\"\n",
+        );
+        router.elect("proxy", "n2").expect("n2 is a candidate");
+        assert_eq!(router.node_identity("proxy").unwrap().node, "n2");
+        assert!(router.elect("proxy", "missing").is_err());
+        router.reset_election("proxy").expect("resets");
+        assert!(router.node_identity("proxy").is_some());
+        assert!(router.reset_election("missing").is_err());
+    }
+
+    #[test]
+    fn a_detoured_node_reports_its_inner_hop() {
+        let router = router(
+            "schema = 2\n\n\
+             [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\n\
+             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n\n\
+             [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
+             [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
+             [routing]\nrules = []\nfallback = \"proxy\"\n",
+        );
+        let identity = router.node_identity("proxy").expect("selection");
+        assert_eq!(identity.node, "outer");
+        assert_eq!(identity.detour.as_deref(), Some("inner"));
+        let nodes = router.nodes();
+        assert_eq!(nodes.len(), 2, "both resources are visible: {nodes:#?}");
+        let outer = nodes
+            .iter()
+            .find(|node| node.node == "outer")
+            .expect("outer is in the catalog");
+        assert_eq!(outer.detour.as_deref(), Some("inner"));
+    }
+
+    #[test]
+    fn a_broken_detour_fails_the_generation_instead_of_dropping_the_node() {
+        let config = daer_config::toml_config::load_str(
+            "schema = 2\n\n\
+             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n\n\
+             [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
+             [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
+             [routing]\nrules = []\nfallback = \"proxy\"\n",
+        )
+        .expect("parses");
+        let error = Router::new(&config, GenerationId::new(7), &RouterOptions::default())
+            .expect_err("an explicitly named missing hop is not an unselectable leaf");
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 }

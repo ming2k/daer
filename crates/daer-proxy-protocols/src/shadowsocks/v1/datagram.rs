@@ -4,7 +4,6 @@
 
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use netune::DatagramTransport;
 
@@ -14,7 +13,7 @@ use crate::shadowsocks::connector::atyp;
 
 /// A datagram session over Shadowsocks 2017 AEAD.
 pub struct ShadowSocksDatagramSession {
-    socket: Arc<tokio::net::UdpSocket>,
+    transport: Box<dyn DatagramTransport>,
     cipher: Cipher,
     master: Vec<u8>,
     target_addr: Vec<u8>,
@@ -31,13 +30,13 @@ impl fmt::Debug for ShadowSocksDatagramSession {
 impl ShadowSocksDatagramSession {
     #[must_use]
     pub fn new(
-        socket: Arc<tokio::net::UdpSocket>,
+        transport: Box<dyn DatagramTransport>,
         cipher: Cipher,
         master: Vec<u8>,
         target_addr: Vec<u8>,
     ) -> Self {
         Self {
-            socket,
+            transport,
             cipher,
             master,
             target_addr,
@@ -65,7 +64,7 @@ impl DatagramTransport for ShadowSocksDatagramSession {
             let mut wire = Vec::with_capacity(salt.len() + packet.len());
             wire.extend_from_slice(&salt);
             wire.extend_from_slice(&packet);
-            self.socket.send(&wire).await?;
+            self.transport.send(&wire).await?;
             Ok(payload.len())
         })
     }
@@ -78,7 +77,7 @@ impl DatagramTransport for ShadowSocksDatagramSession {
             let salt_len = self.cipher.salt_len();
             let tag_len = self.cipher.tag_len();
             let mut raw = vec![0u8; 65535];
-            let read = self.socket.recv(&mut raw).await?;
+            let read = self.transport.recv(&mut raw).await?;
             if read < salt_len + tag_len {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -131,6 +130,10 @@ impl DatagramTransport for ShadowSocksDatagramSession {
     }
 
     fn max_datagram_size(&self) -> usize {
-        65507
+        // The peer address and the salt/tag are part of the wire datagram. Reporting the
+        // underlying transport's full payload ceiling would invite a send that cannot fit.
+        self.transport
+            .max_datagram_size()
+            .saturating_sub(self.target_addr.len() + self.cipher.salt_len() + self.cipher.tag_len())
     }
 }

@@ -46,8 +46,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # `docs/dev/standards/workflow.md` says the kernel datapath and the REALITY interop are
-  # fixtures CI exercises, and until this job existed that sentence was false: `cargo test
+  # The kernel datapath and the REALITY interop are fixtures CI exercises, and until this
+  # job existed that claim was false: `cargo test
   # --workspace` runs `tests/transparent.rs` on a stock runner where it skips itself (no
   # CAP_NET_ADMIN), and it does not install `xray`, so `tests/reality_interop.rs` skipped too.
   # Two green ticks over two skips is exactly what ADR-0007 forbids, so both get a job here and
@@ -70,8 +70,8 @@ jobs:
           sudo unzip -o -q /tmp/xray.zip xray -d /usr/local/bin
           xray version
       - name: Build the datapath objects (the production one and the test one)
-        # `kernel-check.sh` needs both: `datapath.o` for the verifier and attach cases, and
-        # `datapath-test.o` — which only `--tests` compiles — for the in-kernel cases. The
+        # `kernel-check.sh` needs both: `datapath.bpf.o` for the verifier and attach cases, and
+        # `datapath_test.bpf.o` — which only `--tests` compiles — for the in-kernel cases. The
         # `--tests` half used to be missing here, so section 7 skipped and `DAER_REQUIRE`
         # never named a key that would have noticed.
         run: cargo xtask ebpf --tests

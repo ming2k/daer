@@ -30,6 +30,8 @@ pub struct StatusOptions {
     pub bundle: Option<PathBuf>,
     /// Print every recorded event for one flow/session ID.
     pub flow: Option<String>,
+    /// A focused live view: `nodes`, `groups`, or `elections`.
+    pub view: Option<&'static str>,
 }
 
 /// One snapshot and where it came from.
@@ -64,6 +66,9 @@ impl Source {
 pub async fn run(options: StatusOptions) -> anyhow::Result<()> {
     if let Some(flow) = options.flow {
         return print_flow(&flow);
+    }
+    if let Some(view) = options.view {
+        return print_view(view, options.json).await;
     }
     let snapshot = read_snapshot().await?;
 
@@ -177,6 +182,150 @@ fn print_flow(flow: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+async fn print_view(view: &str, json: bool) -> anyhow::Result<()> {
+    let value = crate::control::query(view).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    match view {
+        "nodes" => {
+            println!("NODE\tGROUP\tPROTO\tUDP\tSECURITY\tELECTED_BY\tHEALTH");
+            for node in value
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    text(node, "node"),
+                    text_or_dash(node, "group"),
+                    text(node, "protocol"),
+                    node.get("udp")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    value_text(node.get("security")),
+                    text_or_dash(node, "elected_by"),
+                    health_text(node.get("health")),
+                );
+            }
+        }
+        "groups" => {
+            println!("GROUP\tCANDIDATES\tELECTIONS");
+            for group in value
+                .get("groups")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "{}\t{}\t{}",
+                    text(group, "name"),
+                    group
+                        .get("candidates")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len),
+                    join(group.get("elections")),
+                );
+            }
+        }
+        "elections" => {
+            println!("ELECTION\tINPUT\tTYPE\tCANDIDATES\tPINNED\tEFFECTIVE\tHEALTH\tPROBE");
+            for election in value
+                .get("elections")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    text(election, "name"),
+                    text(election, "input"),
+                    text(election, "kind"),
+                    election
+                        .get("candidates")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    text_or_dash(election, "pinned"),
+                    text_or_dash(election, "effective"),
+                    health_text(election.get("health")),
+                    probe_text(election.get("probe")),
+                );
+            }
+        }
+        other => anyhow::bail!("unknown status view {other:?}"),
+    }
+    Ok(())
+}
+
+fn text(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+        .to_owned()
+}
+
+fn text_or_dash(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| "-".to_owned(), str::to_owned)
+}
+
+fn value_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "-".to_owned(),
+    }
+}
+
+fn join(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn probe_text(probe: Option<&serde_json::Value>) -> String {
+    let Some(probe) = probe else {
+        return "-".to_owned();
+    };
+    let mode = probe
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("server");
+    match probe.get("url").and_then(serde_json::Value::as_str) {
+        Some(url) => format!("{mode} {url}"),
+        None => mode.to_owned(),
+    }
+}
+
+fn health_text(health: Option<&serde_json::Value>) -> String {
+    let Some(health) = health else {
+        return "unknown".to_owned();
+    };
+    let alive = health
+        .get("alive")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match health.get("latency_us").and_then(serde_json::Value::as_u64) {
+        Some(micros) if alive => format!("alive {:.1}ms", micros as f64 / 1000.0),
+        Some(_) => "dead".to_owned(),
+        None if alive => "alive".to_owned(),
+        None => "unknown".to_owned(),
+    }
 }
 
 fn print_human(snapshot: &Snapshot) {

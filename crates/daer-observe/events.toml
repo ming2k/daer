@@ -72,16 +72,6 @@ rate = "daemon.datapath_rebuild_failed"
 remediation = "mac/dscp/pname rules will not match until the generation rebuild succeeds; fix the reported error and reload."
 
 [[events]]
-name = "DaemonRecoveryWarning"
-code = "daemon.recovery_warning"
-level = "warn"
-message = "could not fully recover state from a previous run"
-fields = ["error"]
-counter = "daemon.recovery_warning"
-rate = "daemon.recovery_warning"
-remediation = "Inspect `/run/daer` and run `daer-cleanup`; a stale TC filter or sysctl may still be installed."
-
-[[events]]
 name = "DaemonConfigWarning"
 code = "daemon.config_warning"
 level = "warn"
@@ -338,14 +328,14 @@ name = "GenerationLoaded"
 code = "generation.loaded"
 level = "info"
 message = "configuration loaded"
-fields = ["generation", "rules", "groups", "nodes", "build_ms", "policy_hash"]
+fields = ["generation", "rules", "groups", "elections", "nodes", "build_ms", "policy_hash"]
 
 [[events]]
 name = "GenerationReloaded"
 code = "generation.reloaded"
 level = "info"
 message = "configuration reloaded"
-fields = ["generation", "previous", "rules", "groups", "nodes", "routing_changed", "build_ms", "policy_hash", "source"]
+fields = ["generation", "previous", "rules", "groups", "elections", "nodes", "routing_changed", "build_ms", "policy_hash", "source"]
 
 [[events]]
 name = "GenerationStartupRejected"
@@ -476,31 +466,22 @@ counter = "provider.cache_fallback"
 rate = "provider.cache_fallback"
 remediation = "The rules are stale but serving; check the provider URL and network."
 
-[[events]]
-name = "ProviderUnusableTcpUrl"
-code = "provider.unusable_tcp_url"
-level = "warn"
-message = "health check: unusable tcp-url entry"
-fields = ["entry", "error"]
-counter = "provider.unusable_tcp_url"
-rate = "provider.unusable_tcp_url"
-remediation = "Use a literal `ip:port` or a URL; the entry was skipped."
 
 [[events]]
-name = "ProviderUnusableTcpMethod"
-code = "provider.unusable_tcp_method"
+name = "ElectionProbeMethodInvalid"
+code = "election.probe_method_invalid"
 level = "warn"
-message = "health check: unusable tcp-method; falling back to HEAD"
+message = "probe method is not GET or HEAD; falling back to HEAD"
 fields = ["method", "error"]
-counter = "provider.unusable_tcp_method"
-rate = "provider.unusable_tcp_method"
-remediation = "Use a valid HTTP method for the health probe."
+counter = "election.probe_method_invalid"
+rate = "election.probe_method_invalid"
+remediation = "Use GET or HEAD for an election probe."
 
 [[events]]
-name = "ProviderUnresolvedUdp"
-code = "provider.unresolved_udp"
+name = "ElectionProbeUdpName"
+code = "election.probe_udp_name"
 level = "debug"
-message = "health check: udp-dns entries that are names are not probed"
+message = "probe udp-dns entry is a name; not resolved"
 fields = ["entries"]
 
 [[events]]
@@ -557,7 +538,7 @@ name = "FlowNodeSelected"
 code = "flow.node_selected"
 level = "trace"
 message = "node selected"
-fields = ["flow_id", "group", "node", "protocol", "policy", "latency_us"]
+fields = ["flow_id", "election", "node", "protocol", "kind", "latency_us"]
 
 [[events]]
 name = "FlowAccepted"
@@ -643,7 +624,7 @@ name = "FlowDialFailed"
 code = "flow.dial_failed"
 level = "warn"
 message = "flow dial failed"
-fields = ["flow_id", "generation", "destination", "group", "node", "stage", "error_code", "elapsed_ms"]
+fields = ["flow_id", "generation", "destination", "election", "node", "stage", "error_code", "elapsed_ms"]
 counter = "flow.dial_failed"
 rate = "flow.dial_failed"
 remediation = "Check the selected node and the dial stage; run `daer probe node <node>`."
@@ -698,7 +679,7 @@ message = "datagram flow refused"
 fields = ["flow_id", "destination", "error", "error_code"]
 counter = "flow.datagram_refused"
 rate = "flow.datagram_refused"
-remediation = "The group has no selectable datagram-capable node; check the node and policy."
+remediation = "The election has no electable datagram-capable node; check the node and probe settings."
 
 [[events]]
 name = "DatagramSessionFailed"
@@ -888,7 +869,7 @@ name = "HealthProbeRecordFailed"
 code = "health.probe_record_failed"
 level = "warn"
 message = "probe result could not be recorded; this generation is stale"
-fields = ["group", "node", "error"]
+fields = ["election", "node", "error"]
 counter = "health.probe_record_failed"
 rate = "health.probe_record_failed"
 remediation = "The health scheduler holds a stale router; reload the generation and restart the scheduler."
@@ -898,31 +879,25 @@ name = "HealthNodeAlive"
 code = "health.node_alive"
 level = "trace"
 message = "node alive"
-fields = ["probe_id", "group", "node", "latency_ns"]
+fields = ["probe_id", "election", "node", "latency_ns"]
 
 [[events]]
 name = "HealthProbeFailed"
 code = "health.probe_failed"
 level = "warn"
 message = "node probe failed"
-fields = ["probe_id", "group", "node", "failure", "consecutive_failures"]
+fields = ["probe_id", "election", "node", "failure", "consecutive_failures"]
 counter = "health.probe_failed"
 rate = "health.probe_failed"
 remediation = "Run `daer probe node <node>`; the node is not selectable until a probe succeeds."
 
-[[events]]
-name = "HealthTcpUrlName"
-code = "health.tcp_url_name"
-level = "debug"
-message = "health check: tcp-url entry is a name, not an address"
-fields = ["entry"]
 
 [[events]]
 name = "HealthNodeUnprobeable"
 code = "health.node_unprobeable"
 level = "debug"
 message = "node has no literal address; not probed"
-fields = ["group", "node"]
+fields = ["election", "node"]
 
 [[events]]
 name = "HealthSchedulerStopped"
@@ -984,10 +959,10 @@ name = "DatapathCleanupFailed"
 code = "datapath.cleanup_failed"
 level = "warn"
 message = "datapath cleanup failed"
-fields = ["step", "interface", "path", "error"]
+fields = ["error"]
 counter = "datapath.cleanup_failed"
 rate = "datapath.cleanup_failed"
-remediation = "Run `daer-cleanup`; the recovery journal is kept for ExecStopPost or the next start."
+remediation = "The ingress namespace is private; stopping the process releases it. Inspect the namespace with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list` while the process lives."
 
 [[events]]
 name = "DatapathIpv6Unavailable"
@@ -1007,7 +982,7 @@ message = "could not restore a host sysctl"
 fields = ["path", "error"]
 counter = "datapath.sysctl_restore_failed"
 rate = "datapath.sysctl_restore_failed"
-remediation = "Run `daer-cleanup`; the recovery journal is kept for the next start."
+remediation = "The value is per-device and disappears with `daer0`; inspect `/proc/sys/net/ipv4/conf/daer0` while the device exists."
 
 [[events]]
 name = "DatapathPeerDetachFailed"
@@ -1017,7 +992,7 @@ message = "could not detach the peer ingress link"
 fields = ["error"]
 counter = "datapath.peer_detach_failed"
 rate = "datapath.peer_detach_failed"
-remediation = "Run `daer-cleanup`; inspect the namespace through `/proc/<pid>/root/run/netns` if it remains."
+remediation = "The link is fd-owned and detaches with the process. Inspect `bpftool link show`; no qdisc or persistent filter is created."
 
 [[events]]
 name = "DatapathTelemetryFailed"
@@ -1068,7 +1043,7 @@ message = "could not remove the ingress namespace mount"
 fields = ["error"]
 counter = "netns.cleanup_failed"
 rate = "netns.cleanup_failed"
-remediation = "A stale mount may remain; run `daer-cleanup` and inspect `/proc/<pid>/root/run/netns`."
+remediation = "The namespace mount is private to the daemon's mount namespace. Inspect it with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`."
 
 # ---------------------------------------------------------------------------
 # Protocol-level diagnostics
@@ -1124,3 +1099,71 @@ fields = ["incident_id", "trigger", "path", "events", "redaction"]
 counter = "incident.capture"
 rate = "incident.capture"
 remediation = "Attach the bundle to the incident record; do not paste raw logs separately."
+
+# ---------------------------------------------------------------------------
+# Runtime elections
+# ---------------------------------------------------------------------------
+
+[[events]]
+name = "ElectionPinned"
+code = "election.pinned"
+level = "info"
+message = "election pinned to a node"
+fields = ["election", "node", "previous", "peer_uid", "peer_pid", "generation", "persisted"]
+
+[[events]]
+name = "ElectionReset"
+code = "election.reset"
+level = "info"
+message = "election reset to its configured rule"
+fields = ["election", "previous", "peer_uid", "peer_pid", "generation", "persisted"]
+
+[[events]]
+name = "ElectionRejected"
+code = "election.rejected"
+level = "warn"
+message = "election change rejected"
+fields = ["election", "node", "error", "peer_uid", "peer_pid"]
+counter = "election.rejected"
+rate = "election.rejected"
+remediation = "Run `daer status --elections` to inspect valid elections and candidates."
+
+[[events]]
+name = "ElectionStateRejected"
+code = "election.state_rejected"
+level = "warn"
+message = "election state file is not usable; starting without overrides"
+fields = ["path", "schema", "expected", "error"]
+counter = "election.state_rejected"
+rate = "election.state_rejected"
+remediation = "Inspect /var/lib/daer/elections.json; a corrupt state file is ignored, never fatal."
+
+[[events]]
+name = "ElectionStateWriteFailed"
+code = "election.state_write_failed"
+level = "warn"
+message = "could not persist election state"
+fields = ["error"]
+counter = "election.state_write_failed"
+rate = "election.state_write_failed"
+remediation = "Check that /var/lib/daer is writable and has free space; the running election may not survive a restart."
+
+[[events]]
+name = "ElectionOverridePruned"
+code = "election.override_pruned"
+level = "warn"
+message = "election override no longer names a valid candidate"
+fields = ["election", "node"]
+counter = "election.override_pruned"
+rate = "election.override_pruned"
+remediation = "Run `daer status --elections`; the election now follows its configured rule."
+
+[[events]]
+name = "ElectionSocketFailed"
+code = "election.socket_failed"
+level = "warn"
+message = "could not bind the runtime election admin socket"
+fields = ["path", "error"]
+counter = "election.socket_failed"
+rate = "election.socket_failed"
+remediation = "Check that /run/daer is writable and that the daemon user owns it; daer elect and the live status views need this socket."

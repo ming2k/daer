@@ -13,7 +13,7 @@ This article explains the mechanics of `daer`'s kernel datapath: how the tc hook
                          │
                          ▼
            ┌───────────────────────────┐
-           │ Check SO_MARK == 0x0dae?  │ ──(Yes)──> Pass (TC_ACT_OK)
+           │ Check SO_MARK == 0x64616572?  │ ──(Yes)──> Pass (DAER_TC_PASS)
            └─────────────┬─────────────┘
                          │ (No)
                          ▼
@@ -25,14 +25,14 @@ This article explains the mechanics of `daer`'s kernel datapath: how the tc hook
          ┌───────────────┴───────────────┐
          ▼                               ▼
     Verdict: Direct                Verdict: Proxy
-    (TC_ACT_OK)                    (Redirect to daer0 / TPROXY)
+    (DAER_TC_PASS)                 (Redirect to daer0 / bpf_sk_assign)
 ```
 
 1. **Mark Exemption**: The program first inspects `skb->mark`. If marked with `so-mark`, the packet originated from `daer` itself and is passed through immediately.
 2. **5-Tuple Lookup**: Source IP, destination IP, source port, destination port, and protocol are extracted and evaluated against the active epoch's kernel policy maps.
 3. **Action Execution**:
    - `DIRECT`: Continues native Linux kernel forwarding.
-   - `PROXY`: Redirected via peer veth pair into the transparent port listener.
+   - `PROXY`: Redirected via veth into `daer0ns` and assigned directly to the ephemeral listener via `bpf_sk_assign` (ADR-0038, ADR-0043).
    - `DEFER`: Redirected to userspace control plane for domain/process evaluation.
 
 ---

@@ -12,7 +12,7 @@
 //!
 //! ```text
 //!   tcp ──▶ [none] ──────────────────────▶ plaintext stream
-//!       ──▶ [tls]  ── rustls ───────────▶ opaque stream
+//!       ──▶ [tls]  ── netune TLS ───────▶ opaque stream
 //!       ──▶ [reality] ─ daer TLS 1.3 ───▶ opaque stream
 //! ```
 //!
@@ -35,6 +35,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use netune::Transport;
+use netune_trace::TraceCollector;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::ProxyProtocolError;
@@ -52,6 +53,9 @@ pub struct Opaque {
     pub raw_read: Option<Arc<AtomicBool>>,
     /// The ALPN the peer selected, when the security layer had one to report.
     pub alpn: Option<String>,
+    /// Raw negotiated ALPN bytes, preserved for a protocol that uses a name netune's
+    /// trace enum does not classify.
+    pub alpn_protocol: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Opaque {
@@ -71,6 +75,7 @@ impl Opaque {
             stream,
             raw_read: None,
             alpn: None,
+            alpn_protocol: None,
         }
     }
 }
@@ -126,6 +131,8 @@ impl Security {
     /// Wraps `stream` in this layer.
     ///
     /// `node_host` is the node's own hostname, used when the layer names no SNI of its own.
+    /// `recorder` is passed to netune's TLS handshake so the phase is observable on the same
+    /// trace as the DNS/TCP legs that produced the stream.
     ///
     /// # Errors
     ///
@@ -135,6 +142,7 @@ impl Security {
         &self,
         stream: S,
         node_host: &str,
+        recorder: &TraceCollector,
         timeout: Duration,
     ) -> Result<Opaque, ProxyProtocolError>
     where
@@ -142,7 +150,7 @@ impl Security {
     {
         match self {
             Self::None => Ok(Opaque::plain(Box::new(stream))),
-            Self::Tls(params) => tls::wrap(stream, params, node_host, timeout).await,
+            Self::Tls(params) => tls::wrap(stream, params, node_host, recorder, timeout).await,
             Self::Reality(security) => security.wrap(stream, timeout).await,
         }
     }

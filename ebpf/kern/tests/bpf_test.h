@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 
 //go:build exclude
 
@@ -65,7 +65,7 @@ set_ipv4_tcp_with_flags(struct __sk_buff *skb,
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end) {
 		bpf_printk("data + sizeof(*eth) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	eth->h_dest[0] = 0x0;
 	eth->h_dest[1] = 0x1;
@@ -84,7 +84,7 @@ set_ipv4_tcp_with_flags(struct __sk_buff *skb,
 	struct iphdr *ip = data + ETH_HLEN;
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	ip->ihl = 5;
 	ip->version = 4;
@@ -96,7 +96,7 @@ set_ipv4_tcp_with_flags(struct __sk_buff *skb,
 	struct tcphdr *tcp = data + ETH_HLEN + IP4_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	tcp->source = bpf_htons(sport);
 	tcp->dest = bpf_htons(dport);
@@ -104,7 +104,7 @@ set_ipv4_tcp_with_flags(struct __sk_buff *skb,
 	tcp->ack = ack;
 	tcp->psh = psh;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -123,17 +123,17 @@ set_ipv4_tcp_with_dscp(struct __sk_buff *skb,
 		       __u8 dscp)
 {
 	if (set_ipv4_tcp(skb, saddr, daddr, sport, dport))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *ip = data + ETH_HLEN;
 
 	if ((void *)(ip + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip->tos = dscp << 2;
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -143,9 +143,9 @@ set_ipv4_tcp_fastpath_with_dscp(struct __sk_buff *skb,
 			       __u8 dscp)
 {
 	if (set_ipv4_tcp_with_dscp(skb, saddr, daddr, sport, dport, dscp))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_skb_change_tail(skb, FAST_PATH_PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -154,11 +154,11 @@ set_ipv4_tcp_fastpath_with_dscp(struct __sk_buff *skb,
 
 	if (data + FAST_PATH_PACKET_SIZE > data_end ||
 	    (void *)(tcp + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip->tot_len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN);
 	tcp->doff = 5;
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline void
@@ -179,13 +179,13 @@ set_ipv6_tcp_with_dscp(struct __sk_buff *skb,
 		       __u8 dscp)
 {
 	if (bpf_skb_change_tail(skb, ETH_HLEN + IP6_HLEN + TCP_HLEN, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	if (data + ETH_HLEN + IP6_HLEN + TCP_HLEN > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -222,7 +222,7 @@ set_ipv6_tcp_with_dscp(struct __sk_buff *skb,
 	tcp->doff = 5;
 	tcp->syn = 1;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -236,9 +236,9 @@ set_ipv6_tcp_fastpath_with_dscp(struct __sk_buff *skb,
 				       saddr0, saddr1, saddr2, saddr3,
 				       daddr0, daddr1, daddr2, daddr3,
 				       sport, dport, dscp))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_skb_change_tail(skb, FAST_PATH_PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -247,11 +247,11 @@ set_ipv6_tcp_fastpath_with_dscp(struct __sk_buff *skb,
 
 	if (data + FAST_PATH_PACKET_SIZE > data_end ||
 	    (void *)(tcp + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip6->payload_len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN - IP6_HLEN);
 	tcp->doff = 5;
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -266,22 +266,22 @@ check_status_and_mark(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code,
 			   expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (skb->mark != expected_mark) {
 		bpf_printk("skb->mark(%d) != %d\n", skb->mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -294,26 +294,26 @@ check_redirect_non_syn_tcp(struct __sk_buff *skb)
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
-	if (*status_code != TC_ACT_REDIRECT) {
-		bpf_printk("status_code(%d) != TC_ACT_REDIRECT\n", *status_code);
-		return TC_ACT_SHOT;
+	if (*status_code != DAER_TC_REDIRECT) {
+		bpf_printk("status_code(%d) != DAER_TC_REDIRECT\n", *status_code);
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[0] != TPROXY_MARK) {
 		bpf_printk("skb->cb[0] != TPROXY_MARK\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[1] != 0) {
 		bpf_printk("skb->cb[1] != 0 for non-syn tcp\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -327,27 +327,27 @@ check_redirect_with_listener_l4proto(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
-	if (*status_code != TC_ACT_REDIRECT) {
-		bpf_printk("status_code(%d) != TC_ACT_REDIRECT\n", *status_code);
-		return TC_ACT_SHOT;
+	if (*status_code != DAER_TC_REDIRECT) {
+		bpf_printk("status_code(%d) != DAER_TC_REDIRECT\n", *status_code);
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[0] != TPROXY_MARK) {
 		bpf_printk("skb->cb[0] != TPROXY_MARK\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[1] != expected_listener_l4proto) {
 		bpf_printk("skb->cb[1](%d) != %d\n", skb->cb[1],
 			   expected_listener_l4proto);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -362,40 +362,40 @@ check_redirect_with_listener_l4proto_and_track_ipv4(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
-	if (*status_code != TC_ACT_REDIRECT) {
-		bpf_printk("status_code(%d) != TC_ACT_REDIRECT\n", *status_code);
-		return TC_ACT_SHOT;
+	if (*status_code != DAER_TC_REDIRECT) {
+		bpf_printk("status_code(%d) != DAER_TC_REDIRECT\n", *status_code);
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[0] != TPROXY_MARK) {
 		bpf_printk("skb->cb[0] != TPROXY_MARK\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (skb->cb[1] != expected_listener_l4proto) {
 		bpf_printk("skb->cb[1](%d) != %d\n", skb->cb[1],
 			   expected_listener_l4proto);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct ethhdr *eth = data + sizeof(*status_code);
 	if ((void *)(eth + 1) > data_end) {
 		bpf_printk("data + sizeof(*eth) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 		bpf_printk("eth->h_proto != ETH_P_IP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct iphdr *ip = (void *)eth + ETH_HLEN;
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct redirect_tuple tuple = {};
@@ -408,19 +408,19 @@ check_redirect_with_listener_l4proto_and_track_ipv4(struct __sk_buff *skb,
 		bpf_map_lookup_elem(&redirect_track, &tuple);
 	if (!entry) {
 		bpf_printk("redirect_track entry missing\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (entry->from_wan != expected_from_wan) {
 		bpf_printk("entry->from_wan(%d) != %d\n", entry->from_wan,
 			   expected_from_wan);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (entry->last_seen_ns == 0) {
 		bpf_printk("entry->last_seen_ns == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -439,13 +439,13 @@ check_tcp_conn_state_ipv4_tcp(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct iphdr *ip;
@@ -454,11 +454,11 @@ check_tcp_conn_state_ipv4_tcp(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 			bpf_printk("eth->h_proto != ETH_P_IP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip = (void *)eth + ETH_HLEN;
 	} else {
@@ -467,17 +467,17 @@ check_tcp_conn_state_ipv4_tcp(struct __sk_buff *skb,
 
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->protocol != IPPROTO_TCP) {
 		bpf_printk("ip->protocol != IPPROTO_TCP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tcphdr *tcp = (void *)ip + IP4_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tuples tuples = {};
@@ -493,27 +493,27 @@ check_tcp_conn_state_ipv4_tcp(struct __sk_buff *skb,
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 	if (!conn_state) {
 		bpf_printk("conn_state == NULL\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.has_routing == 0) {
 		bpf_printk("conn_state->meta.data.has_routing == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.outbound != expected_outbound) {
 		bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 			   conn_state->meta.data.outbound, expected_outbound);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.mark != expected_mark) {
 		bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 			   conn_state->meta.data.mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -533,13 +533,13 @@ check_tcp_conn_state_ipv4_tcp_dscp(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct iphdr *ip;
@@ -548,11 +548,11 @@ check_tcp_conn_state_ipv4_tcp_dscp(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 			bpf_printk("eth->h_proto != ETH_P_IP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip = (void *)eth + ETH_HLEN;
 	} else {
@@ -561,17 +561,17 @@ check_tcp_conn_state_ipv4_tcp_dscp(struct __sk_buff *skb,
 
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->protocol != IPPROTO_TCP) {
 		bpf_printk("ip->protocol != IPPROTO_TCP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tcphdr *tcp = (void *)ip + IP4_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tuples tuples = {};
@@ -587,33 +587,33 @@ check_tcp_conn_state_ipv4_tcp_dscp(struct __sk_buff *skb,
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 	if (!conn_state) {
 		bpf_printk("conn_state == NULL\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.has_routing == 0) {
 		bpf_printk("conn_state->meta.data.has_routing == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.outbound != expected_outbound) {
 		bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 			   conn_state->meta.data.outbound, expected_outbound);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.mark != expected_mark) {
 		bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 			   conn_state->meta.data.mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.dscp != expected_dscp) {
 		bpf_printk("conn_state->meta.data.dscp(%d) != %d\n",
 			   conn_state->meta.data.dscp, expected_dscp);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -634,13 +634,13 @@ check_tcp_conn_state_ipv6_tcp_dscp(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct ipv6hdr *ip6;
@@ -649,11 +649,11 @@ check_tcp_conn_state_ipv6_tcp_dscp(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IPV6)) {
 			bpf_printk("eth->h_proto != ETH_P_IPV6\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip6 = (void *)eth + ETH_HLEN;
 	} else {
@@ -662,17 +662,17 @@ check_tcp_conn_state_ipv6_tcp_dscp(struct __sk_buff *skb,
 
 	if ((void *)(ip6 + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip6) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->nexthdr != IPPROTO_TCP) {
 		bpf_printk("ip6->nexthdr != IPPROTO_TCP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tcphdr *tcp = (void *)ip6 + IP6_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (ip6->saddr.in6_u.u6_addr32[0] != bpf_htonl(saddr0) ||
@@ -680,14 +680,14 @@ check_tcp_conn_state_ipv6_tcp_dscp(struct __sk_buff *skb,
 	    ip6->saddr.in6_u.u6_addr32[2] != bpf_htonl(saddr2) ||
 	    ip6->saddr.in6_u.u6_addr32[3] != bpf_htonl(saddr3)) {
 		bpf_printk("ip6->saddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->daddr.in6_u.u6_addr32[0] != bpf_htonl(daddr0) ||
 	    ip6->daddr.in6_u.u6_addr32[1] != bpf_htonl(daddr1) ||
 	    ip6->daddr.in6_u.u6_addr32[2] != bpf_htonl(daddr2) ||
 	    ip6->daddr.in6_u.u6_addr32[3] != bpf_htonl(daddr3)) {
 		bpf_printk("ip6->daddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tuples tuples = {};
@@ -701,33 +701,33 @@ check_tcp_conn_state_ipv6_tcp_dscp(struct __sk_buff *skb,
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 	if (!conn_state) {
 		bpf_printk("conn_state == NULL\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.has_routing == 0) {
 		bpf_printk("conn_state->meta.data.has_routing == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.outbound != expected_outbound) {
 		bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 			   conn_state->meta.data.outbound, expected_outbound);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.mark != expected_mark) {
 		bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 			   conn_state->meta.data.mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.dscp != expected_dscp) {
 		bpf_printk("conn_state->meta.data.dscp(%d) != %d\n",
 			   conn_state->meta.data.dscp, expected_dscp);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -746,24 +746,24 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	if (expected_status_code == TC_ACT_REDIRECT) {
+	if (expected_status_code == DAER_TC_REDIRECT) {
 		if (skb->cb[0] != TPROXY_MARK) {
 			bpf_printk("skb->cb[0] != TPROXY_MARK\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (skb->cb[1] != IPPROTO_TCP) {
 			bpf_printk("skb->cb[1] != IPPROTO_TCP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 	}
@@ -774,11 +774,11 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 			bpf_printk("eth->h_proto != ETH_P_IP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip = (void *)eth + ETH_HLEN;
 	} else {
@@ -787,36 +787,36 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->protocol != IPPROTO_TCP) {
 		bpf_printk("ip->protocol != IPPROTO_TCP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->saddr != bpf_htonl(saddr)) {
 		bpf_printk("ip->saddr != %pI4\n", &saddr);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->daddr != bpf_htonl(daddr)) {
 		bpf_printk("ip->daddr != %pI4\n", &daddr);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tcphdr *tcp = (void *)ip + IP4_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (tcp->source != bpf_htons(sport)) {
 		bpf_printk("tcp->source != %d\n", sport);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (tcp->dest != bpf_htons(dport)) {
 		bpf_printk("tcp->dest != %d\n", dport);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	if (expected_status_code == TC_ACT_REDIRECT) {
+	if (expected_status_code == DAER_TC_REDIRECT) {
 		struct tuples tuples = {};
 		tuples.five.sip.u6_addr32[2] = bpf_htonl(0xffff);
 		tuples.five.sip.u6_addr32[3] = ip->saddr;
@@ -831,28 +831,28 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 		conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 		if (!conn_state) {
 			bpf_printk("conn_state == NULL\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.has_routing == 0) {
 			bpf_printk("conn_state->meta.data.has_routing == 0\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.outbound != expected_outbound) {
 			bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 				   conn_state->meta.data.outbound, expected_outbound);
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.mark != expected_mark) {
 			bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 				   conn_state->meta.data.mark, expected_mark);
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -872,13 +872,13 @@ check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct iphdr *ip;
@@ -887,11 +887,11 @@ check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 			bpf_printk("eth->h_proto != ETH_P_IP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip = (void *)eth + ETH_HLEN;
 	} else {
@@ -900,17 +900,17 @@ check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 
 	if ((void *)(ip + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip->protocol != IPPROTO_UDP) {
 		bpf_printk("ip->protocol != IPPROTO_UDP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct udphdr *udp = (void *)ip + IP4_HLEN;
 	if ((void *)(udp + 1) > data_end) {
 		bpf_printk("data + sizeof(*udp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tuples tuples = {};
@@ -926,33 +926,33 @@ check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 	if (!conn_state) {
 		bpf_printk("conn_state == NULL\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.has_routing == 0) {
 		bpf_printk("conn_state->meta.data.has_routing == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.outbound != expected_outbound) {
 		bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 			   conn_state->meta.data.outbound, expected_outbound);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.mark != expected_mark) {
 		bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 			   conn_state->meta.data.mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.dscp != expected_dscp) {
 		bpf_printk("conn_state->meta.data.dscp(%d) != %d\n",
 			   conn_state->meta.data.dscp, expected_dscp);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -972,23 +972,23 @@ check_routing_ipv6_tcp_state(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	if (expected_status_code == TC_ACT_REDIRECT) {
+	if (expected_status_code == DAER_TC_REDIRECT) {
 		if (skb->cb[0] != TPROXY_MARK) {
 			bpf_printk("skb->cb[0] != TPROXY_MARK\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (skb->cb[1] != IPPROTO_TCP) {
 			bpf_printk("skb->cb[1] != IPPROTO_TCP\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 	}
 
@@ -998,11 +998,11 @@ check_routing_ipv6_tcp_state(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IPV6)) {
 			bpf_printk("eth->h_proto != ETH_P_IPV6\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip6 = (void *)eth + ETH_HLEN;
 	} else {
@@ -1011,25 +1011,25 @@ check_routing_ipv6_tcp_state(struct __sk_buff *skb,
 
 	if ((void *)(ip6 + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip6) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->nexthdr != IPPROTO_TCP) {
 		bpf_printk("ip6->nexthdr != IPPROTO_TCP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tcphdr *tcp = (void *)ip6 + IP6_HLEN;
 	if ((void *)(tcp + 1) > data_end) {
 		bpf_printk("data + sizeof(*tcp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (tcp->source != bpf_htons(sport)) {
 		bpf_printk("tcp->source != %d\n", sport);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (tcp->dest != bpf_htons(dport)) {
 		bpf_printk("tcp->dest != %d\n", dport);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (ip6->saddr.in6_u.u6_addr32[0] != bpf_htonl(saddr0) ||
@@ -1037,17 +1037,17 @@ check_routing_ipv6_tcp_state(struct __sk_buff *skb,
 	    ip6->saddr.in6_u.u6_addr32[2] != bpf_htonl(saddr2) ||
 	    ip6->saddr.in6_u.u6_addr32[3] != bpf_htonl(saddr3)) {
 		bpf_printk("ip6->saddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->daddr.in6_u.u6_addr32[0] != bpf_htonl(daddr0) ||
 	    ip6->daddr.in6_u.u6_addr32[1] != bpf_htonl(daddr1) ||
 	    ip6->daddr.in6_u.u6_addr32[2] != bpf_htonl(daddr2) ||
 	    ip6->daddr.in6_u.u6_addr32[3] != bpf_htonl(daddr3)) {
 		bpf_printk("ip6->daddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	if (expected_status_code == TC_ACT_REDIRECT) {
+	if (expected_status_code == DAER_TC_REDIRECT) {
 		struct tuples tuples = {};
 		__builtin_memcpy(&tuples.five.sip, &ip6->saddr, sizeof(ip6->saddr));
 		__builtin_memcpy(&tuples.five.dip, &ip6->daddr, sizeof(ip6->daddr));
@@ -1059,28 +1059,28 @@ check_routing_ipv6_tcp_state(struct __sk_buff *skb,
 		conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 		if (!conn_state) {
 			bpf_printk("conn_state == NULL\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.has_routing == 0) {
 			bpf_printk("conn_state->meta.data.has_routing == 0\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.outbound != expected_outbound) {
 			bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 				   conn_state->meta.data.outbound, expected_outbound);
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 
 		if (conn_state->meta.data.mark != expected_mark) {
 			bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 				   conn_state->meta.data.mark, expected_mark);
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1138,14 +1138,14 @@ set_minimal_ipv4_udp(struct __sk_buff *skb,
 #define MIN_UDP_PACKET_SIZE 42  // 14 (ETH) + 20 (IP) + 8 (UDP)
 
 	if (bpf_skb_change_tail(skb, MIN_UDP_PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	// Verify full packet size is available
 	if (data + MIN_UDP_PACKET_SIZE > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1181,7 +1181,7 @@ set_minimal_ipv4_udp(struct __sk_buff *skb,
 	udp->len = bpf_htons(8);
 	udp->check = 0;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1191,17 +1191,17 @@ set_minimal_ipv4_udp_with_dscp(struct __sk_buff *skb,
 			       __u8 dscp)
 {
 	if (set_minimal_ipv4_udp(skb, saddr, daddr, sport, dport))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *ip = data + ETH_HLEN;
 
 	if ((void *)(ip + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip->tos = dscp << 2;
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1211,9 +1211,9 @@ set_ipv4_udp_fastpath_with_dscp(struct __sk_buff *skb,
 			       __u8 dscp)
 {
 	if (set_minimal_ipv4_udp_with_dscp(skb, saddr, daddr, sport, dport, dscp))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_skb_change_tail(skb, FAST_PATH_PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -1222,11 +1222,11 @@ set_ipv4_udp_fastpath_with_dscp(struct __sk_buff *skb,
 
 	if (data + FAST_PATH_PACKET_SIZE > data_end ||
 	    (void *)(udp + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip->tot_len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN);
 	udp->len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN - IP4_HLEN);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1237,13 +1237,13 @@ set_minimal_ipv6_udp_with_dscp(struct __sk_buff *skb,
 			       __u8 dscp)
 {
 	if (bpf_skb_change_tail(skb, ETH_HLEN + IP6_HLEN + sizeof(struct udphdr), 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	if (data + ETH_HLEN + IP6_HLEN + sizeof(struct udphdr) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1280,7 +1280,7 @@ set_minimal_ipv6_udp_with_dscp(struct __sk_buff *skb,
 	udp->len = bpf_htons(sizeof(struct udphdr));
 	udp->check = 0;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1294,9 +1294,9 @@ set_ipv6_udp_fastpath_with_dscp(struct __sk_buff *skb,
 				       saddr0, saddr1, saddr2, saddr3,
 				       daddr0, daddr1, daddr2, daddr3,
 				       sport, dport, dscp))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_skb_change_tail(skb, FAST_PATH_PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -1305,11 +1305,11 @@ set_ipv6_udp_fastpath_with_dscp(struct __sk_buff *skb,
 
 	if (data + FAST_PATH_PACKET_SIZE > data_end ||
 	    (void *)(udp + 1) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ip6->payload_len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN - IP6_HLEN);
 	udp->len = bpf_htons(FAST_PATH_PACKET_SIZE - ETH_HLEN - IP6_HLEN);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1330,13 +1330,13 @@ check_udp_conn_state_ipv6_udp_dscp(struct __sk_buff *skb,
 
 	if (data + sizeof(*status_code) > data_end) {
 		bpf_printk("data + sizeof(*status_code) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	status_code = data;
 	if (*status_code != expected_status_code) {
 		bpf_printk("status_code(%d) != %d\n", *status_code, expected_status_code);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct ipv6hdr *ip6;
@@ -1345,11 +1345,11 @@ check_udp_conn_state_ipv6_udp_dscp(struct __sk_buff *skb,
 		struct ethhdr *eth = data + sizeof(*status_code);
 		if ((void *)(eth + 1) > data_end) {
 			bpf_printk("data + sizeof(*eth) > data_end\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		if (eth->h_proto != bpf_htons(ETH_P_IPV6)) {
 			bpf_printk("eth->h_proto != ETH_P_IPV6\n");
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		ip6 = (void *)eth + ETH_HLEN;
 	} else {
@@ -1358,17 +1358,17 @@ check_udp_conn_state_ipv6_udp_dscp(struct __sk_buff *skb,
 
 	if ((void *)(ip6 + 1) > data_end) {
 		bpf_printk("data + sizeof(*ip6) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->nexthdr != IPPROTO_UDP) {
 		bpf_printk("ip6->nexthdr != IPPROTO_UDP\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct udphdr *udp = (void *)ip6 + IP6_HLEN;
 	if ((void *)(udp + 1) > data_end) {
 		bpf_printk("data + sizeof(*udp) > data_end\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (ip6->saddr.in6_u.u6_addr32[0] != bpf_htonl(saddr0) ||
@@ -1376,14 +1376,14 @@ check_udp_conn_state_ipv6_udp_dscp(struct __sk_buff *skb,
 	    ip6->saddr.in6_u.u6_addr32[2] != bpf_htonl(saddr2) ||
 	    ip6->saddr.in6_u.u6_addr32[3] != bpf_htonl(saddr3)) {
 		bpf_printk("ip6->saddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (ip6->daddr.in6_u.u6_addr32[0] != bpf_htonl(daddr0) ||
 	    ip6->daddr.in6_u.u6_addr32[1] != bpf_htonl(daddr1) ||
 	    ip6->daddr.in6_u.u6_addr32[2] != bpf_htonl(daddr2) ||
 	    ip6->daddr.in6_u.u6_addr32[3] != bpf_htonl(daddr3)) {
 		bpf_printk("ip6->daddr mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	struct tuples tuples = {};
@@ -1397,33 +1397,33 @@ check_udp_conn_state_ipv6_udp_dscp(struct __sk_buff *skb,
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &tuples.five);
 	if (!conn_state) {
 		bpf_printk("conn_state == NULL\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.has_routing == 0) {
 		bpf_printk("conn_state->meta.data.has_routing == 0\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.outbound != expected_outbound) {
 		bpf_printk("conn_state->meta.data.outbound(%d) != %d\n",
 			   conn_state->meta.data.outbound, expected_outbound);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.mark != expected_mark) {
 		bpf_printk("conn_state->meta.data.mark(%d) != %d\n",
 			   conn_state->meta.data.mark, expected_mark);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (conn_state->meta.data.dscp != expected_dscp) {
 		bpf_printk("conn_state->meta.data.dscp(%d) != %d\n",
 			   conn_state->meta.data.dscp, expected_dscp);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1432,13 +1432,13 @@ set_ipv4_udp_first_fragment(struct __sk_buff *skb,
 			    __u16 sport, __u16 dport)
 {
 	if (bpf_skb_change_tail(skb, ETH_HLEN + IP4_HLEN + sizeof(struct udphdr), 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	if (data + ETH_HLEN + IP4_HLEN + sizeof(struct udphdr) > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1474,7 +1474,7 @@ set_ipv4_udp_first_fragment(struct __sk_buff *skb,
 	udp->len = bpf_htons(sizeof(struct udphdr));
 	udp->check = 0;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1484,13 +1484,13 @@ set_ipv4_udp_non_initial_fragment(struct __sk_buff *skb,
 	const __u32 payload_len = 8;
 
 	if (bpf_skb_change_tail(skb, ETH_HLEN + IP4_HLEN + payload_len, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	if (data + ETH_HLEN + IP4_HLEN + payload_len > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1522,7 +1522,7 @@ set_ipv4_udp_non_initial_fragment(struct __sk_buff *skb,
 
 	__builtin_memset(data + ETH_HLEN + IP4_HLEN, 0xab, payload_len);
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -1532,13 +1532,13 @@ set_ipv4_tcp_first_fragment_with_flags(struct __sk_buff *skb,
 				       bool syn, bool ack, bool psh)
 {
 	if (bpf_skb_change_tail(skb, ETH_HLEN + IP4_HLEN + TCP_HLEN, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	if (data + ETH_HLEN + IP4_HLEN + TCP_HLEN > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1576,7 +1576,7 @@ set_ipv4_tcp_first_fragment_with_flags(struct __sk_buff *skb,
 	tcp->ack = ack;
 	tcp->psh = psh;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 // BUG-001 test helper: Create IPv6 packet with large extension headers
@@ -1597,14 +1597,14 @@ set_ipv6_with_large_extensions(struct __sk_buff *skb,
 #define PACKET_SIZE 512
 
 	if (bpf_skb_change_tail(skb, PACKET_SIZE, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
 	// Verify we have the full packet size
 	if (data + PACKET_SIZE > data_end)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	struct ethhdr *eth = data;
 	eth->h_dest[0] = 0x0;
@@ -1679,5 +1679,5 @@ set_ipv6_with_large_extensions(struct __sk_buff *skb,
 		tcp->doff = 5;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }

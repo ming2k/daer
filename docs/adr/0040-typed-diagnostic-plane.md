@@ -158,6 +158,10 @@ The manifest records the config path and a hash, not its content. Redaction is a
 (`Secret`, `RedactedLink`), not a call-site convention. Canary tests inject a known
 password/UUID/key and fail if any bundle file contains it.
 
+> Amended by [ADR-0042](0042-tcx-only-linux-6-6.md): the daemon writes incident bundles
+> directly to `/var/lib/daer/incidents`; the tmpfs fallback and the `daer-cleanup` copier are
+> deleted. The paragraph below is retained as the history of the original decision.
+
 `daer-cleanup` preserves the last bundle after a crash; `/run/daer` is tmpfs, so the bundle
 must be copied to `StateDirectory=daer` before the process tree is reaped.
 

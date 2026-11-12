@@ -46,11 +46,16 @@ With `netune ADR-0016` ratifying first-class QUIC and HTTP/3 client capabilities
 
 All QUIC and HTTP/3 transport facilities are consumed exclusively from `netune::quic` (`netune-quic`) and `netune::http3` (`netune-http3`).
 
-`rustls` and `tokio-rustls` remain direct dependencies only where daer owns the
-handshake that netune cannot perform: the REALITY TLS 1.3 client (ADR-0010) and
-the product-specific TLS configuration Hysteria 2 hands to `netune-quic`. Both are
-built with `aws-lc-rs`; the point of this decision is one crypto provider and no
-second QUIC runtime, not the removal of a TLS type daer still needs.
+`rustls` remains a direct dependency for the REALITY TLS 1.3 client (ADR-0010), the
+product-specific TLS configuration Hysteria 2 hands to `netune-quic`, and the
+`AcceptAny` verifier the standard-TLS security layer supplies for
+`netune::TlsConnector`. The standard TLS handshake itself is netune's: the security
+layer passes a preconnected stream and a netune-built profile to `TlsConnector`, so
+the DNS/TCP/TLS phases share one trace and one handshake implementation.
+`tokio-rustls` is no longer a normal dependency of `daer`; it survives only in
+dev-dependencies that stand up local TLS test servers. Both crypto paths use
+`aws-lc-rs`; the point of this decision is one crypto provider and no second QUIC
+runtime, not the removal of a TLS type daer still needs.
 
 ### 2. Hysteria 2 Retains Only Product-Specific Semantics
 Hysteria 2 in `daer-proxy-protocols` is refactored to focus strictly on its proxy protocol
@@ -63,7 +68,7 @@ responsibilities:
 * Ingress/egress stream and UDP datagram framing.
 
 ### 3. The Transport Seams Are netune's, Not daer's
-netune 0.0.24 owns QUIC and HTTP/3; `quinn`, `quinn-proto`, `h3` and `h3-quinn` are absent from
+netune 0.0.28 owns QUIC and HTTP/3; `quinn`, `quinn-proto`, `h3` and `h3-quinn` are absent from
 the production graph. Three capabilities that a proxy needs are exposed as generic seams rather
 than product code in daer:
 

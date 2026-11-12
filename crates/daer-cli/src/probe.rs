@@ -19,15 +19,42 @@
 //! [`NodeReport::render`]. Keeping the two apart is what lets a whole pool be probed
 //! concurrently and still reported in configuration order: forty nodes that answered out of
 //! order would otherwise print a report whose ordering depends on the network.
+//!
+//! # Why phases 1 and 2 use netune with an unmarked socket
+//!
+//! Phase 1 resolves the node's own hostname and phase 2 performs a bare TCP handshake. Both
+//! deliberately use netune's `SystemResolver` and `TcpConnector` with a default
+//! `SocketConfig`, not daer's daemon mark or policy: the question is whether the node's
+//! address is reachable *outside* daer's policy stack. Using the same connector implementation
+//! keeps DNS, socket options and error classification on one seam without applying daer's
+//! routing policy. Phases 3 and 4 use netune through `daer-outbound`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use daer_config::NodeEndpoint;
-use daer_outbound::{DialerOptions, NodeDialer};
+use daer_outbound::{DialerOptions, NodeDialer, NodeGraph};
 use daer_routing::outbound_name;
-use tokio::net::TcpStream;
+use netune::{
+    Connector, DnsResolver, StaticResolver, SystemResolver, Target, TcpConnector, TraceCollector,
+};
+
+/// Formats a host for a netune resolver. IPv6 literals are bracketed before the port is
+/// appended; `daer-config` stores them without brackets.
+fn resolver_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
+/// Formats an authority for `Target::plain`, bracketing IPv6 literals.
+fn authority(host: &str, port: u16) -> String {
+    format!("{}:{port}", resolver_host(host))
+}
 
 /// The URL an end-to-end probe asks for when `--url` is not given.
 ///
@@ -199,10 +226,14 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
             );
             return Ok(());
         }
+        let pool = ProbePool {
+            nodes: Arc::new(resolved.config.node.clone()),
+        };
         probe_pool(
             &resolved.config.node,
             &options,
             &format!("{} (--all)", config_path.display()),
+            Some(pool),
         )
         .await
     } else if options.node.is_empty() {
@@ -247,8 +278,8 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
             .render()
             .map_err(|failure| anyhow::anyhow!("{failure:?}"))
     } else {
-        let node = resolve_node(&options).await?;
-        let report = probe_one(node, options).await;
+        let (node, index, pool) = resolve_node(&options).await?;
+        let report = probe_one(node, index, options, pool).await;
         report.render().map_err(|failure| {
             anyhow::anyhow!("{} probe failed: {}", failure.phase(), describe(&failure))
         })
@@ -256,9 +287,12 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
 }
 
 /// Finds the node `options.node` names: a link, or a name in the configuration.
-async fn resolve_node(options: &ProbeNodeOptions) -> anyhow::Result<daer_config::Node> {
+async fn resolve_node(
+    options: &ProbeNodeOptions,
+) -> anyhow::Result<(daer_config::Node, Option<usize>, Option<ProbePool>)> {
     if options.node.contains("://") {
         return daer_config::Node::from_link(&options.node)
+            .map(|node| (node, None, None))
             .map_err(|e| anyhow::anyhow!("invalid node link {:?}: {e}", options.node));
     }
     let config_path = crate::resolve_config(options.config.clone()).map_err(|e| {
@@ -271,25 +305,24 @@ async fn resolve_node(options: &ProbeNodeOptions) -> anyhow::Result<daer_config:
         .config
         .node
         .iter()
-        .find(|n| {
+        .position(|n| {
             n.label() == options.node
-                || n.tag.as_deref() == Some(&options.node)
+                || n.name.as_deref() == Some(&options.node)
                 || n.default_name() == options.node
                 || n.label().eq_ignore_ascii_case(&options.node)
-                || n.tag
+                || n.name
                     .as_deref()
                     .is_some_and(|t| t.eq_ignore_ascii_case(&options.node))
         })
         .or_else(|| {
-            resolved.config.node.iter().find(|n| {
+            resolved.config.node.iter().position(|n| {
                 n.label()
                     .to_ascii_lowercase()
                     .contains(&options.node.to_ascii_lowercase())
             })
-        })
-        .cloned();
+        });
 
-    let Some(node) = found else {
+    let Some(index) = found else {
         let available: Vec<_> = resolved.config.node.iter().map(|n| n.label()).collect();
         bail!(
             "node {:?} not found in {}; available nodes: {}",
@@ -302,7 +335,10 @@ async fn resolve_node(options: &ProbeNodeOptions) -> anyhow::Result<daer_config:
             }
         );
     };
-    Ok(node)
+    let pool = ProbePool {
+        nodes: Arc::new(resolved.config.node.clone()),
+    };
+    Ok((resolved.config.node[index].clone(), Some(index), Some(pool)))
 }
 
 fn describe(failure: &Failure) -> &str {
@@ -332,13 +368,18 @@ fn protocol_name(node: &daer_config::Node) -> &str {
 }
 
 /// Probes one node. Measures only; [`NodeReport::render`] prints.
-async fn probe_one(node: daer_config::Node, options: ProbeNodeOptions) -> NodeReport {
+async fn probe_one(
+    node: daer_config::Node,
+    index: Option<usize>,
+    options: ProbeNodeOptions,
+    pool: Option<ProbePool>,
+) -> NodeReport {
     let protocol = protocol_name(&node).to_owned();
     let mut report = NodeReport {
         label: node.label(),
         protocol,
         endpoint: None,
-        direct: matches!(node.endpoint, NodeEndpoint::Direct(_)),
+        direct: matches!(node.endpoint, NodeEndpoint::Direct(_)) && node.detour.is_none(),
         trace: Vec::new(),
         outcome: Ok(()),
     };
@@ -368,9 +409,9 @@ async fn probe_one(node: daer_config::Node, options: ProbeNodeOptions) -> NodeRe
             )));
             return report;
         }
-        NodeEndpoint::Direct(_) => unreachable!("handled above"),
+        NodeEndpoint::Direct(_) => ("", 0),
     };
-    report.endpoint = Some(format!("{server}:{port}"));
+    report.endpoint = (!server.is_empty()).then(|| format!("{server}:{port}"));
 
     // Target authority for end-to-end probing
     let probe_url_str = options.url.as_deref().unwrap_or(DEFAULT_PROBE_URL);
@@ -385,77 +426,127 @@ async fn probe_one(node: daer_config::Node, options: ProbeNodeOptions) -> NodeRe
     };
     let probe_authority = format!("{}:{}", check_url.host(), check_url.port());
 
-    // Phase 1: DNS Resolution
-    let dns_start = Instant::now();
-    let server_clean = server.trim_matches(|c| c == '[' || c == ']');
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((server_clean, port)).await {
-        Ok(iter) => iter.collect(),
-        Err(error) => {
-            report
-                .trace
-                .push(format!("  dns resolution  : failed ({error})"));
-            report.outcome = Err(Failure::Dns(format!(
-                "DNS resolution failed for server '{server}': {error}"
-            )));
-            return report;
-        }
-    };
-    if addrs.is_empty() {
-        report
-            .trace
-            .push("  dns resolution  : no IP addresses returned".to_owned());
-        report.outcome = Err(Failure::Dns(format!(
-            "DNS returned no address for '{server}'"
-        )));
+    let detoured = node.detour.is_some();
+    if detoured && pool.is_none() {
+        report.outcome = Err(Failure::Unsupported(
+            "this node declares a detour, but the probe has no node pool to resolve it; \
+             probe it from its configuration file"
+                .to_owned(),
+        ));
         return report;
     }
-    let dns_ms = dns_start.elapsed().as_millis();
-    let target_addr = addrs[0];
-    report.trace.push(format!(
-        "  dns resolution  : ok ({target_addr}) in {dns_ms}ms"
-    ));
+    if detoured {
+        report.trace.push(format!(
+            "  server reach    : through detour {:?}",
+            node.detour.as_deref().unwrap_or_default()
+        ));
+    }
 
-    // Phase 2: L3/L4 TCP Reachability
-    let tcp_start = Instant::now();
-    match tokio::time::timeout(options.timeout, TcpStream::connect(target_addr)).await {
-        Ok(Ok(stream)) => {
-            let tcp_ms = tcp_start.elapsed().as_millis();
-            drop(stream);
-            report.trace.push(format!(
-                "  tcp connect     : ok in {tcp_ms}ms (L3/L4 reachable)"
-            ));
-        }
-        Ok(Err(error)) => {
+    // Phase 1: DNS Resolution
+    if !detoured {
+        let dns_start = Instant::now();
+        let server_clean = server.trim_matches(|c| c == '[' || c == ']');
+        let resolver_name = resolver_host(server_clean);
+        let addrs: Vec<SocketAddr> = match SystemResolver.resolve(&resolver_name, port).await {
+            Ok(addrs) => addrs,
+            Err(error) => {
+                report
+                    .trace
+                    .push(format!("  dns resolution  : failed ({error})"));
+                report.outcome = Err(Failure::Dns(format!(
+                    "DNS resolution failed for server '{server}': {error}"
+                )));
+                return report;
+            }
+        };
+        if addrs.is_empty() {
             report
                 .trace
-                .push(format!("  tcp connect     : failed ({error})"));
-            report.outcome = Err(Failure::Tcp(format!(
-                "TCP connect to {target_addr} failed: {error}"
+                .push("  dns resolution  : no IP addresses returned".to_owned());
+            report.outcome = Err(Failure::Dns(format!(
+                "DNS returned no address for '{server}'"
             )));
             return report;
         }
-        Err(_) => {
-            report.trace.push(format!(
-                "  tcp connect     : timed out after {}s",
-                options.timeout.as_secs()
-            ));
-            report.outcome = Err(Failure::Tcp(format!(
-                "TCP connect to {target_addr} timed out"
-            )));
-            return report;
+        let dns_ms = dns_start.elapsed().as_millis();
+        let target_addr = addrs[0];
+        report.trace.push(format!(
+            "  dns resolution  : ok ({target_addr}) in {dns_ms}ms"
+        ));
+
+        // Phase 2: L3/L4 TCP Reachability. The resolver is pinned to the address phase 1
+        // just reported, so the second phase cannot silently dial a different A/AAAA answer.
+        let resolver = StaticResolver::new().with_host(&resolver_name, target_addr.ip());
+        let connector = TcpConnector::with_resolver(Arc::new(resolver)).with_connect_timeout(None);
+        let target = Target::plain(authority(server_clean, port));
+        let tcp_start = Instant::now();
+        match tokio::time::timeout(
+            options.timeout,
+            connector.connect(&target, &TraceCollector::disabled()),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                let tcp_ms = tcp_start.elapsed().as_millis();
+                drop(stream);
+                report.trace.push(format!(
+                    "  tcp connect     : ok in {tcp_ms}ms (L3/L4 reachable)"
+                ));
+            }
+            Ok(Err(error)) => {
+                report
+                    .trace
+                    .push(format!("  tcp connect     : failed ({error})"));
+                report.outcome = Err(Failure::Tcp(format!(
+                    "TCP connect to {target_addr} failed: {error}"
+                )));
+                return report;
+            }
+            Err(_) => {
+                report.trace.push(format!(
+                    "  tcp connect     : timed out after {}s",
+                    options.timeout.as_secs()
+                ));
+                report.outcome = Err(Failure::Tcp(format!(
+                    "TCP connect to {target_addr} timed out"
+                )));
+                return report;
+            }
         }
     }
 
     // Phase 3: L7 Protocol Handshake
     let dialer_opts = DialerOptions::new(None, options.timeout);
-    let dialer = match NodeDialer::from_node(&node, dialer_opts) {
-        Ok(dialer) => dialer,
-        Err(error) => {
-            report.outcome = Err(Failure::Unsupported(format!(
-                "failed to construct node dialer: {error}"
-            )));
-            return report;
+    let dialer = match pool {
+        Some(pool) => {
+            let mut graph = match NodeGraph::new(&pool.nodes, dialer_opts) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    report.outcome = Err(Failure::Unsupported(format!(
+                        "failed to resolve the detour graph: {error}"
+                    )));
+                    return report;
+                }
+            };
+            match graph.build(index.expect("a configuration probe carries its node index")) {
+                Ok(dialer) => dialer,
+                Err(error) => {
+                    report.outcome = Err(Failure::Unsupported(format!(
+                        "failed to construct node dialer: {error}"
+                    )));
+                    return report;
+                }
+            }
         }
+        None => match NodeDialer::from_node(&node, dialer_opts) {
+            Ok(dialer) => Arc::new(dialer),
+            Err(error) => {
+                report.outcome = Err(Failure::Unsupported(format!(
+                    "failed to construct node dialer: {error}"
+                )));
+                return report;
+            }
+        },
     };
 
     let handshake_start = Instant::now();
@@ -559,16 +650,23 @@ async fn probe_one(node: daer_config::Node, options: ProbeNodeOptions) -> NodeRe
 ///
 /// The *report* stays serial in configuration order: the point of the output is which node is
 /// which, and ordering by who answered first destroys that.
+#[derive(Debug, Clone)]
+struct ProbePool {
+    nodes: Arc<Vec<daer_config::Node>>,
+}
+
 async fn probe_pool(
     nodes: &[daer_config::Node],
     options: &ProbeNodeOptions,
     source: &str,
+    pool: Option<ProbePool>,
 ) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for (index, node) in nodes.iter().enumerate() {
         let node = node.clone();
         let options = options.clone();
-        tasks.spawn(async move { (index, probe_one(node, options).await) });
+        let pool = pool.clone();
+        tasks.spawn(async move { (index, probe_one(node, Some(index), options, pool).await) });
     }
 
     // `JoinSet` yields in completion order; each task carries its index so the report can be
@@ -657,7 +755,7 @@ async fn probe_file(file: &std::path::Path, options: &ProbeNodeOptions) -> anyho
         decoded.format
     );
 
-    probe_pool(&nodes, options, &file.display().to_string()).await
+    probe_pool(&nodes, options, &file.display().to_string(), None).await
 }
 
 pub async fn probe_url(options: ProbeUrlOptions) -> anyhow::Result<()> {
@@ -681,8 +779,9 @@ pub async fn probe_url(options: ProbeUrlOptions) -> anyhow::Result<()> {
 
     println!("probing url: {}", options.url);
     let dns_start = Instant::now();
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(iter) => iter.collect(),
+    let resolver_name = resolver_host(host);
+    let addrs: Vec<SocketAddr> = match SystemResolver.resolve(&resolver_name, port).await {
+        Ok(addrs) => addrs,
         Err(err) => {
             println!("  dns resolution : failed ({err})");
             bail!("DNS resolution failed for '{host}': {err}");

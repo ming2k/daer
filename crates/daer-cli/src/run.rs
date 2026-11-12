@@ -32,6 +32,7 @@ use crate::preflight;
 use crate::sd_notify::Notifier;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -43,6 +44,8 @@ use daer_control::rule_provider::{
     DEFAULT_TIMEOUT as DEFAULT_REFRESH_TIMEOUT, ProviderSchedule, RefreshOutcome,
     refresh_rule_provider,
 };
+use daer_control::subscription::DEFAULT_TIMEOUT as DEFAULT_LOAD_TIMEOUT;
+use daer_outbound::SocketConfig;
 use daer_routing::RuleProviderPool;
 
 /// How the daemon was asked to run.
@@ -76,6 +79,11 @@ pub struct RunOptions {
 /// port that cannot be bound, a configuration that does not compile, or a datapath that
 /// cannot be attached.
 pub async fn run(options: RunOptions) -> anyhow::Result<()> {
+    // TCX is the only TC attachment mode (ADR-0042). Fail before loading a configuration or
+    // creating a namespace when the kernel cannot provide an fd-owned link.
+    if !options.no_datapath {
+        daer_ebpf::require_tcx()?;
+    }
     let run_started = Instant::now();
     // The unit is `Type=notify`: every status below is visible as the unit's state, and the
     // final `READY=1` is what tells systemd the proxy can actually serve. Outside systemd
@@ -108,18 +116,6 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
             %error,
             "host sysctl prerequisite is not met; a real run would refuse to start"
         );
-    }
-
-    // A previous run may have been killed before its guards ran. Its journal detaches TC
-    // filters and removes the qdiscs; an older journal may also restore a host sysctl. The
-    // namespace, pair and host policy routing are removed even without a journal. This
-    // happens before the daemon waits for a route, so stale filters cannot keep redirecting
-    // traffic during that wait.
-    // A dry run changes nothing, so it deliberately skips this.
-    if !options.dry_run
-        && let Err(error) = datapath::cleanup_system_state()
-    {
-        daer_observe::warn!(daer_observe::EventCode::DaemonRecoveryWarning,%error, "could not fully recover state from a previous run");
     }
 
     notifier.status("waiting for network interfaces");
@@ -156,8 +152,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // The socket mark, decided once for the whole run.
     //
     // Every socket consumer has to agree or the proxy captures its own traffic and loops:
-    // the generation's dialers, the transparent listeners (including their replies), and
-    // the datapath's `PARAM.socket_mark`. `--no-datapath` deliberately gets `None`: nothing
+    // the generation's dialers, the transparent listeners (including their replies), the
+    // DNS upstreams, reload-time subscription and rule-provider fetches, and the
+    // datapath's `PARAM.socket_mark`. `--no-datapath` deliberately gets `None`: nothing
     // is redirected, so there is no capture loop to evade; the listener still needs
     // `CAP_NET_ADMIN` for `IP_TRANSPARENT`.
     let so_mark = if options.no_datapath {
@@ -165,17 +162,26 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     } else {
         Some(loaded.global.so_mark.unwrap_or(DEFAULT_SOCKET_MARK))
     };
+    let socket_config = match so_mark {
+        Some(mark) => SocketConfig::default().with_mark(mark),
+        None => SocketConfig::default(),
+    };
 
     // The DNS half is built first, and its Fake-IP pool and snooper are handed to every
     // generation. Without this the pool existed and nothing wrote to it: the resolver's
     // synthetic addresses were unknown to the router, so Fake-IP could never work through
     // the daemon. One pool for the process also survives a reload, which is what a client's
     // open connections to a synthetic address require.
-    let (dns, fake_ip, snooper) = start_dns(&loaded, &options).await?;
+    let (dns, fake_ip, snooper) = start_dns(&loaded, &options, socket_config.clone()).await?;
+    // Runtime election overrides are process state, not configuration. Load them before
+    // the first generation so a pinned election is serving from the first packet, and
+    // share the same handle across reloads so a pin does not disappear on SIGHUP.
+    let overrides = Arc::new(daer_control::ElectionOverrides::load(None));
     let base_options = RouterOptions::for_config(&options.config)
         .with_socket_mark(so_mark)
         .with_fake_ip(fake_ip)
         .with_dns_snooper(Some(snooper))
+        .with_overrides(Arc::clone(&overrides))
         // A dial's span reaches the journal. Without this the transport's recorder is filled
         // by netune and dropped, so "why is this node slow" has no answer in any log — which is
         // exactly the state the daemon was in before the observer existed.
@@ -198,6 +204,10 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         None => Daemon::bind(&loaded, &base_options),
     }
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    daemon.generation().router().reconcile_overrides();
+    for warning in daemon.generation().warnings() {
+        daer_observe::warn!(daer_observe::EventCode::DaemonConfigWarning,%warning, "configuration warning");
+    }
     daer_observe::info!(daer_observe::EventCode::DaemonListening,
         port = daemon.port,
         so_mark = ?so_mark,
@@ -246,6 +256,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
             // warning rather than a refusal.
             match daemon.reload(&loaded, &with_observer) {
                 Ok(()) => {
+                    daemon.generation().router().reconcile_overrides();
                     daer_observe::info!(daer_observe::EventCode::DaemonDatapathRebuilt,
                         generation = %daemon.generation().describe(),
                         "generation rebuilt with the datapath's flow facts (mac/dscp/pname)"
@@ -277,6 +288,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     let telemetry_task = telemetry
         .map(|telemetry| spawn_datapath_telemetry(telemetry, std::sync::Arc::clone(&bpf_snapshot)));
     let status_task = crate::status::spawn_socket();
+    let admin_task = crate::control::spawn_admin(daemon.generations());
 
     let result = serve_until_signal(ServeInputs {
         daemon: &daemon,
@@ -290,6 +302,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         dns: dns.as_ref(),
         bpf: &bpf_snapshot,
         started: run_started,
+        socket_config: socket_config.clone(),
     })
     .await;
     if let Some(task) = telemetry_task {
@@ -300,7 +313,12 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         task.abort();
         let _ = task.await;
     }
+    if let Some(task) = admin_task {
+        task.abort();
+        let _ = task.await;
+    }
     crate::status::remove_socket();
+    crate::control::remove_socket();
     health.stop();
     if let Some(dns) = dns {
         dns.stop().await;
@@ -347,8 +365,13 @@ fn write_state(
             "policy_hash": format!("sha256:{policy_hash}"),
             "rules": generation.rules(),
             "groups": generation.groups(),
+            "elections": generation.elections(),
             "nodes": generation.nodes(),
             "warnings": generation.warnings(),
+        },
+        "selection": {
+            "groups": generation.router().groups(),
+            "elections": generation.router().elections(),
         },
         "datapath": {
             "attached": daemon.datapath.is_attached(),
@@ -520,6 +543,7 @@ fn spawn_datapath_telemetry(
 async fn start_dns(
     config: &daer_config::Config,
     options: &RunOptions,
+    socket_config: SocketConfig,
 ) -> anyhow::Result<(
     Option<DnsHandle>,
     Option<std::sync::Arc<daer_dns::FakeIpPool>>,
@@ -538,7 +562,7 @@ async fn start_dns(
     // would never be consulted. Treating it as a request for the server is what makes the
     // feature usable without a second configuration key.
     let wants_server = config.dns.bind.is_some() || config.dns.fake_ip.enabled;
-    let transports = crate::dns::transports(config)?;
+    let transports = crate::dns::transports(config, socket_config)?;
     let resolver = std::sync::Arc::new(
         daer_dns::Resolver::with_state(
             config,
@@ -681,9 +705,8 @@ async fn report_plan(
         ),
     }
 
-    let param = preflight::planned_param(plan.port, plan.socket_mark);
+    let param = preflight::planned_param(plan.socket_mark);
     daer_observe::info!(daer_observe::EventCode::DryRunListen,
-        port = plan.port,
         so_mark = ?plan.socket_mark,
         control_plane_pid = param.control_plane_pid,
         "would listen for redirected flows"
@@ -776,7 +799,6 @@ async fn attach(
     }
 
     let param = daer_ebpf::RuntimeParam {
-        tproxy_port: u32::from(daemon.port),
         // The datapath checks this pid to tell its own traffic from a client's; a wrong
         // value makes daer proxy itself. `std::process::id` is the running pid.
         control_plane_pid: std::process::id(),
@@ -833,9 +855,9 @@ pub fn resolve_object_path(path: &Path) -> PathBuf {
 
 /// Where a packaged installation puts the datapath object.
 const INSTALLED_OBJECT_PATHS: [&str; 3] = [
-    "/usr/lib/daer/datapath.o",
-    "/usr/local/lib/daer/datapath.o",
-    "/usr/share/daer/datapath.o",
+    "/usr/lib/daer/datapath.bpf.o",
+    "/usr/local/lib/daer/datapath.bpf.o",
+    "/usr/share/daer/datapath.bpf.o",
 ];
 
 /// [`resolve_object_path`] with the search path injected.
@@ -864,9 +886,8 @@ fn resolve_object_path_in(
 
 /// The mark used when `global.so-mark` is absent.
 ///
-/// Non-zero and unlikely to collide with a routing rule's mark: `0` means "no mark" to the
-/// kernel, which is exactly the case that causes self-capture.
-pub const DEFAULT_SOCKET_MARK: u32 = 0x0dae;
+/// One definition in `daer-common`: `0x6461_6572` is the ASCII bytes `daer`.
+pub use daer_common::consts::DEFAULT_SOCKET_MARK;
 
 /// The daemon state the signal/reload loop needs.
 ///
@@ -885,6 +906,7 @@ struct ServeInputs<'a> {
     dns: Option<&'a DnsHandle>,
     bpf: &'a std::sync::Arc<std::sync::Mutex<Option<daer_ebpf::telemetry::BpfCounters>>>,
     started: Instant,
+    socket_config: SocketConfig,
 }
 
 /// Serves until a signal, reloading on `SIGHUP` or provider refresh interval.
@@ -901,6 +923,7 @@ async fn serve_until_signal(inputs: ServeInputs<'_>) -> anyhow::Result<()> {
         dns,
         bpf,
         started,
+        socket_config,
     } = inputs;
     #[cfg(unix)]
     let mut hangup = {
@@ -1018,7 +1041,15 @@ async fn serve_until_signal(inputs: ServeInputs<'_>) -> anyhow::Result<()> {
             _ = hangup.recv() => {
                 notifier.reloading();
                 let reloaded =
-                    reload(daemon, options, router_options, ebpf, health).await;
+                    reload(
+                        daemon,
+                        options,
+                        router_options,
+                        ebpf,
+                        health,
+                        socket_config.clone(),
+                    )
+                    .await;
                 // `RELOADING=1` is only cleared by `READY=1`. It must be sent even when the
                 // new configuration was rejected, because the old generation is still serving.
                 if reloaded.is_some() {
@@ -1124,7 +1155,7 @@ async fn refresh_due_providers(
     let due: Vec<String> = schedule
         .due(|tag| last_refresh.get(tag).map(Instant::elapsed))
         .iter()
-        .map(|entry| entry.tag.clone())
+        .map(|entry| entry.name.clone())
         .collect();
     if due.is_empty() {
         return;
@@ -1143,6 +1174,11 @@ async fn refresh_due_providers(
         .config
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+    let mark = router_options.so_mark.unwrap_or(config.global.so_mark);
+    let socket_config = match mark {
+        Some(mark) => SocketConfig::default().with_mark(mark),
+        None => SocketConfig::default(),
+    };
 
     let mut changed = false;
     // Refresh into a copy. The running generation must keep routing with the pool it was
@@ -1154,7 +1190,7 @@ async fn refresh_due_providers(
         let Some(provider) = config
             .rule_provider
             .iter()
-            .find(|provider| provider.tag == tag)
+            .find(|provider| provider.name == tag)
         else {
             // The tag vanished from the configuration; SIGHUP owns that transition.
             daer_observe::debug!(daer_observe::EventCode::ProviderRemoved,%tag, "rule provider no longer declared; nothing to refresh");
@@ -1162,8 +1198,14 @@ async fn refresh_due_providers(
         };
 
         let current = staged.get(&tag).map(std::sync::Arc::as_ref);
-        let refreshed =
-            refresh_rule_provider(provider, &directory, current, DEFAULT_REFRESH_TIMEOUT).await;
+        let refreshed = refresh_rule_provider(
+            provider,
+            &directory,
+            current,
+            DEFAULT_REFRESH_TIMEOUT,
+            socket_config.clone(),
+        )
+        .await;
         match refreshed.outcome {
             RefreshOutcome::Changed => {
                 if let Some(set) = refreshed.set {
@@ -1199,6 +1241,7 @@ async fn refresh_due_providers(
     match daemon.reload(&config, &republished_options) {
         Ok(()) => {
             *pool = staged;
+            daemon.generation().router().reconcile_overrides();
             publish_generation(daemon, ebpf);
             health.restart(daemon);
             daer_observe::info!(
@@ -1338,13 +1381,9 @@ impl HealthScheduler {
         let generation = daemon.generation();
         let interval = daemon.health_interval();
         let (stop, watch) = tokio::sync::watch::channel(false);
-        // The whole `[global.health-check]` table, so the probe's URL, method and DNS
-        // endpoints are the configured ones rather than a built-in default (ADR-0006).
-        let handle = daer_control::spawn_health_scheduler(
-            generation.router_arc(),
-            &daemon.health_check(),
-            watch,
-        );
+        // The election targets carry their own probe settings; the scheduler takes only
+        // the router and derives the shortest tick from them.
+        let handle = daer_control::spawn_health_scheduler(generation.router_arc(), watch);
         match handle {
             Some(handle) => {
                 daer_observe::info!(daer_observe::EventCode::DaemonHealthStarted,
@@ -1413,9 +1452,16 @@ async fn reload(
     router_options: &RouterOptions,
     ebpf: Option<&daer_control::datapath::Attached>,
     health: &mut HealthScheduler,
+    socket_config: SocketConfig,
 ) -> Option<RuleProviderPool> {
     let started = std::time::Instant::now();
-    let loaded = match daer_control::load_resolved(&options.config).await {
+    let loaded = match daer_control::load_resolved_with_socket_config(
+        &options.config,
+        DEFAULT_LOAD_TIMEOUT,
+        socket_config,
+    )
+    .await
+    {
         Ok(loaded) => loaded,
         Err(error) => {
             // A file that no longer parses is the common reload failure; the running policy
@@ -1430,11 +1476,15 @@ async fn reload(
         .with_rule_providers(Some(loaded.rule_providers.pool.clone()));
     match daemon.reload(&loaded.config, &reloaded_options) {
         Ok(()) => {
+            daemon.generation().router().reconcile_overrides();
             publish_generation(daemon, ebpf);
             // The scheduler holds the router it probes, so it has to be handed the new
             // generation; leaving it running would measure a policy nothing routes to.
             health.restart(daemon);
             let generation = daemon.generation();
+            for warning in generation.warnings() {
+                daer_observe::warn!(daer_observe::EventCode::DaemonConfigWarning,%warning, "configuration warning");
+            }
             daer_observe::info!(daer_observe::EventCode::GenerationReloaded,
                 generation = %generation.describe(),
                 elapsed_ms = started.elapsed().as_millis(),
@@ -1493,7 +1543,7 @@ mod tests {
     fn resolve_object_path_preserves_non_existing_when_no_candidates() {
         // An empty candidate list, not the host's `/usr/lib`: the assertion is about the
         // fallback, and a machine with a packaged daer must not change the answer.
-        let non_existing = Path::new("/non/existing/datapath.o");
+        let non_existing = Path::new("/non/existing/datapath.bpf.o");
         assert_eq!(
             resolve_object_path_in(non_existing, std::iter::empty::<&Path>()),
             non_existing
@@ -1504,11 +1554,14 @@ mod tests {
     fn resolve_object_path_finds_the_first_existing_candidate() {
         let directory = std::env::temp_dir().join(format!("daer-object-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("creates the directory");
-        let present = directory.join("datapath.o");
+        let present = directory.join("datapath.bpf.o");
         std::fs::write(&present, b"x").expect("writes");
         let absent = directory.join("missing.o");
         assert_eq!(
-            resolve_object_path_in(Path::new("/non/existing/datapath.o"), [&absent, &present]),
+            resolve_object_path_in(
+                Path::new("/non/existing/datapath.bpf.o"),
+                [&absent, &present]
+            ),
             present
         );
         let _ = std::fs::remove_dir_all(&directory);

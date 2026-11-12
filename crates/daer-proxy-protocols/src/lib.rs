@@ -28,6 +28,7 @@
 //! | Module | Owns |
 //! | --- | --- |
 //! | [`transport`] | the `ws` upgrade; `tcp` is nothing to do |
+//! | [`server`] | the stream to a node's own server, the seam a detour replaces |
 //! | [`security`] | a handshake, a certificate policy, an ALPN offer |
 //! | [`vless`] | the request header, the response header, and Vision |
 //! | [`vmess`] | VMess AEAD: KDF, AuthID, header seal, chunk stream |
@@ -51,6 +52,7 @@ pub mod hysteria2;
 pub mod options;
 pub mod reality;
 pub mod security;
+pub mod server;
 pub mod shadowsocks;
 pub mod transport;
 mod transport_ws;
@@ -65,6 +67,7 @@ pub use fragment::{Fragment, FragmentingIo, Range};
 pub use hysteria2::Hysteria2Connector;
 pub use options::DialerOptions;
 pub use security::Security;
+pub use server::{DirectServerDialer, ServerConnector, ServerDialer};
 pub use shadowsocks::{
     Cipher, CipherError, SaltReplayFilter, ShadowSocksConnector, ShadowSocksError,
     ShadowSocksStream,

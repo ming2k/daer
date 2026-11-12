@@ -290,10 +290,12 @@ def main():
             sys.stderr.write(f"error: {e}\n")
             sys.exit(1)
 
+        lines.append("---")
         lines.append(f"name: geoip-{code}")
+        lines.append("---")
         lines.append("")
         for cidr in cidrs:
-            lines.append(f"ip: {cidr}")
+            lines.append(f"{cidr}")
 
     elif args.kind == "geosite":
         try:
@@ -307,7 +309,9 @@ def main():
                 f"note: skipped {skipped} plain/regex pattern(s) in '{code}' (ADR-0036: domain routing accepts bare suffix, .subdomain, and =exact only)\n"
             )
 
+        lines.append("---")
         lines.append(f"name: geosite-{code}")
+        lines.append("---")
         lines.append("")
         for kind, pattern in rules:
             if kind == "=":

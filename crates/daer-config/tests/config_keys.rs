@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 const CONFIG_STRUCTS: &[&str] = &[
     "Global",
     "Tls",
-    "HealthCheck",
-    "HealthCheckOverride",
+    "ProbeSettings",
     "Dns",
     "FakeIpConfig",
     "DnsRouting",
     "Routing",
     "Group",
+    "Election",
     "Filter",
     "Node",
     // The per-protocol node tables (ADR-0028/ADR-0029/ADR-0030). Each is a layer's own surface,
@@ -52,11 +52,6 @@ const SKIP: &[&str] = &[
     // The gate's rule is "a key the schema accepts must take effect or not exist". These do take
     // effect; what they do not have is a `.field` access outside `daer-config`, because their
     // consumer is the *deserializer itself* or a byte-exact enum rather than a struct member.
-    // ---------------------------------------------------------------------------------------
-    // `SecurityConfig`/`TransportConfig`/`Flow`/`Hysteria2Congestion`/`VmessCipher` are enums, and
-    // the layer struct's `type`/tag decides which variant is built; the variants are consumed by
-    // `daer_proxy_protocols::dialer`'s `match`, which reads `.kind()` rather than each field.
-    "tag",
     // `Hysteria2Obfs`'s password reaches `hysteria2::obfs::Obfs::from_config`, which calls
     // `.password()` — a method, not a field access. `kind()` likewise.
     "password",
@@ -193,11 +188,10 @@ fn every_configuration_key_has_a_consumer() {
     }
 
     // The count is asserted so that adding a *struct* to `CONFIG_STRUCTS` without adding keys (a
-    // typo, a renamed struct) fails loudly. It grew from 70 to 110 when ADR-0028/0025/0026 added the
-    // per-protocol node tables and the layer tables to the list, and to 111 with the independent
-    // IPv6 Fake-IP pool (`dns.fake-ip.inet6`).
+    // typo, a renamed struct) fails loudly. It was 117 before the resource/election split; the
+    // probe and election fields replaced the old group policy/health-check surface.
     assert_eq!(
-        total, 111,
-        "expected exactly 111 configuration fields to be verified"
+        total, 124,
+        "expected exactly 124 configuration fields to be verified"
     );
 }

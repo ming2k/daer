@@ -19,7 +19,7 @@ They are now implemented in `daer-dns`:
 
 | Item | Earlier claim | Truth |
 | --- | --- | --- |
-| DNS over UDP upstream | "needs the datagram transport from netune" | **Wrong.** A direct UDP upstream is a plain `UdpSocket`. Only datagrams *through a proxy* need netune. Implemented in `daer-dns/src/transport.rs`. |
+| DNS over UDP upstream | "needs the datagram transport from netune" | **Wrong as a blocker.** A direct UDP upstream does not need proxy datagram support. Implemented in `daer-dns/src/transport.rs`; it now uses netune's `UdpConnector` so the daemon's `SocketConfig`/`SO_MARK` and trace vocabulary apply uniformly. |
 | DoT upstream | "needs the TLS client from netune" | **Wrong.** `netune::TlsConnector` returns `Established { stream: Box<dyn Transport> }`, a byte pipe. DNS-over-TLS is the existing length-prefixed framing inside it. Implemented. |
 | DoH upstream | "needs the TLS client from netune" | **Wrong.** `netune::Client::request` takes a body and returns a response; RFC 8484 is `POST` with `application/dns-message`. Implemented. |
 
@@ -47,7 +47,7 @@ own demultiplexing where the wire format already requires it.
 | --- | --- | --- |
 | UDP relay for proxied traffic | `daer-relay::relay::datagram` | ✅ per-peer sessions, bounded table, idle reaping (ADR-0018) |
 | UDP relay ingress | `daer-relay::inbound::udp` | ✅ `TransparentDatagramListener`, wired into the daemon (ADR-0018) |
-| DNS upstream over UDP (direct) | `daer-dns::transport` | ✅ plain `UdpSocket`, **does not use netune** |
+| DNS upstream over UDP (direct) | `daer-dns::transport` | ✅ netune `UdpConnector`, with the daemon's `SocketConfig` |
 | `udp_check_dns` health probe | `daer-outbound` health check | ✅ `UdpDnsChecker` |
 | SOCKS5 UDP associate | proxy protocol support | ✅ via `Socks5DatagramConnector` (literal IP destinations) |
 | QUIC-based protocols (`hysteria2`, `tuic`) | outbound protocols | ✅ QUIC/H3 delivered in netune; `hysteria2` consumes `netune-quic`/`netune-http3` (ADR-0035) |
@@ -59,7 +59,7 @@ One limit is deliberate and named rather than latent:
   the pool key both ignore — a `Target` redesign with its own ADR.
 
 QUIC is no longer a gap: netune ADR-0016 delivered `netune-quic` (RFC 9000,
-RFC 9221) and `netune-http3` (RFC 9114) under `aws-lc-rs`, and netune 0.0.24 owns their
+RFC 9221) and `netune-http3` (RFC 9114) under `aws-lc-rs`, and netune 0.0.28 owns their
 state machines (netune ADR-0027, ADR-0028); daer ADR-0035 removes the direct `quinn`,
 `h3`, `h3-quinn` and `ring` dependencies. Hysteria 2 still owns its product-specific
 socket layers (Salamander/Gecko, port hopping, Brutal), but they implement netune's
@@ -109,7 +109,7 @@ These seams are exactly right and `daer` depends on them:
   confinement and before the first Initial packet, and receives the connector's
   `QuicSocketConfig`. Hysteria 2 applies that config (including `SO_MARK`) to the
   base socket, so the seam cannot silently skip a pre-connect option.
-- `QuicProfile.path_mtu_discovery` (netune 0.0.24) makes DPLPMTUD policy explicit.
+- `QuicProfile.path_mtu_discovery` (netune 0.0.28) makes DPLPMTUD policy explicit.
   daer's `disable-path-mtu-discovery` maps to it instead of being listed as an
   engine property that happened to be true; disabling advertises the 1200-byte
   QUIC floor so the probe ceiling cannot grow.
@@ -159,7 +159,24 @@ as `Established`.
   (`netune-quic`), so this is no longer blocked by a missing stack; it is a daer
   DNS-transport feature that nobody has asked for yet.
 
-## 6. Non-blocking observations
+## 6. Delivered in netune 0.0.28
+
+The three gaps named here were closed upstream in netune 0.0.28 (ADR-0043), and
+`daer` now consumes the seams:
+
+- **Raw ALPN.** `Established.alpn_protocol: Option<Vec<u8>>` carries the exact
+  negotiated name; the trace enum remains the classification. `daer` reports both
+  through `Opaque`, and a private ALPN name survives the handshake.
+- **QUIC authority resolution.** `QuicConnector::connect_authority` uses the
+  injectable `QuicResolver` (default `SystemQuicResolver`), brackets
+  `DnsStart`/`DnsEnd`, and applies `EgressConfinement` to every resolved address
+  before socket creation. Hysteria 2 no longer resolves outside the connector.
+- **Head-only HTTP/1.1.** `netune-http1::write_request_head` writes the caller's
+  exact request line and header list with no synthetic `Content-Length` or
+  `User-Agent`. The WebSocket upgrade uses it; `daer` supplies the product
+  fingerprint headers and netune owns the HTTP grammar.
+
+## 7. Non-blocking observations
 
 - `netune-trace` already parses ClientHello for JA4. If `daer-sniff` ever needs
   more than the SNI, reusing that parser would keep one implementation of a

@@ -154,8 +154,9 @@ fn test_dat_to_rules_and_compile_pipeline() {
 
     let rules_text = fs::read_to_string(&cn_ip_rules).unwrap();
     assert!(rules_text.contains("name: geoip-cn"));
-    assert!(rules_text.contains("ip: 198.51.100.0/24"));
-    assert!(rules_text.contains("ip: 2001:db8::/32"));
+    assert!(rules_text.contains("198.51.100.0/24"));
+    assert!(rules_text.contains("2001:db8::/32"));
+    assert!(!rules_text.contains("ip:"));
 
     // Compile unpacked geoip rules with daer-drb
     let cn_ip_drb = temp.path().join("cn-ip.drb");

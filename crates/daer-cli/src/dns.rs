@@ -20,6 +20,7 @@ use std::sync::Arc;
 use daer_config::Config;
 use daer_dns::Upstream;
 use daer_dns::transport::UpstreamSpec;
+use daer_outbound::SocketConfig;
 
 /// What `daer run` binds for DNS.
 ///
@@ -93,7 +94,10 @@ pub fn check_upstreams(config: &Config) -> Result<Vec<UpstreamReport>, String> {
             .join("+");
         // One predicate, two callers: a spec the daemon cannot build is a spec `daer check`
         // reports. Both go through `UpstreamSpec::build`, so they cannot disagree.
-        let unavailable = spec.build().err().map(|error| error.to_string());
+        let unavailable = spec
+            .build(SocketConfig::default())
+            .err()
+            .map(|error| error.to_string());
         reports.push(UpstreamReport {
             tag: spec.tag,
             protocols,
@@ -115,12 +119,15 @@ pub fn check_upstreams(config: &Config) -> Result<Vec<UpstreamReport>, String> {
 /// Returns a message naming the upstream entry whose transport could not be built. Every
 /// declared upstream must build: a resolver that accepted a tag it cannot serve would answer
 /// "no such upstream" for queries the operator believes are routed.
-pub fn transports(config: &Config) -> anyhow::Result<Vec<(String, Arc<dyn Upstream>)>> {
+pub fn transports(
+    config: &Config,
+    socket_config: SocketConfig,
+) -> anyhow::Result<Vec<(String, Arc<dyn Upstream>)>> {
     let mut transports: Vec<(String, Arc<dyn Upstream>)> = Vec::new();
     for entry in &config.dns.upstream {
         let spec = UpstreamSpec::parse(entry).map_err(|error| anyhow::anyhow!("{error}"))?;
         let transport = spec
-            .build()
+            .build(socket_config.clone())
             .map_err(|error| anyhow::anyhow!("dns.upstream {entry:?}: {error}"))?;
         transports.push((spec.tag, transport));
     }
@@ -223,7 +230,10 @@ upstream = [
                 "{entry} must be usable, got {:?}",
                 report.unavailable
             );
-            assert!(spec.build().is_ok(), "{entry} must build");
+            assert!(
+                spec.build(SocketConfig::default()).is_ok(),
+                "{entry} must build"
+            );
         }
     }
 

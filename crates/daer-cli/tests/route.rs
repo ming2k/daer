@@ -262,9 +262,9 @@ fn naming_two_sources_of_nodes_is_refused() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        "schema = 1\n\
-         [[node]]\ntag = \"n\"\ntype = \"direct\"\n\
-         [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\
+        "schema = 2\n\
+         [[node]]\nname = \"n\"\ntype = \"direct\"\n\
+         [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\
          [routing]\nrules = []\nfallback = \"g\"\n",
     )
     .expect("writes config");
@@ -298,10 +298,10 @@ fn a_node_named_all_is_probeable_by_name() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        "schema = 1\n\
-         [[node]]\ntag = \"all\"\ntype = \"direct\"\n\
-         [[node]]\ntag = \"other\"\ntype = \"direct\"\n\
-         [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\
+        "schema = 2\n\
+         [[node]]\nname = \"all\"\ntype = \"direct\"\n\
+         [[node]]\nname = \"other\"\ntype = \"direct\"\n\
+         [[election]]\nname = \"g\"\nnode = \"all\"\ntype = \"manual\"\n\
          [routing]\nrules = []\nfallback = \"g\"\n",
     )
     .expect("writes config");

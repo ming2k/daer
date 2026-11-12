@@ -13,6 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use daer_control::resolve_subscriptions_with;
+use daer_outbound::SocketConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -86,7 +87,7 @@ fn base64(input: &[u8]) -> String {
 
 fn config(url: &str) -> daer_config::Config {
     daer_config::toml_config::load_str(&format!(
-        "schema = 1\n[[subscription]]\ntag = \"airport\"\nurl = \"{url}\"\npersist = true\n"
+        "schema = 2\n[[subscription]]\nname = \"airport\"\nurl = \"{url}\"\npersist = true\n"
     ))
     .expect("config")
 }
@@ -110,17 +111,22 @@ async fn a_base64_subscription_becomes_a_node_pool() {
     let directory = temp_dir("base64");
 
     let mut configuration = config(&format!("http://{address}/sub"));
-    let resolution =
-        resolve_subscriptions_with(&mut configuration, &directory, Duration::from_secs(5)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut configuration,
+        &directory,
+        Duration::from_secs(5),
+        SocketConfig::default(),
+    )
+    .await;
 
     assert!(resolution.all_usable(), "{resolution:?}");
     assert_eq!(resolution.from_subscription, 3);
     assert_eq!(configuration.node.len(), 3);
-    // The tag is what `subtag(...)` filters match on, so every node must carry one
+    // The name is what `sub(...)` / `subtag(...)` filters match on, so every node must carry one
     // derived from its subscription.
     for node in &configuration.node {
-        let tag = node.tag.as_deref().expect("tagged");
-        assert!(tag.starts_with("airport/"), "{tag}");
+        let name = node.name.as_deref().expect("named");
+        assert!(name.starts_with("airport/"), "{name}");
     }
     // And every fetched link must be one the production parser accepts.
     for node in &configuration.node {
@@ -152,8 +158,13 @@ async fn a_sip008_subscription_becomes_shadowsocks_nodes() {
     let directory = temp_dir("sip008");
 
     let mut configuration = config(&format!("http://{address}/sub"));
-    let resolution =
-        resolve_subscriptions_with(&mut configuration, &directory, Duration::from_secs(5)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut configuration,
+        &directory,
+        Duration::from_secs(5),
+        SocketConfig::default(),
+    )
+    .await;
 
     assert_eq!(
         resolution.subscriptions[0].format,
@@ -174,14 +185,24 @@ async fn the_cache_survives_the_endpoint_dying() {
     let directory = temp_dir("survive");
 
     let mut first = config(&format!("http://{address}/sub"));
-    let resolution =
-        resolve_subscriptions_with(&mut first, &directory, Duration::from_secs(5)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut first,
+        &directory,
+        Duration::from_secs(5),
+        SocketConfig::default(),
+    )
+    .await;
     assert_eq!(resolution.from_subscription, 1);
 
     // Now the endpoint refuses: port 1 on loopback, no server.
     let mut second = config("http://127.0.0.1:1/sub");
-    let resolution =
-        resolve_subscriptions_with(&mut second, &directory, Duration::from_millis(500)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut second,
+        &directory,
+        Duration::from_millis(500),
+        SocketConfig::default(),
+    )
+    .await;
 
     assert_eq!(second.node.len(), 1, "the cache supplied the node");
     assert!(resolution.subscriptions[0].from_cache);
@@ -210,8 +231,13 @@ async fn an_http_error_does_not_replace_a_good_cache() {
     // persisted and the old cache must still be there.
     let address = serve_once(b"<html>subscription expired</html>".to_vec()).await;
     let mut configuration = config(&format!("http://{address}/sub"));
-    let resolution =
-        resolve_subscriptions_with(&mut configuration, &directory, Duration::from_secs(5)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut configuration,
+        &directory,
+        Duration::from_secs(5),
+        SocketConfig::default(),
+    )
+    .await;
 
     assert_eq!(
         configuration.node.len(),
@@ -238,8 +264,13 @@ async fn a_subscription_with_no_usable_node_is_not_a_silent_empty_group() {
     let directory = temp_dir("unusable");
 
     let mut configuration = config(&format!("http://{address}/sub"));
-    let resolution =
-        resolve_subscriptions_with(&mut configuration, &directory, Duration::from_secs(5)).await;
+    let resolution = resolve_subscriptions_with(
+        &mut configuration,
+        &directory,
+        Duration::from_secs(5),
+        SocketConfig::default(),
+    )
+    .await;
 
     // A link the schema cannot express never becomes a node: `Node::from_link` refuses it and
     // the resolution logs why. That is the first half of "a pool must not look populated" —

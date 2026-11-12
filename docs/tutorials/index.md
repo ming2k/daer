@@ -8,7 +8,7 @@ Step-by-step, hands-on lessons taking you from source code to a functioning `dae
 
 | Tutorial | Focus | Prerequisites |
 | :--- | :--- | :--- |
-| **[Getting Started](getting-started.md)** | Build `daer`, write a minimal configuration, compile the eBPF datapath, and verify transparent redirection. | Linux kernel 5.17+, Clang, Rust toolchain |
+| **[Getting Started](getting-started.md)** | Build `daer`, write a minimal configuration, compile the eBPF datapath, and verify transparent redirection. | Linux kernel 6.6+ with TCX, Clang, Rust toolchain |
 
 ---
 

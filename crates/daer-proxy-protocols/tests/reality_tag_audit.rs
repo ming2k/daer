@@ -84,7 +84,7 @@ fn a_link_with_a_wrong_key_still_parses() {
                 &sid=ef37119567cd97&type=tcp&fp=chrome";
     let options = daer_proxy_protocols::DialerOptions::new(None, std::time::Duration::from_secs(5));
     assert!(
-        daer_proxy_protocols::ProxyDialer::from_link(base, options).is_ok(),
+        daer_proxy_protocols::ProxyDialer::from_link(base, options.clone()).is_ok(),
         "the reference link must parse"
     );
 

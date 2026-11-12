@@ -35,7 +35,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
 use crate::error::RelayError;
-use crate::inbound::is_self_connect;
 
 /// Which address family a datagram flow uses.
 ///
@@ -294,17 +293,17 @@ impl ReplySockets {
 }
 
 impl TransparentDatagramListener {
-    /// Binds the transparent port for both families. A `port` of 0 picks one.
+    /// Binds the transparent port for both families ephemerally.
     ///
     /// # Errors
     ///
     /// Returns [`RelayError::Socket`] when a socket cannot be created, configured or
     /// bound — most commonly `EPERM` without `CAP_NET_ADMIN`/`CAP_NET_RAW`.
-    pub fn bind(listen_ip: Ipv4Addr, port: u16) -> Result<Self, RelayError> {
-        Self::bind_with_options(listen_ip, port, None)
+    pub fn bind(listen_ip: Ipv4Addr) -> Result<Self, RelayError> {
+        Self::bind_with_options(listen_ip, None)
     }
 
-    /// Binds the transparent datagram port with the daemon's socket mark.
+    /// Binds the transparent datagram port ephemerally with the daemon's socket mark.
     ///
     /// The mark is applied to the wildcard listeners and to every reply socket bound by
     /// [`Self::try_send_from`]. It is not decoration: the datapath treats its own marked
@@ -316,10 +315,9 @@ impl TransparentDatagramListener {
     /// Same as [`Self::bind`], plus `SO_MARK`'s `EPERM` without `CAP_NET_ADMIN`.
     pub fn bind_with_options(
         listen_ip: Ipv4Addr,
-        port: u16,
         socket_mark: Option<u32>,
     ) -> Result<Self, RelayError> {
-        let v4 = bind_family(Domain::IPV4, IpAddr::V4(listen_ip), port, socket_mark)?;
+        let v4 = bind_family(Domain::IPV4, IpAddr::V4(listen_ip), 0, socket_mark)?;
         let port = v4.local_addr().map_err(RelayError::Socket)?.port();
         let v6 = bind_family(
             Domain::IPV6,
@@ -385,10 +383,9 @@ impl TransparentDatagramListener {
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError::Rejected`] when the datagram was not redirected (see
-    /// [`crate::error::Reject::SelfConnect`]) and [`RelayError::Socket`] when the
-    /// receive itself failed. A truncated datagram is *not* an error: it is returned
-    /// with its truncated length, which is what UDP semantics require.
+    /// Returns [`RelayError::Socket`] when the receive itself failed. A truncated datagram
+    /// is *not* an error: it is returned with its truncated length, which is what UDP semantics
+    /// require.
     pub async fn recv(&self, buffer: &mut [u8]) -> Result<Datagram, RelayError> {
         loop {
             // Readability is awaited on the socket itself, then `recvmsg` runs once.
@@ -479,15 +476,12 @@ impl TransparentDatagramListener {
         Err(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
-    /// Turns a decoded datagram into a [`Datagram`], applying the self-connect rule.
+    /// Turns a decoded datagram into a [`Datagram`].
     fn accept_datagram(
         &self,
         (source, destination, len): (SocketAddr, SocketAddr, usize),
     ) -> Result<Datagram, RelayError> {
         let destination = unmap(destination);
-        if is_self_connect(destination, self.port) {
-            return Err(crate::error::Reject::SelfConnect { destination }.into());
-        }
         Ok(Datagram {
             flow_id: self.ids.flow(),
             source: unmap(source),
@@ -1003,7 +997,7 @@ mod tests {
     fn binding_reports_a_clear_error_without_privileges() {
         // Unprivileged CI: `IP_TRANSPARENT` needs CAP_NET_ADMIN. Accept either a bound
         // socket (privileged runner) or EPERM naming the layer; anything else is a bug.
-        match TransparentDatagramListener::bind(Ipv4Addr::UNSPECIFIED, 0) {
+        match TransparentDatagramListener::bind(Ipv4Addr::UNSPECIFIED) {
             Ok(listener) => assert_ne!(listener.port(), 0, "an ephemeral port was assigned"),
             Err(RelayError::Socket(error)) => {
                 assert!(

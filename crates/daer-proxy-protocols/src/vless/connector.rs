@@ -30,8 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
-    Connector, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError,
-    Target, TcpConnector, Transport,
+    DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError, Transport,
 };
 use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -39,6 +38,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
 use crate::security::{Opaque, Security};
+use crate::server::ServerDialer;
 use crate::transport::TransportLayer;
 use crate::vless::response::ResponseHeaderStream;
 use crate::vless::vision::VisionStream;
@@ -55,7 +55,7 @@ pub struct VlessConnector {
     flow: Flow,
     security: Security,
     transport: TransportLayer,
-    tcp: TcpConnector,
+    base: Arc<dyn ServerDialer>,
     timeout: Duration,
     fragment: Option<crate::fragment::Fragment>,
 }
@@ -125,9 +125,7 @@ impl VlessConnector {
             flow: params.flow,
             security: params.security,
             transport: params.transport,
-            tcp: TcpConnector::new()
-                .with_connect_timeout(Some(options.timeout))
-                .with_socket_config(options.socket_config()),
+            base: options.base().clone(),
             timeout: options.timeout,
             fragment: options.fragment,
         })
@@ -165,6 +163,10 @@ impl VlessConnector {
         })?;
 
         let (opaque, local_port) = self.open_stream(recorder).await?;
+        let alpn_protocol = opaque.alpn_protocol.clone();
+        let alpn = alpn_protocol
+            .as_deref()
+            .map(|name| netune_trace::Alpn::from_name(Some(name)));
         let stream = self.write_head(opaque, &header).await.map_err(|error| {
             ProxyProtocolError::Connect(format!(
                 "write the VLESS request to {}: {error}",
@@ -176,7 +178,8 @@ impl VlessConnector {
             stream,
             local_port,
             socket: None,
-            alpn: None,
+            alpn,
+            alpn_protocol,
         })
     }
 
@@ -190,6 +193,7 @@ impl VlessConnector {
             stream,
             raw_read,
             alpn: _,
+            alpn_protocol: _,
         } = opaque;
 
         // The node precedes its payload with `version || addon_len || addons`, and the reference
@@ -226,12 +230,14 @@ impl VlessConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
-        let target = Target::plain(self.server.clone());
         let established = self
-            .tcp
-            .connect(&target, recorder)
+            .base
+            .connect(&self.server, recorder)
             .await
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+            .map_err(|error| match error {
+                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
+                other => ProxyProtocolError::Connect(other.to_string()),
+            })?;
         let local_port = established.local_port;
 
         // ADR-0028's order is security **then** transport, which is the opposite of what the
@@ -246,11 +252,13 @@ impl VlessConnector {
         let opaque = match (&self.fragment, &self.security) {
             (Some(fragment), Security::Reality(_)) => {
                 let stream = crate::fragment::FragmentingIo::new(established.stream, *fragment);
-                self.security.wrap(stream, &self.host, self.timeout).await?
+                self.security
+                    .wrap(stream, &self.host, recorder, self.timeout)
+                    .await?
             }
             _ => {
                 self.security
-                    .wrap(established.stream, &self.host, self.timeout)
+                    .wrap(established.stream, &self.host, recorder, self.timeout)
                     .await?
             }
         };
@@ -272,9 +280,18 @@ impl VlessConnector {
                 stream,
                 raw_read,
                 alpn: opaque.alpn,
+                alpn_protocol: opaque.alpn_protocol,
             },
             local_port,
         ))
+    }
+
+    /// Opens the bare TCP stream to this VLESS server, before the protocol handshake.
+    pub async fn connect_server(
+        &self,
+        recorder: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base.connect(&self.server, recorder).await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this VLESS node.

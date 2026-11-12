@@ -11,7 +11,8 @@
 //!   daer check                    does this configuration run, and what would it do
 //!   daer route <TARGET>           which rule and outbound decide this flow or target
 //!   daer probe <SUBCOMMAND>       active probe for node reachability, handshake, and health
-//!   daer status                   read-only snapshot of the running daemon
+//!   daer status [--nodes|--groups|--elections]  read-only runtime views
+//!   daer elect <ELECTION> <NODE>  pin an existing election; `--reset` follows its rule
 //!   daer schema                   the JSON Schema, for an editor
 //!   daer version                  build information
 //! ```
@@ -30,6 +31,7 @@
 //!
 //! [ADR-0014]: ../docs/adr/0014-drb-rule-binary-and-providers.md
 
+mod control;
 mod dns;
 mod incident;
 mod preflight;
@@ -46,7 +48,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use daer_config::{Config, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_NAMES, FunctionOrString};
-use daer_outbound::{FilterSet, parse_group_policy};
+use daer_outbound::FilterSet;
 use daer_routing::{
     AliasOptimizer, DeduplicateParamsOptimizer, MergeAndSortOptimizer, NormalizedProgram, Outbound,
     RoutingError, RulesBuilder, ValidationSink, is_builtin_outbound, outbound_name, parse_outbound,
@@ -72,7 +74,11 @@ enum Command {
         #[arg(short, long, value_name = "PATH")]
         config: Option<PathBuf>,
         /// The compiled datapath object.
-        #[arg(long, value_name = "PATH", default_value = "target/ebpf/datapath.o")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            default_value = "target/ebpf/datapath.bpf.o"
+        )]
         object: PathBuf,
         /// Serve without attaching the kernel program.
         ///
@@ -127,11 +133,13 @@ enum Command {
         /// the kernel, so it needs no capability (ADR-0029).
         #[arg(long, value_name = "PATH")]
         object: Option<PathBuf>,
-        /// Also check the host-global sysctl prerequisites the datapath requires.
+        /// Also check the host prerequisites the datapath requires.
         ///
-        /// Reads `/proc/sys` and needs no capability. Without this flag, `daer check`
-        /// validates only the configuration and the object; a deployment gate that wants to
-        /// catch a host that would refuse to start should pass it.
+        /// Checks the Linux 6.6+ TCX baseline and the host-global sysctls (forwarding on,
+        /// `rp_filter`/`arp_filter` relaxed). Reads `uname` and `/proc/sys`, needs no
+        /// capability, and changes nothing. Without this flag, `daer check` validates only
+        /// the configuration and the object; a deployment gate that wants to catch a host
+        /// that would refuse to start should pass it.
         #[arg(long)]
         host: bool,
     },
@@ -161,6 +169,24 @@ enum Command {
         #[command(subcommand)]
         command: ProbeCommand,
     },
+    /// Pin an election to a node, or clear its runtime override.
+    ///
+    /// This changes the election's current choice, not the routing table. All rules that
+    /// target the election immediately use the pinned node; existing flows keep the node
+    /// they started on.
+    Elect {
+        /// Election name (a routing target declared in `[[election]]`).
+        election: String,
+        /// Node name. Required unless `--reset` is given.
+        #[arg(required_unless_present = "reset", conflicts_with = "reset")]
+        node: Option<String>,
+        /// Clear the override and return to the configured election rule.
+        #[arg(long)]
+        reset: bool,
+        /// Print the daemon's JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read the running daemon's snapshot without changing anything.
     ///
     /// Reads `/run/daer/control.sock`; when the daemon is not reachable it falls back to the
@@ -180,6 +206,15 @@ enum Command {
         /// `flow.node_selected`, `flow.dial_finished`, `flow.closed` all carry the same ID.
         #[arg(long, value_name = "FLOW_ID")]
         flow: Option<String>,
+        /// Show the live node catalog.
+        #[arg(long, conflicts_with_all = ["groups", "elections", "flow", "bundle"])]
+        nodes: bool,
+        /// Show the live resource pools and their elections.
+        #[arg(long, conflicts_with_all = ["nodes", "elections", "flow", "bundle"])]
+        groups: bool,
+        /// Show the live elections and their current results.
+        #[arg(long, conflicts_with_all = ["nodes", "groups", "flow", "bundle"])]
+        elections: bool,
     },
     /// Print the JSON Schema of a configuration file.
     ///
@@ -527,8 +562,59 @@ fn main() -> ExitCode {
                 }
             }
         },
-        Command::Status { json, bundle, flow } => {
-            block_on(async move { status::run(status::StatusOptions { json, bundle, flow }).await })
+        Command::Elect {
+            election,
+            node,
+            reset,
+            json,
+        } => block_on(async move {
+            let value = if reset {
+                control::reset(&election).await?
+            } else {
+                let node = node.ok_or_else(|| anyhow::anyhow!("NODE is required"))?;
+                control::elect(&election, &node).await?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if reset {
+                println!("{election}: reset to its configured rule");
+            } else {
+                println!(
+                    "{election}: pinned to {}",
+                    value
+                        .get("node")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                );
+            }
+            Ok(())
+        }),
+        Command::Status {
+            json,
+            bundle,
+            flow,
+            nodes,
+            groups,
+            elections,
+        } => {
+            let view = if nodes {
+                Some("nodes")
+            } else if groups {
+                Some("groups")
+            } else if elections {
+                Some("elections")
+            } else {
+                None
+            };
+            block_on(async move {
+                status::run(status::StatusOptions {
+                    json,
+                    bundle,
+                    flow,
+                    view,
+                })
+                .await
+            })
         }
         Command::Schema => {
             println!("{}", daer_config::schema::json_schema());
@@ -618,7 +704,7 @@ async fn check(
         // The same literal `run`'s `--object` defaults to, and the same resolution: a
         // packaged install puts the object in libdir, not in the working directory.
         None => Some(run::resolve_object_path(Path::new(
-            "target/ebpf/datapath.o",
+            "target/ebpf/datapath.bpf.o",
         ))),
     };
     if let Some(object) = object.as_deref() {
@@ -634,6 +720,12 @@ async fn check(
     }
 
     if host {
+        // The host gate includes the kernel baseline as well as the sysctls: both are
+        // properties of the machine, not of the configuration or the object. A packaged
+        // build uses `daer check` without `--host`, so validating an object never requires
+        // the builder's kernel to match the target's (ADR-0042).
+        daer_ebpf::require_tcx()?;
+        println!("kernel: TCX (Linux 6.6+): ok");
         daer_control::datapath::check_host_sysctls().map_err(|error| anyhow::anyhow!("{error}"))?;
         println!("host sysctl prerequisites: ok");
     }
@@ -801,11 +893,11 @@ async fn explain_route(
     // would make the exit status useless as a check — the whole reason it exists.
     if !explanation.outbound_is_actionable() {
         println!(
-            "  verdict    : undeliverable, group {:?} has no selectable node",
+            "  verdict    : undeliverable, election {:?} has no electable node",
             explanation.outbound.name
         );
         anyhow::bail!(
-            "the flow would be dropped: outbound {:?} has no selectable node",
+            "the flow would be dropped: election {:?} has no electable node",
             explanation.outbound.name
         );
     }
@@ -996,6 +1088,16 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
 
     validate_runtime(&loaded.config, &mut warnings)?;
 
+    // Build the same generation the daemon will serve. This is the only way
+    // `daer check` can reject an election whose node input is unsupported or whose
+    // election graph cannot be assembled; the static checks above cannot see the
+    // resolved node graph.
+    let options = daer_control::RouterOptions::for_config(path)
+        .with_rule_providers(Some(provider_res.pool.clone()));
+    let generations = daer_control::Generations::new(&loaded.config, &options)
+        .context("configuration rejected by the generation builder")?;
+    warnings.extend(generations.current().warnings().iter().cloned());
+
     Ok(ValidationReport {
         rules: loaded.config.routing.rules.len(),
         files: loaded.files.len(),
@@ -1003,11 +1105,9 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     })
 }
 
-/// Validates `group` policies and filters the way the run path builds them.
+/// Validates `group` filters the way the run path builds them.
 fn validate_groups(config: &Config) -> anyhow::Result<()> {
     for group in &config.group {
-        parse_group_policy(&group.policy)
-            .map_err(|message| anyhow::anyhow!("group {:?}: {message}", group.name))?;
         let filters: Vec<Vec<daer_config::Function>> = group
             .filters
             .iter()
@@ -1137,11 +1237,11 @@ fn validate_runtime(config: &Config, warnings: &mut Vec<String>) -> anyhow::Resu
 /// filter engine. A false negative here would be a spurious warning, which is why
 /// the check is only used to warn.
 fn resolve_outbound(config: &Config, name: &str) -> Result<(), RoutingError> {
-    if is_builtin_outbound(name) || config.group.iter().any(|group| group.name == name) {
+    if is_builtin_outbound(name) || config.election.iter().any(|election| election.name == name) {
         return Ok(());
     }
     Err(RoutingError::new(format!(
-        "outbound (group) {name:?} not found; please define it in a [[group]] table"
+        "outbound {name:?} is not an election; define it in an [[election]] table"
     )))
 }
 
@@ -1149,6 +1249,19 @@ fn resolve_outbound(config: &Config, name: &str) -> Result<(), RoutingError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn elect_requires_a_node_or_reset() {
+        assert!(Cli::try_parse_from(["daer", "elect", "proxy"]).is_err());
+        assert!(Cli::try_parse_from(["daer", "elect", "proxy", "--reset"]).is_ok());
+        assert!(Cli::try_parse_from(["daer", "elect", "proxy", "hk-01"]).is_ok());
+    }
+
+    #[test]
+    fn status_views_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["daer", "status", "--nodes", "--elections"]).is_err());
+        assert!(Cli::try_parse_from(["daer", "status", "--elections"]).is_ok());
+    }
 
     #[test]
     fn check_accepts_the_host_gate_flag() {
@@ -1215,9 +1328,9 @@ mod tests {
         let cn = dir.0.join("geosite-cn.drb");
         let cn_ip = dir.0.join("geoip-cn.drb");
         for (path, rules) in [
-            (&private, "ip: 10.0.0.0/8\nip: 192.168.0.0/16\n"),
+            (&private, "10.0.0.0/8\n192.168.0.0/16\n"),
             (&cn, "example.cn\n"),
-            (&cn_ip, "ip: 1.2.3.0/24\n"),
+            (&cn_ip, "1.2.3.0/24\n"),
         ] {
             let set = daer_routing::DrbSet::from_text(
                 path.file_stem()
@@ -1230,10 +1343,10 @@ mod tests {
         }
 
         let mut text = EXAMPLE_TOML.to_owned();
-        for (tag, path) in [("private", &private), ("cn", &cn), ("cn-ip", &cn_ip)] {
-            let marker = format!("[[rule-provider]]\ntag = \"{tag}\"\ntype = \"http\"");
+        for (name, path) in [("private", &private), ("cn", &cn), ("cn-ip", &cn_ip)] {
+            let marker = format!("[[rule-provider]]\nname = \"{name}\"\ntype = \"http\"");
             let start = text.find(&marker).unwrap_or_else(|| {
-                panic!("the shipped example must still declare provider {tag:?} as HTTP: {text}")
+                panic!("the shipped example must still declare provider {name:?} as HTTP: {text}")
             });
             let end = text[start + marker.len()..]
                 .find("[[rule-provider]]")
@@ -1242,7 +1355,7 @@ mod tests {
             block = block.replace(
                 &marker,
                 &format!(
-                    "[[rule-provider]]\ntag = \"{tag}\"\ntype = \"file\"\npath = \"{}\"",
+                    "[[rule-provider]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"",
                     path.display()
                 ),
             );
@@ -1285,7 +1398,7 @@ mod tests {
         // And a node added to the pool must make the group selectable under the default policy,
         // which is the part that regressed (`min-moving-avg` selected nothing until a probe ran).
         let text = format!(
-            "{}\n[[node]]\ntag = \"example\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
+            "{}\n[[node]]\nname = \"example\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
             std::fs::read_to_string(&config).expect("reads the rewritten example")
         );
         let config_with_node = dir.write("with-node.toml", text.as_bytes());
@@ -1299,7 +1412,7 @@ mod tests {
             .router()
             .node_identity("proxy")
             .expect("the example's default policy must select a node once one exists");
-        assert_eq!(node.group, "proxy");
+        assert_eq!(node.group, "proxy-pool");
     }
 
     #[test]
@@ -1314,14 +1427,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_groups() {
+    fn rejects_unknown_elections() {
         let dir = TempDir::new("unknown");
         let config = dir.write(
             "config.toml",
             b"[routing]\nrules = [\"dport(443) -> nope\"]\nfallback = \"nope\"\n",
         );
         let error = block_on(validate_config(&config)).expect_err("must fail");
-        assert!(format!("{error:#}").contains("not found"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("not an election"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1370,14 +1486,15 @@ fallback = "direct"
         let config = dir.write(
             "config.toml",
             br#"[[node]]
-tag = "v"
+name = "v"
 type = "tuic"
 server = "198.51.100.1"
 port = 443
 
-[[group]]
+[[election]]
 name = "g"
-policy = "min"
+node = "v"
+type = "manual"
 
 [routing]
 fallback = "g"
@@ -1391,10 +1508,7 @@ fallback = "g"
     #[test]
     fn warns_when_a_group_selects_no_node() {
         let dir = TempDir::new("emptynode");
-        let config = dir.write(
-            "config.toml",
-            b"[[group]]\nname = \"g\"\npolicy = \"min\"\n",
-        );
+        let config = dir.write("config.toml", b"[[group]]\nname = \"g\"\n");
         let report = block_on(validate_config(&config)).expect("validates");
         assert!(
             report
@@ -1407,17 +1521,14 @@ fallback = "g"
     }
 
     #[test]
-    fn rejects_bad_group_policies() {
+    fn rejects_bad_election_types() {
         let dir = TempDir::new("badgroup");
         let config = dir.write(
             "config.toml",
-            b"[[group]]\nname = \"g\"\npolicy = \"fastest\"\n",
+            b"[[node]]\nname = \"n\"\ntype = \"direct\"\n\n[[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"fastest\"\n",
         );
         let error = block_on(validate_config(&config)).expect_err("must fail");
-        assert!(
-            format!("{error:#}").contains("unexpected policy"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("fastest"), "{error:#}");
     }
 
     #[test]
@@ -1425,7 +1536,7 @@ fallback = "g"
         let dir = TempDir::new("badfilter");
         let config = dir.write(
             "config.toml",
-            b"[[group]]\nname = \"g\"\npolicy = \"min-avg10\"\nfilters = [\"name(regex: '[')\"]\n",
+            b"[[group]]\nname = \"g\"\nfilters = [\"name(regex: '[')\"]\n",
         );
         let error = block_on(validate_config(&config)).expect_err("must fail");
         assert!(format!("{error:#}").contains("bad regexp"), "{error:#}");
@@ -1438,7 +1549,6 @@ fallback = "g"
             "config.toml",
             br#"[[group]]
 name = "g"
-policy = "fixed(0)"
 filters = [
     "name(keyword: HK) && !name(keyword: 'ExpireAt:')",
     { match = "subtag(my_sub)", annotate = { add_latency = "-500ms" } },
@@ -1454,14 +1564,15 @@ filters = [
         let config = dir.write(
             "config.toml",
             br#"[[node]]
-tag = "n1"
+name = "n1"
 type = "socks5"
 server = "127.0.0.1"
 port = 1080
 
-[[group]]
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "n1"
+type = "manual"
 
 [routing]
 rules = ["port(443) -> proxy"]
@@ -1489,13 +1600,13 @@ fallback = "direct"
     #[test]
     fn route_explain_reports_an_empty_group_as_a_failure() {
         // The documented contract: exit 1 when the flow would be dropped. A group
-        // with no selectable node cannot carry the flow, so it is a drop — the
+        // with no electable node cannot carry the flow, so it is a drop — the
         // earlier behaviour printed a verdict and exited 0, which made the exit
         // status useless for the check it exists for.
         let dir = TempDir::new("explain-empty-group");
         let config = dir.write(
             "config.toml",
-            b"[[group]]\nname = \"empty\"\npolicy = \"min\"\n[routing]\nfallback = \"empty\"\n",
+            b"[[group]]\nname = \"empty-pool\"\n\n[[election]]\nname = \"empty\"\ngroup = \"empty-pool\"\ntype = \"min\"\n[routing]\nfallback = \"empty\"\n",
         );
         let error = block_on(explain_route(
             &config,
@@ -1505,8 +1616,11 @@ fallback = "direct"
             None,
         ))
         .expect_err("an empty group must not exit 0");
-        let message = error.to_string();
-        assert!(message.contains("no selectable node"), "{message}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no electable") || message.contains("no selectable"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1553,7 +1667,7 @@ fallback = "direct"
             "config.toml",
             br#"
 [[node]]
-tag = "ss"
+name = "ss"
 type = "shadowsocks"
 server = "1.2.3.4"
 port = 8388
@@ -1561,21 +1675,17 @@ method = "aes-256-gcm"
 password = "secret"
 
 [[node]]
-tag = "tj"
+name = "tj"
 type = "trojan"
 server = "node.example.com"
 port = 443
 password = "pw"
 
 [[node]]
-tag = "plain"
+name = "plain"
 type = "socks5"
 server = "127.0.0.1"
 port = 1080
-
-[[group]]
-name = "proxy"
-policy = "fixed(0)"
 "#,
         );
 
@@ -1619,15 +1729,16 @@ policy = "fixed(0)"
         let config = dir.write(
             "config.toml",
             br#"[[node]]
-tag = "tj"
+name = "tj"
 type = "trojan"
 server = "node.example.com"
 port = 443
 password = "pw"
 
-[[group]]
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "tj"
+type = "manual"
 
 [routing]
 rules = ["port(443) -> proxy"]
@@ -1643,7 +1754,7 @@ fallback = "direct"
         ))
         .expect("explains");
         let selected = explanation.selected.clone().expect("a node is selected");
-        assert_eq!(selected.group, "proxy");
+        assert_eq!(selected.election, "proxy");
         assert_eq!(selected.node, "tj");
         assert!(selected.security.is_confidential());
         let rendered = explanation.to_string();
@@ -1658,10 +1769,10 @@ fallback = "direct"
         let config = dir.write(
             "config.toml",
             br#"
-schema = 1
+schema = 2
 
 [[node]]
-tag = "hk-vless"
+name = "hk-vless"
 type = "vless"
 server = "198.51.100.1"
 port = 443
@@ -1674,7 +1785,7 @@ public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
 short-id = "ab01cd02"
 
 [[node]]
-tag = "us-ss"
+name = "us-ss"
 type = "shadowsocks"
 server = "198.51.100.2"
 port = 8388
@@ -1682,8 +1793,13 @@ method = "chacha20-ietf-poly1305"
 password = "super-secret-password"
 
 [[group]]
+name = "pool"
+filters = ["name(hk-vless)"]
+
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+group = "pool"
+type = "min-moving-avg"
 
 [routing]
 rules = []
@@ -1742,19 +1858,23 @@ fallback = "proxy"
         let sub_url = "https://example.com/api/subscribe?token=test";
         let config_toml = format!(
             r#"
-schema = 1
+schema = 2
 
 [[subscription]]
-tag = "mysub"
+name = "mysub"
 url = "{sub_url}"
 persist = true
 
 [[group]]
-name = "fastest-jp"
-policy = "min-moving-avg"
+name = "jp-pool"
 filters = [
-    "subtag(mysub) && name(keyword: 'Japan')"
+    "sub(mysub) && name(keyword: 'Japan')"
 ]
+
+[[election]]
+name = "fastest-jp"
+group = "jp-pool"
+type = "min-moving-avg"
 
 [routing]
 rules = ["dport(443) -> fastest-jp"]
@@ -1809,7 +1929,8 @@ fallback = "direct"
             .router()
             .node_identity("fastest-jp")
             .expect("node selected");
-        assert_eq!(selected_node.group, "fastest-jp");
+        assert_eq!(selected_node.group, "jp-pool");
+        assert_eq!(selected_node.election, "fastest-jp");
         assert!(selected_node.node.contains("Japan"));
     }
 
@@ -1849,7 +1970,10 @@ fallback = "direct"
             None,
         ))
         .expect_err("must not explain a configuration it cannot run");
-        assert!(format!("{error:#}").contains("not found"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("not an election"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1922,14 +2046,14 @@ fallback = "direct"
     #[test]
     fn rule_provider_integration_with_routing_and_explain() {
         let dir = TempDir::new("rule-provider-routing");
-        let _rules_file = dir.write("direct.rules", b"ip: 192.168.100.0/24\ncorp.lan\n");
+        let _rules_file = dir.write("direct.rules", b"192.168.100.0/24\ncorp.lan\n");
         let config = dir.write(
             "config.toml",
             br#"
-schema = 1
+schema = 2
 
 [[rule-provider]]
-tag = "internal-corp"
+name = "internal-corp"
 type = "file"
 path = "direct.rules"
 format = "text"

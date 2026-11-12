@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
@@ -15,23 +15,23 @@ do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_len,
 		bpf_map_lookup_elem(&parse_ctx_scratch_map, &scratch_key);
 
 	if (!ctx)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	int ret = parse_transport(skb, link_h_len, ctx);
 
 	if (ret) {
 		// Negative: error - drop; Positive: unsupported protocol - pass through
 		if (ret < 0) {
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		report_parse_passthrough(ret);
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 	}
 
 	if (skb->ingress_ifindex == NOWHERE_IFINDEX &&  // Only drop NDP_REDIRECT packets from localhost
 		ctx->l4proto == IPPROTO_ICMPV6 && ctx->icmp6h.icmp6_type == NDP_REDIRECT) {
 		// REDIRECT (NDP)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	if (out) {
@@ -76,7 +76,7 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, &pkt->tuples,
 					   &pkt->ethh, 0)) {
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	set_tproxy_cb(skb, pkt->listener_l4proto);
@@ -140,7 +140,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		 */
 		if (!tcp_state) {
 			bump_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
-			return TC_ACT_OK;
+			return DAER_TC_PASS;
 		}
 
 		/* Compatibility restore for 030902f behavior and align with WAN
@@ -151,7 +151,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			/* No cache: keep historical direct-pass semantics (e.g.
 			 * single-arm / reply-path traffic).
 			 */
-			return TC_ACT_OK;
+			return DAER_TC_PASS;
 		}
 
 		// Load routing from the conn_state we already looked up
@@ -160,10 +160,10 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (outbound == OUTBOUND_DIRECT) {
 			skb->mark = mark;
-			return TC_ACT_OK;
+			return DAER_TC_PASS;
 		}
 		if (unlikely(outbound == OUTBOUND_BLOCK))
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		pkt->datapath_generation = tcp_state->datapath_generation;
 		return redirect_lan_packet_to_control_plane(
 			skb, link_h_len, pkt, tcp_state->meta.raw,
@@ -194,7 +194,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 				ROUTING_EPOCH_SLOT_UNKNOWN, &udp_state_status);
 			if (udp_state && udp_state->is_wan_ingress_direction) {
 				// Replay (outbound) of an inbound flow => direct.
-				return TC_ACT_OK;
+				return DAER_TC_PASS;
 			}
 
 			// Fast path: Use cached routing if available
@@ -275,7 +275,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			    sock_bound_to_daddr(sk, &pkt->tuples,
 						pkt->ethh.h_proto)) {
 				bpf_sk_release(sk);
-				return TC_ACT_OK;
+				return DAER_TC_PASS;
 			}
 			bpf_sk_release(sk);
 		}
@@ -290,7 +290,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			pkt->tuples.five.dip.u6_addr32,
 			mac_be);
 	if (s64_ret < 0) {
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	__u8 outbound = s64_ret & 0xff;
@@ -362,10 +362,10 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		routing_epoch_slot);
 
 direct:
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 
 block:
-	return TC_ACT_SHOT;
+	return DAER_TC_DROP;
 }
 
 /* Middle layer: parse once, then run the LAN-ingress role. One call frame, as
@@ -378,7 +378,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
 
 	if (!pkt)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	/* Ensure scratch bytes are initialized even if verifier can't precisely
 	 * track writes done through callee pointer arguments. */
@@ -387,10 +387,10 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 
 	if (ret) {
 		if (ret < 0) {
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		report_parse_passthrough(ret);
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 	}
 
 	return tproxy_lan_ingress_role(skb, link_h_len, pkt);
@@ -477,7 +477,7 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (pkt->udph.source == bpf_htons(53) ||
 		    pkt->udph.dest == bpf_htons(53))
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 
 		copy_reversed_tuples(&pkt->tuples.five, &reversed_tuples_key);
 		/* Observability only: an unsolicited WAN-ingress UDP flow would
@@ -496,7 +496,7 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			bump_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
 	}
 
-	return DAE_TC_CONTINUE;
+	return DAER_TC_CONTINUE;
 }
 
 /* Middle layer for the WAN-ingress role; see do_tproxy_lan_ingress. */
@@ -507,7 +507,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
 
 	if (!pkt)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	__builtin_memset(pkt, 0, sizeof(*pkt));
 	int ret = parse_packet(skb, link_h_len, pkt);
@@ -515,10 +515,10 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 	if (ret) {
 		// Negative: error - drop; Positive: unsupported protocol - pass through
 		if (ret < 0) {
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		report_parse_passthrough(ret);
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 	}
 
 	return tproxy_wan_ingress_role(skb, link_h_len, pkt);
@@ -548,25 +548,25 @@ do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
 		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
 
 	if (!pkt)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	__builtin_memset(pkt, 0, sizeof(*pkt));
 	int ret = parse_packet(skb, link_h_len, pkt);
 
 	if (ret) {
 		if (ret < 0) {
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 		report_parse_passthrough(ret);
 		/* The wan_ingress role used to consume the packet first and
-		 * return TC_ACT_OK for an unclassifiable frame, which made the
+		 * return DAER_TC_PASS for an unclassifiable frame, which made the
 		 * dual-role hook stop before the lan_ingress role. Preserve
 		 * that forwarding decision. */
-		return TC_ACT_OK;
+		return DAER_TC_PASS;
 	}
 
 	ret = tproxy_wan_ingress_role(skb, link_h_len, pkt);
-	if (ret != DAE_TC_CONTINUE)
+	if (ret != DAER_TC_CONTINUE)
 		return ret;
 	return tproxy_lan_ingress_role(skb, link_h_len, pkt);
 }

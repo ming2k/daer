@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.

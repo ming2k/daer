@@ -38,7 +38,7 @@ fn object_path() -> Option<std::path::PathBuf> {
         return path.is_file().then_some(path);
     }
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/ebpf/datapath-test.o");
+        .join("../../target/ebpf/datapath_test.bpf.o");
     path.is_file().then_some(path)
 }
 
@@ -92,7 +92,7 @@ fn discover_cases(ebpf: &Ebpf) -> Result<Vec<Case>, String> {
 }
 
 /// `markAllOutboundsAlive`: an ARRAY map defaults to 0 ("not alive"), so a case that
-/// routes to a user-defined outbound would get `TC_ACT_SHOT` before exercising anything.
+/// routes to a user-defined outbound would get `DAER_TC_DROP` before exercising anything.
 fn mark_all_outbounds_alive(ebpf: &mut Ebpf) -> Result<(), String> {
     use aya::maps::Array;
     let map = ebpf
@@ -247,7 +247,6 @@ fn skip_without_privilege(reason: &str) {
 
 fn param() -> RuntimeParam {
     RuntimeParam {
-        tproxy_port: 12_345,
         control_plane_pid: std::process::id(),
         device_ifindex: 1,
         netns_id: 0,
@@ -265,7 +264,7 @@ fn param() -> RuntimeParam {
 fn every_datapath_case_passes() {
     let Some(path) = object_path() else {
         eprintln!(
-            "skipped: target/ebpf/datapath-test.o is missing; run `cargo xtask ebpf --tests`"
+            "skipped: target/ebpf/datapath_test.bpf.o is missing; run `cargo xtask ebpf --tests`"
         );
         return;
     };

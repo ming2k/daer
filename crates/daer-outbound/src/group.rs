@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! A dialer group: the alive set plus the per-node measured state.
+//! The runtime half of an election: its candidate dialers and measured state.
 //!
-//! Replaces the selection half of `dialer_group.go`. Filtering happens when the
-//! group is built (`from_properties`), and the resulting dialer list is what
-//! `fixed(<index>)` indexes into — the same order the Go implementation uses.
+//! A group is only a resource pool. This type is built from the pool's survivors
+//! plus the election's selection rule; it owns the alive set and the per-node
+//! latency history that rule ranks. It never decides *which* group to use and it
+//! never owns a routing target: that is the election's name in the routing
+//! program.
 
 use std::collections::HashMap;
 
@@ -15,22 +17,22 @@ use crate::alive::{AliveDialerSet, DialerId, NotifyOutcome};
 use crate::dialer::Dialer;
 use crate::error::OutboundError;
 use crate::filter::FilterSet;
-use crate::property::{GroupPolicy, Property};
+use crate::property::Property;
 
 #[derive(Debug)]
-pub struct DialerGroup {
+pub struct ElectionRuntime {
     name: String,
-    group_policy: GroupPolicy,
+    policy: SelectionPolicy,
     dialers: Vec<Dialer>,
     index: HashMap<DialerId, usize>,
     alive: AliveDialerSet,
 }
 
-impl DialerGroup {
-    /// Builds a group from an already-filtered dialer list.
+impl ElectionRuntime {
+    /// Builds an election runtime from an already-filtered dialer list.
     pub fn new(
         name: impl Into<String>,
-        group_policy: GroupPolicy,
+        policy: SelectionPolicy,
         tolerance: TimeSpan,
         dialers: Vec<Dialer>,
     ) -> Self {
@@ -40,7 +42,7 @@ impl DialerGroup {
             .map(|(position, dialer)| (dialer.id(), position))
             .collect();
         let alive = AliveDialerSet::presuming_alive(
-            group_policy.selection_policy(),
+            policy,
             tolerance,
             dialers
                 .iter()
@@ -49,58 +51,39 @@ impl DialerGroup {
         );
         Self {
             name: name.into(),
-            group_policy,
+            policy,
             dialers,
             index,
             alive,
         }
     }
 
-    /// Applies `filters` to `properties` and builds the group.
-    ///
-    /// # Errors
-    ///
-    /// A `fixed` policy whose index falls outside the filtered list is rejected
-    /// here, where the Go implementation only fails on the first selection.
+    /// Applies `filters` to `properties` and builds the election runtime.
     pub fn from_properties(
         name: impl Into<String>,
-        group_policy: GroupPolicy,
+        policy: SelectionPolicy,
         tolerance: TimeSpan,
         properties: Vec<Property>,
         filters: &FilterSet,
-    ) -> Result<Self, OutboundError> {
+    ) -> Self {
         let mut dialers = Vec::with_capacity(properties.len());
         for property in properties {
-            let Some(annotation) = filters.matches(&property.name, &property.subscription_tag)
+            let Some(annotation) = filters.matches(&property.name, &property.subscription_name)
             else {
                 continue;
             };
             let id = DialerId(dialers.len() as u64);
             dialers.push(Dialer::new(id, property, annotation.add_latency));
         }
-
-        if let GroupPolicy::Fixed { index } = group_policy
-            && index >= dialers.len()
-        {
-            return Err(OutboundError::FixedIndexOutOfRange {
-                index,
-                count: dialers.len(),
-            });
-        }
-
-        Ok(Self::new(name, group_policy, tolerance, dialers))
+        Self::new(name, policy, tolerance, dialers)
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn group_policy(&self) -> GroupPolicy {
-        self.group_policy
-    }
-
     pub fn policy(&self) -> SelectionPolicy {
-        self.group_policy.selection_policy()
+        self.policy
     }
 
     pub fn len(&self) -> usize {
@@ -115,10 +98,14 @@ impl DialerGroup {
         self.index.get(&id).map(|position| &self.dialers[*position])
     }
 
-    /// Every dialer in the group, in filter order.
-    ///
-    /// Filter order is what `fixed(n)` indexes by, so a diagnostic that listed them in another
-    /// order would describe a different group.
+    /// Resolves a node name to its dialer, for runtime `elect`.
+    pub fn dialer_by_name(&self, name: &str) -> Option<&Dialer> {
+        self.dialers
+            .iter()
+            .find(|dialer| dialer.property().name == name)
+    }
+
+    /// Every dialer in the election's candidate order.
     pub fn dialers(&self) -> impl Iterator<Item = &Dialer> {
         self.dialers.iter()
     }
@@ -131,34 +118,42 @@ impl DialerGroup {
         self.alive.best()
     }
 
-    /// Applies one health-check result: updates the node's history, then the
-    /// alive set with the number the policy ranks on.
+    /// Whether a candidate is currently alive.
+    #[must_use]
+    pub fn is_alive(&self, id: DialerId) -> Option<bool> {
+        self.alive.is_alive(id)
+    }
+
+    /// Applies one probe result: updates the node's history, then the alive set
+    /// with the number the election's rule ranks on.
     pub fn record(
         &mut self,
         id: DialerId,
         alive: bool,
         latency: Option<TimeSpan>,
     ) -> Result<NotifyOutcome, OutboundError> {
-        let policy = self.policy();
         let Some(position) = self.index.get(&id).copied() else {
             return Err(OutboundError::UnknownDialer(id));
         };
 
         let dialer = &mut self.dialers[position];
         dialer.record(alive, latency);
-        let sample = dialer.sorting_sample(policy);
+        let sample = dialer.sorting_sample(self.policy);
         Ok(self.alive.notify(id, alive, sample))
     }
 
     /// Picks a node for a new connection.
-    ///
-    /// `fixed` ignores `excluded`, because the configured index is explicit user
-    /// intent (Go documents the same behaviour).
     pub fn select(&self, excluded: Option<DialerId>) -> Option<&Dialer> {
-        match self.group_policy {
-            GroupPolicy::Fixed { index } => self.dialers.get(index),
-            _ => self.alive.select(excluded).and_then(|id| self.dialer(id)),
-        }
+        self.alive.select(excluded).and_then(|id| self.dialer(id))
+    }
+
+    /// Picks a specific candidate by name, bypassing the policy.
+    ///
+    /// This is the runtime `daer elect <election> <node>` path. It is deliberately
+    /// separate from [`Self::select`]: the override is an operator decision and must
+    /// not be silently replaced by a health rule.
+    pub fn select_named(&self, name: &str) -> Option<&Dialer> {
+        self.dialer_by_name(name)
     }
 }
 
@@ -173,7 +168,7 @@ mod tests {
         TimeSpan::from_millis(value)
     }
 
-    fn group(policy: GroupPolicy, offsets: &[i64]) -> DialerGroup {
+    fn group(policy: SelectionPolicy, offsets: &[i64]) -> ElectionRuntime {
         let dialers = offsets
             .iter()
             .enumerate()
@@ -183,23 +178,23 @@ mod tests {
                 Dialer::new(DialerId(position as u64), property, ms(*offset))
             })
             .collect();
-        DialerGroup::new("g", policy, TimeSpan::ZERO, dialers)
+        ElectionRuntime::new("g", policy, TimeSpan::ZERO, dialers)
     }
 
-    fn property(name: &str, tag: &str) -> Property {
+    fn property(name: &str, subscription_name: &str) -> Property {
         Property {
             name: name.to_owned(),
             address: String::new(),
             protocol: crate::property::Protocol::Direct,
             udp: false,
-            subscription_tag: tag.to_owned(),
+            subscription_name: subscription_name.to_owned(),
             security: crate::property::Security::Plaintext,
         }
     }
 
     #[test]
     fn records_checks_and_picks_the_best_node() {
-        let mut group = group(GroupPolicy::MinLastLatency, &[0, 0, 0]);
+        let mut group = group(SelectionPolicy::MinLastLatency, &[0, 0, 0]);
         group
             .record(DialerId(0), true, Some(ms(50)))
             .expect("records");
@@ -215,7 +210,6 @@ mod tests {
             group.select(None).map(|dialer| dialer.id()),
             Some(DialerId(1))
         );
-        // Excluding the best falls back to the next lowest.
         assert_eq!(
             group.select(Some(DialerId(1))).map(|dialer| dialer.id()),
             Some(DialerId(0))
@@ -224,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_dead_node_is_skipped() {
-        let mut group = group(GroupPolicy::MinLastLatency, &[0, 0]);
+        let mut group = group(SelectionPolicy::MinLastLatency, &[0, 0]);
         group
             .record(DialerId(0), true, Some(ms(10)))
             .expect("records");
@@ -245,7 +239,7 @@ mod tests {
 
     #[test]
     fn min_avg10_uses_the_average_not_the_last_sample() {
-        let mut group = group(GroupPolicy::MinAverage10, &[0, 0]);
+        let mut group = group(SelectionPolicy::MinAverage10, &[0, 0]);
         group
             .record(DialerId(0), true, Some(ms(40)))
             .expect("records");
@@ -268,7 +262,6 @@ mod tests {
         group
             .record(DialerId(1), true, Some(ms(90)))
             .expect("records");
-        // Node 1's average is now 50, worse than node 0's 40.
         assert_eq!(
             group.select(None).map(|dialer| dialer.id()),
             Some(DialerId(0))
@@ -277,7 +270,7 @@ mod tests {
 
     #[test]
     fn add_latency_offsets_are_applied() {
-        let mut group = group(GroupPolicy::MinLastLatency, &[100, -30]);
+        let mut group = group(SelectionPolicy::MinLastLatency, &[100, -30]);
         group
             .record(DialerId(0), true, Some(ms(10)))
             .expect("records");
@@ -292,7 +285,7 @@ mod tests {
 
     #[test]
     fn records_reject_unknown_dialers() {
-        let mut group = group(GroupPolicy::MinLastLatency, &[0]);
+        let mut group = group(SelectionPolicy::MinLastLatency, &[0]);
         let error = group
             .record(DialerId(9), true, Some(ms(1)))
             .expect_err("must fail");
@@ -315,14 +308,13 @@ mod tests {
             property("US_node", "sub"),
             property("HK_backup", "sub"),
         ];
-        let group = DialerGroup::from_properties(
+        let group = ElectionRuntime::from_properties(
             "g",
-            GroupPolicy::MinLastLatency,
+            SelectionPolicy::MinLastLatency,
             TimeSpan::ZERO,
             properties,
             &filters,
-        )
-        .expect("builds");
+        );
 
         assert_eq!(group.len(), 2);
         assert_eq!(
@@ -332,53 +324,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["HK_node", "HK_backup"]
         );
-        // The filter's annotation became the latency offset.
         assert_eq!(group.dialers().next().unwrap().offset(), ms(-500));
     }
 
     #[test]
-    fn fixed_selects_the_configured_index_of_the_filtered_list() {
-        let filters = FilterSet::compile(&[], &[]).expect("compiles");
-        let properties = vec![property("a", ""), property("b", ""), property("c", "")];
-        let group = DialerGroup::from_properties(
-            "g",
-            GroupPolicy::Fixed { index: 1 },
-            TimeSpan::ZERO,
-            properties,
-            &filters,
-        )
-        .expect("builds");
-
+    fn manual_selects_the_single_candidate() {
+        let group = group(SelectionPolicy::Manual, &[0]);
         assert_eq!(
             group
                 .select(None)
                 .map(|dialer| dialer.property().name.as_str()),
-            Some("b")
+            Some("node0")
         );
-        // Fixed ignores the exclusion parameter.
         assert_eq!(
             group
-                .select(Some(DialerId(1)))
+                .select_named("node0")
                 .map(|dialer| dialer.property().name.as_str()),
-            Some("b")
+            Some("node0")
         );
-    }
-
-    #[test]
-    fn fixed_rejects_an_out_of_range_index() {
-        let filters = FilterSet::compile(&[], &[]).expect("compiles");
-        let error = DialerGroup::from_properties(
-            "g",
-            GroupPolicy::Fixed { index: 3 },
-            TimeSpan::ZERO,
-            vec![property("a", "")],
-            &filters,
-        )
-        .expect_err("must fail");
-        assert!(matches!(
-            error,
-            OutboundError::FixedIndexOutOfRange { index: 3, count: 1 }
-        ));
+        assert!(group.select_named("missing").is_none());
     }
 
     #[test]
@@ -391,14 +355,13 @@ mod tests {
             &[Vec::new()],
         )
         .expect("compiles");
-        let group = DialerGroup::from_properties(
+        let group = ElectionRuntime::from_properties(
             "g",
-            GroupPolicy::Random,
+            SelectionPolicy::Random,
             TimeSpan::ZERO,
             vec![property("a", "")],
             &filters,
-        )
-        .expect("builds");
+        );
         assert!(group.is_empty());
         assert!(group.select(None).is_none());
     }

@@ -26,37 +26,39 @@
         "upstream": []
       }
     },
+    "election": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Election"
+      }
+    },
     "global": {
       "$ref": "#/$defs/Global",
       "default": {
         "allow-insecure": false,
         "auto-sniff-punt": true,
         "disable-waiting-network": false,
-        "health-check": {
-          "interval": "30s",
-          "tcp-method": "HEAD",
-          "tcp-url": [
-            "http://cp.cloudflare.com",
-            "1.1.1.1",
-            "2606:4700:4700::1111"
-          ],
-          "tolerance": "0s",
-          "udp-dns": [
-            "dns.google:53",
-            "8.8.8.8",
-            "2001:4860:4860::8888"
-          ]
-        },
         "lan-interface": [],
         "log-level": "info",
+        "probe": {
+          "interval": "30s",
+          "method": "HEAD",
+          "mode": "server",
+          "timeout": "5s",
+          "tolerance": "0s",
+          "udp-dns": [
+            "1.1.1.1:53",
+            "8.8.8.8:53",
+            "2001:4860:4860::8888:53"
+          ],
+          "url": null
+        },
         "sniffing-timeout": "30ms",
         "tls": {
           "fragment": false,
           "fragment-interval": "10-20",
           "fragment-length": "50-100"
         },
-        "tproxy-port": 12345,
-        "tproxy-port-protect": true,
         "wan-interface": [
           "auto"
         ]
@@ -98,7 +100,7 @@
       "description": "Schema version. Bumped when a change cannot be expressed as a default.",
       "type": "integer",
       "format": "uint32",
-      "default": 1,
+      "default": 2,
       "minimum": 0
     },
     "subscription": {
@@ -203,6 +205,122 @@
       },
       "additionalProperties": false
     },
+    "Election": {
+      "description": "One `[[election]]` entry: the routing target and the rule that elects one node.\n\nThe input is exactly one of `group` or `node`. A group is a set of candidates; a\nnode is a singleton candidate set. The output is always one node (or no node when\nthe input has no usable candidate).",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "The candidate set. Mutually exclusive with `node`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "description": "Probe overrides. `None` inherits `[global.probe]`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProbeMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "node": {
+          "description": "A singleton candidate set. Mutually exclusive with `group`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tolerance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "The selection rule.",
+          "$ref": "#/$defs/ElectionKind"
+        },
+        "udp-dns": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "ElectionKind": {
+      "description": "How an election selects one node from its input.",
+      "oneOf": [
+        {
+          "description": "The input must be a node; the election returns that node or fails when it is\nnot usable.",
+          "type": "string",
+          "const": "manual"
+        },
+        {
+          "description": "Pick a random alive node.",
+          "type": "string",
+          "const": "random"
+        },
+        {
+          "description": "Pick the node with the lowest last measured latency.",
+          "type": "string",
+          "const": "min"
+        },
+        {
+          "description": "Pick the node with the lowest average of its last 10 latencies.",
+          "type": "string",
+          "const": "min-avg10"
+        },
+        {
+          "description": "Pick the node with the lowest exponentially weighted moving average.",
+          "type": "string",
+          "const": "min-moving-avg"
+        }
+      ]
+    },
     "FakeIpConfig": {
       "description": "`[dns.fake-ip]` — synthetic IP pool configuration (ADR-0012).",
       "type": "object",
@@ -242,7 +360,7 @@
       "description": "A `group.filters` entry: an expression, or an expression plus values the\nselected node inherits.",
       "anyOf": [
         {
-          "description": "`subtag(sub) && !name(keyword: 'ExpireAt:')`",
+          "description": "`sub(sub) && !name(keyword: 'ExpireAt:')`",
           "type": "string"
         },
         {
@@ -299,24 +417,6 @@
           "type": "boolean",
           "default": false
         },
-        "health-check": {
-          "$ref": "#/$defs/HealthCheck",
-          "default": {
-            "interval": "30s",
-            "tcp-method": "HEAD",
-            "tcp-url": [
-              "http://cp.cloudflare.com",
-              "1.1.1.1",
-              "2606:4700:4700::1111"
-            ],
-            "tolerance": "0s",
-            "udp-dns": [
-              "dns.google:53",
-              "8.8.8.8",
-              "2001:4860:4860::8888"
-            ]
-          }
-        },
         "lan-interface": {
           "type": "array",
           "default": [],
@@ -329,12 +429,28 @@
           "type": "string",
           "default": "info"
         },
+        "probe": {
+          "$ref": "#/$defs/ProbeSettings",
+          "default": {
+            "interval": "30s",
+            "method": "HEAD",
+            "mode": "server",
+            "timeout": "5s",
+            "tolerance": "0s",
+            "udp-dns": [
+              "1.1.1.1:53",
+              "8.8.8.8:53",
+              "2001:4860:4860::8888:53"
+            ],
+            "url": null
+          }
+        },
         "sniffing-timeout": {
           "type": "string",
           "default": "30ms"
         },
         "so-mark": {
-          "description": "Socket mark for daer-originated traffic.\n\nOmitted, a privileged run picks [`crate::DEFAULT_SOCKET_MARK`] and an unprivileged one\nmarks nothing; the datapath and the redirect rule have to agree with whichever it is, so\nthe daemon decides once and reports the value it used.",
+          "description": "Socket mark for daer-originated traffic.\n\nOmitted, a privileged run picks [`daer_common::consts::DEFAULT_SOCKET_MARK`] and an\nunprivileged one marks nothing; the datapath and the redirect rule have to agree with\nwhichever it is, so the daemon decides once and reports the value it used.",
           "type": [
             "integer",
             "null"
@@ -349,19 +465,6 @@
             "fragment-interval": "10-20",
             "fragment-length": "50-100"
           }
-        },
-        "tproxy-port": {
-          "description": "Transparent-proxy port. Not an HTTP/SOCKS port: the eBPF program\nredirects here.",
-          "type": "integer",
-          "format": "uint16",
-          "default": 12345,
-          "maximum": 65535,
-          "minimum": 0
-        },
-        "tproxy-port-protect": {
-          "description": "Reject traffic that did not go through the eBPF program.\n\nEnforced by [`crate::validate`] against the listener's shape: with this on, a flow whose\noriginal destination *is* the transparent port is refused, because such a flow was not\nredirected. `false` weakens that to what the socket can observe, and exists only for a\ndebugging session on a box nobody else can reach.",
-          "type": "boolean",
-          "default": true
         },
         "wan-interface": {
           "type": "array",
@@ -379,126 +482,20 @@
       "type": "object",
       "properties": {
         "filters": {
-          "description": "Multiple filters are OR-ed; each filter is a conjunction.",
+          "description": "The candidate set: multiple filters are OR-ed; each filter is a conjunction.\n\nA group carries no selection rule and no probe. It is a resource pool; an\n`[[election]]` names it as input and owns the rule that picks one member.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/Filter"
           }
         },
-        "health-check": {
-          "$ref": "#/$defs/HealthCheckOverride"
-        },
         "name": {
-          "type": "string"
-        },
-        "policy": {
-          "description": "`min_moving_avg`, `fixed(0)`, … `None` means\n[`daer_common::SelectionPolicy`]'s default.",
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "name",
-        "policy"
+        "name"
       ]
-    },
-    "HealthCheck": {
-      "description": "The health-check knobs, shared by `[global.health-check]` (the defaults) and\nevery `[[group.health-check]]` (the overrides).",
-      "type": "object",
-      "properties": {
-        "interval": {
-          "description": "`check-interval`.",
-          "type": "string",
-          "default": "30s"
-        },
-        "tcp-method": {
-          "description": "`tcp-check-http-method`.",
-          "$ref": "#/$defs/HttpMethod",
-          "default": "HEAD"
-        },
-        "tcp-url": {
-          "description": "`tcp-check-url`: URL first, then optional direct IP addresses.",
-          "type": "array",
-          "default": [
-            "http://cp.cloudflare.com",
-            "1.1.1.1",
-            "2606:4700:4700::1111"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "tolerance": {
-          "description": "`check-tolerance`: shifts the switch threshold of moving averages.",
-          "type": "string",
-          "default": "0s"
-        },
-        "udp-dns": {
-          "description": "`udp-check-dns`: DNS endpoints used for the UDP probe.",
-          "type": "array",
-          "default": [
-            "dns.google:53",
-            "8.8.8.8",
-            "2001:4860:4860::8888"
-          ],
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "HealthCheckOverride": {
-      "description": "A group's partial override of [`HealthCheck`].",
-      "type": "object",
-      "properties": {
-        "interval": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "tcp-method": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/HttpMethod"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "tcp-url": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "default": null,
-          "items": {
-            "type": "string"
-          }
-        },
-        "tolerance": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "udp-dns": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "default": null,
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false
     },
     "HttpMethod": {
       "description": "Every HTTP method a health-check probe may use.",
@@ -648,7 +645,14 @@
       "description": "One `[[node]]` entry.",
       "type": "object",
       "properties": {
-        "tag": {
+        "detour": {
+          "description": "The node whose outbound carries this node's connection to its own server.\n\nThis is the detour seam (ADR-0044): the outer node's proxy protocol still names the\n*final* target, while the byte stream to its server is opened by another node. A chain\nis therefore `outer(detour=inner)`, not a new protocol.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
           "type": [
             "string",
             "null"
@@ -659,7 +663,7 @@
         {
           "type": "object",
           "properties": {
-            "tag": {
+            "name": {
               "type": [
                 "string",
                 "null"
@@ -677,6 +681,12 @@
         {
           "type": "object",
           "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "password": {
               "type": [
                 "string",
@@ -691,12 +701,6 @@
             },
             "server": {
               "type": "string"
-            },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "type": {
               "type": "string",
@@ -718,6 +722,12 @@
         {
           "type": "object",
           "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "password": {
               "type": [
                 "string",
@@ -732,12 +742,6 @@
             },
             "server": {
               "type": "string"
-            },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "type": {
               "type": "string",
@@ -762,6 +766,12 @@
             "method": {
               "type": "string"
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "password": {
               "type": "string"
             },
@@ -773,12 +783,6 @@
             },
             "server": {
               "type": "string"
-            },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "type": {
               "type": "string",
@@ -799,6 +803,12 @@
             "allow-insecure": {
               "type": "boolean"
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "password": {
               "type": "string"
             },
@@ -812,12 +822,6 @@
               "type": "string"
             },
             "sni": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "tag": {
               "type": [
                 "string",
                 "null"
@@ -846,6 +850,12 @@
               "format": "uint",
               "minimum": 0
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "password": {
               "type": "string"
             },
@@ -859,12 +869,6 @@
               "type": "string"
             },
             "sni": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "tag": {
               "type": [
                 "string",
                 "null"
@@ -895,6 +899,12 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "obfs": {
               "anyOf": [
@@ -932,12 +942,6 @@
                 "null"
               ]
             },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "type": {
               "type": "string",
               "const": "hysteria2"
@@ -962,6 +966,12 @@
             "flow": {
               "$ref": "#/$defs/Flow"
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "port": {
               "type": "integer",
               "format": "uint16",
@@ -973,12 +983,6 @@
             },
             "server": {
               "type": "string"
-            },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "transport": {
               "$ref": "#/$defs/TransportConfig"
@@ -1009,6 +1013,12 @@
             "cipher": {
               "$ref": "#/$defs/VmessCipher"
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "no-termination-signal": {
               "description": "Omit the terminating signal on shutdown.",
               "type": "boolean"
@@ -1024,12 +1034,6 @@
             },
             "server": {
               "type": "string"
-            },
-            "tag": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "transport": {
               "$ref": "#/$defs/TransportConfig"
@@ -1103,6 +1107,69 @@
         "ranges"
       ]
     },
+    "ProbeMode": {
+      "description": "What a probe measures.",
+      "oneOf": [
+        {
+          "description": "A cheap liveness probe against the node's own server address. It proves the\nserver is reachable, not that the node can carry a request to the internet.",
+          "type": "string",
+          "const": "server"
+        },
+        {
+          "description": "A request through the node to `url`. This is the Clash `url-test` shape: it\nproves the proxy session authenticated and the node can reach the target.",
+          "type": "string",
+          "const": "url"
+        }
+      ]
+    },
+    "ProbeSettings": {
+      "description": "Probe defaults, shared by `[global.probe]` and every election that overrides them.\n\nMeasurement is not a property of a group: a group is only a candidate set. An\nelection owns the probe it needs; the global table supplies defaults so a file\ndoes not repeat the same URL for every election.",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "type": "string",
+          "default": "30s"
+        },
+        "method": {
+          "$ref": "#/$defs/HttpMethod",
+          "default": "HEAD"
+        },
+        "mode": {
+          "$ref": "#/$defs/ProbeMode",
+          "default": "server"
+        },
+        "timeout": {
+          "type": "string",
+          "default": "5s"
+        },
+        "tolerance": {
+          "description": "Shifts the switch threshold of moving averages.",
+          "type": "string",
+          "default": "0s"
+        },
+        "udp-dns": {
+          "description": "DNS endpoints used by the server-liveness probe for datagram-carrying nodes.",
+          "type": "array",
+          "default": [
+            "1.1.1.1:53",
+            "8.8.8.8:53",
+            "2001:4860:4860::8888:53"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "url": {
+          "description": "The URL requested when `mode = \"url\"`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
     "ProviderFormat": {
       "type": "string",
       "enum": [
@@ -1148,14 +1215,14 @@
             "null"
           ]
         },
+        "name": {
+          "type": "string"
+        },
         "path": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "tag": {
-          "type": "string"
         },
         "type": {
           "$ref": "#/$defs/ProviderType",
@@ -1170,7 +1237,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "tag"
+        "name"
       ]
     },
     "SecurityConfig": {
@@ -1267,27 +1334,34 @@
       ]
     },
     "Subscription": {
-      "description": "`subscription = [\"url\"]` or `[[subscription]] tag/url/persist`.",
+      "description": "`subscription = [\"url\"]` or `[[subscription]] name/url/persist`.",
       "anyOf": [
         {
-          "description": "A bare URL, no tag.",
+          "description": "A bare URL, no name.",
           "type": "string"
         },
         {
-          "description": "A tagged subscription.",
+          "description": "A named subscription.",
           "type": "object",
           "properties": {
-            "persist": {
-              "description": "Cache the last successful fetch next to the configuration.",
-              "type": "boolean",
-              "default": false
-            },
-            "tag": {
-              "description": "Tag used by `subtag()` filters.",
+            "detour": {
+              "description": "Detour applied to every node this subscription contributes.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "name": {
+              "description": "Name used by `sub()` / `subtag()` filters.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "persist": {
+              "description": "Cache the last successful fetch next to the configuration.",
+              "type": "boolean",
+              "default": false
             },
             "url": {
               "type": "string"

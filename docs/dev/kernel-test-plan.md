@@ -25,14 +25,14 @@ cd /path/to/daer
 # vmlinux.h from the running kernel
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
 
-cargo xtask ebpf       # -> target/ebpf/datapath.o
+cargo xtask ebpf       # -> target/ebpf/datapath.bpf.o
 cargo build --release  # -> target/release/daer
 
 # the userspace must be green before the kernel side is worth testing
 cargo test --workspace
 ```
 
-Needs `clang`, `bpftool`, `ip`, `tc`, `go` (only for the optional `docs/how-to/vision-lab.md` lab).
+Needs `clang`, `bpftool`, `ip`, and `go` (only for the optional `docs/how-to/vision-lab.md` lab).
 
 ## Step 1 — does the object load?
 
@@ -52,8 +52,8 @@ Expected:
   ok  the object loaded and passed the verifier
        loaded 23 maps
        loaded 23 programs
-4. attaching to a real interface
-  ok  a tc program attached to lo
+4. attaching a TCX link to a real interface
+  ok  a TCX program attached to lo
 ```
 
 **Send me this output either way.** If step 3 fails, the log at
@@ -68,14 +68,13 @@ Save as `/tmp/daer-test.toml`. Replace `wan-interface` with your outbound interf
 (`ip route show default` names it) and `lan-interface` with the one clients use.
 
 ```toml
-schema = 1
+schema = 2
 
 [global]
-tproxy-port = 12345
 wan-interface = ["eth0"]        # <-- yours
 lan-interface = ["eth1"]        # <-- yours, the network you proxy *from*
 # Strongly recommended: separates daer's own outbound flows from client flows.
-so-mark = 0x0dae
+so-mark = 0x64616572
 log-level = "debug"
 
 [[node]]
@@ -87,8 +86,12 @@ url = "vless://<uuid>@<host>:443?encryption=none&security=reality&sni=<sni>&pbk=
 # add `&flow=xtls-rprx-vision` whenever the node expects it.
 
 [[group]]
+name = "proxy-pool"
+
+[[election]]
 name = "proxy"
-policy = "min-moving-avg"
+group = "proxy-pool"
+type = "min-moving-avg"
 
 [routing]
 # `dip(...)` is representable in the kernel; `pname(...)` and `domain(...)` are not,
@@ -110,7 +113,7 @@ does:
 ```
 
 The second command must say `outbound: proxy (mark 33262)`. If it says
-`undeliverable, group "proxy" has no selectable node`, the node did not become selectable
+`undeliverable, election "proxy" has no electable node`, the node did not become selectable
 (the REALITY link parses fine — that is tested — so it would be the group's filter).
 
 ## Step 3 — run it
@@ -124,7 +127,7 @@ Four lines must appear, and the fourth is the one that decides whether traffic i
 ```text
 INFO interfaces resolved lan=["eth1"] wan=["eth0"]
 INFO configuration loaded generation=gen1 rules=2 groups=1 nodes=1 build_ms=2
-INFO listening for redirected flows port=12345 so_mark=Some(3566) namespace=Some("daer0ns") generation=gen1 …
+INFO listening for redirected flows port=12345 so_mark=Some(1684104562) namespace=Some("daer0ns") generation=gen1 …
 INFO datapath attached: redirected flows will be proxied port=12345 namespace=daer0ns device=daer0 peer=daer0peer
 ```
 
@@ -162,7 +165,7 @@ WAN=eth0; LAN=eth1; PORT=12345
 sudo nft add table ip daer
 sudo nft add chain ip daer prerouting '{ type filter hook prerouting priority mangle; }'
 # 1. daer's own traffic must not be captured again, or it loops into itself
-sudo nft add rule ip daer prerouting meta mark 0x0dae return
+sudo nft add rule ip daer prerouting meta mark 0x64616572 return
 # 2. local destinations stay local
 sudo nft add rule ip daer prerouting fib daddr type local return
 # 3. everything else arriving from the LAN is proxied
@@ -171,7 +174,7 @@ sudo nft add rule ip daer prerouting iif $LAN tcp tproxy to :$PORT
 # and the reply path
 sudo nft add table ip daer-reply
 sudo nft add chain ip daer-reply prerouting '{ type filter hook prerouting priority mangle; }'
-sudo nft add rule ip daer-reply prerouting fib daddr type local meta mark set 0x0dae accept
+sudo nft add rule ip daer-reply prerouting fib daddr type local meta mark set 0x64616572 accept
 ```
 
 Rollback:

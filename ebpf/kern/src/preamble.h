@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
@@ -41,9 +41,15 @@
 // #define unlikely(x) x
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
-// TC_ACT_UNSPEC and TCX_NEXT are both -1: the shared continuation action for
-// classic cls_bpf and TCX multiprogram attachment.
-#define DAE_TC_CONTINUE TC_ACT_UNSPEC
+// TCX action values. Attachment is TCX-only (ADR-0042), so the datapath uses these names
+// and never the classic TC_ACT_* vocabulary. The numeric values are the kernel ABI; the
+// arm64 and riscv vendored vmlinux headers predate the TCX enum names, but the values are
+// identical on every architecture.
+#define DAER_TC_NEXT (-1)
+#define DAER_TC_PASS 0
+#define DAER_TC_DROP 2
+#define DAER_TC_REDIRECT 7
+#define DAER_TC_CONTINUE DAER_TC_NEXT
 #ifndef BIT
 #define BIT(nr) (1UL << (nr))
 #endif

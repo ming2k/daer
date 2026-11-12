@@ -21,11 +21,12 @@
 use std::path::{Path, PathBuf};
 
 use daer_config::toml_config::{self, Loaded};
+use daer_outbound::SocketConfig;
 
-use crate::rule_provider::{
-    RuleProviderResolution, resolve_rule_providers, resolve_rule_providers_with,
+use crate::rule_provider::{RuleProviderResolution, resolve_rule_providers_with};
+use crate::subscription::{
+    DEFAULT_TIMEOUT as DEFAULT_LOAD_TIMEOUT, Resolution, resolve_subscriptions_with,
 };
-use crate::subscription::{Resolution, resolve_subscriptions, resolve_subscriptions_with};
 
 /// A configuration with every subscription resolved, plus what to tell the operator.
 #[derive(Debug)]
@@ -63,65 +64,7 @@ impl Resolved {
 /// nodes *and* no cache could supply them. A subscription that fails while a cache exists is a
 /// warning, because the alternative is taking a working proxy down over one unreachable URL.
 pub async fn load_resolved(path: &Path) -> anyhow::Result<Resolved> {
-    let mut warnings = Vec::new();
-    let Loaded {
-        files,
-        config,
-        warnings: loader_warnings,
-        ..
-    } = toml_config::load(path)
-        .map_err(|error| anyhow::anyhow!("failed to load {}: {error}", path.display()))?;
-    warnings.extend(loader_warnings);
-
-    let directory = files
-        .first()
-        .and_then(|path| path.parent())
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-
-    let mut config = config;
-    let subscriptions = resolve_subscriptions(&mut config, &directory).await;
-    if !subscriptions.subscriptions.is_empty() {
-        if subscriptions.all_usable() {
-            warnings.push(format!(
-                "subscriptions: {} ({} node(s) added)",
-                subscriptions.describe(),
-                subscriptions.from_subscription
-            ));
-        } else {
-            let failed = subscriptions.failed().len();
-            let total = subscriptions.subscriptions.len();
-            anyhow::bail!(
-                "{failed} of {total} subscription(s) produced no node and no cache could supply \
-                 one: {}",
-                subscriptions.describe()
-            );
-        }
-    }
-
-    let rule_providers = resolve_rule_providers(&config, &directory).await;
-    if !rule_providers.providers.is_empty() {
-        if rule_providers.all_usable() {
-            warnings.push(format!("rule providers: {}", rule_providers.describe()));
-        } else {
-            let failed = rule_providers.failed().len();
-            let total = rule_providers.providers.len();
-            anyhow::bail!(
-                "{failed} of {total} rule provider(s) could not be loaded and no cache was \
-                 available: {}",
-                rule_providers.describe()
-            );
-        }
-    }
-
-    warn_about_empty_groups(&config, &mut warnings);
-    Ok(Resolved {
-        config,
-        files,
-        warnings,
-        subscriptions,
-        rule_providers,
-    })
+    load_resolved_with_socket_config(path, DEFAULT_LOAD_TIMEOUT, SocketConfig::default()).await
 }
 
 /// Warns about groups that select no node.
@@ -161,6 +104,23 @@ pub async fn load_resolved_with(
     path: &Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<Resolved> {
+    load_resolved_with_socket_config(path, timeout, SocketConfig::default()).await
+}
+
+/// Loads a configuration with an explicit timeout and outbound socket policy.
+///
+/// The daemon uses this during a reload: the datapath is already attached, so a
+/// subscription or HTTP rule-provider fetch that omitted `SO_MARK` would be captured by
+/// daer's own transparent listener.
+///
+/// # Errors
+///
+/// Same as [`load_resolved`].
+pub async fn load_resolved_with_socket_config(
+    path: &Path,
+    timeout: std::time::Duration,
+    socket_config: SocketConfig,
+) -> anyhow::Result<Resolved> {
     let mut warnings = Vec::new();
     let Loaded {
         files,
@@ -178,26 +138,43 @@ pub async fn load_resolved_with(
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
     let mut config = config;
-    let subscriptions = resolve_subscriptions_with(&mut config, &directory, timeout).await;
-    if !subscriptions.subscriptions.is_empty() && !subscriptions.all_usable() {
-        let failed = subscriptions.failed().len();
-        let total = subscriptions.subscriptions.len();
-        anyhow::bail!(
-            "{failed} of {total} subscription(s) produced no node and no cache could supply \
-             one: {}",
-            subscriptions.describe()
-        );
+    let subscriptions =
+        resolve_subscriptions_with(&mut config, &directory, timeout, socket_config.clone()).await;
+    if !subscriptions.subscriptions.is_empty() {
+        if subscriptions.all_usable() {
+            warnings.push(format!(
+                "subscriptions: {} ({} node(s) added)",
+                subscriptions.describe(),
+                subscriptions.from_subscription
+            ));
+        } else {
+            let failed = subscriptions.failed().len();
+            let total = subscriptions.subscriptions.len();
+            anyhow::bail!(
+                "{failed} of {total} subscription(s) produced no node and no cache could supply \
+                 one: {}",
+                subscriptions.describe()
+            );
+        }
     }
 
-    let rule_providers = resolve_rule_providers_with(&config, &directory, timeout).await;
-    if !rule_providers.providers.is_empty() && !rule_providers.all_usable() {
-        let failed = rule_providers.failed().len();
-        let total = rule_providers.providers.len();
-        anyhow::bail!(
-            "{failed} of {total} rule provider(s) could not be loaded and no cache was \
-             available: {}",
-            rule_providers.describe()
-        );
+    daer_config::validate::validate_chain_graph(&config)
+        .map_err(|error| anyhow::anyhow!("invalid configuration: {error}"))?;
+
+    let rule_providers =
+        resolve_rule_providers_with(&config, &directory, timeout, socket_config).await;
+    if !rule_providers.providers.is_empty() {
+        if rule_providers.all_usable() {
+            warnings.push(format!("rule providers: {}", rule_providers.describe()));
+        } else {
+            let failed = rule_providers.failed().len();
+            let total = rule_providers.providers.len();
+            anyhow::bail!(
+                "{failed} of {total} rule provider(s) could not be loaded and no cache was \
+                 available: {}",
+                rule_providers.describe()
+            );
+        }
     }
 
     warn_about_empty_groups(&config, &mut warnings);
@@ -235,6 +212,6 @@ pub fn group_mentions_node(group: &daer_config::Group, node: &daer_config::Node)
         // A filter that does not compile is reported by `validate_groups`.
         return true;
     };
-    set.matches(&property.name, &property.subscription_tag)
+    set.matches(&property.name, &property.subscription_name)
         .is_some()
 }

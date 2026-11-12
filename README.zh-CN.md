@@ -6,7 +6,7 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 [![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
-[![Linux: >= 5.17](https://img.shields.io/badge/Linux-Kernel_%3E%3D_5.17-green.svg)](https://www.kernel.org)
+[![Linux: >= 6.6](https://img.shields.io/badge/Linux-Kernel_%3E%3D_6.6-green.svg)](https://www.kernel.org)
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)]()
 
 [English](README.md) &bull; [简体中文](README.zh-CN.md)
@@ -48,7 +48,7 @@ daer 的使命是探索并实现现代化 Linux 系统中可预测、确定性�
 - **零侵入与极简体验**：纯后台静默运行，无需维护复杂的客户端规则，无需手动切换 SOCKS5/HTTP 端口，保障工作流平滑顺畅。
 - **极度高效与超低资源占用**：采用纯 Rust 语言构建，兼具高并发吞吐能力与严格的内存安全保证，在极低的 CPU 和内存开销下维持线速中继。
 - **链路健壮与环境适应**：针对复杂网络拓扑与丢包波动环境进行了协议层优化，具备出色的传输容错与恢复能力。
-- **完善的第一方诊断工具**：内置第一方配置验证工具、实时路由规则仿真（`daer route`）与节点全链路探测（`daer probe`），运维排障清晰明了。
+- **完善的第一方诊断工具**：内置第一方配置验证工具、实时路由规则仿真（`daer route`）、节点全链路探测（`daer probe`）、只读运行时快照（`daer status --nodes/--groups/--elections`）与运行时选举控制（`daer elect`，覆盖项持久化），运维排障清晰明了。
 
 ---
 
@@ -56,15 +56,15 @@ daer 的使命是探索并实现现代化 Linux 系统中可预测、确定性�
 
 ### 系统要求
 
-- Linux 操作系统（内核版本 5.17 或更高）
-- Root 权限或网络管理权限（`CAP_NET_ADMIN`, `CAP_BPF`）
+- Linux 操作系统（内核版本 6.6 或更高，必须支持 TCX）
+- Root 权限，或 `CAP_NET_ADMIN`、`CAP_BPF`、`CAP_PERFMON`、`CAP_SYS_ADMIN` 能力（`CAP_SYS_ADMIN` 用于创建私有 `daer0ns` 入口命名空间，即 ingress 透明接管入口侧）
 - Rust 工具链（1.95+）及 Clang / LLVM
 
 ### 构建与启动
 
 ```bash
 # 克隆仓库
-git clone https://github.com/daeuniverse/daer.git
+git clone https://github.com/ming2k/daer.git
 cd daer
 
 # 编译用户态程序与内核数据面

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
@@ -455,8 +455,8 @@ struct daer_event_rate {
 	// layout, the ARRAY capacity derived from the highest key, and the
 	// userspace mirror (eventRateSpec in control/event_rate_contract.go) stay
 	// byte-identical.
-	__u32 stateless_tcp_key;        // reserved: DAE_EVENT_RESERVED_* (6)
-	__u32 frag_tail_key;            // reserved: DAE_EVENT_RESERVED_* (7)
+	__u32 stateless_tcp_key;        // reserved: DAER_EVENT_RESERVED_* (6)
+	__u32 frag_tail_key;            // reserved: DAER_EVENT_RESERVED_* (7)
 	// Explicit padding: the Go mirror is written with packed binary encoding,
 	// so the C layout must not carry implicit alignment holes either.
 	__u32 padding[2];

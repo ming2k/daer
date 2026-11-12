@@ -73,7 +73,7 @@ impl Dialer {
                 let average = self.moving_average.get();
                 (average.as_nanos() > 0).then_some(average)
             }
-            SelectionPolicy::Random | SelectionPolicy::Fixed => None,
+            SelectionPolicy::Random | SelectionPolicy::Manual => None,
         }
     }
 
@@ -141,7 +141,7 @@ mod tests {
             Some(ms(50))
         );
         assert_eq!(dialer.sorting_sample(SelectionPolicy::Random), None);
-        assert_eq!(dialer.sorting_sample(SelectionPolicy::Fixed), None);
+        assert_eq!(dialer.sorting_sample(SelectionPolicy::Manual), None);
     }
 
     #[test]

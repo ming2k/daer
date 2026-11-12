@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
-    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, SocketConfig,
-    Target, TcpConnector, TlsConnector,
+    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target, TlsConnector,
 };
 use netune_trace::TraceCollector;
 use tokio::sync::Mutex;
@@ -18,6 +17,7 @@ use crate::anytls::datagram::{AnyTlsDatagramConnector, AnyTlsDatagramSession, UO
 use crate::anytls::session::AnyTlsSession;
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
+use crate::server::ServerConnector;
 use crate::shadowsocks::connector::{encode_address, split_authority};
 
 /// An AnyTLS outbound connector.
@@ -29,8 +29,7 @@ pub struct AnyTlsConnector {
     allow_insecure: bool,
     idle_sessions: usize,
     timeout: Duration,
-    tls_profile: Option<&'static str>,
-    tls: Arc<TlsConnector<TcpConnector>>,
+    tls: Arc<TlsConnector<ServerConnector>>,
     sessions: Arc<Mutex<Vec<Arc<AnyTlsSession>>>>,
 }
 
@@ -58,15 +57,9 @@ impl AnyTlsConnector {
         options: DialerOptions,
     ) -> Result<Self, ProxyProtocolError> {
         let server_name = sni.unwrap_or(server).to_owned();
-        let socket = match options.so_mark {
-            Some(mark) => SocketConfig::default().with_mark(mark),
-            None => SocketConfig::default(),
-        };
-        let tcp = TcpConnector::new()
-            .with_socket_config(socket)
-            .with_connect_timeout(Some(options.timeout));
-        let tls = TlsConnector::platform(tcp)
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        let config = crate::security::tls::profile_config(options.tls_profile, allow_insecure)?;
+        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
+            .with_handshake_timeout(None);
 
         Ok(Self {
             server: format!("{server}:{port}"),
@@ -75,7 +68,6 @@ impl AnyTlsConnector {
             allow_insecure,
             idle_sessions: idle_sessions.max(1),
             timeout: options.timeout,
-            tls_profile: options.tls_profile,
             tls: Arc::new(tls),
             sessions: Arc::new(Mutex::new(Vec::new())),
         })
@@ -117,6 +109,18 @@ impl AnyTlsConnector {
         &self.server_name
     }
 
+    /// Opens the bare TCP stream to this AnyTLS server, before TLS and authentication.
+    pub async fn connect_server(
+        &self,
+        recorder: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        let target = Target::plain(self.server.clone());
+        tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
+            .await
+            .map_err(|_| ProxyProtocolError::Timeout)?
+            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))
+    }
+
     /// Returns a shared datagram connector for this AnyTLS node.
     #[must_use]
     pub fn datagram_connector(&self) -> Arc<dyn DatagramConnector> {
@@ -140,16 +144,13 @@ impl AnyTlsConnector {
 
         // Establish new session over TLS
         let target = Target::tls(&self.server, &self.server_name);
-        let target = match self.tls_profile {
-            Some(profile) => target.with_tls_profile(profile),
-            None => target,
-        };
 
         let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
             .await
             .map_err(|_| ProxyProtocolError::Timeout)?
             .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
 
+        let alpn_protocol = established.alpn_protocol;
         let mut stream = established.stream;
 
         // Perform AnyTLS client authentication flight
@@ -157,7 +158,7 @@ impl AnyTlsConnector {
             .await
             .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
 
-        let session = AnyTlsSession::new(stream);
+        let session = AnyTlsSession::new(stream, alpn_protocol);
         pool.push(Arc::clone(&session));
 
         Ok(session)
@@ -171,12 +172,17 @@ impl AnyTlsConnector {
     ) -> Result<Established, ProxyProtocolError> {
         let session = self.get_or_dial_session(recorder).await?;
         let virtual_stream = session.open_stream(authority).await?;
+        let alpn_protocol = session.alpn_protocol().map(<[u8]>::to_vec);
+        let alpn = alpn_protocol
+            .as_deref()
+            .map(|name| netune_trace::Alpn::from_name(Some(name)));
 
         Ok(Established {
             stream: Box::new(virtual_stream),
             local_port: None,
             socket: None,
-            alpn: None,
+            alpn,
+            alpn_protocol,
         })
     }
 

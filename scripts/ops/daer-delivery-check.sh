@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot privileged check for a daer build with the private ingress namespace.
 #
-#   sudo scripts/ops/daer-netns-e2e.sh --config target/netns-e2e.toml
+#   sudo scripts/ops/daer-delivery-check.sh --config target/daer-e2e.toml
 #
 # The script owns daer0ns/daer0 and temporarily stops daer. It snapshots the host
 # network state it can change and restores the original service state on every exit
@@ -10,18 +10,9 @@
 #
 # Environment:
 #   DAER_E2E_WAN          WAN interface to watch (default: the default route's device)
-#   DAER_E2E_LOG          daemon log path (default: target/daer-netns-e2e.log)
-#   DAER_E2E_RESTORE_DIR  host-state snapshot directory (default: target/daer-netns-restore)
-#   DAER_TC_ATTACH        host TC attachment: `netlink` (default) or `tcx` (Linux 6.6+)
+#   DAER_E2E_LOG          daemon log path (default: target/daer-e2e.log)
+#   DAER_E2E_RESTORE_DIR  host-state snapshot directory (default: target/daer-e2e-restore)
 set -uo pipefail
-
-case "${DAER_TC_ATTACH:-netlink}" in
-    netlink | tcx) ;;
-    *)
-        echo "error: DAER_TC_ATTACH must be netlink or tcx" >&2
-        exit 2
-        ;;
-esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 config=""
@@ -29,7 +20,7 @@ preflight=0
 
 usage() {
     cat <<'EOF'
-usage: scripts/ops/daer-netns-e2e.sh --config <daer.toml> [--preflight]
+usage: scripts/ops/daer-delivery-check.sh --config <daer.toml> [--preflight]
 
 Runs the private-ingress end-to-end diagnostic against a locally built daemon.
 The config file is required and may contain node credentials; keep it out of git.
@@ -77,24 +68,22 @@ if [[ "$preflight" -eq 1 ]]; then
         failures=$((failures + 1))
     }
 
-    if [[ "${DAER_TC_ATTACH:-netlink}" == "tcx" ]]; then
-        kernel_major="$(uname -r | cut -d. -f1)"
-        kernel_minor="$(uname -r | cut -d. -f2)"
-        if [[ "$kernel_major" -lt 6 || ( "$kernel_major" -eq 6 && "$kernel_minor" -lt 6 ) ]]; then
-            fail "TCX needs Linux 6.6+; running $(uname -r)"
-        fi
+    kernel_major="$(uname -r | cut -d. -f1)"
+    kernel_minor="$(uname -r | cut -d. -f2)"
+    if [[ "$kernel_major" -lt 6 || ( "$kernel_major" -eq 6 && "$kernel_minor" -lt 6 ) ]]; then
+        fail "daer needs Linux 6.6+ for TCX; running $(uname -r)"
     fi
-    for tool in ip nft tc bpftool curl tcpdump nsenter sysctl; do
+    for tool in ip nft bpftool curl tcpdump nsenter sysctl; do
         command -v "$tool" >/dev/null 2>&1 || fail "$tool is missing"
     done
     if [[ ! -x "$root/target/release/daer" ]]; then
         fail "target/release/daer is missing; run cargo build --release -p daer-cli --bin daer"
     fi
-    if [[ ! -f "$root/target/ebpf/datapath.o" ]]; then
-        fail "target/ebpf/datapath.o is missing; run cargo xtask ebpf"
+    if [[ ! -f "$root/target/ebpf/datapath.bpf.o" ]]; then
+        fail "target/ebpf/datapath.bpf.o is missing; run cargo xtask ebpf"
     fi
-    if [[ -x "$root/target/release/daer" && -f "$root/target/ebpf/datapath.o" ]]; then
-        "$root/target/release/daer" check -c "$config" --object "$root/target/ebpf/datapath.o" \
+    if [[ -x "$root/target/release/daer" && -f "$root/target/ebpf/datapath.bpf.o" ]]; then
+        "$root/target/release/daer" check -c "$config" --object "$root/target/ebpf/datapath.bpf.o" \
             || fail "daer check rejected the config or object"
     fi
 
@@ -103,8 +92,8 @@ if [[ "$preflight" -eq 1 ]]; then
         exit 1
     fi
     echo "preflight ok"
-    echo "tc attach: ${DAER_TC_ATTACH:-netlink}"
-    echo "run: sudo DAER_TC_ATTACH=${DAER_TC_ATTACH:-netlink} $0 --config $config"
+    echo "tc attach: tcx"
+    echo "run: sudo $0 --config $config"
     exit 0
 fi
 
@@ -113,8 +102,8 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exit 2
 fi
 
-log="${DAER_E2E_LOG:-$root/target/daer-netns-e2e.log}"
-restore_dir="${DAER_E2E_RESTORE_DIR:-$root/target/daer-netns-restore}"
+log="${DAER_E2E_LOG:-$root/target/daer-e2e.log}"
+restore_dir="${DAER_E2E_RESTORE_DIR:-$root/target/daer-e2e-restore}"
 owner="${SUDO_USER:-root}"
 wan_if="${DAER_E2E_WAN:-$(ip route show default 2>/dev/null | awk '/^default/{print $5; exit}')}"
 [[ -n "$wan_if" ]] || wan_if=wlan0
@@ -122,20 +111,6 @@ daer_pid=""
 daer_initial=""
 resolved_initial=""
 cleaned=0
-
-# Remove daer's TC hooks from the WAN device. If a SIGKILL leaves them behind, they
-# keep redirecting host traffic into a listener that no longer exists, which looks
-# exactly like "the network died after running the test".
-remove_daer_tc() {
-    local direction pref
-    for direction in ingress egress; do
-        while read -r pref; do
-            [[ -n "$pref" ]] || continue
-            tc filter del dev "$wan_if" "$direction" pref "$pref" >/dev/null 2>&1
-        done < <(tc filter show dev "$wan_if" "$direction" 2>/dev/null \
-            | awk '/tproxy_/ { for (i = 1; i <= NF; i++) if ($i == "pref") print $(i + 1) }')
-    done
-}
 
 cleanup() {
     set +e
@@ -154,7 +129,6 @@ cleanup() {
     fi
     ip netns del daer0ns >/dev/null 2>&1
     ip link del daer0 >/dev/null 2>&1
-    remove_daer_tc
 
     # Remove only daer's table/rule, never the operator's xray/vpn rules.
     for fam in -4 -6; do
@@ -185,22 +159,18 @@ cleanup() {
         systemctl restart systemd-resolved >/dev/null 2>&1
     fi
     resolvectl flush-caches >/dev/null 2>&1
-    chown -R "$owner" "$log"* "$restore_dir" "$root/target/daer-netns-e2e."*.txt 2>/dev/null
+    chown -R "$owner" "$log"* "$restore_dir" "$root/target/daer-e2e."*.txt 2>/dev/null
 }
 
 cd "$root" || exit 1
 command -v nsenter >/dev/null 2>&1 \
     || { echo "nsenter (util-linux) is required for the ingress topology checks" >&2; exit 1; }
-for file in target/release/daer target/ebpf/datapath.o; do
+for file in target/release/daer target/ebpf/datapath.bpf.o; do
     [[ -f "$file" ]] || { echo "missing $file; build it first" >&2; exit 1; }
 done
 
 mkdir -p "$restore_dir" "$(dirname "$log")"
 chown "$owner" "$restore_dir" 2>/dev/null
-if systemctl is-active --quiet dae 2>/dev/null; then
-    echo "dae is active; run scripts/ops/remove-dae.sh first" >&2
-    exit 1
-fi
 daer_initial="$(systemctl is-active daer 2>/dev/null || true)"
 resolved_initial="$(systemctl is-active systemd-resolved 2>/dev/null || true)"
 echo "initial services: daer=$daer_initial systemd-resolved=$resolved_initial"
@@ -232,6 +202,7 @@ if [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]]; then
 fi
 ip rule show >"$restore_dir/rules-before.txt" 2>&1
 ip route show table 2023 >"$restore_dir/route-before.txt" 2>&1
+tcx_before="$(bpftool link show 2>/dev/null | grep -c 'tcx' || true)"
 
 # Stop the services that would otherwise own daer0/table 2023. Their state was
 # captured above, and cleanup restarts exactly the ones that were active.
@@ -239,7 +210,6 @@ if [[ "$daer_initial" == "active" ]]; then systemctl stop daer >/dev/null 2>&1; 
 mkdir -p /run/netns
 ip netns del daer0ns >/dev/null 2>&1
 ip link del daer0 >/dev/null 2>&1
-remove_daer_tc
 
 # Find the node under test in the config, for the packet capture. The config is
 # parsed loosely on purpose: a missing `server` only skips that capture.
@@ -259,10 +229,9 @@ curl -4 -sS --max-time 12 --resolve example.com:443:172.66.147.243 \
     -o /dev/null -w 'direct-example http=%{http_code}\n' https://example.com/ || true
 timeout 8 getent ahostsv4 example.com | head -2 || true
 
-echo "=== start daer (tc attach: ${DAER_TC_ATTACH:-netlink}) ==="
+echo "=== start daer (tc attach: tcx) ==="
 RUST_LOG=daer=debug,daer_control=debug,daer_relay=debug,daer_outbound=debug,netune=debug \
-DAER_TC_ATTACH="${DAER_TC_ATTACH:-netlink}" \
-    ./target/release/daer run -c "$config" --object target/ebpf/datapath.o >"$log" 2>&1 &
+    ./target/release/daer run -c "$config" --object target/ebpf/datapath.bpf.o >"$log" 2>&1 &
 daer_pid=$!
 chown "$owner" "$log" 2>/dev/null
 echo "daer pid=$daer_pid log=$log"
@@ -283,7 +252,7 @@ fi
 
 echo
 echo "=== topology ==="
-echo "tc attach: ${DAER_TC_ATTACH:-netlink}"
+echo "tc attach: tcx"
 # The namespace mount is private to the daemon's mount namespace. Enter the mount namespace
 # with nsenter so `ip` sees the same /run/netns the daemon created.
 ns_mnt="/proc/$daer_pid/ns/mnt"
@@ -298,9 +267,8 @@ echo "-- host rules --"
 ip rule show
 echo "-- neighbor --"
 ns_ip -n daer0ns neigh show
-echo "-- tc --"
-tc filter show dev "$wan_if" egress | head -20
-ns_ip netns exec daer0ns tc filter show dev daer0peer ingress | head -20
+echo "-- tcx links --"
+bpftool net | head -40
 echo "-- listener --"
 ns_ip netns exec daer0ns ss -lntup | grep 12345 || true
 
@@ -327,7 +295,7 @@ except Exception as error:
 PY
 echo
 echo "=== DNS userspace path ==="
-dns_capture="$root/target/daer-netns-e2e.dns.txt"
+dns_capture="$root/target/daer-e2e.dns.txt"
 timeout 14 tcpdump -i "$wan_if" -nn -c 12 'udp port 53' >"$dns_capture" 2>&1 &
 dns_pid=$!
 sleep 1
@@ -341,7 +309,7 @@ cat "$dns_capture"
 echo
 echo "=== proxied path (pinned example.com) ==="
 if [[ -n "$node_ip" ]]; then
-    node_capture="$root/target/daer-netns-e2e.node.txt"
+    node_capture="$root/target/daer-e2e.node.txt"
     timeout 30 tcpdump -i "$wan_if" -nn -c 20 "host $node_ip" >"$node_capture" 2>&1 &
     node_capture_pid=$!
     sleep 1
@@ -360,13 +328,11 @@ if [[ -n "$node_ip" ]]; then
 fi
 cat "$log.curl"
 echo "example.com http=${proxy_status:-failed}"
-if [[ "${DAER_TC_ATTACH:-netlink}" == "tcx" ]]; then
-    if [[ "${proxy_status:-}" == "200" ]]; then
-        echo "TCX delivery: the redirected flow reached the daemon and returned 200"
-    else
-        echo "TCX delivery failed: example.com http=${proxy_status:-failed}" >&2
-        exit 1
-    fi
+if [[ "${proxy_status:-}" == "200" ]]; then
+    echo "TCX delivery: the redirected flow reached the daemon and returned 200"
+else
+    echo "TCX delivery failed: example.com http=${proxy_status:-failed}" >&2
+    exit 1
 fi
 echo
 echo "=== relevant log ==="
@@ -376,27 +342,48 @@ echo "=== bpf stats ==="
 bpftool map dump name bpf_stats_map 2>&1 | tail -80 || true
 echo
 echo "=== nftables (for diagnosis) ==="
-nft_capture="$root/target/daer-netns-e2e.nft.txt"
+nft_capture="$root/target/daer-e2e.nft.txt"
 nft list ruleset >"$nft_capture" 2>&1 || true
 chown "$owner" "$nft_capture" 2>/dev/null
 wc -l "$nft_capture"
 
 echo
-echo "=== teardown ==="
-# Explicit stop first so we can report a blocked shutdown, then the trap performs
-# the same state restoration on any exit path.
-kill -TERM "$daer_pid" 2>/dev/null || true
-for _ in $(seq 1 150); do
-    kill -0 "$daer_pid" 2>/dev/null || break
-    sleep 0.1
-done
-if kill -0 "$daer_pid" 2>/dev/null; then
-    echo "daemon did not stop on SIGTERM; last log:" >&2
-    tail -80 "$log" >&2
-    kill -KILL "$daer_pid" 2>/dev/null || true
-fi
+echo "=== termination proof: SIGKILL ==="
+# TCX is fd-owned and the ingress namespace is private to the process. A SIGKILL must leave
+# none of daer's network state behind: no TCX link, no qdisc, no veth, no daer0 sysctls.
+# This is the falsifier for "termination restores the pre-run network state" (ADR-0042).
+kill -KILL "$daer_pid" 2>/dev/null || true
 wait "$daer_pid" 2>/dev/null || true
 daer_pid=""
+sleep 1
+if ip link show daer0 >/dev/null 2>&1; then
+    echo "SIGKILL left daer0 behind" >&2
+    exit 1
+fi
+if [[ -e /run/netns/daer0ns ]]; then
+    echo "SIGKILL left the ingress namespace mount behind" >&2
+    exit 1
+fi
+if [[ -e /proc/sys/net/ipv4/conf/daer0 ]]; then
+    echo "SIGKILL left daer0 per-device sysctls behind" >&2
+    exit 1
+fi
+tcx_after="$(bpftool link show 2>/dev/null | grep -c 'tcx' || true)"
+if [[ "${tcx_after:-0}" -ne "${tcx_before:-0}" ]]; then
+    echo "SIGKILL left TCX links behind: before=$tcx_before after=$tcx_after" >&2
+    bpftool link show >&2 || true
+    exit 1
+fi
+if ! curl -4 -sS --max-time 10 -o /dev/null http://1.1.1.1/; then
+    echo "direct traffic did not recover after SIGKILL" >&2
+    exit 1
+fi
+echo "SIGKILL: no TCX links, no qdisc, no veth, no daer-owned sysctls; direct traffic works"
+
+echo
+echo "=== teardown ==="
+# The SIGKILL above already removed the daemon-owned topology. The trap performs the same
+# state restoration on any exit path.
 # The namespace mount was private to the daemon's mount namespace, so the host path must
 # never have held it. `daer0` is the host-visible state that has to be gone.
 if [[ -e /run/netns/daer0ns ]]; then

@@ -6,7 +6,7 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 [![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
-[![Linux: >= 5.17](https://img.shields.io/badge/Linux-Kernel_%3E%3D_5.17-green.svg)](https://www.kernel.org)
+[![Linux: >= 6.6](https://img.shields.io/badge/Linux-Kernel_%3E%3D_6.6-green.svg)](https://www.kernel.org)
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)]()
 
 [English](README.md) &bull; [简体中文](README.zh-CN.md)
@@ -48,7 +48,7 @@ We believe that system-level network tools should be lightweight, reliable, and 
 - **Zero-Intrusion Ergonomics**: Operates quietly in the background without needing PAC files, client-side extensions, or manual SOCKS5/HTTP toggling.
 - **Extreme Efficiency & Low Footprint**: Built with modern Rust for memory safety, high concurrency, and near line-rate throughput with minimal CPU and memory overhead.
 - **Protocol Robustness**: Engineered to handle complex network topologies, high latency variance, and challenging packet conditions gracefully.
-- **Built-in First-Party Diagnostics**: Configuration checking, route simulation (`daer route`), active node probes (`daer probe`), and a read-only runtime inspector (`daer status`) with redacted incident bundles.
+- **Built-in First-Party Diagnostics**: Configuration checking, route simulation (`daer route`), active node probes (`daer probe`), a read-only runtime inspector (`daer status --nodes/--groups/--elections`), and runtime election control (`daer elect`) with persisted overrides.
 
 ---
 
@@ -56,16 +56,17 @@ We believe that system-level network tools should be lightweight, reliable, and 
 
 ### Prerequisites
 
-- Linux operating system (kernel 5.17 or newer)
+- Linux operating system (kernel 6.6 or newer; TCX is required)
 - Root privileges or the `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_PERFMON` and `CAP_SYS_ADMIN`
-  capabilities (`CAP_SYS_ADMIN` creates the private `daer0ns` ingress namespace)
+  capabilities (`CAP_SYS_ADMIN` creates the private `daer0ns` ingress namespace, the local
+  transparent-capture entry side)
 - Rust toolchain (1.95+) and Clang / LLVM
 
 ### Build & Run
 
 ```bash
 # Clone the repository
-git clone https://github.com/daeuniverse/daer.git
+git clone https://github.com/ming2k/daer.git
 cd daer
 
 # Build the userspace binary and kernel datapath

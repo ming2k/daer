@@ -58,7 +58,7 @@ use daer_control::{Daemon, RouterOptions};
 
 /// The daemon's own socket mark. The redirect rule excludes it so the relay's outbound leg
 /// to the origin is not captured again.
-const SOCKET_MARK: u32 = 0x0dae;
+const SOCKET_MARK: u32 = 0x64616572;
 /// The mark the tproxy rule gives the intercepted datagram.
 const TPROXY_MARK: &str = "0x6d61";
 const TPROXY_MARK_SPEC: &str = "0x6d61/0xffff";
@@ -220,14 +220,14 @@ struct Fixture {
     origin_link: String,
     client_host_link: String,
     origin_host_link: String,
-    tproxy_port: u16,
+    daemon_port: u16,
     forwarding_before: Option<String>,
     netns_dir_created: bool,
     cleaned: bool,
 }
 
 impl Fixture {
-    fn new() -> Option<Self> {
+    fn new(daemon_port: u16) -> Option<Self> {
         let suffix = format!("{:x}", std::process::id() & 0xffff);
         let client_ns = format!("d6c{suffix}");
         let origin_ns = format!("d6o{suffix}");
@@ -271,7 +271,7 @@ impl Fixture {
             origin_link,
             client_host_link,
             origin_host_link,
-            tproxy_port: 12_600 + (std::process::id() % 100) as u16,
+            daemon_port,
             forwarding_before,
             netns_dir_created,
             cleaned: false,
@@ -557,12 +557,12 @@ impl Fixture {
             "pre",
             "meta",
             "mark",
-            "0x0dae",
+            "0x64616572",
             "return",
         ])?;
         let rule = format!(
             "iif {} ip6 daddr {} udp dport {} meta mark set {} tproxy to :{}",
-            self.client_host_link, ORIGIN_IP, ORIGIN_PORT, TPROXY_MARK, self.tproxy_port
+            self.client_host_link, ORIGIN_IP, ORIGIN_PORT, TPROXY_MARK, self.daemon_port
         );
         let mut args = vec!["add", "rule", "ip6", "daer-udp6-test", "pre"];
         args.extend(rule.split(' '));
@@ -613,21 +613,18 @@ impl Drop for Fixture {
     }
 }
 
-fn config(port: u16) -> daer_config::Config {
-    let text = format!(
-        r#"
-schema = 1
+fn config() -> daer_config::Config {
+    let text = r#"
+schema = 2
 [global]
-tproxy-port = {port}
 wan-interface = ["lo"]
 lan-interface = ["lo"]
 disable-waiting-network = true
 [routing]
 rules = []
 fallback = "direct"
-"#
-    );
-    daer_config::toml_config::load_str(&text).expect("the IPv6 UDP configuration parses")
+"#;
+    daer_config::toml_config::load_str(text).expect("the IPv6 UDP configuration parses")
 }
 
 fn can_mark_sockets() -> bool {
@@ -650,7 +647,18 @@ fn can_mark_sockets() -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_redirected_ipv6_datagram_is_proxied_by_the_daemon() {
-    let Some(fixture) = Fixture::new() else {
+    let options = if can_mark_sockets() {
+        RouterOptions::default().with_socket_mark(Some(SOCKET_MARK))
+    } else {
+        RouterOptions::default()
+    };
+    let Ok(daemon) = Daemon::bind(&config(), &options) else {
+        eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
+        return;
+    };
+    let port = daemon.port;
+    let daemon = Arc::new(daemon);
+    let Some(fixture) = Fixture::new(port) else {
         return;
     };
 
@@ -664,8 +672,8 @@ async fn a_redirected_ipv6_datagram_is_proxied_by_the_daemon() {
     );
     let origin = spawn_origin(&fixture.origin_ns, origin_address, nonce.clone());
 
-    // Negative control: the tproxy rule is live but no daemon owns the target port. The
-    // client must not receive the origin's nonce; if it does, the redirect is not
+    // Negative control: the tproxy rule is live but the daemon has not begun serving.
+    // The client must not receive the origin's nonce; if it does, the redirect is not
     // intercepting this flow and the positive assertion below would be vacuous.
     let source = SocketAddr::new(std::net::IpAddr::V6(CLIENT_IP), 0);
     let before = send_once_async(&fixture.client_ns, source, origin_address).await;
@@ -675,16 +683,6 @@ async fn a_redirected_ipv6_datagram_is_proxied_by_the_daemon() {
         }
         Ok(_) | Err(_) => {}
     }
-
-    let options = if can_mark_sockets() {
-        RouterOptions::default().with_socket_mark(Some(SOCKET_MARK))
-    } else {
-        RouterOptions::default()
-    };
-    let daemon = Arc::new(
-        Daemon::bind(&config(fixture.tproxy_port), &options)
-            .expect("the transparent port must bind"),
-    );
     let stats = daemon
         .datagram_stats()
         .expect("the daemon owns a datagram relay");

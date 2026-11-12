@@ -43,6 +43,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
+
+use netune::SocketConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -382,10 +384,26 @@ impl Resolver {
     /// Returns [`ResolverError`] for an unparseable entry, an entry whose transport cannot
     /// be built, or a routing/cache configuration that does not compile.
     pub fn from_config(config: &Config) -> Result<Self, ResolverError> {
+        Self::from_config_with_socket_config(config, SocketConfig::default())
+    }
+
+    /// Builds the transports with an explicit outbound socket policy.
+    ///
+    /// The owning daemon should use this with its `SO_MARK`; `from_config` is the
+    /// configuration-only constructor for diagnostics and tests, where there is no
+    /// datapath whose listener could capture an unmarked fetch.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::from_config`].
+    pub fn from_config_with_socket_config(
+        config: &Config,
+        socket_config: SocketConfig,
+    ) -> Result<Self, ResolverError> {
         let mut transports: Vec<(String, Arc<dyn Upstream>)> = Vec::new();
         for entry in &config.dns.upstream {
             let spec = UpstreamSpec::parse(entry).map_err(ResolverError::Upstream)?;
-            let transport = spec.build().map_err(|error| {
+            let transport = spec.build(socket_config.clone()).map_err(|error| {
                 ResolverError::Upstream(format!("dns.upstream {entry:?}: {error}"))
             })?;
             transports.push((spec.tag, transport));

@@ -66,7 +66,7 @@ async fn anytls_session_full_duplex_multiplexing_and_echo() {
     .await
     .expect("auth sent");
 
-    let session = AnyTlsSession::new(Box::new(client_transport));
+    let session = AnyTlsSession::new(Box::new(client_transport), None);
 
     let server_task = tokio::spawn(async move {
         // 1. Read authentication flight
@@ -203,7 +203,7 @@ async fn anytls_session_full_duplex_multiplexing_and_echo() {
 #[tokio::test]
 async fn anytls_server_rejection_propagates_to_open_stream() {
     let (client_transport, mut server_transport) = tokio::io::duplex(4096);
-    let session = AnyTlsSession::new(Box::new(client_transport));
+    let session = AnyTlsSession::new(Box::new(client_transport), None);
 
     tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(1024);

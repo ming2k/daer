@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Canonical Rule Source (CRS v2) intermediate representation and AST (ADR-0031, ADR-0036).
+//! Canonical Rule Source (CRS v3) intermediate representation and AST (ADR-0031, ADR-0036, ADR-0045).
 //!
-//! Under ADR-0031, ADR-0033, and ADR-0036, `RuleSet` is the single source of truth for routing rules:
-//! * **IP**: Normalized as mathematical disjoint closed intervals (`v4_intervals`, `v6_intervals`).
+//! Under ADR-0031, ADR-0033, ADR-0036, and ADR-0045, `RuleSet` is the single source of truth for routing rules:
+//! * **IP**: Normalized as mathematical disjoint closed intervals (`v4_intervals`, `v6_intervals`), parsed from bare IPs, CIDRs, and `..` ranges.
 //! * **Domain**: Normalized as hierarchical patterns (`Suffix` and `Full`, rendered as `=domain`, `.domain`, `domain`).
+//! * **Metadata**: Frontmatter header `--- \n name: <set-name> \n ---` decoupled from rule lines.
 
 mod error;
 mod pattern;
@@ -37,7 +38,7 @@ impl DomainRule {
     }
 }
 
-/// A normalized rule set in Canonical Rule Source (CRS v1) format.
+/// A normalized rule set in Canonical Rule Source (CRS v3) format.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuleSet {
     name: String,
@@ -120,10 +121,80 @@ impl RuleSet {
         Ok(self)
     }
 
-    /// Parses text in CRS v1 format.
+    /// Parses text in CRS v3 format (ADR-0045).
     pub fn parse(text: &str) -> Result<Self, AstError> {
         let mut set = Self::new("");
-        for (idx, raw_line) in text.lines().enumerate() {
+        let mut lines = text.lines().enumerate().peekable();
+
+        // 1. Check for optional Frontmatter
+        let mut in_frontmatter = false;
+        let mut frontmatter_closed = false;
+
+        while let Some(&(_idx, raw_line)) = lines.peek() {
+            let line = strip_comment(raw_line);
+            if line.is_empty() {
+                lines.next();
+                continue;
+            }
+            if line == "---" {
+                lines.next();
+                in_frontmatter = true;
+                break;
+            }
+            break;
+        }
+
+        if in_frontmatter {
+            for (idx, raw_line) in lines.by_ref() {
+                let line_num = idx + 1;
+                let line = strip_comment(raw_line);
+                if line.is_empty() {
+                    continue;
+                }
+                if line == "---" {
+                    frontmatter_closed = true;
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    if key == "name" {
+                        if !set.name.is_empty() {
+                            return Err(AstError::at_line(
+                                line_num,
+                                "duplicate frontmatter key 'name'",
+                            ));
+                        }
+                        if val.is_empty() {
+                            return Err(AstError::at_line(
+                                line_num,
+                                "frontmatter key 'name' cannot be empty",
+                            ));
+                        }
+                        set.name = val.to_owned();
+                    } else {
+                        return Err(AstError::at_line(
+                            line_num,
+                            format!("unknown frontmatter key {key:?}; only 'name' is supported"),
+                        ));
+                    }
+                } else {
+                    return Err(AstError::at_line(
+                        line_num,
+                        format!("invalid frontmatter line {line:?}; expected 'key: value'"),
+                    ));
+                }
+            }
+
+            if !frontmatter_closed {
+                return Err(AstError::new(
+                    "unclosed frontmatter (missing closing '---')",
+                ));
+            }
+        }
+
+        // 2. Parse rule entries
+        for (idx, raw_line) in lines {
             let line_num = idx + 1;
             let line = strip_comment(raw_line);
             if line.is_empty() {
@@ -138,17 +209,18 @@ impl RuleSet {
     }
 
     fn push_line(&mut self, line: &str) -> Result<(), AstError> {
-        if let Some(rest) = line.strip_prefix("name:") {
-            self.name = rest.trim().to_owned();
-            return Ok(());
+        if line == "---" {
+            return Err(AstError::new("unexpected '---' outside frontmatter"));
         }
-        if let Some(rest) = line.strip_prefix("ip:") {
-            return self.push_ip_directive(rest.trim());
+        if line.starts_with("name:") {
+            return Err(AstError::new(
+                "'name:' must be declared in frontmatter '--- ... ---' at top of file (ADR-0045)",
+            ));
         }
-        if let Some(rest) = line.strip_prefix('=') {
-            let pattern = DomainPattern::from_kind("=", rest)?;
-            self.domains.push(DomainRule::new(pattern));
-            return Ok(());
+        if line.starts_with("ip:") {
+            return Err(AstError::new(
+                "'ip:' is retired (ADR-0045); write bare CIDR, host IP, or 'start..end' range",
+            ));
         }
         if let Some((kind, _val)) = line.split_once(':') {
             let k = kind.trim();
@@ -164,37 +236,33 @@ impl RuleSet {
             }
             if k == "keyword" || k == "regex" {
                 return Err(AstError::new(format!(
-                    "'{k}:' directives are removed (ADR-0031, ADR-0033); write explicit '=domain' or suffix patterns, or expand them before compiling."
+                    "'{k}:' directives are removed (ADR-0031, ADR-0033); write explicit '=domain' or suffix patterns."
                 )));
             }
         }
 
-        // Fallbacks
-        if let Ok(()) = self.push_ip_directive(line) {
-            return Ok(());
-        }
-        let pattern = if let Some(rest) = line.strip_prefix('=') {
-            DomainPattern::from_kind("=", rest)?
-        } else {
-            DomainPattern::from_kind("suffix", line)?
-        };
-        self.domains.push(DomainRule::new(pattern));
-        Ok(())
-    }
-
-    fn push_ip_directive(&mut self, val: &str) -> Result<(), AstError> {
-        // Range: start-end (spaces around the dash are accepted for compatibility).
-        if let Some((start_s, end_s)) = val.split_once('-') {
-            let start_s = start_s.trim();
-            let end_s = end_s.trim();
-            let start_ip: IpAddr = start_s
+        // 1. Range: `start..end`
+        if let Some((start_s, end_s)) = line.split_once("..") {
+            if end_s.contains("..") {
+                return Err(AstError::new(format!(
+                    "invalid IP range syntax {line:?}; expected 'start..end'"
+                )));
+            }
+            let s_trimmed = start_s.trim();
+            let e_trimmed = end_s.trim();
+            if s_trimmed.is_empty() || e_trimmed.is_empty() {
+                return Err(AstError::new(format!(
+                    "invalid IP range {line:?}: both start and end must be specified"
+                )));
+            }
+            let start_ip: IpAddr = s_trimmed
                 .parse()
-                .map_err(|_| AstError::new(format!("invalid IP start address: {start_s:?}")))?;
-            let end_ip: IpAddr = end_s
+                .map_err(|_| AstError::new(format!("invalid IP start address: {s_trimmed:?}")))?;
+            let end_ip: IpAddr = e_trimmed
                 .parse()
-                .map_err(|_| AstError::new(format!("invalid IP end address: {end_s:?}")))?;
+                .map_err(|_| AstError::new(format!("invalid IP end address: {e_trimmed:?}")))?;
 
-            match (start_ip, end_ip) {
+            return match (start_ip, end_ip) {
                 (IpAddr::V4(s), IpAddr::V4(e)) => {
                     let s_num = u32::from(s);
                     let e_num = u32::from(e);
@@ -204,7 +272,7 @@ impl RuleSet {
                         )));
                     }
                     self.push_v4_range(s_num, e_num);
-                    return Ok(());
+                    Ok(())
                 }
                 (IpAddr::V6(s), IpAddr::V6(e)) => {
                     let s_num = u128::from(s);
@@ -215,18 +283,29 @@ impl RuleSet {
                         )));
                     }
                     self.push_v6_range(s_num, e_num);
-                    return Ok(());
+                    Ok(())
                 }
-                _ => {
-                    return Err(AstError::new(
-                        "IP interval start and end must belong to the same address family",
-                    ));
-                }
-            }
+                _ => Err(AstError::new(
+                    "IP interval start and end must belong to the same address family",
+                )),
+            };
         }
 
-        // CIDR
-        if let Ok(net) = val.parse::<IpNet>() {
+        // Catch retired hyphen range `start - end`
+        if let Some((start_s, end_s)) = line.split_once('-')
+            && start_s.trim().parse::<IpAddr>().is_ok()
+            && end_s.trim().parse::<IpAddr>().is_ok()
+        {
+            return Err(AstError::new(
+                "'-' range syntax is retired (ADR-0045); write 'start..end'",
+            ));
+        }
+
+        // 2. CIDR: contains `/`
+        if line.contains('/') {
+            let net: IpNet = line
+                .parse()
+                .map_err(|e| AstError::new(format!("invalid CIDR {line:?}: {e}")))?;
             match net {
                 IpNet::V4(net) => {
                     let host_bits = 32 - net.prefix_len();
@@ -244,24 +323,47 @@ impl RuleSet {
             return Ok(());
         }
 
-        // Single IP
-        if let Ok(ip) = val.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(ip) => {
-                    let n = u32::from(ip);
-                    self.push_v4_range(n, n);
-                }
-                IpAddr::V6(ip) => {
-                    let n = u128::from(ip);
-                    self.push_v6_range(n, n);
-                }
-            }
+        // 3. IPv6 single address: contains `:`
+        if line.contains(':') {
+            let ip: Ipv6Addr = line
+                .parse()
+                .map_err(|e| AstError::new(format!("invalid IPv6 address {line:?}: {e}")))?;
+            let n = u128::from(ip);
+            self.push_v6_range(n, n);
             return Ok(());
         }
 
-        Err(AstError::new(format!(
-            "{val:?} is not a valid IP address, CIDR, or range"
-        )))
+        // 4. IPv4 single address: 4 numeric octets separated by dots
+        if is_ipv4_shape(line) {
+            let ip: Ipv4Addr = line
+                .parse()
+                .map_err(|e| AstError::new(format!("invalid IPv4 address {line:?}: {e}")))?;
+            let n = u32::from(ip);
+            self.push_v4_range(n, n);
+            return Ok(());
+        }
+
+        // 5. Exact Domain: starts with '='
+        if let Some(rest) = line.strip_prefix('=') {
+            let pattern = DomainPattern::from_kind("=", rest)?;
+            self.domains.push(DomainRule::new(pattern));
+            return Ok(());
+        }
+
+        // 6. Subdomain-only Domain: starts with '.'
+        if let Some(rest) = line.strip_prefix('.') {
+            if rest.is_empty() {
+                return Err(AstError::new("empty subdomain pattern '.'"));
+            }
+            let pattern = DomainPattern::from_kind("suffix", line)?;
+            self.domains.push(DomainRule::new(pattern));
+            return Ok(());
+        }
+
+        // 7. Domain Suffix: bare domain
+        let pattern = DomainPattern::from_kind("suffix", line)?;
+        self.domains.push(DomainRule::new(pattern));
+        Ok(())
     }
 
     /// Renders the canonical text representation of this rule set.
@@ -269,18 +371,29 @@ impl RuleSet {
     pub fn render(&self) -> String {
         let mut out = String::new();
         if !self.name.is_empty() {
+            let _ = writeln!(out, "---");
             let _ = writeln!(out, "name: {}", self.name);
+            let _ = writeln!(out, "---");
+            let _ = writeln!(out);
         }
 
         for &(start, end) in &self.v4_intervals {
             for cidr in decompose_v4_interval(start, end) {
-                let _ = writeln!(out, "ip: {cidr}");
+                if cidr.prefix_len() == 32 {
+                    let _ = writeln!(out, "{}", cidr.addr());
+                } else {
+                    let _ = writeln!(out, "{cidr}");
+                }
             }
         }
 
         for &(start, end) in &self.v6_intervals {
             for cidr in decompose_v6_interval(start, end) {
-                let _ = writeln!(out, "ip: {cidr}");
+                if cidr.prefix_len() == 128 {
+                    let _ = writeln!(out, "{}", cidr.addr());
+                } else {
+                    let _ = writeln!(out, "{cidr}");
+                }
             }
         }
 
@@ -298,6 +411,16 @@ impl FromStr for RuleSet {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Self::parse(text)
     }
+}
+
+fn is_ipv4_shape(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -403,11 +526,63 @@ mod tests {
 
     #[test]
     fn parses_and_merges_ip_intervals() {
-        let text =
-            "name: test\nip: 192.168.1.0/24\nip: 192.168.2.0/24\nip: 192.168.3.1-192.168.3.254\n";
+        let text = "---\nname: test\n---\n192.168.1.0/24\n192.168.2.0/24\n192.168.3.1..192.168.3.254\n10.0.0.1\n2001:db8::1\n";
         let set = RuleSet::parse(text).unwrap();
+        assert_eq!(set.name(), "test");
         // 192.168.1.0/24 + 192.168.2.0/24 are adjacent! Merges into [192.168.1.0, 192.168.2.255]
-        assert_eq!(set.v4_intervals().len(), 2);
+        assert_eq!(set.v4_intervals().len(), 3); // (192.168.1..2), (192.168.3), (10.0.0.1)
+        assert_eq!(set.v6_intervals().len(), 1); // 2001:db8::1
+    }
+
+    #[test]
+    fn rejects_retired_prefixes_and_syntax() {
+        let err_ip = RuleSet::parse("ip: 1.1.1.1").unwrap_err();
+        assert!(
+            err_ip.to_string().contains("'ip:' is retired (ADR-0045)"),
+            "{err_ip}"
+        );
+
+        let err_name = RuleSet::parse("name: orphan").unwrap_err();
+        assert!(
+            err_name
+                .to_string()
+                .contains("'name:' must be declared in frontmatter"),
+            "{err_name}"
+        );
+
+        let err_range = RuleSet::parse("10.0.0.1 - 10.0.0.50").unwrap_err();
+        assert!(
+            err_range
+                .to_string()
+                .contains("'-' range syntax is retired (ADR-0045)"),
+            "{err_range}"
+        );
+
+        let err_v4 = RuleSet::parse("192.168.1.256").unwrap_err();
+        assert!(
+            err_v4.to_string().contains("invalid IPv4 address"),
+            "{err_v4}"
+        );
+
+        let err_tld = RuleSet::parse("foo.123").unwrap_err();
+        assert!(err_tld.to_string().contains("all-numeric TLD"), "{err_tld}");
+    }
+
+    #[test]
+    fn round_trip_render_and_parse() {
+        let text = "---\nname: my-set\n---\n192.168.1.0/24\n10.0.0.1\n2001:db8::1\nexample.com\n.sub.corp\n=exact.corp\n";
+        let set = RuleSet::parse(text).unwrap();
+        let rendered = set.render();
+        assert!(rendered.starts_with("---\nname: my-set\n---"));
+        assert!(rendered.contains("192.168.1.0/24"));
+        assert!(rendered.contains("10.0.0.1"));
+        assert!(rendered.contains("2001:db8::1"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains(".sub.corp"));
+        assert!(rendered.contains("=exact.corp"));
+
+        let reparsed = RuleSet::parse(&rendered).unwrap();
+        assert_eq!(set, reparsed);
     }
 
     #[test]
@@ -453,5 +628,34 @@ mod tests {
         // No special-case parser code: the ordinary domain/IP validation rejects `@`.
         assert!(RuleSet::parse("example.com @ads").is_err());
         assert!(RuleSet::parse("ip: 1.2.3.4 @ads").is_err());
+    }
+
+    #[test]
+    fn frontmatter_validations() {
+        let err_dup = RuleSet::parse("---\nname: a\nname: b\n---\n1.1.1.1\n").unwrap_err();
+        assert!(
+            err_dup
+                .to_string()
+                .contains("duplicate frontmatter key 'name'"),
+            "{err_dup}"
+        );
+
+        let err_empty = RuleSet::parse("---\nname:\n---\n1.1.1.1\n").unwrap_err();
+        assert!(
+            err_empty.to_string().contains("cannot be empty"),
+            "{err_empty}"
+        );
+
+        let err_unclosed = RuleSet::parse("---\nname: a\n").unwrap_err();
+        assert!(
+            err_unclosed.to_string().contains("unclosed frontmatter"),
+            "{err_unclosed}"
+        );
+
+        let err_caret = RuleSet::parse("test^domain.com").unwrap_err();
+        assert!(
+            err_caret.to_string().contains("illegal character '^'"),
+            "{err_caret}"
+        );
     }
 }

@@ -47,7 +47,7 @@ script = '''
 cd source/daer-${VERSION}
 export CARGO_HOME="${WORKDIR}/.cargo"
 
-# Compile eBPF C datapath into target/ebpf/datapath.o.
+# Compile eBPF C datapath into target/ebpf/datapath.bpf.o.
 #
 # `xtask ebpf` regenerates the kernel ABI from ebpf/abi.toml before it compiles, so this
 # step is what makes the object buildable at all. The generated files are tracked (ADR-0021,
@@ -67,33 +67,24 @@ cargo build --release --locked
 # do with the object it claims to validate. This mirrors `cargo xtask preflight`, which writes
 # the same minimal file for the same reason.
 cat > packaging-check.toml << 'EOF'
-schema = 1
+schema = 2
 
 [global]
 wan-interface = ["auto"]
 EOF
-./target/release/daer check --config packaging-check.toml --object target/ebpf/datapath.o'''
+./target/release/daer check --config packaging-check.toml --object target/ebpf/datapath.bpf.o'''
 
 [pipeline.staging]
 script = '''
 cd source/daer-${VERSION}
 
-# Binaries.
+# The daemon, rule producer, datapath object and systemd unit are one install set.
+# `cargo xtask install` is its single definition; the package build calls it instead of
+# restating the file list, so a binary that drops out of the set fails here too.
 #
-# `geodrb` is gone (ADR-0031): the producer is `daer-drb`, and it is shipped because operators
-# compile their own `.rules` into `.drb`. The daemon never links it — `crates/daer-cli/tests/
-# surface.rs` asserts that closure, so installing it beside `daer` cannot make it reachable
-# from the running service.
-install -Dm755 target/release/daer ${STAGING_DIR}/usr/bin/daer
-# Internal lifecycle helper for the unit's ExecStopPost. Not an operator verb.
-install -Dm755 target/release/daer-cleanup ${STAGING_DIR}/usr/bin/daer-cleanup
-install -Dm755 target/release/daer-drb ${STAGING_DIR}/usr/bin/daer-drb
-
-# eBPF datapath object
-install -Dm644 target/ebpf/datapath.o ${STAGING_DIR}/usr/lib/daer/datapath.o
-
-# Systemd service unit
-install -Dm644 install/daer.service ${STAGING_DIR}/usr/lib/systemd/system/daer.service
+# `daer-drb` is shipped because operators compile their own `.rules` into `.drb`. The
+# daemon never links it — `crates/daer-cli/tests/surface.rs` asserts that closure.
+cargo run --package xtask -- install --prefix /usr --destdir "${STAGING_DIR}"
 
 # Configuration files
 install -dm755 ${STAGING_DIR}/etc/daer
@@ -102,7 +93,7 @@ cat << 'EOF' > ${STAGING_DIR}/etc/daer/config.toml
 # daer transparent proxy configuration
 # See /etc/daer/example.toml for reference documentation.
 
-schema = 1
+schema = 2
 
 [global]
 wan-interface = ["auto"]
@@ -122,7 +113,7 @@ install -dm755 ${STAGING_DIR}/var/lib/daer/rules
 # place the packaged artifact is checked before it reaches a machine.
 ${STAGING_DIR}/usr/bin/daer check \
     --config ${STAGING_DIR}/etc/daer/config.toml \
-    --object ${STAGING_DIR}/usr/lib/daer/datapath.o'''
+    --object ${STAGING_DIR}/usr/lib/daer/datapath.bpf.o'''
 
 [[output]]
 backup = ["/etc/daer/config.toml"]
@@ -132,6 +123,7 @@ post_install = '''
 systemctl daemon-reload 2>/dev/null || true
 echo ":: Configure daer in /etc/daer/config.toml"
 echo ":: Put local .drb/.rules files in /var/lib/daer/rules"
+echo ":: Runtime election control is root-only by default; see the deployment guide for opt-in daer-admin delegation"
 echo ":: Verify configuration with: daer check -c /etc/daer/config.toml"
 echo ":: Ensure permissions are restricted: chmod 0640 /etc/daer/config.toml"
 echo ":: Enable service with: systemctl enable --now daer.service"'''

@@ -13,10 +13,6 @@ default-run = "daer"
 name = "daer"
 path = "src/main.rs"
 
-[[bin]]
-name = "daer-cleanup"
-path = "src/bin/daer-cleanup.rs"
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -28,6 +24,9 @@ daer-ebpf.workspace = true
 daer-observe.workspace = true
 daer-outbound.workspace = true
 daer-routing.workspace = true
+libc.workspace = true
+netune.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

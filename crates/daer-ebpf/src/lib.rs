@@ -2,8 +2,8 @@
 
 //! eBPF integration for daer.
 //!
-//! `ebpf/kern/tproxy.c` is daer's own datapath (ADR-0020). It is compiled into
-//! `target/ebpf/datapath.o` by `cargo xtask ebpf` and loaded here through `aya`;
+//! `ebpf/kern/datapath.bpf.c` is daer's own datapath (ADR-0020). It is compiled into
+//! `target/ebpf/datapath.bpf.o` by `cargo xtask ebpf` and loaded here through `aya`;
 //! this crate owns the userspace side of that boundary — the ABI types, the map and
 //! program names, and the operations on the maps.
 //!
@@ -45,8 +45,8 @@ pub use listeners::Listeners;
 
 #[cfg(feature = "loader")]
 pub use loader::{
-    LoadError, ObjectReport, TcMode, attach_tc, inspect_bytes, inspect_object, load, load_path,
-    set_device_ifindex,
+    LoadError, ObjectReport, attach_tc, inspect_bytes, inspect_object, load, load_path,
+    require_tcx, set_device_ifindex,
 };
 #[cfg(feature = "loader")]
 pub use publish::{AyaWriter, publish_listeners, publish_lpm, publish_outbound_connectivity};

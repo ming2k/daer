@@ -108,6 +108,7 @@ impl RealitySecurity {
             stream: Box::new(connection),
             raw_read: Some(raw_read),
             alpn: None,
+            alpn_protocol: None,
         })
     }
 }

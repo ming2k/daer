@@ -18,10 +18,6 @@ global = "PARAM"
 c_struct = "daer_param"
 
 [[params.fields]]
-name = "tproxy_port"
-c_type = "u32"
-
-[[params.fields]]
 name = "control_plane_pid"
 c_type = "u32"
 

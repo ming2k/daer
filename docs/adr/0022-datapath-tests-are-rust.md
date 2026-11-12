@@ -42,7 +42,7 @@ programs need.
 2. **The test programs stay in C.** `bpf_test.c` is 3,755 lines of kernel-side assertions
    that can only be written as BPF; rewriting them in Rust would be a second ABI to maintain
    for no gain. It is compiled by `cargo xtask ebpf --tests` alongside the production object,
-   into a separate `target/ebpf/datapath-test.o`.
+   into a separate `target/ebpf/datapath_test.bpf.o`.
 3. **The case list is discovered, not enumerated.** The harness reads the compiled object's
    program names, groups them by suffix, and fails if a `check_<case>` has no matching
    `pktgen_<case>` or `setup_<case>`. Adding a case to `bpf_test.c` therefore adds it to the
@@ -71,6 +71,6 @@ programs need.
   has to reproduce its map priming (outbound liveness, `lpm_array_map`, the `PARAM` override
   per object) as well as the triple discovery. That work is the price of deleting the island,
   and it is paid once.
-- `bpf_test.c` keeps its `#include "../tproxy.c"`, so the tests continue to compile against
+- `bpf_test.c` keeps its `#include "../datapath.bpf.c"`, so the tests continue to compile against
   the production datapath rather than a copy. That is the property that makes them worth
   porting.

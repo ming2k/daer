@@ -2,16 +2,13 @@
 
 //! The shadowsocks `Connector`: link parsing, the handshake, and the framed stream.
 
+use netune::{
+    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target, Transport,
+};
+use netune_trace::TraceCollector;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-
-use netune::{
-    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, SocketConfig,
-    Target, TcpConnector, Transport,
-};
-use netune_trace::TraceCollector;
 use tokio::io::AsyncWriteExt;
 
 use super::link::{Link, decode_base64_bytes, decode_base64_string};
@@ -22,6 +19,7 @@ use super::v2::{
 use super::{Cipher, ShadowSocksError};
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
+use crate::server::ServerDialer;
 
 /// The address types shadowsocks encodes in its handshake.
 pub mod atyp {
@@ -41,9 +39,7 @@ pub struct ShadowSocksConnector {
     cipher: Cipher,
     master: Vec<u8>,
     server: String,
-    connector: TcpConnector,
-    timeout: Duration,
-    so_mark: Option<u32>,
+    base: Arc<dyn ServerDialer>,
 }
 
 impl ShadowSocksConnector {
@@ -79,14 +75,7 @@ impl ShadowSocksConnector {
             cipher,
             master,
             server,
-            connector: TcpConnector::new()
-                .with_socket_config(match options.so_mark {
-                    Some(mark) => SocketConfig::default().with_mark(mark),
-                    None => SocketConfig::default(),
-                })
-                .with_connect_timeout(Some(options.timeout)),
-            timeout: options.timeout,
-            so_mark: options.so_mark,
+            base: options.base().clone(),
         })
     }
 
@@ -101,14 +90,7 @@ impl ShadowSocksConnector {
             cipher: parsed.cipher,
             master: parsed.master_key(),
             server: parsed.server,
-            connector: TcpConnector::new()
-                .with_socket_config(match options.so_mark {
-                    Some(mark) => SocketConfig::default().with_mark(mark),
-                    None => SocketConfig::default(),
-                })
-                .with_connect_timeout(Some(options.timeout)),
-            timeout: options.timeout,
-            so_mark: options.so_mark,
+            base: options.base().clone(),
         })
     }
 
@@ -134,12 +116,14 @@ impl ShadowSocksConnector {
             split_authority(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
         let address = encode_address(host, port).map_err(ProxyProtocolError::UnsupportedLink)?;
 
-        let server = Target::plain(&self.server);
-        let established =
-            tokio::time::timeout(self.timeout, self.connector.connect(&server, recorder))
-                .await
-                .map_err(|_| ProxyProtocolError::Timeout)?
-                .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        let established = self
+            .base
+            .connect(&self.server, recorder)
+            .await
+            .map_err(|error| match error {
+                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
+                other => ProxyProtocolError::Connect(other.to_string()),
+            })?;
 
         let stream = established.stream;
         let local_port = established.local_port;
@@ -156,6 +140,7 @@ impl ShadowSocksConnector {
                 local_port,
                 socket,
                 alpn: None,
+                alpn_protocol: None,
             })
         } else {
             let mut stream = stream;
@@ -186,8 +171,20 @@ impl ShadowSocksConnector {
                 local_port,
                 socket,
                 alpn: None,
+                alpn_protocol: None,
             })
         }
+    }
+
+    /// Opens the bare TCP stream to this Shadowsocks server, before the protocol handshake.
+    ///
+    /// This is the chain/probe seam: a health check or a detour target asks for the server
+    /// stream without speaking shadowsocks to it.
+    pub async fn connect_server(
+        &self,
+        recorder: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base.connect(&self.server, recorder).await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this Shadowsocks node.
@@ -200,51 +197,27 @@ impl ShadowSocksConnector {
     pub async fn connect_datagram(
         &self,
         authority: &str,
-        _recorder: &TraceCollector,
+        recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
         let (host, port) = split_authority(authority).map_err(NetError::Protocol)?;
         let addr_bytes = encode_address(host, port).map_err(NetError::Protocol)?;
 
-        let server_addr = tokio::net::lookup_host(&self.server)
-            .await
-            .map_err(|e| NetError::Resolve(e.to_string()))?
-            .next()
-            .ok_or_else(|| NetError::Resolve(format!("cannot resolve {}", self.server)))?;
+        // The datagram leg to the Shadowsocks server is a generic UDP capability: resolve,
+        // confinement, socket options and tracing are netune's. This connector supplies only
+        // the Shadowsocks framing above the session.
+        let connector = self.base.datagram().ok_or_else(|| {
+            NetError::Protocol(format!(
+                "shadowsocks server {} has no datagram leg; a detoured node cannot carry \
+                 shadowsocks UDP until the detour's datagram path is defined",
+                self.server
+            ))
+        })?;
+        let established = connector.connect(&self.server, recorder).await?;
+        let local_port = established.local_port;
 
-        let bind_addr = if server_addr.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = tokio::net::UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-
-        if let Some(mark) = self.so_mark {
-            #[cfg(unix)]
-            // SAFETY: socket is an open UDP socket owned by us; libc::SO_MARK is a valid sockopt on Linux.
-            unsafe {
-                use std::os::fd::AsRawFd;
-                let val = mark as libc::c_int;
-                let _ = libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_MARK,
-                    &val as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        socket
-            .connect(server_addr)
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-
-        let local_port = socket.local_addr().ok().map(|a| a.port());
         if self.cipher.is_2022() {
             let session = ShadowSocks2022DatagramSession::new(
-                Arc::new(socket),
+                established.datagrams,
                 self.cipher,
                 self.master.clone(),
                 addr_bytes,
@@ -255,7 +228,7 @@ impl ShadowSocksConnector {
             })
         } else {
             let session = ShadowSocksDatagramSession::new(
-                Arc::new(socket),
+                established.datagrams,
                 self.cipher,
                 self.master.clone(),
                 addr_bytes,
@@ -385,6 +358,7 @@ async fn read_exact(stream: &mut Box<dyn Transport>, buffer: &mut [u8]) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn addresses_are_encoded_with_the_right_address_type() {

@@ -15,7 +15,7 @@
 //! | [`routing`] — `[dns.request]` / `[dns.response]` evaluation | done |
 //! | [`cache`] — bounded, TTL-aware, stale-while-revalidate | done |
 //! | [`resolver`] — the pipeline: routing → cache → transport → response routing | done |
-//! | [`transport`] — `dns.upstream` syntax, DNS over TCP | done (UDP/DoT/DoH need netune) |
+//! | [`transport`] — `dns.upstream` syntax, UDP/TCP/DoT/DoH transports | done |
 //! | [`server`] — UDP and TCP server sockets | done |
 //! | bootstrap resolver | not started |
 //!

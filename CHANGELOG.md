@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **Configuration schema 2 separates resources from elections
+  ([ADR-0046](docs/adr/0046-resource-election-model.md)).** `[[group]]` is now a pure
+  candidate pool; `[[election]]` is the routing target and the owner of the selection rule and
+  probe settings. Routing rules and `fallback` name elections, never groups. A node can be an
+  election input directly (`node = "…"`), and a single node no longer requires a dynamic group.
+  `group.policy`, `group.health-check`, `[global.health-check]`, `tcp-url`, `tcp-method`,
+  `fixed(n)`, and rules targeting groups are rejected. The clean break has no schema-1 shim.
+- **Runtime elections are controlled by `daer elect <election> <node>` / `--reset`
+  ([ADR-0047](docs/adr/0047-runtime-election-control.md)).** A separate
+  `/run/daer/admin.sock` (`0600 root:root` by default; opt-in `0660` group delegation) is
+  the authorization boundary; overrides
+  persist under `/var/lib/daer/elections.json`. `daer status --nodes/--groups/--elections`
+  are the read-only views. There is no separate control binary and no dynamic URL policy
+  creation.
+- **Linux 6.6 is now the minimum kernel, and TCX is the only TC attachment
+  ([ADR-0042](docs/adr/0042-tcx-only-linux-6-6.md)).** The classic `cls_bpf` path,
+  `DAER_TC_ATTACH`, the `clsact` qdisc ownership logic, the crash-recovery journal,
+  `daer-cleanup`, and the systemd `ExecStopPost=` hook are deleted. TCX links are fd-owned,
+  so every TC program detaches when the daemon exits, including after `SIGKILL`; the veth
+  peer is created directly in the private ingress namespace, so the namespace and the pair
+  have one lifetime. Incident bundles are written directly to `/var/lib/daer/incidents`.
+  Pre-TCX state is not migrated: an operator upgrading across this boundary must remove a
+  stale host qdisc/filter explicitly.
+- **Node names must be unique across the resolved pool ([ADR-0044](docs/adr/0044-outbound-detour-chain.md)).**
+  A `detour` names exactly one node, so duplicate `name`/`tag` values are now a load error
+  instead of an ambiguous pool. A `direct` node also cannot declare `detour` (it has no server
+  leg to replace); route to the inner node's group instead. URI chain strings (`a -> b`) remain
+  rejected — the chain is a structured `[[node]] detour`.
+
+### Changed
+
+- **The datapath translation unit and object are named for the datapath, not one of its
+  hooks.** `ebpf/kern/tproxy.c` is now `ebpf/kern/datapath.bpf.c`; the build produces
+  `target/ebpf/datapath.bpf.o`, the test object is `datapath_test.bpf.o`, and packaged
+  installs use `/usr/lib/daer/datapath.bpf.o`. The `.bpf` stem follows the eBPF toolchain
+  convention and makes the object's target explicit. Program and map names such as
+  `tproxy_lan_ingress_l2` are ABI and are unchanged. Operators using a custom `--object`
+  path or a packaged unit must update the path (ADR-0024, naming amendment).
+
+### Added
+
+- **Outbound detour chains ([ADR-0044](docs/adr/0044-outbound-detour-chain.md)).**
+  `[[node]] detour = "<name>"` makes an outer proxy protocol run over another node's server
+  leg while still carrying the flow's final target; `[[subscription]] detour` applies the
+  same chain to every node a subscription contributes. Chains are validated as a DAG (unknown,
+  self-referential and cyclic edges are load errors), health probes traverse the chain, and
+  `daer route nodes` / `daer probe node` report it. Hysteria 2 cannot be the outer hop because
+  its QUIC socket stack has no datagram-under-proxy seam; a detoured SOCKS5 node is TCP-only
+  because a UDP associate would bypass the chain.
+
 ## [0.0.13] - 2026-11-11
 
 ### Changed
@@ -486,7 +538,7 @@ protocol layer types and the generated kernel ABI all changed shape.
   closures, so both are now named subcommands rather than one entry point.
 - **Documentation that pointed at what the tree no longer has.** `AGENTS.md` routed to
   `docs/dev/standards/testing.md`, deleted in favour of
-  [ADR-0007](docs/adr/0007-verification.md); `docs/dev/standards/workflow.md` told contributors
+  [ADR-0007](docs/adr/0007-verification.md); the workflow guidance told contributors
   to run `make ci`, and there is no `Makefile` — the gates live in `cargo xtask ci` — and named
   `daer-outbound/tests/*` for suites that moved to `daer-proxy-protocols`. `docs/dev/build-and-run.md`
   named crates (`daer-daemon`, `daer-ctl`), a script (`scripts/run-in-netns.sh`) and a
@@ -759,7 +811,7 @@ protocol layer types and the generated kernel ABI all changed shape.
 - **Engineering management & governance suite**:
   - Root `AGENTS.md` establishing operational guardrails, architectural mental model, and invariant boundaries.
   - Centralized ADR master index in `docs/adr/index.md`.
-  - Engineering standards suite in `docs/dev/standards/` covering architecture, invariants, workflow verification gates, testing strategies, documentation taxonomy, and markdown style.
+  - Engineering standards suite in `docs/dev/standards/` covering architecture, invariants, decision records, documentation taxonomy, and markdown style.
   - Reorganized `docs/` according to the Diátaxis information architecture: `tutorials/`, `how-to/`, `reference/`, `explanation/`, `adr/`, and `dev/`. Zero loose files at `docs/` root.
 
 ### Removed

@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use daer_config::{Config, Node};
+use daer_outbound::SocketConfig;
 use daer_outbound::subscription::{self, ResolvedSubscription};
 
 /// How long one subscription fetch may take, end to end.
@@ -104,23 +105,34 @@ pub async fn resolve_subscriptions(
     config: &mut Config,
     config_directory: &std::path::Path,
 ) -> Resolution {
-    resolve_subscriptions_with(config, config_directory, DEFAULT_TIMEOUT).await
+    resolve_subscriptions_with(
+        config,
+        config_directory,
+        DEFAULT_TIMEOUT,
+        SocketConfig::default(),
+    )
+    .await
 }
 
-/// [`resolve_subscriptions`] with an explicit timeout, for tests and for a caller
-/// that knows its network is slow.
+/// [`resolve_subscriptions`] with an explicit timeout and socket policy.
 pub async fn resolve_subscriptions_with(
     config: &mut Config,
     config_directory: &std::path::Path,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> Resolution {
     if config.subscription.is_empty() {
         return Resolution::default();
     }
 
     let cache = cache_directory(config_directory);
-    let resolved =
-        subscription::resolve(&config.subscription, Some(cache.as_path()), timeout).await;
+    let resolved = subscription::resolve(
+        &config.subscription,
+        Some(cache.as_path()),
+        timeout,
+        socket_config,
+    )
+    .await;
 
     // Inline nodes first: an operator's explicit list is the authority, and a
     // subscription that happens to repeat a tag must not shadow it.
@@ -138,13 +150,13 @@ pub async fn resolve_subscriptions_with(
                 }
             });
 
-            let tag = match fragment_tag {
-                Some(name) => format!("{}/{}", entry.tag, name),
+            let node_name = match fragment_tag {
+                Some(name) => format!("{}/{}", entry.name, name),
                 None => {
                     if entry.links.len() == 1 {
-                        entry.tag.clone()
+                        entry.name.clone()
                     } else {
-                        format!("{}/{index}", entry.tag)
+                        format!("{}/{index}", entry.name)
                     }
                 }
             };
@@ -154,21 +166,22 @@ pub async fn resolve_subscriptions_with(
                 Err(e) => {
                     // A subscription link is a credential carrier. The only safe spelling in
                     // a log or an incident bundle is the scheme plus an explicit redaction
-                    // marker; the tag is operator-chosen and is not secret.
+                    // marker; the name is operator-chosen and is not secret.
                     let link = daer_observe::RedactedLink::new(&url);
                     daer_observe::warn!(
                         daer_observe::EventCode::SubscriptionLinkRejected,
                         scheme = %link.scheme(),
                         link = %link,
-                        node = %tag,
+                        node = %node_name,
                         error = %e,
                         "unsupported subscription node link (skipped)"
                     );
                     continue;
                 }
             };
-            node.tag = Some(tag);
-            node.subscription = Some(entry.tag.clone());
+            node.name = Some(node_name);
+            node.detour = entry.detour.clone();
+            node.subscription = Some(entry.name.clone());
             config.node.push(node);
             added += 1;
         }
@@ -232,12 +245,16 @@ mod tests {
     #[tokio::test]
     async fn a_configuration_without_subscriptions_is_untouched() {
         let mut config = config_with(
-            "schema = 1\n[[node]]\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
+            "schema = 2\n[[node]]\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
         );
         let before = config.node.len();
-        let resolution =
-            resolve_subscriptions_with(&mut config, std::path::Path::new("."), Duration::ZERO)
-                .await;
+        let resolution = resolve_subscriptions_with(
+            &mut config,
+            std::path::Path::new("."),
+            Duration::ZERO,
+            SocketConfig::default(),
+        )
+        .await;
         assert_eq!(config.node.len(), before);
         assert!(resolution.subscriptions.is_empty());
         assert!(resolution.all_usable(), "vacuously true");
@@ -248,14 +265,19 @@ mod tests {
     async fn a_failing_subscription_with_no_cache_contributes_nothing_and_says_so() {
         // Port 1 on loopback refuses instantly, so this test needs no network.
         let mut config = config_with(
-            "schema = 1\n[[subscription]]\ntag = \"dead\"\nurl = \"http://127.0.0.1:1/sub\"\n",
+            "schema = 2\n[[subscription]]\ntag = \"dead\"\nurl = \"http://127.0.0.1:1/sub\"\n",
         );
         let directory =
             std::env::temp_dir().join(format!("daer-sub-resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
 
-        let resolution =
-            resolve_subscriptions_with(&mut config, &directory, Duration::from_millis(500)).await;
+        let resolution = resolve_subscriptions_with(
+            &mut config,
+            &directory,
+            Duration::from_millis(500),
+            SocketConfig::default(),
+        )
+        .await;
 
         assert!(config.node.is_empty(), "nothing was fetched");
         assert_eq!(resolution.subscriptions.len(), 1);
@@ -281,10 +303,15 @@ mod tests {
             .expect("writes");
 
         let mut config = config_with(
-            "schema = 1\n[[subscription]]\ntag = \"tag\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\n",
+            "schema = 2\n[[subscription]]\ntag = \"tag\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\n",
         );
-        let resolution =
-            resolve_subscriptions_with(&mut config, &directory, Duration::from_millis(500)).await;
+        let resolution = resolve_subscriptions_with(
+            &mut config,
+            &directory,
+            Duration::from_millis(500),
+            SocketConfig::default(),
+        )
+        .await;
 
         assert_eq!(config.node.len(), 1, "the cache supplied the node");
         assert!(resolution.subscriptions[0].from_cache);
@@ -311,15 +338,25 @@ mod tests {
             .expect("writes");
 
         let mut config = config_with(
-            "schema = 1\n[[subscription]]\ntag = \"mysub\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\n",
+            "schema = 2\n[[subscription]]\nname = \"mysub\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\ndetour = \"inner\"\n",
         );
-        let _ =
-            resolve_subscriptions_with(&mut config, &directory, Duration::from_millis(500)).await;
+        let _ = resolve_subscriptions_with(
+            &mut config,
+            &directory,
+            Duration::from_millis(500),
+            SocketConfig::default(),
+        )
+        .await;
 
         assert_eq!(config.node.len(), 2);
         for node in &config.node {
-            let tag = node.tag.as_deref().expect("every fetched node is tagged");
+            let tag = node.name.as_deref().expect("every fetched node is tagged");
             assert!(tag.starts_with("mysub/"), "{tag}");
+            assert_eq!(
+                node.detour.as_deref(),
+                Some("inner"),
+                "a subscription-wide detour applies to every node it contributes"
+            );
         }
         let _ = std::fs::remove_dir_all(&directory);
     }

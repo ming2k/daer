@@ -30,16 +30,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use netune::{
-    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target,
-    TcpConnector, Transport,
-};
+use netune::{DatagramConnector, Established, EstablishedDatagrams, NetError, Transport};
 use netune_trace::TraceCollector;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
 use crate::security::{Opaque, Security};
+use crate::server::ServerDialer;
 use crate::transport::TransportLayer;
 use crate::vmess::aead::{create_auth_id, seal_header};
 use crate::vmess::chunk::{Cipher, SizeMode};
@@ -59,7 +57,7 @@ pub struct VmessConnector {
     options: u8,
     security: Security,
     transport: TransportLayer,
-    tcp: TcpConnector,
+    base: Arc<dyn ServerDialer>,
     timeout: Duration,
     /// The reference's `NoTerminationSignal` account flag (`vmess`'s `no-termination-signal`).
     termination_signal: bool,
@@ -147,9 +145,7 @@ impl VmessConnector {
             options: option,
             security: params.security,
             transport: params.transport,
-            tcp: TcpConnector::new()
-                .with_connect_timeout(Some(options.timeout))
-                .with_socket_config(options.socket_config()),
+            base: options.base().clone(),
             timeout: options.timeout,
             termination_signal: !params.no_termination_signal,
         })
@@ -173,7 +169,8 @@ impl VmessConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let (stream, session, local_port) = self.open(authority, Command::Tcp, recorder).await?;
+        let (stream, session, local_port, alpn, alpn_protocol) =
+            self.open(authority, Command::Tcp, recorder).await?;
         // The response header is consumed on the first read, not here: the node buffers it until
         // the *target* produces data, so an eager read deadlocks a caller that has not sent its
         // payload yet (`vmess::response`).
@@ -190,8 +187,17 @@ impl VmessConnector {
             stream,
             local_port,
             socket: None,
-            alpn: None,
+            alpn,
+            alpn_protocol,
         })
+    }
+
+    /// Opens the bare TCP stream to this VMess server, before the protocol handshake.
+    pub async fn connect_server(
+        &self,
+        recorder: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base.connect(&self.server, recorder).await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this VMess node.
@@ -209,7 +215,7 @@ impl VmessConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
-        let (stream, session, local_port) = self
+        let (stream, session, local_port, _alpn, _alpn_protocol) = self
             .open(authority, Command::Udp, recorder)
             .await
             .map_err(|error| NetError::Connect(error.to_string()))?;
@@ -234,7 +240,16 @@ impl VmessConnector {
         authority: &str,
         command: Command,
         recorder: &TraceCollector,
-    ) -> Result<(BoundedStream, Session, Option<u16>), ProxyProtocolError> {
+    ) -> Result<
+        (
+            BoundedStream,
+            Session,
+            Option<u16>,
+            Option<netune_trace::Alpn>,
+            Option<Vec<u8>>,
+        ),
+        ProxyProtocolError,
+    > {
         let session = Session::new();
         let security = match self.cipher {
             Cipher::Aes128Gcm => header::Security::Aes128Gcm,
@@ -254,6 +269,10 @@ impl VmessConnector {
         let sealed = seal_header(&self.cmd_key, &plain, auth_id, nonce);
 
         let (opaque, local_port) = self.open_stream(recorder).await?;
+        let alpn_protocol = opaque.alpn_protocol.clone();
+        let alpn = alpn_protocol
+            .as_deref()
+            .map(|name| netune_trace::Alpn::from_name(Some(name)));
         let mut stream: BoundedStream = opaque.stream;
         stream.write_all(&sealed).await.map_err(|error| {
             ProxyProtocolError::Connect(format!(
@@ -267,7 +286,7 @@ impl VmessConnector {
                 self.server
             ))
         })?;
-        Ok((stream, session, local_port))
+        Ok((stream, session, local_port, alpn, alpn_protocol))
     }
 
     /// Dials, upgrades the transport, and applies the security layer.
@@ -275,12 +294,14 @@ impl VmessConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
-        let target = Target::plain(self.server.clone());
         let established = self
-            .tcp
-            .connect(&target, recorder)
+            .base
+            .connect(&self.server, recorder)
             .await
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+            .map_err(|error| match error {
+                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
+                other => ProxyProtocolError::Connect(other.to_string()),
+            })?;
         let local_port = established.local_port;
 
         // `global.tls.fragment` slices a handshake daer writes. VMess over plain TLS rides
@@ -290,7 +311,7 @@ impl VmessConnector {
         // nodes those are rather than half-applying the setting (`fragment.rs`'s module note).
         let opaque = self
             .security
-            .wrap(established.stream, &self.host, self.timeout)
+            .wrap(established.stream, &self.host, recorder, self.timeout)
             .await?;
 
         // Security then transport (ADR-0028): a `ws` upgrade is HTTP inside the secured stream.
@@ -310,6 +331,7 @@ impl VmessConnector {
                 stream,
                 raw_read,
                 alpn: opaque.alpn,
+                alpn_protocol: opaque.alpn_protocol,
             },
             local_port,
         ))

@@ -11,16 +11,17 @@ use std::str::FromStr;
 /// Binary name used by daer's own artifacts.
 pub const APP_NAME: &str = "daer";
 
-/// Default tproxy listen port. It is not an HTTP/SOCKS port; only eBPF uses it.
-///
-/// This is the single definition: `daer-config`'s schema default references it, so the
-/// documented default and the value published into `PARAM` cannot disagree.
-pub const TPROXY_PORT_DEFAULT: u16 = 12345;
-
 /// skb mark used to identify daer-originated traffic (`TPROXY_MARK` in
-/// `ebpf/kern/tproxy.c`). This is the one definition of the mark; the `ip rule`
+/// `ebpf/kern/datapath.bpf.c`). This is the one definition of the mark; the `ip rule`
 /// selector the control plane installs is formatted from it (ADR-0023).
 pub const TPROXY_MARK: u32 = 0x0800_0000;
+
+/// Default `SO_MARK` for daer-originated sockets when `global.so-mark` is absent.
+///
+/// `0x6461_6572` is the ASCII bytes `daer` in network (= big-endian) order. It is non-zero,
+/// unlikely to collide with a routing mark, and self-describing in a packet capture or an
+/// nftables rule. `0` means "no mark" to the kernel and is the value that causes self-capture.
+pub const DEFAULT_SOCKET_MARK: u32 = 0x6461_6572;
 
 /// Default bound for `MAX_MATCH_SET_LEN`, the number of 32-bit match words the
 /// kernel routing program evaluates per packet. Overridable at build time with
@@ -166,8 +167,9 @@ pub enum SelectionPolicy {
     /// Pick a random alive node.
     #[default]
     Random,
-    /// Always use the configured node; connectivity checks are disabled.
-    Fixed,
+    /// Return the input's only candidate. A manual election over a group is rejected
+    /// at configuration load; runtime `elect` overrides use this variant.
+    Manual,
     /// Pick the node with the lowest last measured latency.
     MinLastLatency,
     /// Pick the node with the lowest average of its last 10 latencies.
@@ -180,7 +182,7 @@ impl SelectionPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Random => "random",
-            Self::Fixed => "fixed",
+            Self::Manual => "manual",
             Self::MinLastLatency => "min",
             Self::MinAverage10 => "min_avg10",
             Self::MinMovingAverage => "min_moving_avg",
@@ -208,7 +210,7 @@ impl FromStr for SelectionPolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "random" => Ok(Self::Random),
-            "fixed" => Ok(Self::Fixed),
+            "manual" => Ok(Self::Manual),
             "min" => Ok(Self::MinLastLatency),
             "min_avg10" => Ok(Self::MinAverage10),
             "min_moving_avg" => Ok(Self::MinMovingAverage),
@@ -237,9 +239,9 @@ mod tests {
     /// Every exported constant has a reader outside this crate (ADR-0023).
     ///
     /// `rustc`'s dead-code lint does not fire on `pub` items, so a constant transcribed
-    /// "for compatibility" can sit here unused for months — which is exactly how the
-    /// `dae0`/`dae0peer` names contradicted the `daer0`/`daer0peer` devices the daemon
-    /// actually creates. This test walks the crate sources of the workspace and fails
+    /// "for compatibility" can sit here unused for months — which is exactly how stale
+    /// device constants contradicted the `daer0`/`daer0peer` devices the daemon actually
+    /// creates. This test walks the crate sources of the workspace and fails
     /// when a constant in this file is not named anywhere else.
     ///
     /// The list is explicit rather than reflective because Rust has no runtime
@@ -249,7 +251,6 @@ mod tests {
         // (name, is this constant still expected to exist?)
         let constants = [
             ("APP_NAME", true),
-            ("TPROXY_PORT_DEFAULT", true),
             ("TPROXY_MARK", true),
             ("MAX_MATCH_SET_LEN", true),
         ];

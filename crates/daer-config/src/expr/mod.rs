@@ -8,7 +8,7 @@
 //! | Where | Shape | Example |
 //! | --- | --- | --- |
 //! | `routing.rules` | `predicate && … -> outbound` | `domain(a.com) && port(443) -> proxy` |
-//! | `group.filters` | `predicate && …` | `subtag(sub) && !name(keyword: 'ExpireAt:')` |
+//! | `group.filters` | `predicate && …` | `sub(sub) && !name(keyword: 'ExpireAt:')` |
 //! | `group.policy`, `dns.*.fallback` | name or call | `fixed(0)`, `min-moving-avg` |
 //!
 //! They stay expressions because a boolean combination over arbitrary predicates

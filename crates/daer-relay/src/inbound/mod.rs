@@ -13,7 +13,7 @@
 pub mod tcp;
 pub mod udp;
 
-pub use tcp::{Accepted, FlowFacts, TransparentListener, bind_shared, is_self_connect, unmap};
+pub use tcp::{Accepted, FlowFacts, TransparentListener, bind_shared, unmap};
 pub use udp::{
     Datagram, DatagramFamily, DatagramIngress, ReplySocketFactory, TransparentDatagramListener,
     bind_reply_socket,

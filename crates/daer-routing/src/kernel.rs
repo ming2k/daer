@@ -283,7 +283,7 @@ impl OutboundIds {
 /// `fallback` is the outbound the program applies when no rule fires. It is emitted as a
 /// trailing `MatchType_Fallback` entry, because the C has no "no rule hit" path that is not an
 /// error: without an explicit fallback set the last thing `route()` can do is `-EPERM`, which
-/// every caller converts into `TC_ACT_SHOT`.
+/// every caller converts into `DAER_TC_DROP`.
 #[must_use]
 pub fn compile(sets: &[MatchSet], fallback: &Outbound, rule_of: impl Fn(usize) -> usize) -> Policy {
     // 1. Group match sets into discrete rules (terminated by a non-logical target).

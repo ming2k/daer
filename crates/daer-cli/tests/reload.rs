@@ -56,12 +56,10 @@ fn binary() -> PathBuf {
 }
 
 /// Writes a configuration that needs no privileges beyond the transparent port itself.
-fn config(path: &std::path::Path, port: u16) -> String {
-    let text = format!(
-        "schema = 1\n\
+fn config(path: &std::path::Path) -> String {
+    let text = "schema = 2\n\
          [global]\n\
          log-level = \"debug\"\n\
-         tproxy-port = {port}\n\
          wan-interface = [\"lo\"]\n\
          lan-interface = [\"lo\"]\n\
          disable-waiting-network = true\n\
@@ -69,7 +67,7 @@ fn config(path: &std::path::Path, port: u16) -> String {
          [routing]\n\
          rules = []\n\
          fallback = \"direct\"\n"
-    );
+        .to_string();
     std::fs::write(path, &text).expect("writes the configuration");
     text
 }
@@ -92,10 +90,7 @@ fn the_daemon_survives_a_hangup_and_publishes_a_new_generation() {
     std::fs::create_dir_all(&directory).expect("creates the fixture directory");
     let config_path = directory.join("daer.toml");
 
-    // A port unlikely to collide with a developer's daemon. The test does not assume it is free:
-    // a bind failure shows up as "cannot bind the transparent port" and is reported as a skip.
-    let port = 12_347 + (std::process::id() % 200) as u16;
-    config(&config_path, port);
+    config(&config_path);
 
     let mut child = Command::new(binary())
         .args(["run", "--no-datapath", "-c"])
@@ -220,7 +215,7 @@ fn the_daemon_survives_a_hangup_and_publishes_a_new_generation() {
     // A typo on the next SIGHUP must be rejected without stopping the daemon. The cadence
     // rebuild reads the file a second time; an error there must not propagate out of the
     // signal handler (the previous implementation did exactly that).
-    std::fs::write(&config_path, "schema = 1\n[global]\nwan-interface = []\n")
+    std::fs::write(&config_path, "schema = 2\n[global]\nwan-interface = []\n")
         .expect("writes the invalid configuration");
     hang_up(pid);
     let deadline = Instant::now() + Duration::from_secs(10);

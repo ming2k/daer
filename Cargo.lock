@@ -555,6 +555,9 @@ dependencies = [
  "daer-observe",
  "daer-outbound",
  "daer-routing",
+ "libc",
+ "netune",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -593,6 +596,8 @@ dependencies = [
  "daer-routing",
  "daer-sniff",
  "libc",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -652,6 +657,7 @@ dependencies = [
  "netune",
  "netune-trace",
  "regex",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -673,10 +679,10 @@ dependencies = [
  "hkdf",
  "hmac",
  "http",
- "libc",
  "md-5",
  "ml-kem",
  "netune",
+ "netune-http1",
  "netune-http3",
  "netune-quic",
  "netune-trace",
@@ -1164,8 +1170,8 @@ dependencies = [
 
 [[package]]
 name = "netune"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "base64",
  "brotli",
@@ -1189,13 +1195,13 @@ dependencies = [
 
 [[package]]
 name = "netune-egress"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 
 [[package]]
 name = "netune-http1"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "bytes",
  "http",
@@ -1204,8 +1210,8 @@ dependencies = [
 
 [[package]]
 name = "netune-http3"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "bytes",
  "http",
@@ -1217,8 +1223,8 @@ dependencies = [
 
 [[package]]
 name = "netune-io"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "netune-trace",
  "tokio",
@@ -1226,8 +1232,8 @@ dependencies = [
 
 [[package]]
 name = "netune-quic"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1242,16 +1248,16 @@ dependencies = [
 
 [[package]]
 name = "netune-trace"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "netune-ws"
-version = "0.0.24"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.24#84a8c5b22e400993c30c840c0cf9f2d4b7c2be40"
+version = "0.0.28"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
 dependencies = [
  "base64",
  "bytes",

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 
 // This file is compiled only by `cargo xtask ebpf --tests`, into
-// `target/ebpf/datapath-test.o`. That is a build-system fact, not a tag: it used to carry
+// `target/ebpf/datapath_test.bpf.o`. That is a build-system fact, not a tag: it used to carry
 // a Go `//go:build exclude` directive, which clang ignores and which therefore documented
 // nothing. The cases are driven by `crates/daer-ebpf/tests/datapath.rs` (ADR-0022).
 
@@ -16,7 +16,7 @@
 #endif
 #define __BPF_TEST_DISABLE_LPM_CACHE  // Disable LPM cache in test mode
 
-#include "../tproxy.c"
+#include "../datapath.bpf.c"
 #include "./bpf_test.h"
 
 /* A PROG_ARRAY's `values` names the inner map type. The initialiser below has to carry
@@ -84,7 +84,7 @@ setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
 		bpf_map_lookup_elem(&test_routing_cache_ctx_map, &zero_key);
 
 	if (!ctx)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	__builtin_memset(ctx, 0, sizeof(*ctx));
 	ctx->key.sip.u6_addr32[2] = bpf_htonl(0xffff);
@@ -105,7 +105,7 @@ setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
 		bpf_map_lookup_elem(&test_conn_state_scratch_map, &zero_key);
 
 	if (!conn_state)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	__builtin_memset(conn_state, 0, sizeof(*conn_state));
 
 	conn_state->is_wan_ingress_direction = false;
@@ -147,17 +147,17 @@ set_routing_epoch_port_rule(__u32 slot, __u16 port, __u8 outbound)
 	__u32 rules_len = 1;
 
 	if (slot >= ROUTING_EPOCH_SLOT_NUM)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	match_set.port_range = port_range;
 	match_set.type = MatchType_Port;
 	match_set.outbound = outbound;
 
 	if (bpf_map_update_elem(&routing_map, &routing_key, &match_set, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_map_update_elem(&routing_meta_map, &slot, &rules_len, BPF_ANY))
-		return TC_ACT_SHOT;
-	return TC_ACT_OK;
+		return DAER_TC_DROP;
+	return DAER_TC_PASS;
 }
 
 static __always_inline int
@@ -167,18 +167,18 @@ setup_routing_epoch_lan_ingress(struct __sk_buff *skb, __u32 active_slot)
 	int ret;
 
 	if (set_routing_epoch_port_rule(0, 443, OUTBOUND_USER_DEFINED_MIN))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (set_routing_epoch_port_rule(1, 443,
 					OUTBOUND_USER_DEFINED_MIN + 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&active_slot, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&slot_zero, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -195,22 +195,22 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 	__u32 rules_len = 2;
 
 	if (slot >= ROUTING_EPOCH_SLOT_NUM)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	domain_rule.type = MatchType_DomainSet;
 	domain_rule.outbound = outbound;
 	if (bpf_map_update_elem(&routing_map, &domain_key, &domain_rule,
 				BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	fallback_rule.type = MatchType_Fallback;
 	fallback_rule.outbound = OUTBOUND_USER_DEFINED_MIN + 2;
 	if (bpf_map_update_elem(&routing_map, &fallback_key, &fallback_rule,
 				BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_map_update_elem(&routing_meta_map, &slot, &rules_len,
 				BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	// The packet generator below targets 198.51.100.20.
 	ip_key.slot = slot;
@@ -219,7 +219,7 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 	projection = bpf_map_lookup_elem(&test_domain_routing_scratch_map,
 					 &scratch_key);
 	if (!projection)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	__builtin_memset(projection, 0, sizeof(*projection));
 	projection->bitmap[0] = bitmap;
 	return bpf_map_update_elem(&domain_routing_map, &ip_key, projection,
@@ -235,18 +235,18 @@ setup_routing_epoch_domain_lan_ingress(struct __sk_buff *skb,
 
 	// Only slot zero projects this destination into the domain rule.
 	if (set_routing_epoch_domain_rule(0, OUTBOUND_USER_DEFINED_MIN, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (set_routing_epoch_domain_rule(1, OUTBOUND_USER_DEFINED_MIN + 1, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&active_slot, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
 	zero_key = 0;
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&zero_key, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -265,7 +265,7 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 	if (check_tcp_conn_state_ipv4_tcp(skb, expected_status_code,
 					  saddr, daddr, sport, dport,
 					  expected_outbound, 0, true))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
 	key.sip.u6_addr32[3] = bpf_htonl(saddr);
@@ -279,7 +279,7 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 	if (!conn_state || conn_state->routing_epoch_slot != expected_epoch_slot ||
 	    conn_state->datapath_generation != PARAM.datapath_generation) {
 		bpf_printk("conn_state routing epoch slot mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	handoff = bpf_map_lookup_elem(&routing_handoff_map, &key);
@@ -287,10 +287,10 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 	    handoff->result.routing_epoch_slot != expected_epoch_slot ||
 	    handoff->result.datapath_generation != PARAM.datapath_generation) {
 		bpf_printk("routing handoff epoch attribution mismatch\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/dport_match")
@@ -318,14 +318,14 @@ int testsetup_dport_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dport_match")
 int testcheck_dport_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -355,14 +355,14 @@ int testsetup_dport_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dport_mismatch")
 int testcheck_dport_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -399,14 +399,14 @@ int testsetup_ipset_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/ipset_match")
 int testcheck_ipset_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(100,64,0,2),
 				      19233, 80);
 }
@@ -443,14 +443,14 @@ int testsetup_ipset_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/ipset_mismatch")
 int testcheck_ipset_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(100,65,0,2),
 				      19233, 80);
 }
@@ -487,14 +487,14 @@ int testsetup_source_ipset_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/source_ipset_match")
 int testcheck_source_ipset_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,50,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -531,14 +531,14 @@ int testsetup_source_ipset_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/source_ipset_mismatch")
 int testcheck_source_ipset_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,51,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -568,14 +568,14 @@ int testsetup_sport_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/sport_match")
 int testcheck_sport_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -605,14 +605,14 @@ int testsetup_sport_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/sport_mismatch")
 int testcheck_sport_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -633,7 +633,7 @@ int testsetup_tcp_non_syn_mark_restore(struct __sk_buff *skb)
 					      19233, 80, 0, TPROXY_MARK);
 
 	if (ret)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	return do_tproxy_lan_ingress(skb, 14);
 }
@@ -641,7 +641,7 @@ int testsetup_tcp_non_syn_mark_restore(struct __sk_buff *skb)
 SEC("classifier/check/tcp_non_syn_mark_restore")
 int testcheck_tcp_non_syn_mark_restore(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, TPROXY_MARK);
+	return check_status_and_mark(skb, DAER_TC_PASS, TPROXY_MARK);
 }
 
 SEC("classifier/pktgen/tcp_non_syn_cached_proxy_redirect")
@@ -662,7 +662,7 @@ int testsetup_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb)
 					      TPROXY_MARK);
 
 	if (ret)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	return do_tproxy_lan_ingress(skb, 14);
 }
@@ -704,7 +704,7 @@ int testsetup_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb)
 SEC("classifier/check/tcp_non_syn_stateless_passthrough")
 int testcheck_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAER_TC_PASS, 0);
 }
 
 SEC("classifier/pktgen/wan_egress_tcp_non_syn_cached_proxy_redirect")
@@ -725,7 +725,7 @@ int testsetup_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb
 					      TPROXY_MARK);
 
 	if (ret)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	return do_tproxy_wan_egress(skb, 14, NULL);
 }
@@ -735,8 +735,8 @@ int testcheck_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb
 {
 	struct tuples_key key = {};
 
-	if (check_redirect_non_syn_tcp(skb) != TC_ACT_OK)
-		return TC_ACT_SHOT;
+	if (check_redirect_non_syn_tcp(skb) != DAER_TC_PASS)
+		return DAER_TC_DROP;
 	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,1));
 	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -746,9 +746,9 @@ int testcheck_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb
 	key.l4proto = IPPROTO_TCP;
 	if (bpf_map_lookup_elem(&routing_handoff_map, &key)) {
 		bpf_printk("steady TCP routing handoff was written\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/wan_egress_tcp_non_syn_stateless_passthrough")
@@ -782,7 +782,7 @@ int testsetup_wan_egress_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb
 SEC("classifier/check/wan_egress_tcp_non_syn_stateless_passthrough")
 int testcheck_wan_egress_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
+	return check_status_and_mark(skb, DAER_TC_CONTINUE, 0);
 }
 
 SEC("classifier/pktgen/wan_egress_tcp_syn_redirect_track")
@@ -798,7 +798,7 @@ int testsetup_wan_egress_tcp_syn_redirect_track(struct __sk_buff *skb)
 {
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/wan_egress_tcp_syn_redirect_track")
@@ -822,7 +822,7 @@ int testsetup_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 {
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/wan_egress_udp_redirect_track")
@@ -831,8 +831,8 @@ int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 	struct tuples_key key = {};
 
 	if (check_redirect_with_listener_l4proto_and_track_ipv4(
-			skb, IPPROTO_UDP, 1) != TC_ACT_OK)
-		return TC_ACT_SHOT;
+			skb, IPPROTO_UDP, 1) != DAER_TC_PASS)
+		return DAER_TC_DROP;
 	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,3));
 	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -842,9 +842,9 @@ int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 	key.l4proto = IPPROTO_UDP;
 	if (!bpf_map_lookup_elem(&routing_handoff_map, &key)) {
 		bpf_printk("new UDP routing handoff is missing\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/wan_egress_udp_expired_state_recreates_handoff")
@@ -865,13 +865,13 @@ int testsetup_wan_egress_udp_expired_state_recreates_handoff(
 	if (setup_cached_routing_result_for_proto(
 			IPV4(192,168,11,3), IPV4(9,9,9,12), 34570, 8443,
 			IPPROTO_UDP, OUTBOUND_USER_DEFINED_MIN, TPROXY_MARK))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	ctx = bpf_map_lookup_elem(&test_routing_cache_ctx_map, &zero_key);
 	if (!ctx)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	state = bpf_map_lookup_elem(&conn_state_map, &ctx->key);
 	if (!state)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	/* Seed a state that is expired by exactly one nanosecond. Test builds
 	 * shorten UDP_CONN_STATE_TIMEOUT_NS (see the Makefile) so this stays a
 	 * real past timestamp on a freshly booted host: with the production
@@ -890,8 +890,8 @@ int testcheck_wan_egress_udp_expired_state_recreates_handoff(
 {
 	struct tuples_key key = {};
 
-	if (check_redirect_with_listener_l4proto(skb, IPPROTO_UDP) != TC_ACT_OK)
-		return TC_ACT_SHOT;
+	if (check_redirect_with_listener_l4proto(skb, IPPROTO_UDP) != DAER_TC_PASS)
+		return DAER_TC_DROP;
 	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,11,3));
 	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -901,8 +901,8 @@ int testcheck_wan_egress_udp_expired_state_recreates_handoff(
 	key.l4proto = IPPROTO_UDP;
 	if (!bpf_map_lookup_elem(&conn_state_map, &key) ||
 	    !bpf_map_lookup_elem(&routing_handoff_map, &key))
-		return TC_ACT_SHOT;
-	return TC_ACT_OK;
+		return DAER_TC_DROP;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/lan_wan_egress_combined_udp_redirect")
@@ -962,24 +962,24 @@ int testsetup_tcp_active_idle_state_retained(struct __sk_buff *skb)
 	state.state = TCP_STATE_ACTIVE;
 	state.last_seen_ns = 1;
 	if (tcp_conn_state_expired(&state, 120000000002ULL))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	state.state = TCP_STATE_CLOSING;
 	if (tcp_conn_state_expired(
 		    &state, state.last_seen_ns + TCP_CONN_STATE_CLOSING_TIMEOUT_NS))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (!tcp_conn_state_expired(
 		    &state,
 		    state.last_seen_ns + TCP_CONN_STATE_CLOSING_TIMEOUT_NS + 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/tcp_active_idle_state_retained")
 int testcheck_tcp_active_idle_state_retained(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAER_TC_PASS, 0);
 }
 
 SEC("classifier/pktgen/tcp_pure_syn_preserves_live_state")
@@ -1027,7 +1027,7 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	live_state.routing_epoch_slot = routing_epoch_slot_encode(0);
 	live_state.datapath_generation = PARAM.datapath_generation;
 	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
 	rerouted_before =
@@ -1040,36 +1040,36 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 				  routing_epoch_slot_encode(0));
 	if (!cur_state || !cur_state->meta.data.has_routing ||
 	    cur_state->state != TCP_STATE_ACTIVE)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (cur_state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (cur_state->last_seen_ns <= bpf_ktime_get_ns() - 10000000000ULL)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
 	    rerouted_before)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	/* A routingless entry is still replaceable, and replacing it is not a
 	 * generation change: there is no cached decision to replace. */
 	if (bpf_map_delete_elem(&conn_state_map, &key))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	__builtin_memset(&live_state, 0, sizeof(live_state));
 	live_state.state = TCP_STATE_ACTIVE;
 	live_state.last_seen_ns = now - 10000000000ULL;
 	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	cur_state = mark_tcp_seen(&key, &tcph, false,
 				  NULL, NULL, NULL, NULL,
 				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	if (!cur_state)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
 	    rerouted_before)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	/* A SYN that cannot name the generation it was routed under is not
 	 * evidence of equality: the live flow's routing is not inherited by
@@ -1077,7 +1077,7 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	 * a flow that outlived a rules change, with the packet's generation
 	 * unreadable instead of merely different. */
 	if (bpf_map_delete_elem(&conn_state_map, &key))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	__builtin_memset(&live_state, 0, sizeof(live_state));
 	live_state.state = TCP_STATE_ACTIVE;
 	live_state.last_seen_ns = now - 10000000000ULL;
@@ -1086,25 +1086,25 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	live_state.routing_epoch_slot = routing_epoch_slot_encode(0);
 	live_state.datapath_generation = PARAM.datapath_generation;
 	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	cur_state = mark_tcp_seen(&key, &tcph, false,
 				  NULL, NULL, NULL, NULL,
 				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	if (cur_state && cur_state->meta.data.has_routing)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
 	    rerouted_before + 1)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/tcp_pure_syn_preserves_live_state")
 int testcheck_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAER_TC_PASS, 0);
 }
 
 SEC("classifier/pktgen/lan_tcp_cached_outbound_survives_connectivity_change")
@@ -1128,11 +1128,11 @@ int testsetup_lan_tcp_cached_outbound_survives_connectivity_change(
 					  IPV4(10,20,0,3), 41002, 443,
 					  outbound, TPROXY_MARK);
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1164,11 +1164,11 @@ int testsetup_wan_tcp_cached_outbound_survives_connectivity_change(
 					  IPV4(10,20,0,4), 41003, 443,
 					  outbound, TPROXY_MARK);
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1198,11 +1198,11 @@ int testsetup_lan_udp_cached_outbound_survives_connectivity_change(
 		IPV4(192,168,20,5), IPV4(10,20,0,5), 41004, 8443,
 		IPPROTO_UDP, outbound, TPROXY_MARK);
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1232,11 +1232,11 @@ int testsetup_wan_udp_cached_outbound_survives_connectivity_change(
 		IPV4(192,168,20,6), IPV4(10,20,0,6), 41005, 8443,
 		IPPROTO_UDP, outbound, TPROXY_MARK);
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1247,8 +1247,8 @@ int testcheck_wan_udp_cached_outbound_survives_connectivity_change(
 	struct tuples_key key = {};
 
 	if (check_redirect_with_listener_l4proto_and_track_ipv4(
-			skb, IPPROTO_UDP, 1) != TC_ACT_OK)
-		return TC_ACT_SHOT;
+			skb, IPPROTO_UDP, 1) != DAER_TC_PASS)
+		return DAER_TC_DROP;
 	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,6));
 	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -1258,9 +1258,9 @@ int testcheck_wan_udp_cached_outbound_survives_connectivity_change(
 	key.l4proto = IPPROTO_UDP;
 	if (bpf_map_lookup_elem(&routing_handoff_map, &key)) {
 		bpf_printk("steady UDP routing handoff was written\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/wan_tcp_new_outbound_obeys_connectivity_change")
@@ -1281,11 +1281,11 @@ int testsetup_wan_tcp_new_outbound_obeys_connectivity_change(
 
 	set_routing_fallback(outbound, false);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1293,7 +1293,7 @@ SEC("classifier/check/wan_tcp_new_outbound_obeys_connectivity_change")
 int testcheck_wan_tcp_new_outbound_obeys_connectivity_change(
 	struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
+	return check_status_and_mark(skb, DAER_TC_DROP, 0);
 }
 
 SEC("classifier/pktgen/wan_udp_new_outbound_obeys_connectivity_change")
@@ -1313,11 +1313,11 @@ int testsetup_wan_udp_new_outbound_obeys_connectivity_change(
 
 	set_routing_fallback(outbound, false);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	return ret;
 }
 
@@ -1325,11 +1325,11 @@ SEC("classifier/check/wan_udp_new_outbound_obeys_connectivity_change")
 int testcheck_wan_udp_new_outbound_obeys_connectivity_change(
 	struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
+	return check_status_and_mark(skb, DAER_TC_DROP, 0);
 }
 
-// Blocked-event rate-limit regression. DAE_EVENT_BLOCKED (type 0) shares
-// alive_block_rate_map with the per-outbound DAE_EVENT_BLOCKED_ALIVE
+// Blocked-event rate-limit regression. DAER_EVENT_BLOCKED (type 0) shares
+// alive_block_rate_map with the per-outbound DAER_EVENT_BLOCKED_ALIVE
 // domains. The reserved EVENT_RATE.blocked_key slot must resolve inside the
 // ARRAY (previously 0xFFFFFFFF exceeded max_entries, so every lookup
 // failed and type-0 emissions were suppressed forever) and each key must
@@ -1343,7 +1343,7 @@ int testpktgen_blocked_event_rate_limit(struct __sk_buff *skb)
 SEC("classifier/setup/blocked_event_rate_limit")
 int testsetup_blocked_event_rate_limit(struct __sk_buff *skb)
 {
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/blocked_event_rate_limit")
@@ -1360,7 +1360,7 @@ int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 	last = bpf_map_lookup_elem(&alive_block_rate_map, &blocked_key);
 	if (!last) {
 		bpf_printk("no alive_block_rate_map slot for blocked events\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// Start from a known state: put the alive key inside its 1s window
@@ -1370,19 +1370,19 @@ int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 	if (bpf_map_update_elem(&alive_block_rate_map, &alive_key, &now,
 				BPF_ANY)) {
 		bpf_printk("cannot arm alive rate-limit slot\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (bpf_map_update_elem(&alive_block_rate_map, &blocked_key, &zero,
 				BPF_ANY)) {
 		bpf_printk("cannot clear blocked rate-limit slot\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// Per-outbound budget: a second blocked-alive emission for the same
 	// outbound within 1s must be suppressed.
 	if (!blocked_event_rate_limited(alive_key)) {
 		bpf_printk("alive rate-limit slot ignored its 1s window\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// Budget independence (alive -> blocked): the fresh alive timestamp
@@ -1391,13 +1391,13 @@ int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 	// so the zeroed timestamp is always outside the window.
 	if (blocked_event_rate_limited(blocked_key)) {
 		bpf_printk("blocked rate-limit slot suppressed a clean emission\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// The type-0 key now honours its own 1s budget.
 	if (!blocked_event_rate_limited(blocked_key)) {
 		bpf_printk("blocked rate-limit slot ignored its 1s window\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// Budget independence (blocked -> alive), value-level: the type-0
@@ -1408,21 +1408,21 @@ int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 	last = bpf_map_lookup_elem(&alive_block_rate_map, &alive_key);
 	if (!last) {
 		bpf_printk("alive rate-limit slot vanished\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (*last != now) {
 		bpf_printk("blocked emission refreshed the alive rate-limit slot\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
 	// Budget independence (blocked -> alive), behaviour-level: the type-0
 	// emission above must not have reset the alive key's window.
 	if (!blocked_event_rate_limited(alive_key)) {
 		bpf_printk("blocked emission reset the alive rate-limit slot\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/pktgen/lan_ingress_udp_first_fragment_listener")
@@ -1499,7 +1499,7 @@ SEC("classifier/check/lan_ingress_tcp_dscp_conn_state")
 int testcheck_lan_ingress_tcp_dscp_conn_state(struct __sk_buff *skb)
 {
 	return check_tcp_conn_state_ipv4_tcp_dscp(skb,
-						  TC_ACT_REDIRECT,
+						  DAER_TC_REDIRECT,
 						  IPV4(192,168,0,1), IPV4(1,1,1,1),
 						  19233, 443,
 						  OUTBOUND_USER_DEFINED_MIN,
@@ -1523,7 +1523,7 @@ int testsetup_routing_epoch_slot_zero_handoff(struct __sk_buff *skb)
 SEC("classifier/check/routing_epoch_slot_zero_handoff")
 int testcheck_routing_epoch_slot_zero_handoff(struct __sk_buff *skb)
 {
-	return check_routing_epoch_lan_ingress(skb, TC_ACT_REDIRECT,
+	return check_routing_epoch_lan_ingress(skb, DAER_TC_REDIRECT,
 						   IPV4(192,168,0,10), IPV4(1,1,1,1),
 						   24560, 443,
 						   OUTBOUND_USER_DEFINED_MIN,
@@ -1547,7 +1547,7 @@ int testsetup_routing_epoch_slot_one_handoff(struct __sk_buff *skb)
 SEC("classifier/check/routing_epoch_slot_one_handoff")
 int testcheck_routing_epoch_slot_one_handoff(struct __sk_buff *skb)
 {
-	return check_routing_epoch_lan_ingress(skb, TC_ACT_REDIRECT,
+	return check_routing_epoch_lan_ingress(skb, DAER_TC_REDIRECT,
 						   IPV4(192,168,0,11), IPV4(1,1,1,1),
 						   24561, 443,
 						   OUTBOUND_USER_DEFINED_MIN + 1,
@@ -1571,7 +1571,7 @@ SEC("classifier/check/routing_epoch_domain_projection_slot_zero")
 int testcheck_routing_epoch_domain_projection_slot_zero(struct __sk_buff *skb)
 {
 	return check_routing_epoch_lan_ingress(
-		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		skb, DAER_TC_REDIRECT, IPV4(192,168,0,1),
 		IPV4(198,51,100,20), 19233, 443, OUTBOUND_USER_DEFINED_MIN,
 		routing_epoch_slot_encode(0));
 }
@@ -1593,7 +1593,7 @@ SEC("classifier/check/routing_epoch_domain_projection_slot_one")
 int testcheck_routing_epoch_domain_projection_slot_one(struct __sk_buff *skb)
 {
 	return check_routing_epoch_lan_ingress(
-		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		skb, DAER_TC_REDIRECT, IPV4(192,168,0,1),
 		IPV4(198,51,100,20), 19233, 443, OUTBOUND_USER_DEFINED_MIN + 2,
 		routing_epoch_slot_encode(1));
 }
@@ -1630,7 +1630,7 @@ SEC("classifier/check/lan_ingress_tcp_ipv6_dscp_conn_state")
 int testcheck_lan_ingress_tcp_ipv6_dscp_conn_state(struct __sk_buff *skb)
 {
 	return check_tcp_conn_state_ipv6_tcp_dscp(skb,
-						  TC_ACT_REDIRECT,
+						  DAER_TC_REDIRECT,
 						  0x20010db8, 0, 0, 0x10,
 						  0x26064700, 0, 0, 0x1111,
 						  19233, 443,
@@ -1669,7 +1669,7 @@ SEC("classifier/check/lan_ingress_udp_dscp_conn_state")
 int testcheck_lan_ingress_udp_dscp_conn_state(struct __sk_buff *skb)
 {
 	return check_udp_conn_state_ipv4_udp_dscp(skb,
-						  TC_ACT_REDIRECT,
+						  DAER_TC_REDIRECT,
 						  IPV4(192,168,0,1), IPV4(1,1,1,1),
 						  24567, 443,
 						  OUTBOUND_USER_DEFINED_MIN,
@@ -1708,7 +1708,7 @@ SEC("classifier/check/lan_ingress_udp_ipv6_dscp_conn_state")
 int testcheck_lan_ingress_udp_ipv6_dscp_conn_state(struct __sk_buff *skb)
 {
 	return check_udp_conn_state_ipv6_udp_dscp(skb,
-						  TC_ACT_REDIRECT,
+						  DAER_TC_REDIRECT,
 						  0x20010db8, 0, 0, 0x10,
 						  0x26064700, 0, 0, 0x1111,
 						  24567, 443,
@@ -1729,7 +1729,7 @@ int testsetup_wan_egress_udp_first_fragment_listener(struct __sk_buff *skb)
 {
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/wan_egress_udp_first_fragment_listener")
@@ -1754,7 +1754,7 @@ int testsetup_lan_ingress_udp_non_initial_fragment_passthrough(struct __sk_buff 
 SEC("classifier/check/lan_ingress_udp_non_initial_fragment_passthrough")
 int testcheck_lan_ingress_udp_non_initial_fragment_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAER_TC_PASS, 0);
 }
 
 SEC("classifier/pktgen/wan_egress_udp_non_initial_fragment_passthrough")
@@ -1768,13 +1768,13 @@ SEC("classifier/setup/wan_egress_udp_non_initial_fragment_passthrough")
 int testsetup_wan_egress_udp_non_initial_fragment_passthrough(struct __sk_buff *skb)
 {
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/wan_egress_udp_non_initial_fragment_passthrough")
 int testcheck_wan_egress_udp_non_initial_fragment_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
+	return check_status_and_mark(skb, DAER_TC_CONTINUE, 0);
 }
 
 SEC("classifier/pktgen/wan_egress_direct_mark_reroute")
@@ -1806,16 +1806,16 @@ int testsetup_wan_egress_direct_mark_reroute(struct __sk_buff *skb)
 	if (!mark_tcp_seen(&key, &tcph, false,
 			   &outbound, &mark, &must, NULL,
 			   0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN))
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/wan_egress_direct_mark_reroute")
 int testcheck_wan_egress_direct_mark_reroute(struct __sk_buff *skb)
 {
 	return check_tcp_conn_state_ipv4_tcp(skb,
-					     TC_ACT_OK,
+					     DAER_TC_PASS,
 					     IPV4(192,168,0,1), IPV4(9,9,9,9),
 					     24567, 80,
 					     OUTBOUND_DIRECT,
@@ -1842,7 +1842,7 @@ int testsetup_conntrack_args_scratch_reset(struct __sk_buff *skb)
 		bpf_map_lookup_elem(&conntrack_args_map, &zero_key);
 
 	if (!args)
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 
 	conntrack_args_set(args, &outbound, &mark, &must, NULL, 11, pname, 99,
 			   ROUTING_EPOCH_SLOT_UNKNOWN);
@@ -1851,35 +1851,35 @@ int testsetup_conntrack_args_scratch_reset(struct __sk_buff *skb)
 
 	if (args->flags != 0) {
 		bpf_printk("args->flags(%u) != 0\n", args->flags);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (args->dscp != 0) {
 		bpf_printk("args->dscp(%u) != 0\n", args->dscp);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	if (args->flags & CT_ARGS_HAS_PNAME) {
 		bpf_printk("args->flags reports a pname\n");
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 	for (int i = 0; i < TASK_COMM_LEN; i++) {
 		if (args->pname[i] != 0) {
 			bpf_printk("args->pname[%d](%u) != 0\n", i,
 				   args->pname[i]);
-			return TC_ACT_SHOT;
+			return DAER_TC_DROP;
 		}
 	}
 	if (args->pid != 0) {
 		bpf_printk("args->pid(%u) != 0\n", args->pid);
-		return TC_ACT_SHOT;
+		return DAER_TC_DROP;
 	}
 
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/conntrack_args_scratch_reset")
 int testcheck_conntrack_args_scratch_reset(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAER_TC_PASS, 0);
 }
 
 SEC("classifier/pktgen/l4proto_match")
@@ -1906,14 +1906,14 @@ int testsetup_l4proto_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/l4proto_match")
 int testcheck_l4proto_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -1942,14 +1942,14 @@ int testsetup_l4proto_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/l4proto_mismatch")
 int testcheck_l4proto_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -1978,14 +1978,14 @@ int testsetup_ipversion_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/ipversion_match")
 int testcheck_ipversion_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2014,14 +2014,14 @@ int testsetup_ipversion_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/ipversion_mismatch")
 int testcheck_ipversion_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2064,7 +2064,7 @@ int testsetup_mac_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/mac_match")
@@ -2084,7 +2084,7 @@ int testcheck_mac_match(struct __sk_buff *skb)
 	bpf_map_delete_elem(&unused_lpm_type, &lpm_key);
 
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2127,14 +2127,14 @@ int testsetup_mac_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/mac_mismatch")
 int testcheck_mac_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2165,14 +2165,14 @@ int testsetup_dscp_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dscp_match")
 int testcheck_dscp_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2202,14 +2202,14 @@ int testsetup_dscp_ipv6_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dscp_ipv6_match")
 int testcheck_dscp_ipv6_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv6_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      0x20010db8, 0, 0, 0x10,
 				      0x26064700, 0, 0, 0x1111,
 				      19233, 79);
@@ -2241,14 +2241,14 @@ int testsetup_dscp_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dscp_mismatch")
 int testcheck_dscp_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2278,14 +2278,14 @@ int testsetup_dscp_ipv6_mismatch(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/dscp_ipv6_mismatch")
 int testcheck_dscp_ipv6_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv6_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      0x20010db8, 0, 0, 0x10,
 				      0x26064700, 0, 0, 0x1111,
 				      19233, 79);
@@ -2359,14 +2359,14 @@ int testsetup_and_match_1(struct __sk_buff *skb)
 	bpf_map_update_elem(&routing_map, &four_key, &ms, BPF_ANY);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/and_match_1")
 int testcheck_and_match_1(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2439,14 +2439,14 @@ int testsetup_and_match_2(struct __sk_buff *skb)
 	bpf_map_update_elem(&routing_map, &four_key, &ms, BPF_ANY);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/and_match_2")
 int testcheck_and_match_2(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 8443);
 }
@@ -2519,14 +2519,14 @@ int testsetup_and_mismatch(struct __sk_buff *skb)
 	bpf_map_update_elem(&routing_map, &four_key, &ms, BPF_ANY);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/and_mismatch")
 int testcheck_and_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 2333);
 }
@@ -2556,14 +2556,14 @@ int testsetup_not_match(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/not_match")
 int testcheck_not_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      DAE_TC_CONTINUE,
+				      DAER_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -2593,14 +2593,14 @@ int testsetup_not_mismtach(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
 	bpf_tail_call(skb, &entry_call_map, 0);
-	return TC_ACT_OK;
+	return DAER_TC_PASS;
 }
 
 SEC("classifier/check/not_mismtach")
 int testcheck_not_mismtach(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_REDIRECT,
+				      DAER_TC_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2720,7 +2720,7 @@ int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
  *     to the control plane, so a :53 listener never wins.
  *
  * The runner installs a live proxy fallback: a bypassed packet returns
- * TC_ACT_OK (0), a routed one returns TC_ACT_REDIRECT (7).
+ * DAER_TC_PASS (0), a routed one returns DAER_TC_REDIRECT (7).
  * --------------------------------------------------------------------------- */
 #define AB_TEST_SERVICE_UDP_PORT 54322
 #define AB_TEST_SERVICE_ADDR IPV4(192, 0, 2, 1)
@@ -3541,7 +3541,7 @@ int test_ab_stateless_tcp_passthrough(struct __sk_buff *skb)
 		if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 1, 1),
 				      IPV4(5, 5, 5, 5), 33333, 443, 5, TCPH_ACK, 0))
 			return 2;
-		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != DAER_TC_PASS)
 			return 3;
 	}
 	/* Counter exactness: one increment per packet, no more and no less. */
@@ -3583,7 +3583,7 @@ int test_ab_unsolicited_udp_wan_ingress(struct __sk_buff *skb)
 		bpf_map_delete_elem(&conn_state_map, &reversed);
 
 	before = ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
-	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAE_TC_CONTINUE)
+	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAER_TC_CONTINUE)
 		return 3;
 	after = ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
 	if (after != before + 1)
@@ -3594,7 +3594,7 @@ int test_ab_unsolicited_udp_wan_ingress(struct __sk_buff *skb)
 		return 5;
 
 	/* A packet of a flow that already has state is not counted. */
-	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAE_TC_CONTINUE)
+	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAER_TC_CONTINUE)
 		return 6;
 	if (ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN) != after)
 		return 7;
@@ -3624,7 +3624,7 @@ int test_ab_frag_tail_passthrough(struct __sk_buff *skb)
 		if (ab_build_ipv4_udp(skb, IPV4(192, 168, 2, 1),
 				      IPV4(9, 9, 9, 9), 34567, 4500, 1))
 			return 2;
-		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != DAER_TC_PASS)
 			return 3;
 	}
 	if (ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED) !=
@@ -3680,7 +3680,7 @@ int test_ab_parse_return_code_split(struct __sk_buff *skb)
 			  IPV4(7, 7, 7, 7), 0, 8, &ip, &l4))
 		return 7;
 	before = ab_read_stat(BPF_STATS_PARSE_UNSUPPORTED_L4);
-	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != DAER_TC_PASS)
 		return 8;
 	if (ab_read_stat(BPF_STATS_PARSE_UNSUPPORTED_L4) != before + 1)
 		return 9;

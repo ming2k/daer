@@ -22,6 +22,8 @@ daer-relay.workspace = true
 daer-routing.workspace = true
 daer-sniff.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [[test]]

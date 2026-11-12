@@ -23,24 +23,28 @@ You can write human-readable plain text rule lists and compile them to `.drb` us
 Create a text file (e.g. `company-direct.rules`):
 
 ```text
-# Corporate subnets and intranet services
+---
 name: company-direct
+---
 
-# IP and CIDR rules
+# IP and CIDR rules (CRS v3, ADR-0045)
 192.168.0.0/16
 10.0.0.0/8
 172.16.0.0/12
+10.0.0.1..10.0.0.50
 
-# Domain rules (CRS v2 symbolic syntax, ADR-0036)
+# Domain rules (CRS v3 symbolic syntax, ADR-0036, ADR-0045)
 internal.company.com         # Suffix match: internal.company.com and *.internal.company.com
 .corp.company.com            # Subdomain only: *.corp.company.com
 =vpn.company.com             # Exact match: strictly vpn.company.com only
 ```
 
-Under CRS v2 (ADR-0036), domain rules use prefix-free, symbolic notation:
-- Bare names (`example.com`) are suffixes matching the bare domain and all subdomains.
+Under CRS v3 (ADR-0045), all rules use prefix-free, orthogonal notation:
+- Network rules accept bare host IPs (`1.1.1.1`, `::1`), standard CIDRs (`192.168.0.0/16`), and double-dot ranges (`10.0.0.1..10.0.0.50`). The legacy `ip:` prefix and `-` range are retired.
+- Bare domain names (`example.com`) are suffixes matching the bare domain and all subdomains.
 - Leading dots (`.example.com`) match subdomains only.
 - Leading equals (`=example.com`) match the exact full domain.
+- Metadata is declared in the frontmatter header (`--- \n name: <set-name> \n ---`) at the top of the file.
 
 `keyword:` and `regex:` are permanently refused: they were legacy geodata codes that each required a dedicated engine on the matching path. Expand such patterns into concrete names before compilation.
 
@@ -100,25 +104,25 @@ daer-drb compile cn-ip.rules -o geoip-cn.drb
 Declare local file or remote HTTP providers in your daemon configuration:
 
 ```toml
-schema = 1
+schema = 2
 
 # 1. Local pre-compiled DRB rule set
 [[rule-provider]]
-tag = "company-direct"
+name = "company-direct"
 type = "file"
 path = "rules/company-direct.drb"
 format = "drb"
 
 # 2. Remote HTTP rule set with automated 24-hour background sync
 [[rule-provider]]
-tag = "geosite-cn"
+name = "geosite-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
-tag = "geoip-cn"
+name = "geoip-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"
@@ -173,6 +177,10 @@ files are build inputs/outputs, not repository content.
 
 End users reference the public URLs in `[[rule-provider]]`, receiving automated background updates without manual maintenance or root privileges.
 
+For a fully local install — building the artifacts, verifying them, copying them to
+`/var/lib/daer/rules`, and declaring file providers — see
+[Install DRB Rule Sets Manually](drb-sets-manual-install.md).
+
 ---
 
 ## 6. Architecture Best Practices: Coarse-Grained Providers vs. Anti-Patterns
@@ -214,7 +222,7 @@ fallback = "proxy"
   - **The Kernel Danger**: Lowering $> 1024$ match sets exceeds the eBPF datapath's fixed array ceiling (`MAX_MATCH_SET_LEN`), causing `daer` to emit `DeferReason::TooManySets`. When this happens, **line-rate eBPF hardware offload is immediately aborted**, forcing 100% of all packet flows to fall back to the userspace relay.
 - **Anti-Pattern: Splitting IP and Domain for Composite Assets**:
   Do not maintain separate IP and domain files for a single business entity (e.g. `corp-ips.txt` and `corp-domains.txt`).
-  - Combine them into a single `.rules` source file (`ip: ...` and domain lines (`example.com`, `=host.example`)) and compile them into a unified `.drb`. `daer-routing` automatically links them with a zero-cost logical-OR predicate under a single rule statement.
+  - Combine them into a single `.rules` source file (CIDR/range lines and domain lines (`example.com`, `=host.example`)) and compile them into a unified `.drb`. `daer-routing` automatically links them with a zero-cost logical-OR predicate under a single rule statement.
 - **Format Selection**:
   - Use `format = "drb"` for external subscriptions, production workloads, and large rule sets ($> 1,000$ entries) for instant sub-millisecond cold start.
   - Use `format = "text"` only for small, human-edited local override files during active prototyping.
@@ -247,7 +255,7 @@ python3 scripts/rules/dat_to_rules.py --kind geosite \
     --dat geosite.dat --code cn --output geosite-cn.rules
 
 # 2. Review it. This step is the point: the file is plain text, diffable, and committable.
-$EDITOR geosite-cn.rules      # ip: …  domain.com  .sub.domain.com  =exact.com
+$EDITOR geosite-cn.rules      # cidrs/ranges  domain.com  .sub.domain.com  =exact.com
 
 # 3. Encode it.
 daer-drb compile geosite-cn.rules -o geosite-cn.drb
@@ -271,11 +279,9 @@ through an artifact shows the same rules without their `@` markers.
 The following configuration deploys the compiled Loyalsoldier rule sets with automated 24-hour background synchronization and line-rate eBPF kernel offload:
 
 ```toml
-schema = 1
+schema = 2
 
 [global]
-tproxy-port = 12345
-dial-mode = "domain"
 wan-interface = ["eth0"]
 lan-interface = ["lan0"]
 
@@ -283,15 +289,15 @@ lan-interface = ["lan0"]
 
 # Ad & tracking rejection (daily update)
 [[rule-provider]]
-tag = "ads"
+name = "ads"
 type = "http"
-url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-ads.drb"
+url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-category-ads-all.drb"
 format = "drb"
 interval = "24h"
 
 # Private subnets (RFC1918 / Loopback)
 [[rule-provider]]
-tag = "private-ips"
+name = "private-ips"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
 format = "drb"
@@ -299,7 +305,7 @@ interval = "168h"
 
 # Mainland China Domains (daily update)
 [[rule-provider]]
-tag = "geosite-cn"
+name = "geosite-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
@@ -307,7 +313,7 @@ interval = "24h"
 
 # Mainland China IP CIDRs (weekly update)
 [[rule-provider]]
-tag = "geoip-cn"
+name = "geoip-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"
@@ -315,7 +321,7 @@ interval = "168h"
 
 # Designated GFW Proxy Domains (daily update)
 [[rule-provider]]
-tag = "geosite-gfw"
+name = "geosite-gfw"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-geolocation-!cn.drb"
 format = "drb"
@@ -331,9 +337,9 @@ rules = [
     # 2. Bypass private LAN subnets
     "provider(private-ips) -> direct",
 
-    # 3. Direct route domestic domains & IPs
-    "provider(geosite-cn) -> direct",
+    # 3. Direct route domestic IPs first, then domestic domains
     "provider(geoip-cn) -> direct",
+    "provider(geosite-cn) -> direct",
 
     # 4. Explicit proxy for known GFW domains
     "provider(geosite-gfw) -> proxy",

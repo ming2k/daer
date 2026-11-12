@@ -1,6 +1,6 @@
 # Architectural Decision Records (ADR) Standards
 
-This document establishes the qualification criteria, lifecycle management, and authoring standards for Architectural Decision Records in `daer`.
+This document establishes the qualification criteria, lifecycle management, and authoring standards for Architectural Decision Records in a software repository.
 
 ---
 
@@ -9,7 +9,7 @@ This document establishes the qualification criteria, lifecycle management, and 
 Not every design decision requires an ADR. To prevent document fatigue while capturing load-bearing architecture, a decision must pass the **3-Question Test**:
 
 1. **High Reversal Cost**: Would reverting this decision in six months require rewriting substantial code or breaking cross-crate APIs?
-2. **Structural Boundary or Invariant**: Does this decision set a boundary between subsystems (e.g. kernel vs userspace, `daer` vs `netune`), or establish a System Invariant?
+2. **Structural Boundary or Invariant**: Does this decision set a boundary between subsystems (for example kernel vs userspace, or core vs plugin), or establish a System Invariant?
 3. **Negative Knowledge**: Does the decision document discarded alternatives, verifier failure modes, or architectural traps that future maintainers must not re-attempt?
 
 If the answer to all three is yes, an ADR is mandatory.
@@ -40,7 +40,7 @@ ADRs follow an in-place lifecycle. When an architecture evolves, existing record
 
 ## 3. ADR Frontmatter Schema & Template
 
-New ADRs must be numbered sequentially with a four-digit zero-padded index (e.g. `0011-topic.md`) in `docs/adr/`, registered in `docs/adr/index.md`, and formatted as follows:
+New ADRs are numbered sequentially with a four-digit zero-padded index (for example `0011-topic.md`), placed in the repository's ADR directory, and registered in its ADR index. Use the following template:
 
 ```markdown
 ---
@@ -49,8 +49,8 @@ title: "Imperative statement of the architectural decision"
 status: accepted # draft | accepted | superseded | rejected
 date: YYYY-MM-DD
 scope: [subsystem/topic, boundary/category]
-supersedes: [] # e.g. [ADR-0001]
-superseded_by: [] # e.g. [ADR-0005]
+supersedes: [] # e.g. [ADR-XXXX]
+superseded_by: [] # e.g. [ADR-YYYY]
 ---
 
 # NNNN. Imperative statement of the decision
@@ -62,7 +62,7 @@ superseded_by: [] # e.g. [ADR-0005]
 
 ## Context
 
-What problem are we solving? What are the physical or kernel constraints?
+What problem are we solving? What are the physical, operational, or architectural constraints?
 
 ## Decision
 
@@ -76,3 +76,5 @@ What alternatives were considered and why were they rejected? What failure modes
 
 What becomes easier, what becomes harder, and what follow-ups are created?
 ```
+
+Repository-specific decisions, identifiers, and enforcement commands belong in the repository's own ADRs, not in this neutral standard.

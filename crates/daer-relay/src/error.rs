@@ -11,11 +11,6 @@ pub use daer_observe::DialFailure;
 /// The reason an accepted flow is not eligible for proxying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
-    /// The original destination *is* the transparent port itself: someone
-    /// connected to the port directly instead of being redirected into it. That
-    /// traffic has no destination to reach, and answering it would turn the
-    /// transparent port into a service.
-    SelfConnect { destination: SocketAddr },
     /// A routing rule matched `block`: the flow is dropped on purpose.
     Blocked { destination: SocketAddr },
 }
@@ -23,11 +18,6 @@ pub enum Reject {
 impl fmt::Display for Reject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SelfConnect { destination } => write!(
-                f,
-                "connection to the transparent port itself ({destination}); \
-                 not a redirected flow"
-            ),
             Self::Blocked { destination } => {
                 write!(f, "blocked by a routing rule: {destination}")
             }

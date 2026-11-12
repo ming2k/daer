@@ -4,21 +4,31 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use daer_proxy_protocols::ProxyDialer;
 pub use daer_proxy_protocols::options::DialerOptions;
+use daer_proxy_protocols::server::{ServerConnector, ServerDialer};
 use netune::{
-    Connector, DatagramConnector, Established, Proxy, ProxyConnector, SocketConfig,
-    Socks5DatagramConnector, Target, TcpConnector, UdpConnector,
+    Connector, DatagramConnector, Established, Proxy, ProxyConnector, Socks5DatagramConnector,
 };
 use netune_trace::TraceCollector;
 
 use crate::error::OutboundError;
 use crate::property::Protocol;
 
-/// A node's transport.
-pub enum NodeDialer {
+/// One selectable outbound node, optionally carried by another node.
+///
+/// The transport is what speaks the node's protocol; `detour` is the outbound that opens the
+/// stream to this node's *server*. Keeping the chain beside the transport rather than folding
+/// it into the transport is what lets `daer route` and the health scheduler name both hops
+/// (ADR-0044).
+pub struct NodeDialer {
+    label: String,
+    transport: NodeTransport,
+    detour: Option<Arc<NodeDialer>>,
+}
+
+enum NodeTransport {
     Direct(DirectTransport),
     Proxy(ProxyTransport),
     Protocol(ProxyDialer),
@@ -26,12 +36,38 @@ pub enum NodeDialer {
 
 impl fmt::Debug for NodeDialer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeDialer")
+            .field("label", &self.label)
+            .field("transport", &self.transport)
+            .field("detour", &self.detour.as_ref().map(|inner| inner.label()))
+            .finish()
+    }
+}
+
+impl fmt::Debug for NodeTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Direct(dialer) => f.debug_tuple("Direct").field(dialer).finish(),
             Self::Proxy(dialer) => f.debug_tuple("Proxy").field(dialer).finish(),
             Self::Protocol(dialer) => f.debug_tuple("Protocol").field(dialer).finish(),
         }
     }
+}
+
+/// A link's diagnostic label, with credentials and query parameters removed.
+///
+/// `Debug` on a [`NodeDialer`] must never print a password. A node built from configuration
+/// already has a name or a `host:port` default; a node built from a link gets this instead of
+/// the raw string.
+fn safe_link_label(link: &str) -> String {
+    let Some((scheme, rest)) = link.split_once("://") else {
+        return link.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}")
 }
 
 /// The first hop's scheme when `link` is a chain, or `None` for a single link.
@@ -49,41 +85,67 @@ impl NodeDialer {
         node: &daer_config::Node,
         options: DialerOptions,
     ) -> Result<Self, OutboundError> {
-        match &node.endpoint {
-            daer_config::NodeEndpoint::Direct(_) => Ok(Self::Direct(DirectTransport::new(options))),
+        let label = node.label();
+        let transport = match &node.endpoint {
+            daer_config::NodeEndpoint::Direct(_) => {
+                if options.is_detoured() {
+                    return Err(OutboundError::UnsupportedLink(
+                        "a direct node has no server leg to replace; remove detour and route to \
+                         the inner node's group instead"
+                            .to_owned(),
+                    ));
+                }
+                NodeTransport::Direct(DirectTransport::new(&options))
+            }
             daer_config::NodeEndpoint::Socks5(n) => {
                 let link = n.to_link();
                 let proxy = Proxy::parse(&link)
                     .map_err(|e| OutboundError::UnsupportedLink(e.to_string()))?;
-                Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
+                NodeTransport::Proxy(ProxyTransport::new(proxy, options))
             }
             daer_config::NodeEndpoint::Http(n) => {
                 let link = n.to_link();
                 let proxy = Proxy::parse(&link)
                     .map_err(|e| OutboundError::UnsupportedLink(e.to_string()))?;
-                Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
+                NodeTransport::Proxy(ProxyTransport::new(proxy, options))
             }
             daer_config::NodeEndpoint::Unsupported { scheme, .. } => Err(
                 OutboundError::UnsupportedLink(format!("unsupported protocol {scheme:?}")),
-            ),
+            )?,
             endpoint => {
                 let dialer = ProxyDialer::from_node(endpoint, options)?;
-                Ok(Self::Protocol(dialer))
+                NodeTransport::Protocol(dialer)
             }
-        }
+        };
+        Ok(Self {
+            label,
+            transport,
+            detour: None,
+        })
     }
 
     /// Builds the transport a node link describes.
     pub fn from_link(link: &str, options: DialerOptions) -> Result<Self, OutboundError> {
         let link = link.trim();
+        let label = safe_link_label(link);
         if link.is_empty() || link == "direct" {
-            return Ok(Self::Direct(DirectTransport::new(options)));
+            if options.is_detoured() {
+                return Err(OutboundError::UnsupportedLink(
+                    "a direct node has no server leg to replace; remove detour and route to \
+                     the inner node's group instead"
+                        .to_owned(),
+                ));
+            }
+            return Ok(Self {
+                label,
+                transport: NodeTransport::Direct(DirectTransport::new(&options)),
+                detour: None,
+            });
         }
 
         if let Some(scheme) = chain_head_scheme(link) {
             return Err(OutboundError::UnsupportedLink(format!(
-                "chained links (`a -> b`) are not implemented; {scheme:?} is the first hop \
-                 of a chain this build would otherwise silently ignore"
+                "chained links (`a -> b`) are not implemented; use a `[[node]]` with `detour = \"<name>\"`; {scheme:?} is the first hop of a chain this build would otherwise silently ignore"
             )));
         }
 
@@ -103,7 +165,11 @@ impl NodeDialer {
             || scheme.eq_ignore_ascii_case("vless")
         {
             let dialer = ProxyDialer::from_link(link, options)?;
-            return Ok(Self::Protocol(dialer));
+            return Ok(Self {
+                label,
+                transport: NodeTransport::Protocol(dialer),
+                detour: None,
+            });
         }
 
         let (link_clean, _fragment) = match link.split_once('#') {
@@ -132,7 +198,34 @@ impl NodeDialer {
 
         let proxy = Proxy::parse(&normalized)
             .map_err(|error| OutboundError::UnsupportedLink(error.to_string()))?;
-        Ok(Self::Proxy(ProxyTransport::new(proxy, options)))
+        Ok(Self {
+            label,
+            transport: NodeTransport::Proxy(ProxyTransport::new(proxy, options)),
+            detour: None,
+        })
+    }
+
+    /// Attaches the outbound that carries this node's server leg.
+    ///
+    /// The caller has already injected the matching [`ServerDialer`] into the options; this
+    /// field is the diagnostic/health view of the same edge, and the two are set together by
+    /// [`crate::NodeGraph`].
+    #[must_use]
+    pub(crate) fn with_detour(mut self, detour: Arc<NodeDialer>) -> Self {
+        self.detour = Some(detour);
+        self
+    }
+
+    /// The immediate inner outbound, when this node is a detour hop.
+    #[must_use]
+    pub fn detour(&self) -> Option<&Arc<NodeDialer>> {
+        self.detour.as_ref()
+    }
+
+    /// This node's configured label (its name, or its default name).
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Opens a TCP connection to `authority` (`host:port`) without observing it.
@@ -155,21 +248,43 @@ impl NodeDialer {
         authority: &str,
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
-        match self {
-            Self::Direct(dialer) => dialer.connect_with_collector(authority, collector).await,
-            Self::Proxy(dialer) => dialer.connect_with_collector(authority, collector).await,
-            Self::Protocol(dialer) => {
+        match &self.transport {
+            NodeTransport::Direct(dialer) => {
+                dialer.connect_with_collector(authority, collector).await
+            }
+            NodeTransport::Proxy(dialer) => {
+                dialer.connect_with_collector(authority, collector).await
+            }
+            NodeTransport::Protocol(dialer) => {
                 Ok(dialer.connect_with_collector(authority, collector).await?)
             }
         }
     }
 
+    /// Opens the bare stream to this node's server, before the protocol handshake.
+    ///
+    /// A health probe of a detoured node must test the *chain* to the node's own server, not
+    /// the final internet target and not a direct socket that would report the outer server
+    /// unreachable while the chain is fine (ADR-0044).
+    pub async fn probe_server(
+        &self,
+        collector: &TraceCollector,
+    ) -> Result<Established, OutboundError> {
+        match &self.transport {
+            NodeTransport::Direct(_) => Err(OutboundError::UnsupportedLink(
+                "a direct node has no remote server to probe".to_owned(),
+            )),
+            NodeTransport::Proxy(dialer) => dialer.connect_server(collector).await,
+            NodeTransport::Protocol(dialer) => Ok(dialer.connect_server(collector).await?),
+        }
+    }
+
     #[must_use]
     pub fn protocol(&self) -> Protocol {
-        match self {
-            Self::Direct(_) => Protocol::Direct,
-            Self::Proxy(dialer) => dialer.protocol(),
-            Self::Protocol(dialer) => dialer.protocol().into(),
+        match &self.transport {
+            NodeTransport::Direct(_) => Protocol::Direct,
+            NodeTransport::Proxy(dialer) => dialer.protocol(),
+            NodeTransport::Protocol(dialer) => dialer.protocol().into(),
         }
     }
 
@@ -183,44 +298,87 @@ impl NodeDialer {
     /// carry datagrams through it.
     #[must_use]
     pub fn datagram(&self) -> Option<Arc<dyn DatagramConnector>> {
-        match self {
-            Self::Direct(dialer) => Some(Arc::new(dialer.datagram_connector())),
-            Self::Proxy(dialer) => dialer.datagram_connector(),
-            Self::Protocol(dialer) => dialer.datagram_connector(),
+        match &self.transport {
+            NodeTransport::Direct(dialer) => dialer.datagram_connector(),
+            NodeTransport::Proxy(dialer) => dialer.datagram_connector(),
+            NodeTransport::Protocol(dialer) => dialer.datagram_connector(),
         }
     }
 }
 
+/// Makes an outbound node usable as another node's server leg.
+///
+/// This is the only place a chain edge becomes code. The outer protocol asks for its server
+/// stream, this adapter asks the inner node for a stream to that server, and the inner node's
+/// own detour (if any) applies recursively — the configuration validation has already proven
+/// the graph is acyclic (ADR-0044).
+#[derive(Clone)]
+pub(crate) struct NodeServerDialer {
+    node: Arc<NodeDialer>,
+}
+
+impl NodeServerDialer {
+    #[must_use]
+    pub fn new(node: Arc<NodeDialer>) -> Self {
+        Self { node }
+    }
+}
+
+impl fmt::Debug for NodeServerDialer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeServerDialer")
+            .field("node", &self.node.label())
+            .finish()
+    }
+}
+
+impl ServerDialer for NodeServerDialer {
+    fn connect<'a>(
+        &'a self,
+        authority: &'a str,
+        recorder: &'a TraceCollector,
+    ) -> daer_proxy_protocols::server::ServerFuture<'a> {
+        let node = Arc::clone(&self.node);
+        Box::pin(async move {
+            node.connect_with_collector(authority, recorder)
+                .await
+                .map_err(|error| match error {
+                    OutboundError::Timeout => daer_proxy_protocols::ProxyProtocolError::Timeout,
+                    other => daer_proxy_protocols::ProxyProtocolError::Connect(other.to_string()),
+                })
+        })
+    }
+
+    fn datagram(&self) -> Option<Arc<dyn DatagramConnector>> {
+        self.node.datagram()
+    }
+
+    fn is_direct(&self) -> bool {
+        false
+    }
+
+    fn route_shape(&self) -> Option<String> {
+        Some(format!("detour:{}", self.node.label()))
+    }
+}
+
 pub struct DirectTransport {
-    connector: TcpConnector,
-    timeout: Duration,
-    /// Kept so the datagram leg is configured exactly like the stream leg; a mark
-    /// that applied to TCP but not UDP would let a proxy capture its own traffic.
-    socket_config: SocketConfig,
+    base: Arc<dyn ServerDialer>,
 }
 
 impl fmt::Debug for DirectTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DirectTransport")
-            .field("timeout", &self.timeout)
+            .field("server", &self.base)
             .finish_non_exhaustive()
     }
 }
 
 impl DirectTransport {
-    pub fn new(options: DialerOptions) -> Self {
+    pub fn new(options: &DialerOptions) -> Self {
         Self {
-            connector: TcpConnector::new()
-                .with_socket_config(options.socket_config())
-                .with_connect_timeout(Some(options.timeout)),
-            timeout: options.timeout,
-            socket_config: options.socket_config(),
+            base: options.base().clone(),
         }
-    }
-
-    pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
-        self.connect_with_collector(authority, &TraceCollector::disabled())
-            .await
     }
 
     pub async fn connect_with_collector(
@@ -228,37 +386,36 @@ impl DirectTransport {
         authority: &str,
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
-        let target = Target::plain(authority);
-        tokio::time::timeout(self.timeout, self.connector.connect(&target, collector))
+        self.base
+            .connect(authority, collector)
             .await
-            .map_err(|_| OutboundError::Timeout)?
-            .map_err(|error| OutboundError::Connect(error.to_string()))
+            .map_err(OutboundError::from)
     }
 
-    /// The datagram twin of [`Self::connect`]: same socket configuration, so
-    /// `SO_MARK` travels with it and a direct datagram flow is not captured by the
-    /// proxy's own routing rules.
-    fn datagram_connector(&self) -> UdpConnector {
-        UdpConnector::new()
-            .with_socket_config(self.socket_config.clone())
-            .with_connect_timeout(Some(self.timeout))
+    /// The datagram twin of [`Self::connect`]: the base dialer applies the same
+    /// socket configuration, so `SO_MARK` travels with it and a direct datagram
+    /// flow is not captured by the proxy's own routing rules.
+    fn datagram_connector(&self) -> Option<Arc<dyn DatagramConnector>> {
+        self.base.datagram()
     }
 }
 
 pub struct ProxyTransport {
-    connector: ProxyConnector<TcpConnector>,
+    connector: ProxyConnector<ServerConnector>,
+    base: Arc<dyn ServerDialer>,
+    server: String,
     protocol: Protocol,
-    timeout: Duration,
-    /// Kept so a `socks5` node can also open a UDP associate. `None` for an HTTP
-    /// proxy, which has no datagram form: `CONNECT` tunnels TCP only.
-    proxy: Option<Proxy>,
+    /// `None` when the node cannot carry datagrams. A SOCKS5 UDP associate is a session with
+    /// the proxy server itself; when the server is reached through a detour, the associate's
+    /// datagrams would still take the local UDP path and silently bypass the chain. Refusing
+    /// is the honest answer (ADR-0044).
+    datagram: Option<Arc<dyn DatagramConnector>>,
 }
 
 impl fmt::Debug for ProxyTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyTransport")
             .field("protocol", &self.protocol)
-            .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
 }
@@ -269,34 +426,44 @@ impl ProxyTransport {
             Proxy::Http { .. } => Protocol::Http,
             Proxy::Socks5 { .. } => Protocol::Socks5,
         };
-        let inner = TcpConnector::new()
-            .with_socket_config(options.socket_config())
-            .with_connect_timeout(Some(options.timeout));
-        // Only SOCKS5 has a UDP associate; an HTTP proxy's `CONNECT` is TCP-only,
-        // so the field stays `None` and `datagram()` answers honestly.
-        let datagram_proxy = match &proxy {
-            Proxy::Socks5 { .. } => Some(proxy.clone()),
-            Proxy::Http { .. } => None,
+        // Only SOCKS5 has a UDP associate; an HTTP proxy's `CONNECT` is TCP-only.
+        // A detoured SOCKS5 node keeps TCP but reports no datagram support, because the
+        // associate would otherwise send packets directly to a server reached through a chain.
+        let datagram: Option<Arc<dyn DatagramConnector>> =
+            match (&proxy, options.base().is_direct()) {
+                (Proxy::Socks5 { .. }, true) => {
+                    let inner = ServerConnector::new(options.base().clone());
+                    Socks5DatagramConnector::new(inner, proxy.clone())
+                        .ok()
+                        .map(|connector| Arc::new(connector) as Arc<dyn DatagramConnector>)
+                }
+                _ => None,
+            };
+        let base = options.base().clone();
+        let server = match &proxy {
+            Proxy::Http { authority, .. } | Proxy::Socks5 { authority, .. } => authority.clone(),
         };
         Self {
-            connector: ProxyConnector::new(inner, proxy),
+            connector: ProxyConnector::new(ServerConnector::new(Arc::clone(&base)), proxy),
+            base,
+            server,
             protocol,
-            timeout: options.timeout,
-            proxy: datagram_proxy,
+            datagram,
         }
     }
 
-    /// The SOCKS5 UDP associate for this node, if the proxy has one.
     fn datagram_connector(&self) -> Option<Arc<dyn DatagramConnector>> {
-        let proxy = self.proxy.clone()?;
-        let inner = TcpConnector::new().with_connect_timeout(Some(self.timeout));
-        let connector = Socks5DatagramConnector::new(inner, proxy).ok()?;
-        Some(Arc::new(connector))
+        self.datagram.clone()
     }
 
-    pub async fn connect(&self, authority: &str) -> Result<Established, OutboundError> {
-        self.connect_with_collector(authority, &TraceCollector::disabled())
+    async fn connect_server(
+        &self,
+        collector: &TraceCollector,
+    ) -> Result<Established, OutboundError> {
+        self.base
+            .connect(&self.server, collector)
             .await
+            .map_err(OutboundError::from)
     }
 
     pub async fn connect_with_collector(
@@ -304,10 +471,10 @@ impl ProxyTransport {
         authority: &str,
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
-        let target = Target::plain(authority);
-        tokio::time::timeout(self.timeout, self.connector.connect(&target, collector))
+        let target = netune::Target::plain(authority);
+        self.connector
+            .connect(&target, collector)
             .await
-            .map_err(|_| OutboundError::Timeout)?
             .map_err(|error| OutboundError::Connect(error.to_string()))
     }
 
@@ -442,14 +609,11 @@ mod tests {
 
     #[test]
     fn direct_and_empty_links_use_the_direct_transport() {
-        assert!(matches!(
-            NodeDialer::from_link("", options()),
-            Ok(NodeDialer::Direct(_))
-        ));
-        assert!(matches!(
-            NodeDialer::from_link("direct", options()),
-            Ok(NodeDialer::Direct(_))
-        ));
+        for link in ["", "direct"] {
+            let dialer = NodeDialer::from_link(link, options()).expect("builds");
+            assert_eq!(dialer.protocol(), Protocol::Direct, "link {link:?}");
+            assert!(dialer.detour().is_none());
+        }
     }
 
     #[test]
@@ -490,5 +654,15 @@ mod tests {
 
         let error = NodeDialer::from_link("127.0.0.1:1080", options()).expect_err("must fail");
         assert!(error.to_string().contains("no scheme"), "{error}");
+    }
+
+    #[test]
+    fn a_link_label_never_prints_credentials() {
+        let dialer =
+            NodeDialer::from_link("http://user:secret@127.0.0.1:8080", options()).expect("builds");
+        let rendered = format!("{dialer:?}");
+        assert!(!rendered.contains("user"), "{rendered}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:8080"), "{rendered}");
     }
 }

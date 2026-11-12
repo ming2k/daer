@@ -68,6 +68,7 @@
 pub mod daemon;
 pub mod datapath;
 pub mod decide;
+pub mod election;
 pub mod generation;
 pub mod health;
 pub mod load;
@@ -80,15 +81,20 @@ pub use daemon::{
     BindError, Daemon, DatapathSettings, DatapathStatus, detect_wan_interface, listen_address,
     resolve_interfaces,
 };
-pub use datapath::{DEVICE, DatapathError, PEER, peer_mac};
-pub use decide::{Explanation, NodeIdentity, Router, RouterOptions, Verdict};
+pub use datapath::{DEVICE, DatapathError, PEER};
+pub use decide::{
+    ElectionHealth, ElectionIdentity, Explanation, GroupIdentity, NodeIdentity, Router,
+    RouterOptions, Verdict,
+};
+pub use election::ElectionOverrides;
 pub use generation::{Generation, GenerationId, Generations, ReloadError, ReloadReport};
 pub use health::{
     ProbeFailure, ProbeResult, ProbeTarget, Scheduler, has_measurable_nodes,
     policy_needs_measurement, spawn as spawn_health_scheduler,
 };
 pub use load::{
-    Resolved, group_mentions_node, load_resolved, load_resolved_with, warn_about_empty_groups,
+    Resolved, group_mentions_node, load_resolved, load_resolved_with,
+    load_resolved_with_socket_config, warn_about_empty_groups,
 };
 pub use netns::{INGRESS_NETNS, IngressNamespace, PreparedIngress};
 pub use rule_provider::{

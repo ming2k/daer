@@ -30,7 +30,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use netune::{Client, ClientConfig, Pool, RequestHead, Target, TcpConnector, TlsRouterConnector};
+use netune::{
+    Client, ClientConfig, Pool, RequestHead, SocketConfig, Target, TcpConnector, TlsRouterConnector,
+};
 
 /// Which wire format a subscription body was decoded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +110,21 @@ pub const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Fetches and decodes `url`.
 ///
+/// `socket_config` is applied to the netune TCP/TLS connector. The daemon passes its
+/// `SO_MARK` here on a reload, when the datapath is already attached; a fetch that omitted
+/// it would be captured by daer's own transparent listener.
+///
 /// # Errors
 ///
 /// Every failure mode is reported; none is turned into an empty node list, because
 /// "this subscription has no nodes" and "this subscription could not be read" lead
 /// an operator to opposite conclusions.
-pub async fn fetch(url: &str, timeout: Duration) -> Result<Decoded, SubscriptionError> {
-    let body = fetch_body(url, timeout).await?;
+pub async fn fetch(
+    url: &str,
+    timeout: Duration,
+    socket_config: SocketConfig,
+) -> Result<Decoded, SubscriptionError> {
+    let body = fetch_body(url, timeout, socket_config).await?;
     decode(&body)
 }
 
@@ -131,8 +141,12 @@ pub enum FetchOutcome {
 }
 
 /// Fetches the raw body unconditionally.
-pub async fn fetch_body(url: &str, timeout: Duration) -> Result<Vec<u8>, SubscriptionError> {
-    match fetch_body_conditional(url, None, timeout).await? {
+pub async fn fetch_body(
+    url: &str,
+    timeout: Duration,
+    socket_config: SocketConfig,
+) -> Result<Vec<u8>, SubscriptionError> {
+    match fetch_body_conditional(url, None, timeout, socket_config).await? {
         FetchOutcome::Updated { bytes, .. } => Ok(bytes),
         FetchOutcome::NotModified => Ok(Vec::new()),
     }
@@ -143,6 +157,7 @@ pub async fn fetch_body_conditional(
     url: &str,
     etag: Option<&str>,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> Result<FetchOutcome, SubscriptionError> {
     let (scheme, rest) = url
         .split_once("://")
@@ -160,7 +175,9 @@ pub async fn fetch_body_conditional(
         ));
     }
 
-    let connector = TcpConnector::new().with_connect_timeout(Some(timeout));
+    let connector = TcpConnector::new()
+        .with_socket_config(socket_config)
+        .with_connect_timeout(Some(timeout));
     let connector = TlsRouterConnector::new(connector);
     let mut config = ClientConfig {
         max_redirects: 5,
@@ -580,18 +597,19 @@ pub async fn resolve(
     subscriptions: &[daer_config::Subscription],
     cache_directory: Option<&Path>,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> Vec<ResolvedSubscription> {
     let mut resolved = Vec::with_capacity(subscriptions.len());
     for subscription in subscriptions {
-        let tag = subscription
-            .tag
+        let name = subscription
+            .name
             .clone()
             .unwrap_or_else(|| "subscription".to_owned());
         let cache = cache_directory
             .filter(|_| subscription.persist)
-            .map(|directory| Cache::new(directory, &tag));
+            .map(|directory| Cache::new(directory, &name));
 
-        let outcome = fetch(&subscription.url, timeout).await;
+        let outcome = fetch(&subscription.url, timeout, socket_config.clone()).await;
         let entry = match outcome {
             Ok(decoded) => {
                 // Persist only a result that is worth restoring.
@@ -601,7 +619,8 @@ pub async fn resolve(
                     let _ = cache.write(&decoded.links);
                 }
                 ResolvedSubscription {
-                    tag,
+                    name,
+                    detour: subscription.detour.clone(),
                     format: Some(decoded.format),
                     links: decoded.links,
                     rejected: decoded.rejected,
@@ -622,7 +641,8 @@ pub async fn resolve(
                 };
                 match cached {
                     Some(links) => ResolvedSubscription {
-                        tag,
+                        name,
+                        detour: subscription.detour.clone(),
                         format: None,
                         links,
                         rejected: Vec::new(),
@@ -630,7 +650,8 @@ pub async fn resolve(
                         from_cache: true,
                     },
                     None => ResolvedSubscription {
-                        tag,
+                        name,
+                        detour: subscription.detour.clone(),
                         format: None,
                         links: Vec::new(),
                         rejected: Vec::new(),
@@ -648,7 +669,9 @@ pub async fn resolve(
 /// What happened to one subscription.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubscription {
-    pub tag: String,
+    pub name: String,
+    /// The detour applied to every node this subscription contributes.
+    pub detour: Option<String>,
     pub format: Option<Format>,
     pub links: Vec<String>,
     pub rejected: Vec<String>,
@@ -659,6 +682,12 @@ pub struct ResolvedSubscription {
 }
 
 impl ResolvedSubscription {
+    /// Compatibility accessor for the subscription name.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.name
+    }
+
     #[must_use]
     pub fn is_usable(&self) -> bool {
         !self.links.is_empty()
@@ -666,9 +695,9 @@ impl ResolvedSubscription {
 }
 
 impl fmt::Display for ResolvedSubscription {
-    /// One line, safe to log: the tag and the outcome, never the URL or a node.
+    /// One line, safe to log: the name and the outcome, never the URL or a node.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {} node(s)", self.tag, self.links.len())?;
+        write!(f, "{}: {} node(s)", self.name, self.links.len())?;
         if let Some(format) = self.format {
             write!(f, " [{}]", format.as_str())?;
         }
@@ -840,7 +869,8 @@ mod tests {
     #[test]
     fn the_token_in_a_url_never_reaches_a_display() {
         let entry = ResolvedSubscription {
-            tag: "sub".to_owned(),
+            name: "sub".to_owned(),
+            detour: None,
             format: Some(Format::Base64),
             links: vec!["ss://a@1.2.3.4:8388".to_owned()],
             rejected: Vec::new(),

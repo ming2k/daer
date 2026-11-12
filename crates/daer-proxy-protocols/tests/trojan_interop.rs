@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use daer_proxy_protocols::{DialerOptions, ProxyDialer, ProxyProtocol};
+use netune_trace::TraceCollector;
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -134,6 +135,125 @@ async fn serve(
     (address, receiver)
 }
 
+/// Starts a Trojan UDP-associate server that verifies `password` and echoes each frame.
+async fn serve_udp(
+    password: &'static str,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<Observed>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("binds");
+    let address = listener.local_addr().expect("addr");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let acceptor = acceptor();
+
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut stream) = acceptor.accept(stream).await else {
+            return;
+        };
+
+        let mut observed = Observed::default();
+        let mut credential = vec![0u8; 58];
+        if stream.read_exact(&mut credential).await.is_err() {
+            return;
+        }
+        let expected = format!("{:x}\r\n", Sha224::digest(password.as_bytes()));
+        observed.credential_ok = credential == expected.as_bytes();
+        observed.credential = credential[..56].to_vec();
+
+        let mut head = [0u8; 2];
+        if stream.read_exact(&mut head).await.is_err() {
+            return;
+        }
+        observed.command = head[0];
+        observed.atyp = head[1];
+        observed.host = match head[1] {
+            1 => {
+                let mut octets = [0u8; 4];
+                if stream.read_exact(&mut octets).await.is_err() {
+                    return;
+                }
+                format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+            }
+            3 => {
+                let mut length = [0u8; 1];
+                if stream.read_exact(&mut length).await.is_err() {
+                    return;
+                }
+                let mut host = vec![0u8; usize::from(length[0])];
+                if stream.read_exact(&mut host).await.is_err() {
+                    return;
+                }
+                String::from_utf8_lossy(&host).into_owned()
+            }
+            _ => return,
+        };
+        let mut port = [0u8; 2];
+        if stream.read_exact(&mut port).await.is_err() {
+            return;
+        }
+        observed.port = u16::from_be_bytes(port);
+        let mut crlf = [0u8; 2];
+        if stream.read_exact(&mut crlf).await.is_err() || &crlf != b"\r\n" {
+            return;
+        }
+        let _ = sender.send(std::mem::take(&mut observed));
+
+        loop {
+            let mut frame = Vec::with_capacity(2048);
+            let mut atyp = [0u8; 1];
+            if stream.read_exact(&mut atyp).await.is_err() {
+                return;
+            }
+            frame.push(atyp[0]);
+            let address_len = match atyp[0] {
+                1 => 6,
+                4 => 18,
+                3 => {
+                    let mut length = [0u8; 1];
+                    if stream.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+                    frame.push(length[0]);
+                    usize::from(length[0]) + 2
+                }
+                _ => return,
+            };
+            let mut address = vec![0u8; address_len];
+            if stream.read_exact(&mut address).await.is_err() {
+                return;
+            }
+            frame.extend_from_slice(&address);
+
+            let mut length = [0u8; 2];
+            if stream.read_exact(&mut length).await.is_err() {
+                return;
+            }
+            frame.extend_from_slice(&length);
+            let payload_len = u16::from_be_bytes(length) as usize;
+
+            let mut crlf = [0u8; 2];
+            if stream.read_exact(&mut crlf).await.is_err() || &crlf != b"\r\n" {
+                return;
+            }
+            frame.extend_from_slice(&crlf);
+
+            let mut payload = vec![0u8; payload_len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            frame.extend_from_slice(&payload);
+            if stream.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    (address, receiver)
+}
+
 fn options() -> DialerOptions {
     DialerOptions::new(None, Duration::from_secs(10))
 }
@@ -189,6 +309,53 @@ async fn a_trojan_node_is_dialed_through_tls() {
             assert_eq!(seen.port, address.port());
         }
     }
+}
+
+#[test]
+fn trojan_datagram_is_exposed_by_governance() {
+    let dialer = ProxyDialer::from_link("trojan://pw@localhost:443?sni=localhost", options())
+        .expect("the link is accepted");
+    assert!(
+        dialer.datagram_connector().is_some(),
+        "Trojan's UDP associate is implemented and must be selectable"
+    );
+}
+
+#[tokio::test]
+async fn a_trojan_udp_associate_carries_a_datagram_round_trip() {
+    let (address, observed) = serve_udp("hunter2").await;
+    let link = format!(
+        "trojan://hunter2@localhost:{}?sni=localhost&allowInsecure=1",
+        address.port()
+    );
+    let dialer = ProxyDialer::from_link(&link, options()).expect("the link is accepted");
+    let connector = dialer
+        .datagram_connector()
+        .expect("Trojan carries UDP over its TLS stream");
+
+    let session = connector
+        .connect("8.8.8.8:53", &TraceCollector::disabled())
+        .await
+        .expect("UDP associate");
+    let payload = b"ping";
+    assert_eq!(
+        session.datagrams.send(payload).await.expect("sends"),
+        payload.len()
+    );
+    let mut received = [0u8; 32];
+    let read = session
+        .datagrams
+        .recv(&mut received)
+        .await
+        .expect("receives");
+    assert_eq!(&received[..read], payload);
+
+    let seen = observed.await.expect("the server reported");
+    assert!(seen.credential_ok, "the credential must match");
+    assert_eq!(seen.command, 3, "UDP_ASSOCIATE");
+    assert_eq!(seen.atyp, 1, "IPv4 target");
+    assert_eq!(seen.host, "8.8.8.8");
+    assert_eq!(seen.port, 53);
 }
 
 #[tokio::test]

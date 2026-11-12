@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daer_config::TimeSpan;
+use daer_config::{ProbeMode, ProbeSettings, TimeSpan};
 use daer_outbound::{
     CheckError, CheckUrl, DialerId, HttpChecker, Protocol, TcpChecker, UdpDnsChecker,
 };
@@ -49,18 +49,25 @@ use tokio::sync::Mutex;
 use crate::decide::Router;
 
 /// One node to probe, resolved from its link.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProbeTarget {
-    /// The group this node belongs to.
-    pub group: String,
-    /// The node's identity within the group.
+    /// The election this candidate belongs to.
+    pub election: String,
+    /// The node's identity within the election.
     pub dialer: DialerId,
     /// Its name, for diagnostics.
     pub name: String,
-    /// The address the probe connects to.
-    pub address: SocketAddr,
+    /// The literal address to probe, when the node has one.
+    ///
+    /// `None` for a domain-named node. A detoured node is still probeable: the name is passed
+    /// to the chain's own resolver, which is the same resolution the data path uses.
+    pub address: Option<SocketAddr>,
     /// Whether the node claims to carry datagrams.
     pub udp: bool,
+    /// The live node dialer, so a detoured probe can open the chain to the node's server.
+    pub node: Arc<daer_outbound::NodeDialer>,
+    /// The election's effective probe settings.
+    pub probe: ProbeSettings,
 }
 
 /// Why a probe attempt did not produce a latency.
@@ -72,6 +79,8 @@ pub enum ProbeFailure {
     Unsupported(Protocol),
     /// The probe ran and failed.
     Check(CheckError),
+    /// The probe could not open the detour chain to the node's server.
+    Chain(String),
 }
 
 impl std::fmt::Display for ProbeFailure {
@@ -86,12 +95,13 @@ impl std::fmt::Display for ProbeFailure {
                 protocol.as_str()
             ),
             Self::Check(error) => write!(f, "{error}"),
+            Self::Chain(message) => write!(f, "detour chain: {message}"),
         }
     }
 }
 
 /// The result of one node's probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProbeResult {
     /// Which node.
     pub target: ProbeTarget,
@@ -109,40 +119,28 @@ impl ProbeResult {
     }
 }
 
-/// What to probe with, from `[global.health-check]` and its per-group overrides.
+impl From<daer_outbound::OutboundError> for ProbeFailure {
+    fn from(error: daer_outbound::OutboundError) -> Self {
+        Self::Chain(error.to_string())
+    }
+}
+
+/// What a server-mode probe uses.
 ///
-/// # Why this is a value rather than three arguments
-///
-/// These were configuration keys that nothing read: `tcp-cpu-url`, `tcp-method` and `udp-dns`
-/// were parsed, validated and ignored, so an operator who pointed the probe at their own
-/// endpoint got a bare TCP handshake to the node instead and never knew (ADR-0006). Grouping
-/// them makes "the probe uses what the file says" a single fact to inspect and to test.
+/// A URL-mode probe does not use this value: it establishes a session through the
+/// node and asks the URL through netune's HTTP client. The distinction is explicit in
+/// [`ProbeMode`], not inferred from a list's first entry.
 #[derive(Debug)]
 pub struct ProbeInstruments {
-    /// The HTTP(S) request an `http`-scheme `tcp-url` performs, if one is configured.
-    pub http: Option<(HttpChecker, CheckUrl)>,
-    /// The address a bare `ip` entry in `tcp-url` is dialled on, if one is configured.
-    ///
-    /// The port comes from the node, so only the probe's *kind* is fixed here: `None` means the
-    /// node's own address is dialled, which is the only thing a health check can do without a
-    /// configured endpoint.
     pub tcp: TcpChecker,
     /// The UDP DNS endpoints a datagram-carrying node is probed against.
     pub udp_dns: Vec<SocketAddr>,
-    /// The checker for those endpoints.
     pub udp: UdpDnsChecker,
-    /// The `udp-dns` entries that are names rather than addresses, reported rather than dropped.
-    ///
-    /// An entry that is not an `ip:port` cannot be probed without resolving it, and resolving it
-    /// inside the probe would be a second, silent DNS decision — the same rule the node's own
-    /// address follows.
+    /// `udp-dns` entries that are names rather than addresses, reported rather than dropped.
     pub unresolved_udp: Vec<String>,
 }
 
 /// Splits `host:port` or `[v6]:port` without resolving anything.
-///
-/// Local because the only caller is the probe table, and because a shared parser would tempt a
-/// future caller into resolving: the point is that a *name* stays a name here.
 fn split_host_port(entry: &str) -> Option<(&str, u16)> {
     let entry = entry.trim();
     if let Some(rest) = entry.strip_prefix('[') {
@@ -150,7 +148,6 @@ fn split_host_port(entry: &str) -> Option<(&str, u16)> {
         let port = rest.strip_prefix(':')?.parse().ok()?;
         return Some((host, port));
     }
-    // A bare IPv6 address has multiple colons and no port; anything with one colon is host:port.
     let (host, port) = entry.rsplit_once(':')?;
     if host.contains(':') {
         return None;
@@ -164,7 +161,6 @@ impl ProbeInstruments {
     pub fn default_for(interval: Duration) -> Self {
         let timeout = probe_timeout(interval);
         Self {
-            http: None,
             tcp: TcpChecker::new(timeout),
             udp_dns: Vec::new(),
             udp: UdpDnsChecker::new(timeout),
@@ -172,64 +168,19 @@ impl ProbeInstruments {
         }
     }
 
-    /// Builds the instruments a configuration asks for.
-    ///
-    /// # What an unusable entry does
-    ///
-    /// An entry that does not parse is **reported and skipped**, never silently dropped and never
-    /// fatal: `daer config validate` rejects a malformed `tcp-url` already, so a value that
-    /// reaches here unparsed is a name (a URL with no literal address), and refusing to probe
-    /// *anything* because one endpoint needs DNS would be worse than probing the node directly.
+    /// Builds the server-mode instruments an election asks for.
     #[must_use]
-    pub fn from_config(
-        check: &daer_config::HealthCheck,
-        interval: Duration,
-        method: daer_outbound::HttpMethod,
+    pub fn from_settings(
+        settings: &ProbeSettings,
         socket_config: daer_outbound::SocketConfig,
     ) -> Self {
-        let timeout = probe_timeout(interval);
-
-        // The first `tcp-url` entry decides the probe's shape: a URL makes it an HTTP request, a
-        // bare address makes it a handshake. Both are accepted by the schema, and the upstream
-        // semantics are "URL first, then addresses", so the first entry is the authority.
-        let mut http = None;
-        let mut tcp_url_seen = false;
-        for entry in &check.tcp_url {
-            if entry.contains("://") {
-                match CheckUrl::parse(entry) {
-                    Ok(url) => {
-                        http = Some((
-                            HttpChecker::new(method, timeout)
-                                .with_socket_config(socket_config.clone()),
-                            url,
-                        ));
-                        tcp_url_seen = true;
-                        break;
-                    }
-                    Err(error) => {
-                        daer_observe::warn!(daer_observe::EventCode::ProviderUnusableTcpUrl,%entry, %error, "health check: unusable tcp-url entry");
-                    }
-                }
-            } else if entry.parse::<std::net::IpAddr>().is_ok() {
-                // A bare address means "dial the node", which is the default instrument.
-                tcp_url_seen = true;
-                break;
-            } else {
-                daer_observe::debug!(daer_observe::EventCode::HealthTcpUrlName,
-                    %entry,
-                    "health check: tcp-url entry is a name, not an address; the node's own \
-                     address is dialled instead"
-                );
-            }
-        }
-        let _ = tcp_url_seen;
-
+        let timeout = settings
+            .timeout
+            .as_std()
+            .unwrap_or_else(|| Duration::from_secs(5));
         let mut udp_dns = Vec::new();
         let mut unresolved_udp = Vec::new();
-        for entry in &check.udp_dns {
-            // `host:port`, `ip:port`, or a bare IP whose conventional DNS port is 53.
-            // A name is reported rather than resolved here: resolving it would be a second,
-            // silent DNS decision, and the node's own proxy port is not a DNS server.
+        for entry in &settings.udp_dns {
             if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
                 udp_dns.push(SocketAddr::new(ip, 53));
                 continue;
@@ -242,9 +193,7 @@ impl ProbeInstruments {
                 None => unresolved_udp.push(entry.clone()),
             }
         }
-
         Self {
-            http,
             tcp: TcpChecker::new(timeout).with_socket_config(socket_config.clone()),
             udp_dns,
             udp: UdpDnsChecker::new(timeout).with_socket_config(socket_config),
@@ -257,10 +206,13 @@ impl ProbeInstruments {
 pub struct Scheduler {
     router: Arc<Router>,
     interval: Duration,
-    instruments: ProbeInstruments,
-    /// Serialises records: the router's group table is behind a lock, and a probe result
-    /// arriving during a selection must not interleave half-way through it.
+    socket_config: daer_outbound::SocketConfig,
+    /// Test-only override for server-mode instruments.
+    forced: Option<ProbeInstruments>,
     write: Mutex<()>,
+    /// Last time each candidate was probed, so a slower election is not hammered at the
+    /// shortest tick.
+    last: Mutex<std::collections::HashMap<(String, DialerId), std::time::Instant>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -273,36 +225,32 @@ impl std::fmt::Debug for Scheduler {
 
 impl Scheduler {
     /// Builds a scheduler for one routing generation.
-    ///
-    /// `interval` is `check-interval`; a zero value means "never probe", and
-    /// [`Scheduler::run`] returns immediately in that case.
     #[must_use]
     pub fn new(router: Arc<Router>, interval: Duration) -> Self {
-        // A scheduler built without a configuration probes each node on its own address, which is
-        // what a test wants and what a configuration that names no endpoint gets.
-        let instruments = ProbeInstruments::default_for(interval);
-        Self::with_instruments(router, interval, instruments)
+        let socket_config = daer_outbound::SocketConfig {
+            mark: router.socket_mark(),
+            ..daer_outbound::SocketConfig::default()
+        };
+        Self {
+            router,
+            interval,
+            socket_config,
+            forced: None,
+            write: Mutex::new(()),
+            last: Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
-    /// Builds a scheduler whose probes use `instruments`.
+    /// Builds a scheduler whose server-mode probes use `instruments`.
     #[must_use]
     pub fn with_instruments(
         router: Arc<Router>,
         interval: Duration,
         instruments: ProbeInstruments,
     ) -> Self {
-        Self {
-            router,
-            interval,
-            instruments,
-            write: Mutex::new(()),
-        }
-    }
-
-    /// The instruments this scheduler probes with, for diagnostics and tests.
-    #[must_use]
-    pub fn instruments(&self) -> &ProbeInstruments {
-        &self.instruments
+        let mut scheduler = Self::new(router, interval);
+        scheduler.forced = Some(instruments);
+        scheduler
     }
 
     /// The generation this scheduler reports into.
@@ -311,27 +259,24 @@ impl Scheduler {
         &self.router
     }
 
-    /// Every node that can be probed, across every group.
-    ///
-    /// A node without a literal address is skipped: probing would need the node's own
-    /// resolution, and a probe that resolves differently from the data path measures the
-    /// wrong destination.
+    /// Every node that can be probed, across every election.
     #[must_use]
     pub fn targets(&self) -> Vec<ProbeTarget> {
         let mut targets = Vec::new();
-        for (group, ids) in self.router.probe_table() {
-            for (dialer, name, protocol, address, udp) in ids {
-                let Some(address) = address else {
-                    daer_observe::debug!(daer_observe::EventCode::HealthNodeUnprobeable,%group, %name, "node has no literal address; not probed");
+        for (election, rows) in self.router.elections_for_probes() {
+            for row in rows {
+                if row.address.is_none() && row.node.detour().is_none() {
+                    daer_observe::debug!(daer_observe::EventCode::HealthNodeUnprobeable,%election, %row.name, "node has no literal address; not probed");
                     continue;
-                };
-                let _ = (&protocol, ProbeFailure::Unsupported(protocol.clone()));
+                }
                 targets.push(ProbeTarget {
-                    group: group.clone(),
-                    dialer,
-                    name,
-                    address,
-                    udp,
+                    election: election.clone(),
+                    dialer: row.dialer,
+                    name: row.name,
+                    address: row.address,
+                    udp: row.udp,
+                    node: row.node,
+                    probe: row.probe,
                 });
             }
         }
@@ -344,40 +289,125 @@ impl Scheduler {
     /// healthy while its datagrams are dropped, which is exactly the failure a health
     /// check exists to catch.
     pub async fn probe(&self, target: &ProbeTarget) -> ProbeResult {
-        // A datagram-carrying node is measured against the configured DNS endpoints when there
-        // are any: those are reachable over UDP by definition, whereas the node's own port is a
-        // proxy port that speaks no DNS. Otherwise the node's own address is measured, which is
-        // the only thing left that says anything true about it.
-        let latency = if target.udp {
-            // A datagram-carrying node is measured over UDP. The endpoints come from `udp-dns`
-            // when the configuration names any; otherwise the node's own address is used, which
-            // is what `Scheduler::new` (a test, or a configuration that overrides nothing) gives.
-            // A *TCP* probe here would report the node healthy while every datagram is dropped,
-            // which is the failure the instrument choice exists to catch.
-            let endpoints: Vec<SocketAddr> = if self.instruments.udp_dns.is_empty() {
-                vec![target.address]
-            } else {
-                self.instruments.udp_dns.clone()
+        let timeout = target
+            .probe
+            .timeout
+            .as_std()
+            .unwrap_or_else(|| Duration::from_secs(5));
+
+        // A URL-mode probe goes *through* the node. This is the Clash `url-test`
+        // semantic: establishing the proxy session and asking the URL through it is
+        // the only measurement that proves the node can carry traffic, not merely
+        // that its server port accepts a connection.
+        if target.probe.mode == ProbeMode::Url {
+            let Some(raw) = &target.probe.url else {
+                return ProbeResult {
+                    target: clone_target(target),
+                    latency: None,
+                    failure: Some(ProbeFailure::Check(CheckError::InvalidUrl(
+                        "mode = \"url\" without a URL".to_owned(),
+                    ))),
+                };
             };
-            let mut last = None;
-            let mut answered = None;
-            for endpoint in &endpoints {
-                match self.instruments.udp.check(*endpoint).await {
-                    Ok(latency) => {
-                        answered = Some(latency);
-                        break;
-                    }
-                    Err(error) => last = Some(error),
+            let url = match CheckUrl::parse(raw) {
+                Ok(url) => url,
+                Err(error) => {
+                    return ProbeResult {
+                        target: clone_target(target),
+                        latency: None,
+                        failure: Some(ProbeFailure::Check(error)),
+                    };
                 }
-            }
-            match answered {
-                Some(latency) => Ok(latency),
-                None => Err(last.unwrap_or(CheckError::Timeout)),
-            }
-        } else if let Some((checker, url)) = &self.instruments.http {
-            checker.check(url, target.address.ip()).await
+            };
+            let method =
+                daer_outbound::HttpMethod::parse(&target.probe.method).unwrap_or_else(|error| {
+                    daer_observe::warn!(
+                        daer_observe::EventCode::ElectionProbeMethodInvalid,
+                        %error,
+                        method = %target.probe.method,
+                        "health check: unusable method; falling back to HEAD"
+                    );
+                    daer_outbound::HttpMethod::Head
+                });
+            let checker =
+                HttpChecker::new(method, timeout).with_socket_config(self.socket_config.clone());
+            let outcome = tokio::time::timeout(timeout, async {
+                let established = target.node.connect(&url.authority()).await?;
+                checker
+                    .check_through(established, &url)
+                    .await
+                    .map_err(ProbeFailure::Check)
+            })
+            .await;
+            return match outcome {
+                Ok(Ok(latency)) => ProbeResult {
+                    target: clone_target(target),
+                    latency: Some(latency),
+                    failure: None,
+                },
+                Ok(Err(failure)) => ProbeResult {
+                    target: clone_target(target),
+                    latency: None,
+                    failure: Some(failure),
+                },
+                Err(_) => ProbeResult {
+                    target: clone_target(target),
+                    latency: None,
+                    failure: Some(ProbeFailure::Check(CheckError::Timeout)),
+                },
+            };
+        }
+
+        // A detoured node's liveness is the chain's liveness. Measuring its server directly
+        // would report a node dead precisely when the detour is doing its job, and a
+        // stream-carried UDP protocol shares the same chain anyway (ADR-0044).
+        if target.node.detour().is_some() {
+            let started = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                timeout,
+                target
+                    .node
+                    .probe_server(&daer_outbound::TraceCollector::disabled()),
+            )
+            .await;
+            return match outcome {
+                Ok(Ok(established)) => {
+                    let elapsed = started.elapsed();
+                    drop(established);
+                    ProbeResult {
+                        target: clone_target(target),
+                        latency: Some(TimeSpan::from_nanos(elapsed.as_nanos() as i64)),
+                        failure: None,
+                    }
+                }
+                Ok(Err(error)) => ProbeResult {
+                    target: clone_target(target),
+                    latency: None,
+                    failure: Some(ProbeFailure::Chain(error.to_string())),
+                },
+                Err(_) => ProbeResult {
+                    target: clone_target(target),
+                    latency: None,
+                    failure: Some(ProbeFailure::Check(CheckError::Timeout)),
+                },
+            };
+        }
+
+        let address = target
+            .address
+            .expect("probe target has an address or a detour");
+        let latency = if let Some(instruments) = &self.forced {
+            server_probe(instruments, target, address).await
         } else {
-            self.instruments.tcp.check(target.address).await
+            let instruments =
+                ProbeInstruments::from_settings(&target.probe, self.socket_config.clone());
+            if !instruments.unresolved_udp.is_empty() {
+                daer_observe::debug!(daer_observe::EventCode::ElectionProbeUdpName,
+                    entries = ?instruments.unresolved_udp,
+                    "health check: udp-dns entries that are names are not probed"
+                );
+            }
+            server_probe(&instruments, target, address).await
         };
         match latency {
             Ok(latency) => ProbeResult {
@@ -397,12 +427,12 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Returns the router's error when the group or dialer has gone away (a reload
+    /// Returns the router's error when the election or dialer has gone away (a reload
     /// replaced this generation), which the caller treats as "this scheduler is stale".
     pub async fn record(&self, result: &ProbeResult) -> Result<(), daer_outbound::OutboundError> {
         let _guard = self.write.lock().await;
         self.router.record(
-            &result.target.group,
+            &result.target.election,
             result.target.dialer,
             result.is_alive(),
             result.latency,
@@ -410,19 +440,37 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Probes every target once and records the results.
-    ///
-    /// Returns the results so a caller can log or surface them; the recording is the
-    /// side effect that matters for selection.
+    /// Probes every target that is due and records the results.
     pub async fn sweep(&self) -> Vec<ProbeResult> {
-        let targets = self.targets();
+        let now = std::time::Instant::now();
+        let targets: Vec<ProbeTarget> = {
+            let last = self.last.lock().await;
+            self.targets()
+                .into_iter()
+                .filter(|target| {
+                    let interval = target.probe.interval.as_std().unwrap_or(Duration::ZERO);
+                    if interval.is_zero() {
+                        return false;
+                    }
+                    last.get(&(target.election.clone(), target.dialer))
+                        .is_none_or(|previous| now.duration_since(*previous) >= interval)
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return Vec::new();
+        }
         // Concurrent, because a sweep of N nodes must take one probe timeout, not N.
         let results = probe_all(self, &targets).await;
         for result in &results {
+            self.last
+                .lock()
+                .await
+                .insert((result.target.election.clone(), result.target.dialer), now);
             if let Err(error) = self.record(result).await {
                 daer_observe::warn!(daer_observe::EventCode::HealthProbeRecordFailed,
                     %error,
-                    group = %result.target.group,
+                    election = %result.target.election,
                     node = %result.target.name,
                     "probe result could not be recorded; this generation is stale"
                 );
@@ -431,7 +479,7 @@ impl Scheduler {
             match (&result.latency, &result.failure) {
                 (Some(latency), _) => {
                     daer_observe::trace!(daer_observe::EventCode::HealthNodeAlive,
-                        group = %result.target.group,
+                        election = %result.target.election,
                         node = %result.target.name,
                         latency_ns = latency.as_nanos(),
                         "node alive"
@@ -439,7 +487,7 @@ impl Scheduler {
                 }
                 (None, Some(failure)) => {
                     daer_observe::warn!(daer_observe::EventCode::HealthProbeFailed,
-                        group = %result.target.group,
+                        election = %result.target.election,
                         node = %result.target.name,
                         %failure,
                         "node probe failed"
@@ -478,6 +526,35 @@ impl Scheduler {
                 }
             }
         }
+    }
+}
+
+/// Runs the server-mode liveness probe.
+///
+/// A datagram-carrying node is measured over UDP: a TCP probe would report it healthy
+/// while its datagrams are dropped. The endpoints come from the election's `udp-dns`;
+/// otherwise the node's own address is used.
+async fn server_probe(
+    instruments: &ProbeInstruments,
+    target: &ProbeTarget,
+    address: SocketAddr,
+) -> Result<TimeSpan, CheckError> {
+    if target.udp {
+        let endpoints: Vec<SocketAddr> = if instruments.udp_dns.is_empty() {
+            vec![address]
+        } else {
+            instruments.udp_dns.clone()
+        };
+        let mut last = None;
+        for endpoint in &endpoints {
+            match instruments.udp.check(*endpoint).await {
+                Ok(latency) => return Ok(latency),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(CheckError::Timeout))
+    } else {
+        instruments.tcp.check(address).await
     }
 }
 
@@ -535,66 +612,38 @@ async fn probe_all(scheduler: &Scheduler, targets: &[ProbeTarget]) -> Vec<ProbeR
 
 fn clone_target(target: &ProbeTarget) -> ProbeTarget {
     ProbeTarget {
-        group: target.group.clone(),
+        election: target.election.clone(),
         dialer: target.dialer,
         name: target.name.clone(),
         address: target.address,
         udp: target.udp,
+        node: Arc::clone(&target.node),
+        probe: target.probe.clone(),
     }
 }
 
 /// Spawns a scheduler for `router` unless probing is disabled or there is nothing probe.
 ///
-/// This is the one call a daemon makes. It exists so the wiring lives here, next to the
-/// reasoning about intervals and policies, instead of being re-derived at every entry
-/// point — and so "probing never ran" is a visible decision (`None`) rather than a task
-/// that silently did nothing.
-///
-/// Returns `None` when `interval` is zero (probing disabled by configuration) or when no
-/// node has a literal address to probe.
+/// Returns `None` when every election disables probing or when no node has a literal
+/// address to probe.
 #[must_use]
 pub fn spawn(
     router: Arc<Router>,
-    check: &daer_config::HealthCheck,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    // A negative interval is a configuration error the loader already rejects; treating it
-    // as zero here keeps a bad value from spawning a busy loop.
-    let interval = check.interval.as_std().unwrap_or(Duration::ZERO);
+    let interval = shortest_interval(&router).unwrap_or(Duration::ZERO);
     if interval.is_zero() || !has_measurable_nodes(&router) {
         daer_observe::debug!(
             daer_observe::EventCode::DaemonHealthDisabled,
             probes = with_interval(interval),
-            "health probing not started; see check-interval and node addresses"
+            "health probing not started; see election probe intervals and node addresses"
         );
         return None;
     }
-    // The method comes from `tcp-method`, which used to be validated and ignored: a probe that
-    // pointed at an endpoint rejecting `HEAD` reported the node dead for a configuration reason.
-    let method = daer_outbound::HttpMethod::parse(&check.tcp_method).unwrap_or_else(|error| {
-        daer_observe::warn!(daer_observe::EventCode::ProviderUnusableTcpMethod,
-            %error,
-            method = %check.tcp_method,
-            "health check: unusable tcp-method; falling back to HEAD"
-        );
-        daer_outbound::HttpMethod::Head
-    });
-    let socket_config = daer_outbound::SocketConfig {
-        mark: router.socket_mark(),
-        ..daer_outbound::SocketConfig::default()
-    };
-    let instruments = ProbeInstruments::from_config(check, interval, method, socket_config);
-    if !instruments.unresolved_udp.is_empty() {
-        daer_observe::debug!(daer_observe::EventCode::ProviderUnresolvedUdp,
-            entries = ?instruments.unresolved_udp,
-            "health check: udp-dns entries that are names are not probed;              a probe must not resolve a name the data path resolves elsewhere"
-        );
-    }
-    let scheduler = Scheduler::with_instruments(router, interval, instruments);
+    let scheduler = Scheduler::new(router, interval);
     let mut shutdown = shutdown;
     Some(tokio::spawn(async move {
         let stopped = async move {
-            // A watch channel that starts at `false` and is set to `true` on stop.
             while shutdown.changed().await.is_ok() {
                 if *shutdown.borrow() {
                     return;
@@ -605,35 +654,40 @@ pub fn spawn(
     }))
 }
 
+fn shortest_interval(router: &Router) -> Option<Duration> {
+    router
+        .elections_for_probes()
+        .into_iter()
+        .flat_map(|(_, rows)| rows)
+        .filter_map(|row| row.probe.interval.as_std())
+        .filter(|interval| !interval.is_zero())
+        .min()
+}
+
 fn with_interval(interval: Duration) -> String {
     if interval.is_zero() {
-        "disabled by check-interval = 0".to_owned()
+        "disabled by every election probe interval".to_owned()
     } else {
         format!("{interval:?}")
     }
 }
 
-/// Builds the probe table for a router without exposing the group internals.
-///
-/// The tuple shape keeps this crate's public surface small: a caller gets what a probe
-/// needs, not the dialers themselves.
-type ProbeRow = (DialerId, String, Protocol, Option<SocketAddr>, bool);
-
+/// Builds the probe table for a router without exposing the election internals.
 impl Router {
-    /// Every probe target, grouped by group name.
+    /// Every probe target, grouped by election name.
     #[must_use]
-    pub fn probe_table(&self) -> Vec<(String, Vec<ProbeRow>)> {
-        self.groups_for_probes()
+    pub fn probe_table(&self) -> Vec<(String, Vec<crate::decide::ProbeRow>)> {
+        self.elections_for_probes()
     }
 }
 
-/// Whether a checker's policy needs measured latency at all.
+/// Whether a checker's policy needs measurement at all.
 ///
-/// `fixed(n)` is explicit user intent and must not be overridden by a probe: recording
-/// into an unmeasured group would rewrite an operator's choice.
+/// A manual election does not rank candidates; `daer probe` is the on-demand path for a
+/// pinned node. Random needs liveness even though it does not rank latency.
 #[must_use]
 pub fn policy_needs_measurement(policy: daer_common::SelectionPolicy) -> bool {
-    !matches!(policy, daer_common::SelectionPolicy::Fixed)
+    !matches!(policy, daer_common::SelectionPolicy::Manual)
 }
 
 /// A node that a group cannot measure is still selectable by `fixed(0)`; this reports
@@ -682,10 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_policy_is_not_measured() {
+    fn a_manual_policy_is_not_measured() {
         // `fixed(n)` is explicit intent; a probe must not rewrite it.
         assert!(!policy_needs_measurement(
-            daer_common::SelectionPolicy::Fixed
+            daer_common::SelectionPolicy::Manual
         ));
         assert!(policy_needs_measurement(
             daer_common::SelectionPolicy::MinMovingAverage
@@ -697,8 +751,8 @@ mod tests {
         // A domain-named node would need its own resolution; a probe that resolved
         // differently from the data path would measure the wrong destination.
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"example.com\"\nport = 1080\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"example.com\"\nport = 1080\n\n\
+             [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
         let scheduler = Scheduler::new(router, Duration::from_secs(30));
@@ -732,8 +786,8 @@ mod tests {
         let ip = address.ip();
         let port = address.port();
         let router = router(&format!(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
+             [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n"
         ));
         let scheduler = Scheduler::with_instruments(
@@ -761,18 +815,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_group_has_nothing_to_probe() {
-        // `fixed(n)` is an operator choice, not a latency policy. Probing it would let an
-        // unrelated DNS endpoint failure rewrite that choice, and it made a fixed node look
-        // unhealthy in the incident logs.
+    fn a_manual_election_has_nothing_to_probe() {
+        // A manual election does not rank candidates; probing it would only rewrite a
+        // choice the operator made.
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+             [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
         assert!(
             router.probe_table().is_empty(),
-            "a fixed group must not contribute probe rows"
+            "a manual election must not contribute probe rows"
         );
         let scheduler = Scheduler::new(router, Duration::from_secs(30));
         assert!(scheduler.targets().is_empty());
@@ -780,13 +833,12 @@ mod tests {
 
     #[test]
     fn a_bare_udp_dns_address_uses_the_conventional_port() {
-        let check = daer_config::HealthCheck::default();
-        let instruments = ProbeInstruments::from_config(
-            &check,
-            Duration::from_secs(30),
-            daer_outbound::HttpMethod::Head,
-            daer_outbound::SocketConfig::default(),
-        );
+        let check = daer_config::ProbeSettings {
+            udp_dns: vec!["dns.google:53".to_owned(), "8.8.8.8".to_owned()],
+            ..daer_config::ProbeSettings::default()
+        };
+        let instruments =
+            ProbeInstruments::from_settings(&check, daer_outbound::SocketConfig::default());
         assert!(
             instruments
                 .udp_dns
@@ -795,8 +847,8 @@ mod tests {
             instruments.udp_dns
         );
         assert!(
-            instruments.udp_dns.len() >= 2,
-            "both literal defaults must be usable: {:?}",
+            !instruments.udp_dns.is_empty(),
+            "the literal default must be usable: {:?}",
             instruments.udp_dns
         );
         assert!(
@@ -832,8 +884,8 @@ mod tests {
         let ip = address.ip();
         let port = address.port();
         let router = router(&format!(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
+             [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n"
         ));
         let scheduler = Scheduler::with_instruments(
@@ -856,11 +908,15 @@ mod tests {
         // Recording a failure is what removes a node from selection; skipping it would
         // leave a dead node alive forever.
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+             [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
-        let scheduler = Scheduler::new(Arc::clone(&router), Duration::from_secs(30));
+        let scheduler = Scheduler::with_instruments(
+            Arc::clone(&router),
+            Duration::from_secs(30),
+            ProbeInstruments::default_for(Duration::from_secs(30)),
+        );
         let targets = scheduler.targets();
         assert_eq!(targets.len(), 1);
 
@@ -877,8 +933,8 @@ mod tests {
     #[tokio::test]
     async fn a_zero_interval_disables_probing_entirely() {
         let router = router(
-            "schema = 1\n\n[[node]]\ntag = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\n\
+            "schema = 2\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+             [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
         );
         let scheduler = Scheduler::new(router, Duration::ZERO);
@@ -912,10 +968,10 @@ mod tests {
         let b = answering_dns().await;
 
         let router = router(&format!(
-            "schema = 1\n\n\
-             [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\
-             [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
-             [[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\n\
+            "schema = 2\n\n\
+             [[node]]\nname = \"a\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\
+             [[node]]\nname = \"b\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
+             [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
              [routing]\nrules = []\nfallback = \"g\"\n",
             a.ip(),
             a.port(),
@@ -927,5 +983,28 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(ProbeResult::is_alive), "{results:?}");
         assert!(router.has_selection("g"));
+    }
+
+    #[test]
+    fn a_detoured_node_is_probeable_even_when_its_server_is_a_name() {
+        // The detour chain resolves the outer server's name, so a local pre-resolution would
+        // measure a different destination. The target must reach the scheduler; the chain probe
+        // is what resolves it, exactly like the data path.
+        let router = router(
+            "schema = 2\n\n\
+             [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"outer.example\"\nport = 443\ndetour = \"inner\"\n\n\
+             [[group]]\nname = \"gg\"\nfilters = [\"name(outer)\"]\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
+             [routing]\nrules = []\nfallback = \"g\"\n",
+        );
+        let scheduler = Scheduler::new(router, Duration::from_secs(30));
+        let targets = scheduler.targets();
+        assert_eq!(targets.len(), 1, "the detoured node must be probeable");
+        assert_eq!(targets[0].name, "outer");
+        assert!(
+            targets[0].address.is_none(),
+            "the outer server is intentionally a name"
+        );
+        assert!(targets[0].node.detour().is_some());
     }
 }

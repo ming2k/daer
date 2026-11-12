@@ -21,12 +21,11 @@ use std::path::PathBuf;
 use daer_ebpf::RuntimeParam;
 
 fn object_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ebpf/datapath.o")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ebpf/datapath.bpf.o")
 }
 
 fn param() -> RuntimeParam {
     RuntimeParam {
-        tproxy_port: 12_345,
         control_plane_pid: std::process::id(),
         device_ifindex: 1,
         netns_id: 0,
@@ -35,7 +34,7 @@ fn param() -> RuntimeParam {
         use_redirect_peer: false,
         has_bpf_get_current_task: true,
         datapath_generation: 1,
-        socket_mark: 0x0dae,
+        socket_mark: 0x64616572,
     }
 }
 
@@ -84,47 +83,15 @@ fn every_program_we_reference_is_in_the_object() {
     }
 }
 
-#[test]
-#[ignore = "needs CAP_BPF and CAP_NET_ADMIN"]
-fn a_tc_program_attaches_to_loopback() {
-    // `lo` exists in every namespace, so this needs no device setup. The attach is the part
-    // that needs `CAP_NET_ADMIN`; detaching happens when the handle drops.
-    use aya::programs::tc::TcAttachType;
-
-    let path = object_path();
-    if !path.exists() {
-        eprintln!(
-            "skipped: {} is missing; run `cargo xtask ebpf`",
-            path.display()
-        );
-        return;
-    }
-    let mut ebpf = daer_ebpf::load_path(&path, &param()).expect("the object must load");
-    let link = daer_ebpf::attach_tc(
-        &mut ebpf,
-        daer_ebpf::names::program::DEVICE_INGRESS,
-        "lo",
-        TcAttachType::Ingress,
-        daer_ebpf::TcMode::Netlink,
-    )
-    .expect("attaching to lo must work");
-    println!("attached as link id {link:?}");
-}
-
-/// TCX is the opt-in fd-owned attachment. This proves it attaches on Linux 6.6+, not that
+/// TCX is the only attachment mode. This proves it attaches on Linux 6.6+, not that
 /// `bpf_sk_assign` delivers a flow: the real-daemon delivery check is
-/// `scripts/ops/daer-netns-e2e.sh` run with `DAER_TC_ATTACH=tcx`.
+/// `scripts/ops/daer-delivery-check.sh`.
 #[test]
 #[ignore = "needs CAP_BPF and CAP_NET_ADMIN; TCX needs Linux 6.6+"]
 fn a_tcx_program_attaches_to_loopback() {
     use aya::programs::tc::TcAttachType;
-    use aya::util::KernelVersion;
 
-    let current = KernelVersion::current().expect("the running kernel version");
-    if current < KernelVersion::new(6, 6, 0) {
-        eprintln!("skipped: TCX needs Linux 6.6 or newer; running {current:?}");
-        return;
-    }
+    daer_ebpf::require_tcx().expect("the kernel must support TCX");
 
     let path = object_path();
     if !path.exists() {
@@ -140,7 +107,6 @@ fn a_tcx_program_attaches_to_loopback() {
         daer_ebpf::names::program::DEVICE_INGRESS,
         "lo",
         TcAttachType::Ingress,
-        daer_ebpf::TcMode::Tcx,
     )
     .expect("TCX must attach on this kernel");
     println!("attached TCX as link id {link:?}");

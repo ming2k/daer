@@ -202,16 +202,36 @@ impl ProxyDialer {
         }
     }
 
+    /// Opens the bare stream to this protocol's server, before the protocol handshake.
+    ///
+    /// Used by detour chains and health probes. It never speaks the proxy protocol, so no
+    /// credential is needed and no target authority is named.
+    pub async fn connect_server(
+        &self,
+        collector: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        match self {
+            Self::ShadowSocks(c) => c.connect_server(collector).await,
+            Self::Trojan(c) => c.connect_server(collector).await,
+            Self::AnyTls(c) => c.connect_server(collector).await,
+            Self::Hysteria2(c) => c.connect_server(),
+            Self::Vless(c) => c.connect_server(collector).await,
+            Self::Vmess(c) => c.connect_server(collector).await,
+        }
+    }
+
     /// Returns the datagram connector if this protocol carries UDP.
     ///
-    /// `None` is a fact about the protocol, not a failure: shadowsocks AEAD and trojan in
-    /// this build are stream-only, and a caller that asks must be told so rather than
-    /// handed a connector that would silently drop packets.
+    /// Returns the datagram connector when this protocol carries UDP.
+    ///
+    /// Every protocol in this build has a datagram form. The `Option` remains at the
+    /// governance seam so a future stream-only protocol can say `None` instead of handing a
+    /// caller a connector that would silently drop packets.
     #[must_use]
     pub fn datagram_connector(&self) -> Option<Arc<dyn DatagramConnector>> {
         match self {
-            Self::ShadowSocks(_) => None,
-            Self::Trojan(_) => None,
+            Self::ShadowSocks(c) => Some(c.datagram_connector()),
+            Self::Trojan(c) => Some(c.datagram_connector()),
             Self::AnyTls(c) => Some(c.datagram_connector()),
             Self::Hysteria2(c) => Some(c.datagram_connector()),
             Self::Vless(c) => Some(c.datagram_connector()),

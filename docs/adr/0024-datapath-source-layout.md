@@ -2,13 +2,14 @@
 
 - Status: accepted
 - Date: 2026-11-06
+- Amended: 2026-11-12 — the translation unit is `datapath.bpf.c` and the object is `datapath.bpf.o`
 - Refines: [ADR-0020](0020-datapath-is-daer-own.md)
-- Enforced by: [INV-DATAPATH-ABI-01](../dev/standards/invariants.md)
+- Enforced by: [INV-DATAPATH-ABI-01](../dev/invariants.md)
 
 ## Context
 
-ADR-0020 established that `ebpf/kern/tproxy.c` is daer's own source, and made the
-loader stop repairing it. It left the file's *shape* alone: 4,394 lines in one
+ADR-0020 established that `ebpf/kern/tproxy.c` (now `datapath.bpf.c`) is daer's own
+source, and made the loader stop repairing it. It left the file's *shape* alone: 4,394 lines in one
 translation unit, holding the packet parser, the connection-tracking state machines, the
 rule-matching engine, the tc/cgroup/sockmap hooks, the ring-buffer event encoder, and the
 debug scaffolding.
@@ -64,8 +65,8 @@ preference about directory names.
    classification by taste: `daer-ebpf/src/loader.rs` attaches them through different
    `aya` APIs, and a bug in one cannot be reached from the others.
 
-3. **One translation unit still produces the object, and it is `datapath.c`.**
-   `datapath.c` includes the headers and compiles to a single `datapath.o`. The files
+3. **One translation unit still produces the object, and it is `datapath.bpf.c`.**
+   `datapath.bpf.c` includes the headers and compiles to a single `datapath.bpf.o`. The files
    above are *source* boundaries, not link boundaries.
 
    This is deliberate and it is the load-bearing decision of this ADR. Compiling each
@@ -82,7 +83,7 @@ preference about directory names.
    for a readability problem everybody has to live with. The split keeps the guarantee
    and fixes the readability.
 
-4. **`datapath.c` contains no logic.** It is includes, the license string, and the
+4. **`datapath.bpf.c` contains no logic.** It is includes, the license string, and the
    generated layout assertions. Its length is a smell detector: if it grows past ~60
    lines, something that belongs in a module was written there.
 
@@ -113,9 +114,9 @@ preference about directory names.
   `BPF_PROG_LOAD`, which this change does not have access to — a split that perturbed
   stack allocation would be undetectable until the kernel tests run.
 - The build does not change: `cargo xtask ebpf` still runs one `clang` and produces
-  `target/ebpf/datapath.o`. `bpftool gen object` is not introduced, so no new tool is
+  `target/ebpf/datapath.bpf.o`. `bpftool gen object` is not introduced, so no new tool is
   added to the packaging requirements in `docs/how-to/deployment.md`.
-- `datapath.c` is not a business-logic file and must not become one. Its length is the
+- `datapath.bpf.c` is not a business-logic file and must not become one. Its length is the
   cheapest available proxy for "somebody put logic in the assembly file".
 - The scratch maps (`parse_ctx_scratch_map`, `pkt_scratch_map`, `route_ctx_scratch_map`,
   `wan_egress_route_scratch_map`) are **retained by this ADR**. They exist because the

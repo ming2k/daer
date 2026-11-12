@@ -6,5 +6,5 @@
 pub mod consts;
 pub mod net;
 
-pub use consts::{DialMode, SelectionPolicy};
+pub use consts::{DEFAULT_SOCKET_MARK, DialMode, SelectionPolicy};
 pub use net::{MacAddr, PortRange};

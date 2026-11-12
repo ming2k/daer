@@ -2,20 +2,25 @@
 
 What a box needs to run `daer` as a transparent proxy, and what to check when it does not.
 
+> A running daemon is not by itself a production gate. The release checklist and clean-host
+> test procedure are maintained with the engineering docs; operators should treat the
+> delivery check as a separate acceptance step, not as part of `cargo test`.
+
 ## Requirements
 
 | Thing | Why |
 | --- | --- |
-| Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
+| Linux 6.6+ | TCX (`BPF_TCX_INGRESS`/`BPF_TCX_EGRESS`), `bpf_loop`, and the cgroup hooks the datapath uses |
 | `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` | load and attach the datapath (`CAP_PERFMON` enables the verifier's `allow_ptr_leaks` for variable-offset packet parsing); `IP_TRANSPARENT` on the listeners |
-| `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, unshare its private mount namespace, move `daer0peer` into it, and `setns` to bind the listeners and attach the peer program (ADR-0038) |
+| `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, unshare its private mount namespace, create the veth peer directly inside it, and `setns` to bind the listeners and attach the peer program (ADR-0038, ADR-0042) |
 | `ip` | create the `daer0`/`daer0peer` pair and configure the ingress namespace |
 | Host sysctls | `net.ipv4.ip_forward=1`, `net.ipv4.conf.all.forwarding=1`, `net.ipv4.conf.all.rp_filter=0`, `net.ipv4.conf.all.arp_filter=0`; `net.ipv6.conf.all.forwarding=1` on a dual-stack kernel. `daer` checks them at startup and refuses to change them. |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
-| `[[rule-provider]]` sources | only when a rule says `provider(<tag>)`; a `file` provider is read from `/var/lib/daer/rules/` (or the declared path), an `http` one is cached under `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it explicitly) |
+| `[[rule-provider]]` sources | only when a rule says `provider(<name>)`; a `file` provider is read from `/var/lib/daer/rules/` (or the declared path), an `http` one is cached under `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it explicitly) |
 
-The default TC attachment is classic `cls_bpf`, which works on Linux 5.17+. The opt-in TCX
-path (`DAER_TC_ATTACH=tcx`, used by the real-daemon delivery check) needs Linux 6.6+.
+TC attachment is TCX-only: every hook is an fd-owned `bpf_link`, and the daemon creates no
+`clsact` qdisc. The minimum kernel is 6.6. There is no classic `cls_bpf` fallback and no
+`DAER_TC_ATTACH` switch (ADR-0042).
 
 ### Host sysctls
 
@@ -45,8 +50,8 @@ namespace-local knobs, which disappear with their devices.
 ## Build
 
 ```sh
-cargo xtask ebpf           # -> target/ebpf/datapath.o  (needs clang + a vmlinux.h tree)
-cargo build --release      # -> target/release/{daer,daer-cleanup,daer-drb}
+cargo xtask ebpf           # -> target/ebpf/datapath.bpf.o  (needs clang + a vmlinux.h tree)
+cargo build --release      # -> target/release/{daer,daer-drb}
 ```
 
 To install the built artifacts and the unit under `/usr`:
@@ -57,11 +62,15 @@ cargo xtask install --prefix /usr/local  # unit paths follow the prefix
 cargo xtask install --destdir /tmp/pkg   # stage a package tree
 ```
 
-`cargo xtask install` installs the exact set the unit names, including `daer-cleanup`; it
-does not write `/etc/daer/config.toml`, enable the unit, or start it. It runs as the
+`cargo xtask install` installs the exact set the unit names; it does not write
+`/etc/daer/config.toml`, enable the unit, or start it. It runs as the
 invoking user, so writing `/usr` needs the permissions to do so. Use
 `scripts/ops/daer-install-netns.sh --config <path>` for those activation steps: it stages
-the same tree as your user and uses `sudo` only for the copy and the service restart.
+with `cargo xtask install` and uses `sudo` only for the copy and the service restart. The
+script is not a second artifact list; `xtask` remains the SSOT for what gets installed.
+
+The package plan (`packaging/daer.plan.toml`) calls `cargo xtask install` for the same
+reason, then adds only distribution files such as the example configuration and JSON schema.
 
 `cargo xtask ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
 (defaults to `ebpf/headers`). `ebpf/headers/vmlinux.h` is per-kernel and is not vendored;
@@ -83,7 +92,7 @@ The supported deployment is system-wide:
 | `/etc/daer/config.toml` | Configuration. |
 | `/etc/daer/example.toml` | Annotated reference installed by the package. |
 | `/usr/bin/daer` | Daemon and inspection CLI. |
-| `/usr/lib/daer/datapath.o` | eBPF datapath object. |
+| `/usr/lib/daer/datapath.bpf.o` | eBPF datapath object. |
 | `/var/lib/daer/rules/` | Operator-managed local `.drb` / `.rules` files. |
 | `/var/cache/daer/rules/` | Disposable HTTP provider cache. |
 
@@ -96,30 +105,34 @@ does not scan `/var/lib/daer/rules` automatically. Relative paths resolve agains
 The minimum that proxies anything:
 
 ```toml
-schema = 1
+schema = 2
 
 [global]
-tproxy-port = 12345
 wan-interface = ["auto"]      # or the interface name
 lan-interface = ["eth0"]      # the network you are proxying traffic *from*
 # Strongly recommended; see "The socket mark" below.
-so-mark = 0x0dae
+so-mark = 0x64616572
 
 [[node]]
-tag = "edge"
+name = "edge"
 type = "vless"
 server = "example.com"
 port = 443
 uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 flow = "xtls-rprx-vision"
-[node.reality]
+[node.security]
+type = "reality"
 sni = "impersonate.example.com"
 public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
-fingerprint = "chrome"
+short-id = "ab01cd02"
 
 [[group]]
+name = "proxy-pool"
+
+[[election]]
 name = "proxy"
-policy = "min-moving-avg"
+group = "proxy-pool"
+type = "min-moving-avg"
 
 [routing]
 rules = ["provider(private) -> direct", "provider(cn) -> direct"]
@@ -130,14 +143,14 @@ Check it before starting:
 
 ```sh
 daer check -c /etc/daer/config.toml
-daer check --host -c /etc/daer/config.toml   # also verifies the sysctl prerequisites
+daer check --host -c /etc/daer/config.toml   # also verifies Linux 6.6+ TCX and the sysctl prerequisites
 daer route 10.0.0.2:1234 1.1.1.1:443 --domain example.com --why -c /etc/daer/config.toml
 # or simply:
 daer route example.com --why -c /etc/daer/config.toml
 ```
 
 `daer route --why` prints the verdict a running daer would act on, including
-"undeliverable, group X has no selectable node" — which is the failure that otherwise looks
+"undeliverable, election X has no electable node" — which is the failure that otherwise looks
 like a network problem.
 
 ## Running
@@ -203,20 +216,20 @@ was threaded through.
 
 ```toml
 [global]
-so-mark = 0x0dae
+so-mark = 0x64616572
 ```
 
 `daer run` applies that value in every place that creates a socket and logs it once:
 
 ```text
-INFO listening for redirected flows port=12345 so_mark=Some(3566) namespace=Some("daer0ns") generation=gen1
+INFO listening for redirected flows port=12345 so_mark=Some(1684104562) namespace=Some("daer0ns") generation=gen1
 ```
 
 * the generation's dialers (`SocketConfig::mark`, applied **before** `connect(2)`);
 * the TCP and UDP transparent listener sockets, so accepted replies and datagrams are
   recognised as daer's own egress;
 * the UDP reply sockets that bind an original destination, created inside `daer0ns`;
-* health-check TCP, HTTP and UDP sockets, so probes are not captured as client flows;
+* probe TCP, HTTP and UDP sockets, so probes are not captured as client flows;
 * `PARAM.socket_mark`, which the datapath compares against `skb->mark`;
 * the redirect exclusion is the datapath's own check — there is no firewall rule to write for
   it.
@@ -225,7 +238,7 @@ The ingress policy rule is keyed by `iif daer0peer`, not by the mark: the mark o
 replies is what makes the host skip them, and a mark rule inside `daer0ns` would instead route
 those replies to `lo`.
 
-When the datapath is enabled, an absent `global.so-mark` uses the non-zero default `0x0dae`
+When the datapath is enabled, an absent `global.so-mark` uses the non-zero default `0x64616572`
 because a mark of `0` is exactly the self-capture case. `--no-datapath` uses no mark: nothing
 is redirected, so there is no loop to evade.
 
@@ -260,19 +273,18 @@ the daemon installs in the namespace and on the devices it owns.
 | `daer0` ingress TC, `daer0peer` ingress TC | host / ingress | the return path and the assign hook live on opposite sides of the boundary |
 | `listen_socket_map` entries `0` (tcp4), `1` (udp4), `2` (tcp6), `3` (udp6) | — | `assign_listener` looks the socket up by protocol and family; an empty slot is a flow the datapath has already taken off the direct path and then drops |
 
-All of it is removed again when the daemon exits: the namespace guard deletes `daer0ns` (and
-with it the peer and the host end of the pair), the per-device `daer0` knobs disappear with
-the device, Aya detaches every TC filter, and the `clsact` qdisc is removed when daer created
-it. A clean shutdown leaves no host table-2023 rule and no daer-owned kernel state. The
-host-global prerequisites are never changed.
+All of it is released when the daemon exits, without a cleanup helper: TCX links are
+fd-owned, so closing the process's fds detaches every program; the veth peer is created
+directly inside `daer0ns`, so deleting the private namespace removes the peer and the host
+end together; the per-device `daer0` knobs disappear with the device. A clean shutdown
+leaves no host table-2023 rule and no daer-owned kernel state. The host-global prerequisites
+are never changed.
 
-The namespace mount is private to the daemon, so a `SIGKILL` releases `daer0ns`, the pair, and
-the ingress policy and sysctls with the process. Host-side state that is not namespace-owned
-is covered by two backstops: the daemon writes an undo journal under `/run/daer` before it
-creates a qdisc, and the unit's `ExecStopPost=daer-cleanup` replays it after a `SIGKILL`,
-panic or stop timeout. A current (v2) journal removes host TC filters and qdiscs only; a
-pre-v2 journal also restores host sysctls and a host namespace/pair from older releases. The
-same recovery runs before a new daemon starts, so a crash cannot compound leftovers.
+The namespace mount is private to the daemon's mount namespace, so a `SIGKILL`, OOM kill,
+panic abort or systemd stop timeout releases `daer0ns`, the pair, the ingress policy, the
+TCX links and the per-device sysctls with the process. `daer-cleanup` no longer exists, and
+there is no crash journal: a cleanup process cannot run inside a `SIGKILL`, so the state is
+owned by the kernel instead (ADR-0042).
 
 ### Which TC program goes on which interface
 
@@ -327,6 +339,8 @@ NotifyAccess=main
 # nothing. The daemon feeds this at half the interval, including while a reload is running.
 WatchdogSec=30s
 User=root
+# Runtime election control is root-only by default. Opt in to a group with a drop-in
+# that sets SupplementaryGroups= and DAER_ADMIN_GROUP; see below.
 
 # Resource limits
 LimitNPROC=4096
@@ -339,15 +353,12 @@ OOMScoreAdjust=-100
 # mutates kernel state, and Type=notify above makes systemd wait for that gate. Running
 # `daer check` first repeated every subscription and rule-provider fetch on each start and
 # restart, doubling startup network work without adding a check.
-ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --shutdown-timeout 5
+ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.bpf.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
-# The Rust guards are the primary cleanup path. This runs after them — and also after a
-# SIGKILL, panic or stop timeout — replaying the daemon's recovery journal. A current (v2)
-# journal removes the host TC filters and qdiscs only; the namespace and pair die with the
-# daemon. A pre-v2 journal also runs the full legacy restore. It is a dedicated helper,
-# not a hidden flag on `daer run`: the operator CLI stays the six verbs in ADR-0015, and
-# systemd's post-stop hook is not one of them.
-ExecStopPost=/usr/bin/daer-cleanup
+# There is deliberately no ExecStopPost. TCX links are fd-owned, the ingress namespace is
+# private to the process, and host-global sysctls are operator prerequisites (ADR-0042).
+# The kernel releases every piece of daer-owned network state when the process exits,
+# including after SIGKILL or an aborted panic.
 
 # Restart policy. One second keeps a transient failure from turning into a five-second
 # outage; StartLimit above still stops a genuine crash loop.
@@ -377,9 +388,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
-# ProtectKernelTunables must remain false: daer needs to tune sysctls on its peer
-# devices (/proc/sys/net/ipv4/conf/daer0peer and the ingress namespace) and pin eBPF
-# maps to /sys/fs/bpf.
+# ProtectKernelTunables must remain false: daer tunes per-device sysctls on the host end
+# (daer0) and, through daer0ns, on the peer.
 ProtectKernelTunables=false
 LockPersonality=true
 RestrictRealtime=true
@@ -390,17 +400,17 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # Configuration directory and runtime state. `RuntimeDirectory` creates /run/daer and
 # /run/netns; the latter is the mount target for the daemon's private tmpfs.
 ConfigurationDirectory=daer
-# `daer` holds its crash-recovery journal in /run/daer. The ingress namespace mounts a
-# private tmpfs at /run/netns inside its own mount namespace, so the host directory is not
+# `/run/daer` holds the status and event files. The ingress namespace mounts a private
+# tmpfs at /run/netns inside its own mount namespace, so the host directory is not
 # modified; it still has to exist as the mount target.
 RuntimeDirectory=daer netns
 # `/run/netns` is shared with every other network namespace on the host. Do not let systemd
 # remove the whole directory when daer stops: other applications' namespaces may be there,
 # and the directory is the mount target.
 RuntimeDirectoryPreserve=yes
-# `/run/netns` stays writable for a legacy mount an older version may have left; the daemon's
-# own namespace mount is private and never writes the host path.
-ReadWritePaths=/etc/daer /sys/fs/bpf /run/netns
+# `/run/netns` is the mount target for the daemon's private ingress tmpfs; the daemon never
+# writes the host path.
+ReadWritePaths=/etc/daer /run/netns
 
 # Persistent, operator-managed rule sets live in /var/lib/daer/rules. StateDirectory
 # creates /var/lib/daer and grants write access to it under ProtectSystem=strict; the
@@ -424,8 +434,33 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now daer
 ```
 
+**Runtime election control is root-only by default.** The daemon binds
+`/run/daer/admin.sock` as `0600 root:root`; only root can run `daer elect` or the live
+`daer status --nodes/--groups/--elections` views. Non-root delegation is opt-in:
+
+```sh
+sudo groupadd --system daer-admin
+sudo usermod -aG daer-admin alice
+sudo systemctl edit daer
+```
+
+```ini
+[Service]
+SupplementaryGroups=daer-admin
+Environment=DAER_ADMIN_GROUP=daer-admin
+```
+
+The group and the environment variable are both required: systemd must make the daemon a
+member of the group so it can chown the socket without `CAP_CHOWN`, and the daemon only
+switches the socket to `0660 root:daer-admin` when `DAER_ADMIN_GROUP` names that group.
+There is no world-writable mode. The broad `/run/daer/control.sock` remains `0600 root:root`
+and read-only (ADR-0041, ADR-0047). The daemon persists overrides to
+`/var/lib/daer/elections.json`; `StateDirectory=daer` already makes that path writable under
+`ProtectSystem=strict`.
+
 `ExecReload` is what makes SIGHUP usable: `systemctl reload daer` then swaps the policy
-without dropping a connection.
+without dropping a connection. A runtime `daer elect` does not reload the configuration; it
+only changes the named election's current choice.
 
 The unit does **not** run `daer check` as an `ExecStartPre=`. `daer run` performs the same
 `load_resolved` validation before it binds a socket or mutates kernel state, and `Type=notify`
@@ -436,13 +471,17 @@ before a manual edit; it is still the command that answers "will this configurat
 
 ## Verifying the kernel datapath
 
-Two scripts, two questions. They are separate because a failure in one must not be readable as
-a failure in the other:
+Three gates, three questions. They are separate because a failure in one must not be readable
+as a failure in the other:
 
 | Script | Question | Depends on |
 | --- | --- | --- |
 | `sudo ./scripts/verify/kernel-check.sh` | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
 | `sudo ./scripts/verify/e2e-check.sh` | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
+| `sudo ./scripts/ops/daer-delivery-check.sh --config <site.toml>` | does the real daemon deliver through TCX, and does `SIGKILL` release the host state? | a clean test host, a real node, `root` |
+
+The delivery check changes host networking and needs a site-specific config on a clean,
+disposable test host. Do not run it on a production machine.
 
 Run the kernel one before `daer run` on a new machine:
 
@@ -536,11 +575,11 @@ events for one connection.
 
 Be aware before trusting it with traffic:
 
-* **vmess, plain vless, tuic** are not implemented; a link naming one is listed but not
-  selectable, and is never silently downgraded to `direct`.
-* A REALITY node has **no datagram transport**, so a UDP flow routed to such a group is
-  refused rather than silently sent direct. Silence there would be a leak: the client would
-  believe UDP was tunnelled when it was not.
+* **tuic** is not implemented; a link naming it is listed but not selectable, and is never
+  silently downgraded to `direct`. VMess is implemented as AEAD only (ADR-0030).
+* A REALITY node has **no datagram transport**, so a UDP flow routed to an election whose
+  only candidate is such a node is refused rather than silently sent direct. Silence there
+  would be a leak: the client would believe UDP was tunnelled when it was not.
 * **The event ring and counters are consumed.** `bpf_stats_map` and `event_ringbuf` are read
   by the daemon, surfaced by `daer status`, and retained in an incident bundle after
   `SIGUSR1`, a panic or an error burst. The ring is rate-limited per key; volume comes from

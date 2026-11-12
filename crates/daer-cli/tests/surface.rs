@@ -212,9 +212,9 @@ fn the_surface_is_clean_verbs() {
     assert_eq!(
         listed,
         [
-            "check", "probe", "route", "run", "schema", "status", "version"
+            "check", "elect", "probe", "route", "run", "schema", "status", "version"
         ],
-        "the surface is `run`, `check`, `route`, `probe`, `status`, `schema`, `version`"
+        "the surface is `run`, `check`, `route`, `probe`, `status`, `elect`, `schema`, `version`"
     );
 }
 

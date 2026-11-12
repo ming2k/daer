@@ -23,7 +23,7 @@ fn an_unparseable_log_level_fails_the_pre_bind_gate() {
     let config = dir.join("config.toml");
     fs::write(
         &config,
-        "schema = 1\n\n[global]\nwan-interface = [\"lo\"]\nlog-level = \"###\"\n",
+        "schema = 2\n\n[global]\nwan-interface = [\"lo\"]\nlog-level = \"###\"\n",
     )
     .expect("writes config");
     let output = Command::new(daer())

@@ -26,14 +26,19 @@ use crate::error::ParseError;
 use crate::expr::{Function, Param, ParamValue, RoutingRule};
 use crate::scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration};
 
-/// The configuration schema version written as `schema = 1`.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The configuration schema version written as `schema = 2`.
+///
+/// Version 2 is the clean break that separates resources (`node`/`group`) from
+/// elections: a group is a candidate set, an election is the routing target that
+/// selects one node from it, and the old `group.policy`/`group.health-check`
+/// surface no longer exists.
+pub const SCHEMA_VERSION: u32 = 2;
 
-pub const DEFAULT_TCP_CHECK_URL: &str = "http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111";
-pub const DEFAULT_UDP_CHECK_DNS: &str = "dns.google:53,8.8.8.8,2001:4860:4860::8888";
+/// Default UDP endpoints for the server-liveness probe.
+pub const DEFAULT_UDP_CHECK_DNS: &str = "1.1.1.1:53,8.8.8.8:53,2001:4860:4860::8888:53";
 
 /// A configuration value that may be written either as a bare name or as a
-/// function expression (`policy: min_moving_avg` vs `policy: fixed(0)`).
+/// function expression (`fallback: direct` vs `provider: name(...)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionOrString {
     Name(String),
@@ -233,64 +238,184 @@ impl<'de> Deserialize<'de> for TimeSpan {
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 
-/// The health-check knobs, shared by `[global.health-check]` (the defaults) and
-/// every `[[group.health-check]]` (the overrides).
+/// What a probe measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeMode {
+    /// A cheap liveness probe against the node's own server address. It proves the
+    /// server is reachable, not that the node can carry a request to the internet.
+    #[default]
+    Server,
+    /// A request through the node to `url`. This is the Clash `url-test` shape: it
+    /// proves the proxy session authenticated and the node can reach the target.
+    Url,
+}
+
+/// Probe defaults, shared by `[global.probe]` and every election that overrides them.
+///
+/// Measurement is not a property of a group: a group is only a candidate set. An
+/// election owns the probe it needs; the global table supplies defaults so a file
+/// does not repeat the same URL for every election.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
-pub struct HealthCheck {
-    /// `tcp-check-url`: URL first, then optional direct IP addresses.
-    pub tcp_url: Vec<String>,
-    /// `tcp-check-http-method`.
+pub struct ProbeSettings {
+    pub mode: ProbeMode,
+    /// The URL requested when `mode = "url"`.
+    pub url: Option<String>,
     #[cfg_attr(
         feature = "schema",
         schemars(with = "crate::schema::mirror::HttpMethod")
     )]
-    pub tcp_method: String,
-    /// `udp-check-dns`: DNS endpoints used for the UDP probe.
+    pub method: String,
+    /// DNS endpoints used by the server-liveness probe for datagram-carrying nodes.
     pub udp_dns: Vec<String>,
-    /// `check-interval`.
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub interval: TimeSpan,
-    /// `check-tolerance`: shifts the switch threshold of moving averages.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub timeout: TimeSpan,
+    /// Shifts the switch threshold of moving averages.
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub tolerance: TimeSpan,
 }
 
-impl Default for HealthCheck {
+impl Default for ProbeSettings {
     fn default() -> Self {
         Self {
-            tcp_url: DEFAULT_TCP_CHECK_URL
-                .split(',')
-                .map(str::to_owned)
-                .collect(),
-            tcp_method: "HEAD".to_owned(),
+            mode: ProbeMode::Server,
+            url: None,
+            method: "HEAD".to_owned(),
             udp_dns: DEFAULT_UDP_CHECK_DNS
                 .split(',')
                 .map(str::to_owned)
                 .collect(),
             interval: TimeSpan::from_secs(30),
+            timeout: TimeSpan::from_secs(5),
             tolerance: TimeSpan::ZERO,
         }
     }
 }
 
-/// A group's partial override of [`HealthCheck`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// How an election selects one node from its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
-pub struct HealthCheckOverride {
-    pub tcp_url: Option<Vec<String>>,
+#[serde(rename_all = "kebab-case")]
+pub enum ElectionKind {
+    /// The input must be a node; the election returns that node or fails when it is
+    /// not usable.
+    Manual,
+    /// Pick a random alive node.
+    #[default]
+    Random,
+    /// Pick the node with the lowest last measured latency.
+    Min,
+    /// Pick the node with the lowest average of its last 10 latencies.
+    MinAvg10,
+    /// Pick the node with the lowest exponentially weighted moving average.
+    MinMovingAvg,
+}
+
+impl ElectionKind {
+    /// The runtime selection policy this election uses.
+    #[must_use]
+    pub const fn selection_policy(self) -> daer_common::SelectionPolicy {
+        match self {
+            Self::Manual => daer_common::SelectionPolicy::Manual,
+            Self::Random => daer_common::SelectionPolicy::Random,
+            Self::Min => daer_common::SelectionPolicy::MinLastLatency,
+            Self::MinAvg10 => daer_common::SelectionPolicy::MinAverage10,
+            Self::MinMovingAvg => daer_common::SelectionPolicy::MinMovingAverage,
+        }
+    }
+
+    /// Whether the election ranks candidates by measured latency.
+    #[must_use]
+    pub const fn needs_measurement(self) -> bool {
+        matches!(self, Self::Min | Self::MinAvg10 | Self::MinMovingAvg)
+    }
+}
+
+/// One `[[election]]` entry: the routing target and the rule that elects one node.
+///
+/// The input is exactly one of `group` or `node`. A group is a set of candidates; a
+/// node is a singleton candidate set. The output is always one node (or no node when
+/// the input has no usable candidate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Election {
+    pub name: String,
+    /// The candidate set. Mutually exclusive with `node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// A singleton candidate set. Mutually exclusive with `group`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The selection rule.
+    #[serde(rename = "type")]
+    pub kind: ElectionKind,
+    /// Probe overrides. `None` inherits `[global.probe]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ProbeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(
         feature = "schema",
         schemars(with = "Option<crate::schema::mirror::HttpMethod>")
     )]
-    pub tcp_method: Option<String>,
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_dns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub interval: Option<TimeSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub timeout: Option<TimeSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub tolerance: Option<TimeSpan>,
+}
+
+impl Election {
+    /// Resolves this election's effective probe settings.
+    #[must_use]
+    pub fn resolved_probe(&self, defaults: &ProbeSettings) -> ProbeSettings {
+        let mode = self.mode.unwrap_or(defaults.mode);
+        ProbeSettings {
+            mode,
+            // A server probe never requests a URL. The mode is the authority; a URL
+            // inherited from the global defaults must not silently make it a URL probe.
+            url: if mode == ProbeMode::Url {
+                self.url.clone().or_else(|| defaults.url.clone())
+            } else {
+                None
+            },
+            method: self
+                .method
+                .clone()
+                .unwrap_or_else(|| defaults.method.clone()),
+            udp_dns: self
+                .udp_dns
+                .clone()
+                .unwrap_or_else(|| defaults.udp_dns.clone()),
+            interval: self.interval.unwrap_or(defaults.interval),
+            timeout: self.timeout.unwrap_or(defaults.timeout),
+            tolerance: self.tolerance.unwrap_or(defaults.tolerance),
+        }
+    }
+
+    /// The input kind, as a diagnostic string.
+    #[must_use]
+    pub fn input(&self) -> &'static str {
+        if self.group.is_some() {
+            "group"
+        } else {
+            "node"
+        }
+    }
 }
 
 /// TLS identity and fragmentation.
@@ -328,21 +453,11 @@ impl Default for Tls {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct Global {
-    /// Transparent-proxy port. Not an HTTP/SOCKS port: the eBPF program
-    /// redirects here.
-    pub tproxy_port: u16,
-    /// Reject traffic that did not go through the eBPF program.
-    ///
-    /// Enforced by [`crate::validate`] against the listener's shape: with this on, a flow whose
-    /// original destination *is* the transparent port is refused, because such a flow was not
-    /// redirected. `false` weakens that to what the socket can observe, and exists only for a
-    /// debugging session on a box nobody else can reach.
-    pub tproxy_port_protect: bool,
     /// Socket mark for daer-originated traffic.
     ///
-    /// Omitted, a privileged run picks [`crate::DEFAULT_SOCKET_MARK`] and an unprivileged one
-    /// marks nothing; the datapath and the redirect rule have to agree with whichever it is, so
-    /// the daemon decides once and reports the value it used.
+    /// Omitted, a privileged run picks [`daer_common::consts::DEFAULT_SOCKET_MARK`] and an
+    /// unprivileged one marks nothing; the datapath and the redirect rule have to agree with
+    /// whichever it is, so the daemon decides once and reports the value it used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub so_mark: Option<u32>,
     /// `tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.
@@ -355,16 +470,12 @@ pub struct Global {
     pub sniffing_timeout: TimeSpan,
     pub auto_sniff_punt: bool,
     pub tls: Tls,
-    pub health_check: HealthCheck,
+    pub probe: ProbeSettings,
 }
 
 impl Default for Global {
     fn default() -> Self {
         Self {
-            // The one definition (ADR-0023): the schema default and the value published
-            // into the datapath's `PARAM` cannot drift.
-            tproxy_port: daer_common::consts::TPROXY_PORT_DEFAULT,
-            tproxy_port_protect: true,
             so_mark: None,
             log_level: "info".to_owned(),
             lan_interface: Vec::new(),
@@ -380,7 +491,7 @@ impl Default for Global {
             sniffing_timeout: TimeSpan::from_millis(30),
             auto_sniff_punt: true,
             tls: Tls::default(),
-            health_check: HealthCheck::default(),
+            probe: ProbeSettings::default(),
         }
     }
 }
@@ -389,12 +500,27 @@ impl Default for Global {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Subscription {
-    /// Tag used by `subtag()` filters.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    /// Name used by `sub(...)` / `subtag()` filters.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub url: String,
     /// Cache the last successful fetch next to the configuration.
     pub persist: bool,
+    /// Apply this detour to every node the subscription contributes (ADR-0044).
+    ///
+    /// A subscription link cannot carry a detour (it is another panel's wire format), so the
+    /// operator declares the chain once, next to the subscription. The target may be an inline
+    /// node or another subscription node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detour: Option<String>,
+}
+
+impl Subscription {
+    /// Compatibility accessor for the subscription name.
+    #[must_use]
+    pub fn tag(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
 }
 
 impl<'de> Deserialize<'de> for Subscription {
@@ -409,22 +535,27 @@ impl<'de> Deserialize<'de> for Subscription {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields, rename_all = "kebab-case")]
         struct Table {
-            tag: Option<String>,
+            #[serde(alias = "tag")]
+            name: Option<String>,
             url: String,
             #[serde(default)]
             persist: bool,
+            #[serde(default)]
+            detour: Option<String>,
         }
 
         Ok(match Repr::deserialize(d)? {
             Repr::Url(url) => Self {
-                tag: None,
+                name: None,
                 url,
                 persist: false,
+                detour: None,
             },
             Repr::Table(table) => Self {
-                tag: table.tag,
+                name: table.name,
                 url: table.url,
                 persist: table.persist,
+                detour: table.detour,
             },
         })
     }
@@ -435,7 +566,8 @@ impl<'de> Deserialize<'de> for Subscription {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuleProvider {
-    pub tag: String,
+    #[serde(alias = "tag")]
+    pub name: String,
     #[serde(rename = "type", default)]
     pub provider_type: ProviderType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +579,14 @@ pub struct RuleProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub interval: Option<TimeSpan>,
+}
+
+impl RuleProvider {
+    /// Compatibility accessor for the rule provider name.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -472,42 +612,63 @@ pub enum ProviderFormat {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Node {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     #[serde(flatten)]
     pub endpoint: NodeEndpoint,
+    /// The node whose outbound carries this node's connection to its own server.
+    ///
+    /// This is the detour seam (ADR-0044): the outer node's proxy protocol still names the
+    /// *final* target, while the byte stream to its server is opened by another node. A chain
+    /// is therefore `outer(detour=inner)`, not a new protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detour: Option<String>,
     /// The subscription this node came from, filled in by the resolver.
     #[serde(skip)]
     pub subscription: Option<String>,
 }
 
 impl Node {
-    /// Creates a node with an optional tag and an endpoint.
-    pub fn new(tag: Option<String>, endpoint: NodeEndpoint) -> Self {
+    /// The optional name of this node.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Compatibility accessor for the node name.
+    #[must_use]
+    pub fn tag(&self) -> Option<&str> {
+        self.name()
+    }
+
+    /// Creates a node with an optional name and an endpoint.
+    pub fn new(name: Option<String>, endpoint: NodeEndpoint) -> Self {
         Self {
-            tag,
+            name,
             endpoint,
+            detour: None,
             subscription: None,
         }
     }
 
-    /// Creates a node with a subscription tag provenance.
+    /// Creates a node with a subscription name provenance.
     pub fn with_subscription(
-        tag: Option<String>,
+        name: Option<String>,
         endpoint: NodeEndpoint,
         subscription: Option<String>,
     ) -> Self {
         Self {
-            tag,
+            name,
             endpoint,
+            detour: None,
             subscription,
         }
     }
 
-    /// Creates a node from an endpoint, extracting any tag declared on it.
+    /// Creates a node from an endpoint, extracting any name declared on it.
     pub fn from_endpoint(endpoint: NodeEndpoint) -> Self {
-        let tag = endpoint.tag().map(str::to_owned);
-        Self::new(tag, endpoint)
+        let name = endpoint.name().map(str::to_owned);
+        Self::new(name, endpoint)
     }
 
     /// Alias for `from_endpoint`.
@@ -515,13 +676,19 @@ impl Node {
         Self::from_endpoint(structured)
     }
 
-    /// The tag `subtag(...)` matches against, or `""` for an inline node.
+    /// The subscription name `sub(...)` / `subtag(...)` matches against, or `""` for an inline node.
     #[must_use]
-    pub fn subscription_tag(&self) -> &str {
+    pub fn subscription_name(&self) -> &str {
         self.subscription.as_deref().unwrap_or("")
     }
 
-    /// Default name for this node when tag is omitted.
+    /// Compatibility alias for `subscription_name`.
+    #[must_use]
+    pub fn subscription_tag(&self) -> &str {
+        self.subscription_name()
+    }
+
+    /// Default name for this node when name is omitted.
     #[must_use]
     pub fn default_name(&self) -> String {
         self.endpoint.default_name()
@@ -530,7 +697,7 @@ impl Node {
     /// Display label for this node.
     #[must_use]
     pub fn label(&self) -> String {
-        self.tag.clone().unwrap_or_else(|| self.default_name())
+        self.name.clone().unwrap_or_else(|| self.default_name())
     }
 
     /// Formats this node as a URI link.
@@ -543,10 +710,11 @@ impl Node {
     /// into a typed `Node`.
     pub fn from_link(link: &str) -> Result<Self, String> {
         let endpoint = NodeEndpoint::from_link(link)?;
-        let tag = endpoint.tag().map(str::to_owned);
+        let name = endpoint.name().map(str::to_owned);
         Ok(Self {
-            tag,
+            name,
             endpoint,
+            detour: None,
             subscription: None,
         })
     }
@@ -839,21 +1007,27 @@ impl NodeEndpoint {
         }
     }
 
-    /// The optional tag of this node.
+    /// The optional name of this node.
     #[must_use]
-    pub fn tag(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         match self {
-            Self::Direct(n) => n.tag.as_deref(),
-            Self::Socks5(n) => n.tag.as_deref(),
-            Self::Http(n) => n.tag.as_deref(),
-            Self::Shadowsocks(n) => n.tag.as_deref(),
-            Self::Trojan(n) => n.tag.as_deref(),
-            Self::AnyTls(n) => n.tag.as_deref(),
-            Self::Hysteria2(n) => n.tag.as_deref(),
-            Self::Vless(n) => n.tag.as_deref(),
-            Self::Vmess(n) => n.tag.as_deref(),
+            Self::Direct(n) => n.name.as_deref(),
+            Self::Socks5(n) => n.name.as_deref(),
+            Self::Http(n) => n.name.as_deref(),
+            Self::Shadowsocks(n) => n.name.as_deref(),
+            Self::Trojan(n) => n.name.as_deref(),
+            Self::AnyTls(n) => n.name.as_deref(),
+            Self::Hysteria2(n) => n.name.as_deref(),
+            Self::Vless(n) => n.name.as_deref(),
+            Self::Vmess(n) => n.name.as_deref(),
             Self::Unsupported { .. } => None,
         }
+    }
+
+    /// Compatibility accessor for the node name.
+    #[must_use]
+    pub fn tag(&self) -> Option<&str> {
+        self.name()
     }
 
     /// Default name for this node when tag is omitted.
@@ -935,8 +1109,8 @@ impl NodeEndpoint {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct DirectNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
 }
 
 impl DirectNode {
@@ -950,8 +1124,8 @@ impl DirectNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Socks5Node {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -980,8 +1154,8 @@ impl Socks5Node {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct HttpNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1010,8 +1184,8 @@ impl HttpNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ShadowsocksNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     pub method: String,
@@ -1032,8 +1206,8 @@ impl ShadowsocksNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TrojanNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     pub password: String,
@@ -1072,8 +1246,8 @@ impl TrojanNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AnyTlsNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     pub password: String,
@@ -1404,8 +1578,8 @@ struct ObfsGecko {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Hysteria2Node {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     /// One port, a list, or a range (ADR-0029).
     pub ports: PortSet,
@@ -1656,8 +1830,8 @@ impl Flow {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VlessNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     pub uuid: String,
@@ -1713,8 +1887,8 @@ pub enum VmessCipher {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VmessNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    pub name: Option<String>,
     pub server: String,
     pub port: u16,
     pub uuid: String,
@@ -1925,8 +2099,8 @@ impl VmessNode {
             // form branched on `is_tcp()` and returned "none" either way.
             "\"type\":\"none\"".to_owned(),
         ];
-        if let Some(tag) = &self.tag {
-            fields.push(format!("\"ps\":\"{}\"", json_escape(tag)));
+        if let Some(name) = &self.name {
+            fields.push(format!("\"ps\":\"{}\"", json_escape(name)));
         }
         match &self.security {
             SecurityConfig::Tls(tls) => {
@@ -2401,7 +2575,7 @@ fn parse_interval_ms(value: &str) -> Option<u64> {
 /// Builds a VLESS node from a link's query, splitting the security and transport layers
 /// out of the flat parameter list the link format uses (ADR-0028).
 fn parse_vless_layers(
-    tag: Option<String>,
+    name: Option<String>,
     user_part: &str,
     server: String,
     port: u16,
@@ -2520,7 +2694,7 @@ fn parse_vless_layers(
     };
 
     let vless = VlessNode {
-        tag,
+        name,
         server,
         port,
         uuid: user_part.to_owned(),
@@ -2555,7 +2729,7 @@ impl VmessNode {
 /// them — but a field naming a layer daer does not implement is refused, because silently
 /// dialling `net = "kcp"` as TCP produces a session that never authenticates.
 fn parse_vmess_link(
-    tag: Option<String>,
+    name: Option<String>,
     body: &str,
     whole_link: &str,
 ) -> Result<VmessNode, String> {
@@ -2650,9 +2824,9 @@ fn parse_vmess_link(
         }
     };
 
-    let tag = tag.or_else(|| (!get("ps").is_empty()).then(|| get("ps").to_owned()));
+    let name = name.or_else(|| (!get("ps").is_empty()).then(|| get("ps").to_owned()));
     let vmess = VmessNode {
-        tag,
+        name,
         server: server.to_owned(),
         port,
         uuid: uuid.to_owned(),
@@ -2809,7 +2983,7 @@ impl StructuredNode {
     fn from_link_unchecked(link: &str) -> Result<Self, String> {
         let link = link.trim();
         if link.is_empty() || link == "direct" || link == "direct://" {
-            return Ok(Self::Direct(DirectNode { tag: None }));
+            return Ok(Self::Direct(DirectNode { name: None }));
         }
 
         if link.contains("->") {
@@ -2820,18 +2994,18 @@ impl StructuredNode {
             return Err(format!("{link:?} has no '://' scheme separator"));
         };
 
-        // Split off #fragment as tag
-        let (before_fragment, tag) = match rest.split_once('#') {
+        // Split off #fragment as name
+        let (before_fragment, name) = match rest.split_once('#') {
             Some((before, fragment)) => {
-                let tag = percent_decode(fragment);
-                let tag = if tag.is_empty() { None } else { Some(tag) };
-                (before, tag)
+                let name = percent_decode(fragment);
+                let name = if name.is_empty() { None } else { Some(name) };
+                (before, name)
             }
             None => (rest, None),
         };
 
         match scheme.to_ascii_lowercase().as_str() {
-            "direct" => Ok(Self::Direct(DirectNode { tag })),
+            "direct" => Ok(Self::Direct(DirectNode { name })),
             "socks" | "socks5" | "socks5h" => {
                 let (auth, authority) = match before_fragment.rsplit_once('@') {
                     Some((auth, hostport)) => (Some(auth), hostport),
@@ -2846,7 +3020,7 @@ impl StructuredNode {
                 };
                 let (server, port) = parse_host_port(authority)?;
                 Ok(Self::Socks5(Socks5Node {
-                    tag,
+                    name,
                     server,
                     port,
                     username,
@@ -2867,7 +3041,7 @@ impl StructuredNode {
                 };
                 let (server, port) = parse_host_port(authority)?;
                 Ok(Self::Http(HttpNode {
-                    tag,
+                    name,
                     server,
                     port,
                     username,
@@ -2904,7 +3078,7 @@ impl StructuredNode {
                 })?;
                 let (server, port) = parse_host_port(&authority)?;
                 Ok(Self::Shadowsocks(ShadowsocksNode {
-                    tag,
+                    name,
                     server,
                     port,
                     method: method.to_owned(),
@@ -2939,7 +3113,7 @@ impl StructuredNode {
                     }
                 }
                 Ok(Self::Trojan(TrojanNode {
-                    tag,
+                    name,
                     server,
                     port,
                     password: password.to_owned(),
@@ -2981,7 +3155,7 @@ impl StructuredNode {
                     }
                 }
                 Ok(Self::AnyTls(AnyTlsNode {
-                    tag,
+                    name,
                     server,
                     port,
                     password: percent_decode(password),
@@ -3096,7 +3270,7 @@ impl StructuredNode {
                 };
 
                 Ok(Self::Hysteria2(Hysteria2Node {
-                    tag,
+                    name,
                     server,
                     ports,
                     password: percent_decode(password),
@@ -3119,9 +3293,9 @@ impl StructuredNode {
                     None => (rest, ""),
                 };
                 let (server, port) = parse_host_port(authority)?;
-                parse_vless_layers(tag, user_part, server, port, query).map(Self::Vless)
+                parse_vless_layers(name, user_part, server, port, query).map(Self::Vless)
             }
-            "vmess" => parse_vmess_link(tag, before_fragment, link).map(Self::Vmess),
+            "vmess" => parse_vmess_link(name, before_fragment, link).map(Self::Vmess),
             other => Ok(Self::Unsupported {
                 scheme: other.to_owned(),
                 link: link.to_owned(),
@@ -3153,7 +3327,9 @@ impl<'de> Deserialize<'de> for Node {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "kebab-case")]
                 struct NodeHelper {
-                    tag: Option<String>,
+                    #[serde(alias = "tag")]
+                    name: Option<String>,
+                    detour: Option<String>,
                     #[serde(flatten)]
                     endpoint: NodeEndpoint,
                 }
@@ -3162,8 +3338,9 @@ impl<'de> Deserialize<'de> for Node {
                     NodeHelper::deserialize(toml::Value::Table(table)).map_err(D::Error::custom)?;
                 helper.endpoint.validate().map_err(D::Error::custom)?;
                 Ok(Self {
-                    tag: helper.tag,
+                    name: helper.name,
                     endpoint: helper.endpoint,
+                    detour: helper.detour,
                     subscription: None,
                 })
             }
@@ -3251,26 +3428,16 @@ impl Serialize for Filter {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Group {
     pub name: String,
-    /// Multiple filters are OR-ed; each filter is a conjunction.
+    /// The candidate set: multiple filters are OR-ed; each filter is a conjunction.
+    ///
+    /// A group carries no selection rule and no probe. It is a resource pool; an
+    /// `[[election]]` names it as input and owns the rule that picks one member.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(
         feature = "schema",
         schemars(with = "Vec<crate::schema::mirror::Filter>")
     )]
     pub filters: Vec<Filter>,
-    /// `min_moving_avg`, `fixed(0)`, … `None` means
-    /// [`daer_common::SelectionPolicy`]'s default.
-    #[serde(with = "function_value")]
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub policy: FunctionOrString,
-    #[serde(default, skip_serializing_if = "HealthCheckOverride::is_empty")]
-    pub health_check: HealthCheckOverride,
-}
-
-impl HealthCheckOverride {
-    pub fn is_empty(&self) -> bool {
-        self == &Self::default()
-    }
 }
 
 /// `[dns.request]` / `[dns.response]`.
@@ -3405,6 +3572,8 @@ pub struct Config {
     pub node: Vec<Node>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group: Vec<Group>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub election: Vec<Election>,
     #[serde(
         default,
         rename = "rule-provider",
@@ -3424,6 +3593,7 @@ impl Default for Config {
             subscription: Vec::new(),
             node: Vec::new(),
             group: Vec::new(),
+            election: Vec::new(),
             rule_provider: Vec::new(),
             routing: Routing::default(),
             dns: Dns::default(),
@@ -3443,16 +3613,15 @@ mod tests {
     fn defaults_apply_and_unknown_keys_are_rejected() {
         let parsed = config("");
         assert_eq!(parsed.schema, SCHEMA_VERSION);
-        assert_eq!(parsed.global.tproxy_port, 12_345);
         assert_eq!(
             parsed.routing.fallback,
             FunctionOrString::Name("direct".into())
         );
 
-        let error = toml::from_str::<Config>("[global]\ntproxy-port = 1\ntproxy-prt = 2\n")
+        let error = toml::from_str::<Config>("[global]\ntproxy-port = 1\n")
             .expect_err("unknown key must fail");
         assert!(
-            error.to_string().contains("tproxy-prt"),
+            error.to_string().contains("tproxy-port"),
             "unexpected error: {error}"
         );
     }
@@ -3463,7 +3632,7 @@ mod tests {
     /// proxied traffic"), so while the default was `[]` the documented smallest valid file —
     /// and the reference documentation's own default column, and `daer.example.toml`, which
     /// both said `["auto"]` — produced a daemon that exited immediately. The falsifier is one
-    /// command: `printf 'schema = 1\n' > c.toml && daer run -c c.toml --no-datapath` used to
+    /// command: `printf 'schema = 2\n' > c.toml && daer run -c c.toml --no-datapath` used to
     /// fail with that message; the default is now the value the documentation promised.
     #[test]
     fn the_defaults_are_a_configuration_the_daemon_can_run() {
@@ -3495,11 +3664,11 @@ mod tests {
 
     #[test]
     fn durations_require_units() {
-        let parsed = config("[global.health-check]\ninterval = \"45s\"\ntolerance = \"-1s\"\n");
-        assert_eq!(parsed.global.health_check.interval, TimeSpan::from_secs(45));
-        assert!(parsed.global.health_check.tolerance.is_negative());
+        let parsed = config("[global.probe]\ninterval = \"45s\"\ntolerance = \"-1s\"\n");
+        assert_eq!(parsed.global.probe.interval, TimeSpan::from_secs(45));
+        assert!(parsed.global.probe.tolerance.is_negative());
 
-        let error = toml::from_str::<Config>("[global.health-check]\ninterval = \"45\"\n")
+        let error = toml::from_str::<Config>("[global.probe]\ninterval = \"45\"\n")
             .expect_err("a unitless duration must fail");
         assert!(error.to_string().contains("invalid duration"), "{error}");
     }
@@ -3507,16 +3676,24 @@ mod tests {
     #[test]
     fn subscriptions_accept_both_shapes_and_nodes_require_structured_tables() {
         let plain = config("subscription = [\"https://a/sub\"]\n");
-        assert_eq!(plain.subscription[0].tag, None);
+        assert_eq!(plain.subscription[0].name, None);
         assert!(!plain.subscription[0].persist);
 
         let tables = config(
-            "[[subscription]]\ntag = \"b\"\nurl = \"https://b/sub\"\npersist = true\n\
-             [[node]]\ntag = \"n1\"\ntype = \"direct\"\n",
+            "[[subscription]]\nname = \"b\"\nurl = \"https://b/sub\"\npersist = true\n\
+             [[node]]\nname = \"n1\"\ntype = \"direct\"\n",
         );
-        assert_eq!(tables.subscription[0].tag.as_deref(), Some("b"));
+        assert_eq!(tables.subscription[0].name.as_deref(), Some("b"));
         assert!(tables.subscription[0].persist);
-        assert_eq!(tables.node[0].tag.as_deref(), Some("n1"));
+        assert_eq!(tables.node[0].name.as_deref(), Some("n1"));
+
+        // Backwards compatibility alias for `tag`
+        let legacy = config(
+            "[[subscription]]\ntag = \"b_leg\"\nurl = \"https://b/sub\"\n\
+             [[node]]\ntag = \"n_leg\"\ntype = \"direct\"\n",
+        );
+        assert_eq!(legacy.subscription[0].name.as_deref(), Some("b_leg"));
+        assert_eq!(legacy.node[0].name.as_deref(), Some("n_leg"));
 
         // Legacy bare URL strings in node are rejected with clear explanation
         let err = toml::from_str::<Config>("node = [\"ss://x\"]\n")
@@ -3544,7 +3721,7 @@ mod tests {
         let structured = StructuredNode::from_link(vless_link).expect("converts vless link");
         match structured {
             StructuredNode::Vless(vless) => {
-                assert_eq!(vless.tag.as_deref(), Some("US VIP 01"));
+                assert_eq!(vless.name.as_deref(), Some("US VIP 01"));
                 assert_eq!(vless.server, "fkus1keria.itknowledgeblog.com");
                 assert_eq!(vless.port, 443);
                 assert_eq!(vless.uuid, "df4af3d0-030e-4062-baa6-eb9dd45298ef");
@@ -3574,7 +3751,7 @@ mod tests {
         let structured = StructuredNode::from_link(ss_link).expect("converts ss link");
         match structured {
             StructuredNode::Shadowsocks(ss) => {
-                assert_eq!(ss.tag.as_deref(), Some("Website: user.totorofree.com"));
+                assert_eq!(ss.name.as_deref(), Some("Website: user.totorofree.com"));
                 assert_eq!(ss.server, "127.0.0.1");
                 assert_eq!(ss.port, 1080);
                 // The fixture spelled the cipher `aes-128-grm` — a typo the test asserted
@@ -3589,17 +3766,17 @@ mod tests {
         // SOCKS5 and Trojan
         let socks_link = "socks5://user:pass@127.0.0.1:1080#my-socks";
         let structured = StructuredNode::from_link(socks_link).expect("converts socks link");
-        assert_eq!(structured.tag(), Some("my-socks"));
+        assert_eq!(structured.name(), Some("my-socks"));
 
         let trojan_link = "trojan://password@node.example.com:443?sni=sni.example.com#my-trojan";
         let structured = StructuredNode::from_link(trojan_link).expect("converts trojan link");
-        assert_eq!(structured.tag(), Some("my-trojan"));
+        assert_eq!(structured.name(), Some("my-trojan"));
 
         let anytls_link = "anytls://secret-pass@anytls.example.com:443?sni=sni.example.com&allowInsecure=1&idle_sessions=3#my-anytls";
         let structured = StructuredNode::from_link(anytls_link).expect("converts anytls link");
         match structured {
             StructuredNode::AnyTls(anytls) => {
-                assert_eq!(anytls.tag.as_deref(), Some("my-anytls"));
+                assert_eq!(anytls.name.as_deref(), Some("my-anytls"));
                 assert_eq!(anytls.server, "anytls.example.com");
                 assert_eq!(anytls.port, 443);
                 assert_eq!(anytls.password, "secret-pass");
@@ -3614,7 +3791,7 @@ mod tests {
         let structured = StructuredNode::from_link(hy2_link).expect("converts hysteria2 link");
         match structured {
             StructuredNode::Hysteria2(hy2) => {
-                assert_eq!(hy2.tag.as_deref(), Some("my-hy2"));
+                assert_eq!(hy2.name.as_deref(), Some("my-hy2"));
                 assert_eq!(hy2.server, "hy2.example.com");
                 assert_eq!(hy2.ports.ranges, vec![(443, 443)]);
                 assert_eq!(hy2.password, "secret-hy2");
@@ -3638,7 +3815,7 @@ mod tests {
     #[test]
     fn filters_accept_a_string_or_a_table() {
         let parsed = config(
-            "[[group]]\nname = \"g\"\npolicy = \"min-moving-avg\"\n\
+            "[[group]]\nname = \"g\"\n\
              filters = [\"subtag(a) && !name(keyword: 'x')\", { match = \"name(n1)\", annotate = { mark = \"1\" } }]\n",
         );
         assert_eq!(parsed.group[0].filters.len(), 2);
@@ -3702,7 +3879,7 @@ type = "direct"
 
         // hk-vless
         let n0 = &parsed.node[0];
-        assert_eq!(n0.tag.as_deref(), Some("hk-vless"));
+        assert_eq!(n0.name.as_deref(), Some("hk-vless"));
         assert!(matches!(n0.endpoint, NodeEndpoint::Vless(_)));
         let link0 = n0.to_link();
         assert!(
@@ -3718,7 +3895,7 @@ type = "direct"
 
         // us-ss
         let n1 = &parsed.node[1];
-        assert_eq!(n1.tag.as_deref(), Some("us-ss"));
+        assert_eq!(n1.name.as_deref(), Some("us-ss"));
         assert!(matches!(n1.endpoint, NodeEndpoint::Shadowsocks(_)));
         let link1 = n1.to_link();
         assert!(link1.starts_with("ss://"));
@@ -3726,7 +3903,7 @@ type = "direct"
 
         // jp-trojan
         let n2 = &parsed.node[2];
-        assert_eq!(n2.tag.as_deref(), Some("jp-trojan"));
+        assert_eq!(n2.name.as_deref(), Some("jp-trojan"));
         assert!(matches!(n2.endpoint, NodeEndpoint::Trojan(_)));
         assert_eq!(
             n2.to_link(),
@@ -3735,19 +3912,19 @@ type = "direct"
 
         // local-socks5
         let n3 = &parsed.node[3];
-        assert_eq!(n3.tag.as_deref(), Some("local-socks5"));
+        assert_eq!(n3.name.as_deref(), Some("local-socks5"));
         assert!(matches!(n3.endpoint, NodeEndpoint::Socks5(_)));
         assert_eq!(n3.to_link(), "socks5://admin:123@127.0.0.1:1080");
 
         // local-http
         let n4 = &parsed.node[4];
-        assert_eq!(n4.tag.as_deref(), Some("local-http"));
+        assert_eq!(n4.name.as_deref(), Some("local-http"));
         assert!(matches!(n4.endpoint, NodeEndpoint::Http(_)));
         assert_eq!(n4.to_link(), "http://127.0.0.1:8080");
 
         // direct-node
         let n5 = &parsed.node[5];
-        assert_eq!(n5.tag.as_deref(), Some("direct-node"));
+        assert_eq!(n5.name.as_deref(), Some("direct-node"));
         assert!(matches!(n5.endpoint, NodeEndpoint::Direct(_)));
         assert_eq!(n5.to_link(), "direct://");
 
@@ -3789,7 +3966,7 @@ type = "direct"
                 !rendered.lines().any(|line| line.starts_with("[reality]")),
                 "the sub-table must be scoped to the node:\n{rendered}"
             );
-            let document = format!("schema = 1\n\n{rendered}");
+            let document = format!("schema = 2\n\n{rendered}");
             let parsed: Config = toml::from_str(&document)
                 .unwrap_or_else(|error| panic!("{link}\n{rendered}\n{error}"));
             assert_eq!(
@@ -3803,21 +3980,21 @@ type = "direct"
             // every other field matched, which is a difference in where the loader stores
             // the value, not in what was written.
             assert_eq!(
-                parsed.node[0].tag.as_deref(),
-                endpoint.tag(),
+                parsed.node[0].name.as_deref(),
+                endpoint.name(),
                 "\n{rendered}"
             );
             let mut expected = endpoint.clone();
             match &mut expected {
-                NodeEndpoint::Direct(n) => n.tag = None,
-                NodeEndpoint::Socks5(n) => n.tag = None,
-                NodeEndpoint::Http(n) => n.tag = None,
-                NodeEndpoint::Shadowsocks(n) => n.tag = None,
-                NodeEndpoint::Trojan(n) => n.tag = None,
-                NodeEndpoint::AnyTls(n) => n.tag = None,
-                NodeEndpoint::Hysteria2(n) => n.tag = None,
-                NodeEndpoint::Vless(n) => n.tag = None,
-                NodeEndpoint::Vmess(n) => n.tag = None,
+                NodeEndpoint::Direct(n) => n.name = None,
+                NodeEndpoint::Socks5(n) => n.name = None,
+                NodeEndpoint::Http(n) => n.name = None,
+                NodeEndpoint::Shadowsocks(n) => n.name = None,
+                NodeEndpoint::Trojan(n) => n.name = None,
+                NodeEndpoint::AnyTls(n) => n.name = None,
+                NodeEndpoint::Hysteria2(n) => n.name = None,
+                NodeEndpoint::Vless(n) => n.name = None,
+                NodeEndpoint::Vmess(n) => n.name = None,
                 NodeEndpoint::Unsupported { .. } => {}
             }
             assert_eq!(parsed.node[0].endpoint, expected, "\n{rendered}");
@@ -3944,11 +4121,13 @@ type = "direct"
     #[test]
     fn every_field_round_trips_through_the_serializer() {
         let original = config(
-            "schema = 1\n[global]\ntproxy-port = 1234\nso-mark = 7\n\
-             [global.tls]\nprofile = \"chrome\"\n[global.health-check]\ninterval = \"10s\"\n\
-             [[subscription]]\ntag = \"s\"\nurl = \"https://s\"\n\
-             [[group]]\nname = \"g\"\npolicy = \"fixed(0)\"\n\
-             [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"g\"\n\
+            "schema = 2\n[global]\nso-mark = 7\n\
+             [global.tls]\nprofile = \"chrome\"\n[global.probe]\ninterval = \"10s\"\n\
+             [[subscription]]\nname = \"s\"\nurl = \"https://s\"\n\
+             [[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
+             [[group]]\nname = \"g\"\n\
+             [[election]]\nname = \"e\"\ngroup = \"g\"\ntype = \"random\"\n\
+             [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"e\"\n\
              [dns]\nupstream = [\"udp://1.1.1.1:53\"]\n[dns.fixed-domain-ttl]\n\"example.com\" = 60\n",
         );
         let rendered = toml::to_string(&original).expect("serializes");

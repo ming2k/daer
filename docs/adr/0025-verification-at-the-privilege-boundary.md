@@ -3,7 +3,10 @@
 - Status: accepted
 - Date: 2026-11-06
 - Refines: [ADR-0007](0007-verification.md)
-- Enforced by: [INV-PREFLIGHT-01](../dev/standards/invariants.md)
+- Enforced by: [INV-PREFLIGHT-01](../dev/invariants.md)
+
+> Amended by [ADR-0042](0042-tcx-only-linux-6-6.md): kernel attachment is a TCX
+> `bpf_link`, not a `clsact` filter, and the minimum kernel is 6.6.
 
 ## Context
 
@@ -35,7 +38,7 @@ failure being reported by the *attachment* code, several layers away from the ch
 would have named it.
 
 There is a second, independent hole. `daer check` validates the configuration and nothing
-else. It does not look at the compiled object at all, so a `datapath.o` whose section names
+else. It does not look at the compiled object at all, so a `datapath.bpf.o` whose section names
 `aya` cannot parse, whose BTF `func_info` drifted, or whose map set no longer matches
 `ebpf/abi.toml` passes `daer check` and fails at attach time — in production, as a crash
 loop. `tests/object.rs` does check those things, but a test is not a gate an operator or a
@@ -129,10 +132,10 @@ developer typing a command.
 
 `packaging/daer.plan.toml` therefore runs the gate twice, both unprivileged:
 
-1. **`pipeline.compile`**, against `target/ebpf/datapath.o` and `daer.example.toml`. This
+1. **`pipeline.compile`**, against `target/ebpf/datapath.bpf.o` and `daer.example.toml`. This
    catches a repository that is internally inconsistent — and, because `xtask ebpf`
    regenerates the ABI first, a clean checkout that has never been built here.
-2. **`pipeline.staging`**, against `${STAGING_DIR}/usr/lib/daer/datapath.o` — the exact path
+2. **`pipeline.staging`**, against `${STAGING_DIR}/usr/lib/daer/datapath.bpf.o` — the exact path
    the service unit passes to `daer run`. This is the one that matters: it validates the
    artifact *as it will be installed*, so a stale or drifted object fails the build instead of
    crash-looping under systemd.

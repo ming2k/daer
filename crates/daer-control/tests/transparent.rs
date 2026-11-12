@@ -46,7 +46,7 @@ const ORIGIN6: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 18_081);
 
 /// The mark daer's own dials carry, and the one the redirect rule excludes.
-const MARK: u32 = 0x0dae;
+const MARK: u32 = 0x64616572;
 
 /// The address the datagram test's client binds, and the one the redirect rule names.
 ///
@@ -85,38 +85,32 @@ impl Drop for Fixture {
     }
 }
 
-fn direct_config(port: u16) -> daer_config::Config {
-    let text = format!(
-        r#"
-schema = 1
+fn direct_config() -> daer_config::Config {
+    let text = r#"
+schema = 2
 [global]
-tproxy-port = {port}
 wan-interface = ["lo"]
 log-level = "debug"
 [routing]
 rules = ["dip(127.0.0.1) -> direct"]
 fallback = "direct"
-"#
-    );
-    daer_config::toml_config::load_str(&text).expect("the probe configuration must parse")
+"#;
+    daer_config::toml_config::load_str(text).expect("the probe configuration must parse")
 }
 
 /// A config whose only outbound is `direct`, for the IPv6 data-path test.
-fn direct_config6(port: u16) -> daer_config::Config {
-    let text = format!(
-        r#"
-schema = 1
+fn direct_config6() -> daer_config::Config {
+    let text = r#"
+schema = 2
 [global]
-tproxy-port = {port}
 wan-interface = ["lo"]
 lan-interface = ["lo"]
 log-level = "debug"
 [routing]
 rules = []
 fallback = "direct"
-"#
-    );
-    daer_config::toml_config::load_str(&text).expect("the IPv6 probe configuration must parse")
+"#;
+    daer_config::toml_config::load_str(text).expect("the IPv6 probe configuration must parse")
 }
 
 /// A body that only this run's origin knows.
@@ -179,7 +173,7 @@ fn install_redirect(port: u16) -> bool {
         "pre",
         "meta",
         "mark",
-        "0x0dae",
+        "0x64616572",
         "return",
     ];
     if !nft(&args) {
@@ -231,7 +225,7 @@ fn install_redirect6(port: u16) -> bool {
         "pre",
         "meta",
         "mark",
-        "0x0dae",
+        "0x64616572",
         "return",
     ];
     if !nft(&args) {
@@ -273,7 +267,7 @@ fn ip(args: &[&str]) -> bool {
 /// delivered to the transparent socket. For TCP that happens through the socket's own transparent
 /// state; for a **datagram** whose destination is not a local address, the marked packet is
 /// dropped unless policy routing sends it to `local`. The datapath's own C comment says exactly
-/// this (`ebpf/kern/tproxy.c`: `ip rule add fwmark 0x8000000/0x8000000 table 2023` /
+/// this (`ebpf/kern/datapath.bpf.c`: `ip rule add fwmark 0x8000000/0x8000000 table 2023` /
 /// `ip route add local default dev lo table 2023`).
 ///
 /// Leaving it out is why a first attempt at this test concluded "UDP cannot be proven in one
@@ -382,7 +376,7 @@ fn install_datagram_redirect(port: u16) -> bool {
         "pre",
         "meta",
         "mark",
-        "0x0dae",
+        "0x64616572",
         "return",
     ];
     if !nft(&args) {
@@ -584,10 +578,15 @@ async fn request_at(address: SocketAddr) -> std::io::Result<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_redirected_flow_is_proxied_by_the_daemon() {
     let _fixture = Fixture::acquire();
-    // The redirect needs nftables and CAP_NET_ADMIN. Without either, this is a skip with a
-    // reason rather than a pass; `spawn_origin` below panics if the origin cannot bind, so a
-    // fixture failure can never be mistaken for a proxy failure.
-    if !install_redirect(12_347) {
+    let config = direct_config();
+    // The same mark the redirect rule excludes. Without it daer's own dial to the origin is
+    // captured by its own tproxy rule and the flow loops (see `RouterOptions::so_mark`).
+    let options = RouterOptions::default().with_socket_mark(Some(MARK));
+    let Ok(daemon) = Daemon::bind(&config, &options) else {
+        eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
+        return;
+    };
+    if !install_redirect(daemon.port) {
         eprintln!(
             "skipped: cannot install the tproxy rule (needs nftables and CAP_NET_ADMIN; run \
              under `unshare -Urn`)"
@@ -597,15 +596,6 @@ async fn a_redirected_flow_is_proxied_by_the_daemon() {
     // The redirect is installed; from here on every failure is real.
     let nonce = nonce();
     let origin = spawn_origin(nonce.clone());
-
-    let config = direct_config(12_347);
-    // The same mark the redirect rule excludes. Without it daer's own dial to the origin is
-    // captured by its own tproxy rule and the flow loops (see `RouterOptions::so_mark`).
-    let options = RouterOptions::default().with_socket_mark(Some(MARK));
-    let Ok(daemon) = Daemon::bind(&config, &options) else {
-        remove_redirect();
-        panic!("the transparent port must bind (is CAP_NET_ADMIN present?)");
-    };
 
     // The daemon is shared with the serving task so the test can read its counters: the liveness
     // assertion below needs to know the *daemon* saw the flow, not merely that a reply came back.
@@ -666,7 +656,17 @@ async fn a_redirected_ipv6_flow_is_proxied_by_the_daemon() {
         eprintln!("skipped: this host has no usable IPv6 loopback");
         return;
     }
-    if !install_redirect6(12_353) {
+
+    let config = direct_config6();
+    let options = match can_mark_sockets() {
+        true => RouterOptions::default().with_socket_mark(Some(MARK)),
+        false => RouterOptions::default(),
+    };
+    let Ok(daemon) = Daemon::bind(&config, &options) else {
+        eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
+        return;
+    };
+    if !install_redirect6(daemon.port) {
         eprintln!(
             "skipped: cannot install the IPv6 tproxy rule (needs nftables and CAP_NET_ADMIN; \
              run under `unshare -Urn`)"
@@ -676,15 +676,6 @@ async fn a_redirected_ipv6_flow_is_proxied_by_the_daemon() {
 
     let nonce = nonce();
     let origin = spawn_origin_at(ORIGIN6, nonce.clone());
-    let config = direct_config6(12_353);
-    let options = match can_mark_sockets() {
-        true => RouterOptions::default().with_socket_mark(Some(MARK)),
-        false => RouterOptions::default(),
-    };
-    let Ok(daemon) = Daemon::bind(&config, &options) else {
-        remove_redirect6();
-        panic!("the transparent port must bind (is CAP_NET_ADMIN present?)");
-    };
     let daemon = std::sync::Arc::new(daemon);
     let serve = tokio::spawn({
         let daemon = std::sync::Arc::clone(&daemon);
@@ -751,43 +742,6 @@ async fn the_negative_control_fails_without_the_daemon() {
     }
 }
 
-/// A flow that was not redirected must not be served.
-///
-/// This is a property of the listener, not of the redirect, and it is what keeps the transparent
-/// port from being an open relay into the box's own traffic.
-#[tokio::test]
-async fn the_transparent_port_refuses_a_flow_that_was_not_redirected() {
-    let config = direct_config(12_349);
-    let options = RouterOptions::default();
-    let Ok(daemon) = Daemon::bind(&config, &options) else {
-        eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
-        return;
-    };
-
-    let serve = tokio::spawn({
-        async move {
-            let _ = daemon.serve(std::future::pending::<()>()).await;
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    use tokio::io::AsyncReadExt;
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", 12_349))
-        .await
-        .expect("the port accepts the connection at the kernel level");
-    let mut buffer = [0u8; 16];
-    let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
-        .await
-        .expect("the rejection must not hang");
-    match read {
-        Ok(0) => {}
-        Ok(n) => panic!("a self-connect must not be served, got {n} bytes"),
-        Err(_) => {}
-    }
-
-    serve.abort();
-}
-
 /// A datagram is redirected by `tproxy`, decided by the daemon, relayed to the origin, and the
 /// reply comes back to the client (ADR-0007).
 ///
@@ -849,7 +803,16 @@ async fn a_redirected_datagram_is_proxied_by_the_daemon() {
         );
         return;
     }
-    if !install_datagram_redirect(12_351) {
+    let config = direct_config();
+    let options = match can_mark_sockets() {
+        true => RouterOptions::default().with_socket_mark(Some(MARK)),
+        false => RouterOptions::default().with_socket_mark(None),
+    };
+    let Ok(daemon) = Daemon::bind(&config, &options) else {
+        eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
+        return;
+    };
+    if !install_datagram_redirect(daemon.port) {
         eprintln!(
             "skipped: cannot install the UDP tproxy rule (needs nftables, `ip rule` and \
              CAP_NET_ADMIN; run under `unshare -Urn`)"
@@ -859,15 +822,6 @@ async fn a_redirected_datagram_is_proxied_by_the_daemon() {
 
     let nonce = nonce();
     let origin = spawn_datagram_origin(nonce.clone());
-    let config = direct_config(12_351);
-    let options = match can_mark_sockets() {
-        true => RouterOptions::default().with_socket_mark(Some(MARK)),
-        false => RouterOptions::default().with_socket_mark(None),
-    };
-    let Ok(daemon) = Daemon::bind(&config, &options) else {
-        remove_datagram_redirect();
-        panic!("the transparent port must bind (is CAP_NET_ADMIN present?)");
-    };
     let stats = daemon
         .datagram_stats()
         .expect("the daemon owns a datagram relay");
@@ -940,7 +894,7 @@ fn two_namespaces_available() -> bool {
 /// message, while a routing problem fails the other.
 #[tokio::test]
 async fn the_datagram_relay_is_wired_into_the_daemon() {
-    let config = direct_config(12_350);
+    let config = direct_config();
     let Ok(daemon) = Daemon::bind(&config, &RouterOptions::default()) else {
         eprintln!("skipped: cannot bind a transparent port without CAP_NET_ADMIN");
         return;

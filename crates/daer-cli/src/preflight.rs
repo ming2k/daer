@@ -26,8 +26,6 @@ use daer_control::generation::{Generation, GenerationId};
 pub struct Plan {
     /// The generation that would serve, fully built.
     pub generation: Generation,
-    /// The port the configuration asks for.
-    pub port: u16,
     /// The interfaces the attachment would use.
     pub lan: Vec<String>,
     pub wan: Vec<String>,
@@ -141,7 +139,6 @@ pub fn plan(
     };
 
     Ok(Plan {
-        port: config.global.tproxy_port,
         lan: lan.to_vec(),
         wan: wan.to_vec(),
         socket_mark,
@@ -180,9 +177,8 @@ pub fn validate_object(path: &Path) -> Result<ObjectReport, String> {
 /// peer MAC and the `daer0` ifindex. This is the same struct with the values that are known
 /// before either exists, so the report can show the parts an operator would get wrong.
 #[must_use]
-pub fn planned_param(port: u16, socket_mark: Option<u32>) -> daer_ebpf::RuntimeParam {
+pub fn planned_param(socket_mark: Option<u32>) -> daer_ebpf::RuntimeParam {
     daer_ebpf::RuntimeParam {
-        tproxy_port: u32::from(port),
         control_plane_pid: std::process::id(),
         device_ifindex: 0,
         netns_id: 0,

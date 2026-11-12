@@ -130,6 +130,8 @@ without `ExecStopPost`.
   TC filters and the qdiscs a classic attach created. A current (v2) journal carries only
   those records; it no longer removes the namespace, the pair, or a host sysctl. A pre-v2
   journal still triggers the full legacy restore.
+  > Amended by [ADR-0042](0042-tcx-only-linux-6-6.md): TCX removes the host TC filters and
+  > qdiscs from the ownership model, so `daer-cleanup` and the journal are deleted.
 
 ## Consequences
 

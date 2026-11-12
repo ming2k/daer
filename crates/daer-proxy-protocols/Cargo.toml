@@ -18,7 +18,6 @@ ignored = ["md-5"]
 bytes.workspace = true
 daer-config.workspace = true
 daer-observe.workspace = true
-libc.workspace = true
 aes.workspace = true
 aes-gcm.workspace = true
 blake3.workspace = true
@@ -33,6 +32,7 @@ zeroize.workspace = true
 fastrand.workspace = true
 getrandom.workspace = true
 netune.workspace = true
+netune-http1.workspace = true
 netune-trace.workspace = true
 netune-ws.workspace = true
 netune-quic.workspace = true
@@ -40,7 +40,6 @@ netune-http3.workspace = true
 tokio.workspace = true
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 ml-kem.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
@@ -49,6 +48,9 @@ sha3.workspace = true
 
 # `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
 # targets explicitly is what keeps cargo from compiling it as a binary of its own.
+[[test]]
+name = "architecture"
+
 [[test]]
 name = "shadowsocks_interop"
 

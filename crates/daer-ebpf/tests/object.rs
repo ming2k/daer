@@ -17,7 +17,7 @@ fn object_path() -> Option<PathBuf> {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ebpf/datapath.o");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ebpf/datapath.bpf.o");
     path.is_file().then_some(path)
 }
 
@@ -39,7 +39,7 @@ fn parsed_object() -> Option<Object> {
 #[test]
 fn every_program_section_is_one_aya_parses() {
     let Some(path) = object_path() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     let bytes = std::fs::read(&path).expect("reads the compiled object");
@@ -58,7 +58,7 @@ fn every_program_section_is_one_aya_parses() {
 #[test]
 fn object_contains_every_map_we_reference() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     for name in daer_ebpf::names::map::ALL {
@@ -69,7 +69,7 @@ fn object_contains_every_map_we_reference() {
 #[test]
 fn the_listener_map_is_a_sockmap_with_fd_sized_values() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     let map = &object.maps[daer_ebpf::names::map::LISTEN_SOCKET];
@@ -94,7 +94,7 @@ fn the_listener_map_is_a_sockmap_with_fd_sized_values() {
 #[test]
 fn object_contains_every_program_we_reference() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     for name in daer_ebpf::names::program::ALL {
@@ -169,7 +169,7 @@ fn assert_programs_survive_call_relocation(object: &mut Object, source: &str) {
 #[test]
 fn every_program_keeps_a_verifier_legal_func_info_after_linking() {
     let Some(mut object) = parsed_object() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     assert_programs_survive_call_relocation(&mut object, "compiled object");
@@ -178,7 +178,7 @@ fn every_program_keeps_a_verifier_legal_func_info_after_linking() {
 #[test]
 fn object_is_licensed_for_the_kernel() {
     let Some(object) = parsed_object() else {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     };
     // GPL-compatible helpers (bpf_loop, bpf_get_current_task) require this.
@@ -189,7 +189,7 @@ fn object_is_licensed_for_the_kernel() {
 #[test]
 fn param_layout_is_what_the_c_struct_expects() {
     // Kept next to the object checks: both guard the same boundary.
-    assert_eq!(std::mem::size_of::<daer_ebpf::RuntimeParam>(), 32);
+    assert_eq!(std::mem::size_of::<daer_ebpf::RuntimeParam>(), 28);
     let param = daer_ebpf::RuntimeParam::default();
-    assert_eq!(param.as_bytes().len(), 32);
+    assert_eq!(param.as_bytes().len(), 28);
 }

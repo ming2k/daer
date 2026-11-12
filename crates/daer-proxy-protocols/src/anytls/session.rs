@@ -29,6 +29,7 @@ pub struct AnyTlsSession {
     active_streams: StreamMap,
     outbound_tx: mpsc::UnboundedSender<Frame>,
     is_closed: Arc<AtomicBool>,
+    alpn_protocol: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for AnyTlsSession {
@@ -39,13 +40,14 @@ impl std::fmt::Debug for AnyTlsSession {
                 &self.next_stream_id.load(Ordering::Relaxed),
             )
             .field("is_closed", &self.is_closed())
+            .field("alpn_protocol", &self.alpn_protocol)
             .finish()
     }
 }
 
 impl AnyTlsSession {
     /// Spawns background reader, writer, and heartbeat tasks for an established TLS transport.
-    pub fn new(transport: Box<dyn netune::Transport>) -> Arc<Self> {
+    pub fn new(transport: Box<dyn netune::Transport>, alpn_protocol: Option<Vec<u8>>) -> Arc<Self> {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let pending_synacks = Arc::new(Mutex::new(HashMap::new()));
         let active_streams = Arc::new(Mutex::new(HashMap::new()));
@@ -57,6 +59,7 @@ impl AnyTlsSession {
             active_streams: Arc::clone(&active_streams),
             outbound_tx: outbound_tx.clone(),
             is_closed: Arc::clone(&is_closed),
+            alpn_protocol,
         });
 
         let (reader, writer) = tokio::io::split(transport);
@@ -97,6 +100,12 @@ impl AnyTlsSession {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
+    }
+
+    /// The raw ALPN name negotiated by the underlying TLS session.
+    #[must_use]
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
     }
 
     /// Opens a virtual stream to the requested destination (`host:port`).

@@ -41,9 +41,8 @@
 //!
 //! # Privilege
 //!
-//! Creating and mounting the private namespace, moving a link into it and `setns(2)` all
-//! require `CAP_SYS_ADMIN`. The shipped unit carries it; `daer run --no-datapath` does not
-//! touch this module.
+//! Creating and mounting the private namespace and `setns(2)` require `CAP_SYS_ADMIN`.
+//! The shipped unit carries it; `daer run --no-datapath` does not touch this module.
 
 use std::fs;
 use std::fs::File;
@@ -119,9 +118,6 @@ pub fn isolate_ingress_mounts() -> Result<(), DatapathError> {
         return Ok(());
     }
 
-    // A mount left by a daemon that predates this isolation lives in the host `/run/netns`;
-    // remove it before the private tmpfs hides that directory.
-    remove_legacy_ingress();
     isolate().map_err(|error| DatapathError::Device(error.to_string()))?;
     *private = Some(mount_namespace_id().map_err(|error| {
         DatapathError::Device(format!("cannot read the private mount namespace: {error}"))
@@ -176,24 +172,6 @@ fn isolate() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Removes a `daer0ns` mount left in the host `/run/netns` by an older daemon.
-///
-/// This runs before the private tmpfs is mounted. A failed `ip netns del` is not fatal: the
-/// path may be the regular file `ip netns add` creates before its bind mount, which has no
-/// namespace behind it. Unlinking that file is the cleanup.
-fn remove_legacy_ingress() {
-    let path = namespace_path(INGRESS_NETNS);
-    if !path.exists() {
-        return;
-    }
-    let _ = Command::new("ip")
-        .args(["netns", "del", INGRESS_NETNS])
-        .output();
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
 }
 
 fn format_mac(mac: [u8; 6]) -> String {
@@ -273,32 +251,6 @@ impl IngressNamespace {
         &self.name
     }
 
-    /// Moves a host link into this namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DatapathError::Device`] when `ip link set` fails. On failure the caller's
-    /// guard still owns and removes the namespace.
-    pub fn move_link(&self, link: &str) -> Result<(), DatapathError> {
-        let output = Command::new("ip")
-            .args(["link", "set", link, "netns", &self.name])
-            .output()
-            .map_err(|error| {
-                DatapathError::Device(format!(
-                    "cannot run `ip link set {link} netns {}`: {error}",
-                    self.name
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(DatapathError::Device(format!(
-                "`ip link set {link} netns {}` failed: {}",
-                self.name,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(())
-    }
-
     /// Brings one link in this namespace up.
     ///
     /// # Errors
@@ -316,6 +268,21 @@ impl IngressNamespace {
             )));
         }
         Ok(())
+    }
+
+    /// The MAC address of a link inside this namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatapathError::Device`] when the namespace cannot be entered or the link
+    /// does not report a six-octet Ethernet address.
+    pub fn link_mac(&self, link: &str) -> Result<[u8; 6], DatapathError> {
+        self.with(|| datapath::link_mac(link)).map_err(|error| {
+            DatapathError::Device(format!(
+                "cannot enter {} to read {link}'s MAC: {error}",
+                self.name
+            ))
+        })?
     }
 
     /// Runs a command inside this namespace and returns its output.
@@ -477,8 +444,8 @@ impl IngressNamespace {
 ///
 /// `ip netns del` is the normal path: it unmounts `/run/netns/daer0ns` and unlinks the mount
 /// point. If `ip` is unavailable, the namespace is still a bind mount; detaching it and
-/// unlinking the path is the same operation the tool performs. The function is deliberately
-/// idempotent so both the RAII guard and the post-crash cleanup can call it.
+/// unlinking the path is the same operation the tool performs. The function is idempotent so
+/// the RAII guard and a partial-creation path can both call it.
 pub(crate) fn remove_ingress_namespace() {
     let path = namespace_path(INGRESS_NETNS);
     let output = Command::new("ip")
@@ -512,49 +479,20 @@ impl Drop for IngressNamespace {
     }
 }
 
-/// Removes the host-visible pair if preparation fails before the namespace owns the peer.
-///
-/// `reset_device_pair` creates both ends before the namespace exists. Every later step can
-/// fail (`ip netns add`, moving the peer, configuring it), and without this guard a failed
-/// start leaves `daer0`/`daer0peer` in the host namespace even though no daemon is running.
-#[derive(Debug)]
-struct DevicePairGuard {
-    armed: bool,
-}
-
-impl DevicePairGuard {
-    const fn armed() -> Self {
-        Self { armed: true }
-    }
-
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DevicePairGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            datapath::remove_device_pair();
-        }
-    }
-}
-
 /// Everything the host needs after the private ingress has been prepared.
 #[derive(Debug)]
 pub struct PreparedIngress {
     /// The namespace guard. Hold it for the daemon's lifetime; dropping it tears down the
     /// peer device and the namespace.
     pub namespace: Arc<IngressNamespace>,
-    /// The peer MAC captured before the peer was moved out of the host namespace.
+    /// The peer MAC captured inside the private ingress namespace.
     pub peer_mac: [u8; 6],
     /// The host-side `daer0` ifindex, the datapath's redirect target.
     pub device_ifindex: u32,
 }
 
 impl PreparedIngress {
-    /// Creates the veth pair, captures its host facts, creates the namespace and moves the
-    /// peer into it.
+    /// Creates the namespace first, then the veth pair with the peer already inside it.
     ///
     /// # Errors
     ///
@@ -564,21 +502,17 @@ impl PreparedIngress {
         // Host forwarding and martian settings are the operator's. Check them before creating
         // a device or changing a route; the daemon does not mutate global policy to work.
         datapath::check_host_sysctls()?;
-        // Remove host policy state from a pre-namespace daer run before any listener binds.
-        // The current table is installed inside the namespace, so leaving a host-level
-        // mark rule in place would route the listener's own marked replies to `lo`.
-        datapath::clear_host_policy_routing();
-        datapath::reset_device_pair()?;
-        // From here until the namespace owns the peer, a failure must not leave the pair
-        // behind. Disarmed only after the peer is inside the namespace, where deleting the
-        // namespace removes both ends.
-        let pair = DevicePairGuard::armed();
-        let peer_mac = datapath::peer_mac()?;
+
+        // The namespace exists before the pair. `create_device_pair` places the peer inside
+        // it in the same netlink operation that creates the host end, so there is no window
+        // in which both ends live in the host namespace. If the process dies at any later
+        // point, deleting the namespace destroys the peer and with it the host end.
+        let namespace = IngressNamespace::create()?;
+        datapath::create_device_pair(namespace.name())?;
+        let peer_mac = namespace.link_mac(PEER)?;
         let device_mac = datapath::link_mac(DEVICE)?;
         let device_ifindex = datapath::ifindex(DEVICE)?;
 
-        let namespace = IngressNamespace::create()?;
-        namespace.move_link(PEER)?;
         namespace.link_up(PEER)?;
         datapath::link_up(DEVICE)?;
 
@@ -586,7 +520,6 @@ impl PreparedIngress {
             daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 host-side next hop is unavailable");
         }
         namespace.configure_peer(device_mac)?;
-        pair.disarm();
 
         Ok(Self {
             namespace: Arc::new(namespace),

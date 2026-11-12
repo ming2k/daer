@@ -68,9 +68,7 @@ pub mod supervise;
 mod testkit;
 
 pub use error::{DialFailure, Reject, RelayError};
-pub use inbound::tcp::{
-    Accepted, FlowFacts, TransparentListener, bind_shared, is_self_connect, unmap,
-};
+pub use inbound::tcp::{Accepted, FlowFacts, TransparentListener, bind_shared, unmap};
 pub use inbound::udp::{Datagram, DatagramFamily, DatagramIngress, TransparentDatagramListener};
 pub use relay::datagram::{
     DatagramLeg, DatagramRouter, DatagramService, DatagramSnapshot, DatagramStats, OpenDatagram,

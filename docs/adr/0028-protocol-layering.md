@@ -150,7 +150,8 @@ fields by construction, and `security.type = "tls"` cannot carry a `public-key` 
 
 ## What this ADR does not decide
 
-- **Chained outbounds** (`a -> b`). Still rejected, unchanged.
+- **Chained outbounds** (`a -> b`). Expanded by [ADR-0044](0044-outbound-detour-chain.md):
+  a `[[node]] detour` is a validated outbound chain; URI chain strings remain rejected.
 - **Mux / XUDP as a general capability.** VLESS over Vision carries UDP as XUDP because
   the reference does; that is recorded in ADR-0029 and does not create a
   general-purpose mux layer.

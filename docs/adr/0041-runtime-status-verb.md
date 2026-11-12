@@ -1,6 +1,7 @@
 ---
 id: ADR-0041
 title: "The CLI gains a read-only runtime inspector: daer status"
+amended-by: [ADR-0046, ADR-0047]
 status: accepted
 date: 2026-11-11
 scope: [cli/surface, architecture/diagnostics, observability]

@@ -10,6 +10,9 @@ the contract. `daer status` is the first command; the rest of this page is the d
 daer status                 # live socket, or the last state file with a warning
 daer status --json          # the versioned snapshot for automation
 daer status --bundle DIR    # a redacted incident bundle
+daer status --nodes         # live node resources and elected-by/health
+daer status --groups        # live resource pools
+daer status --elections     # live elections and current results
 ```
 
 The snapshot answers generation, policy hash, datapath attachment, live flows, DNS counters,
@@ -20,8 +23,8 @@ the JSONL flight recorder; `daer status --flow <ID>` prints every event for one 
 ## 1. "What is running?"
 
 ```
-info  configuration loaded      generation=gen1 rules=6 groups=2 nodes=8 build_ms=3
-info  configuration reloaded    generation=gen2 previous=gen1 rules=7 groups=2 nodes=8 routing_changed=true build_ms=2
+info  configuration loaded      generation=gen1 rules=6 groups=2 elections=2 nodes=8 build_ms=3
+info  configuration reloaded    generation=gen2 previous=gen1 rules=7 groups=2 elections=2 nodes=8 routing_changed=true build_ms=2
 ```
 
 * `generation` is monotonically increasing. Identifiers count **attempts**: a
@@ -36,7 +39,7 @@ Inspect without a log pipeline:
 ```rust
 let generations = Generations::new(&config)?;
 let current = generations.current();          // Arc<Generation>, pinned for a flow
-current.describe();                            // "gen1 rules=6 groups=2 nodes=8 built_in=3ms"
+current.describe();                            // "gen1 rules=6 groups=2 elections=2 nodes=8 built_in=3ms"
 current.policy_hash();                         // [u8; 32]
 ```
 
@@ -44,7 +47,7 @@ current.policy_hash();                         // [u8; 32]
 
 ```
 error configuration reload rejected; the running generation is unchanged
-      generation=gen5 serving=gen4 error=outbound (group) "nope" not found …
+      generation=gen5 serving=gen4 error=outbound "nope" is not an election …
 ```
 
 A rejected generation publishes nothing: `Generations::reload` returns
@@ -56,7 +59,7 @@ The `Display` of the error says both facts, because a reload failure that leaves
 the proxy serving is not an outage and must not read like one:
 
 ```
-reload rejected: outbound (group) "nope" not found; gen4 is still serving
+reload rejected: outbound "nope" is not an election; gen4 is still serving
 ```
 
 ## 3. "This flow went to the wrong outbound."
@@ -73,7 +76,7 @@ change what the kernel and the outbound do, and reading them from the log is fas
 than reading the config.
 
 ```
-trace node selected  flow_id=f0000000000000012 group=proxy node=hk-01 protocol=Socks5
+trace node selected  flow_id=f0000000000000012 election=proxy node=hk-01 protocol=Socks5
 debug flow closed    flow_id=f0000000000000012 destination=93.184.216.34:443
                      to_upstream=512 to_client=4096 elapsed_ms=87
 ```
@@ -101,8 +104,8 @@ daer route 192.168.1.10:41234 93.184.216.34:443 -c config.toml
 It compiles the same generation a running daer would use and asks it the same
 question, so the answer is the answer the data path acts on — no kernel, no
 privileges, no traffic. The exit status is part of the contract: `0` when the flow
-has a usable outbound, `1` when it would be dropped (`block`, a missing group, an
-empty group) or when the configuration cannot run at all. A diagnostic that always
+has a usable outbound, `1` when it would be dropped (`block`, a missing election, an
+empty election) or when the configuration cannot run at all. A diagnostic that always
 exits 0 cannot be used in a check.
 
 The `decided by` line is the **normalized** rule, not the file's spelling: the
@@ -205,7 +208,7 @@ fires here" — visible as a rule that never appears in `flow decided` logs.
 | --- | --- | --- |
 | `debug dropped a flow that was not redirected` | `Reject::SelfConnect` | a client connected to the transparent port directly; nothing to route |
 | `debug blocked by a routing rule` | `Reject::Blocked` | a rule said `block`; the flow was dropped on purpose |
-| `warn no outbound leg` | `IngressError::Dial` | the group had no selectable node, or the dial failed |
+| `warn no outbound leg` | `IngressError::Dial` | the election had no electable node, or the dial failed |
 | `warn accept failed on a resource limit; backing off` | `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` | fd or memory pressure; the loop backs off and keeps serving |
 | `warn flow task ended abnormally` | a cancelled or panicked flow | isolated to that flow; `panicked` in the counters |
 
@@ -216,7 +219,7 @@ let stats = metrics.snapshot();
 // ServeStats { accepted, rejected, failed, exhausted, panicked }
 ```
 
-`failed` includes both "no selectable node" and "dial failed"; the log line tells
+`failed` includes both "no electable node" and "dial failed"; the log line tells
 them apart.
 
 ### "The listener accepts a direct connection but redirected flows time out"
@@ -471,7 +474,7 @@ and "bind 127.0.0.1" differ by something the operator cannot see in the file.
 | `credentials are not \`method:password\`` | the base64 payload is malformed |
 | `link has an empty password` | the link parses but has no secret |
 | `shadowsocks record failed authentication` | the key, the salt or the bytes are wrong — the message deliberately does not say which |
-| the node is listed but `no selectable node` | the link was rejected at generation build; see the log line naming the reason |
+| the node is listed but `no electable node` | the link was rejected at generation build; see the log line naming the reason |
 
 Two failure modes that are protocol-level, not configuration-level:
 

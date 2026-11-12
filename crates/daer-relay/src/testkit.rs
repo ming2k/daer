@@ -88,7 +88,7 @@ impl crate::serve::Decide for EchoDecide {
         let destination = flow.destination;
         Box::pin(async move {
             if reject {
-                return Err(RelayError::Rejected(crate::error::Reject::SelfConnect {
+                return Err(RelayError::Rejected(crate::error::Reject::Blocked {
                     destination,
                 }));
             }

@@ -425,7 +425,7 @@ pub fn is_resource_exhausted(error: &std::io::Error) -> bool {
 /// Convenience for a rejection without an accepted flow.
 #[must_use]
 pub fn reject(destination: std::net::SocketAddr) -> RelayError {
-    RelayError::Rejected(Reject::SelfConnect { destination })
+    RelayError::Rejected(Reject::Blocked { destination })
 }
 
 #[cfg(test)]

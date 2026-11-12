@@ -18,8 +18,8 @@
 //!
 //! | Protocol | Wire | Where it comes from |
 //! | --- | --- | --- |
-//! | `udp` | RFC 1035 §4.2.1 | a plain `UdpSocket` — no dependency on any other subsystem |
-//! | `tcp` | RFC 1035 §4.2.2 | a plain `TcpStream` |
+//! | `udp` | RFC 1035 §4.2.1 | netune's [`UdpConnector`], one connected session per query |
+//! | `tcp` | RFC 1035 §4.2.2 | netune's [`TcpConnector`], with the daemon's socket policy |
 //! | `tls` / `dot` | RFC 7858 | netune's [`TlsConnector`], used only as a byte pipe |
 //! | `https` / `doh` | RFC 8484 | netune's HTTP client, for framing and `Content-Type` |
 //!
@@ -28,12 +28,14 @@
 //! per-query failure: a resolver that loads and then refuses every query is a
 //! configuration an operator believes is working, which is the worst of both.
 //!
-//! # Encryption is netune's; DNS is ours
+//! # Transport is netune's; DNS is ours
 //!
-//! For DoT and DoH this module supplies the DNS framing and nothing else. What TLS
+//! For every upstream this module supplies the DNS framing and nothing else. What TLS
 //! identity is presented is [`Target::tls`]'s business, and what HTTP looks like on the
 //! wire is the client's — so a fingerprint profile configured for the resolver is the
-//! same mechanism as for any other dial, not a parallel one.
+//! same mechanism as for any other dial, not a parallel one. Every connector receives the
+//! daemon's [`SocketConfig`], so a privileged run marks DNS egress like every other
+//! outbound instead of letting the resolver be captured by daer's own listener.
 //!
 //! # UDP and truncation
 //!
@@ -47,10 +49,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use netune::{Client, ClientConfig, Method, Pool, RequestHead, Target, TcpConnector, TlsConnector};
+use netune::{
+    Client, ClientConfig, Connector, DatagramConnector, Method, Pool, RequestHead, SocketConfig,
+    Target, TcpConnector, TlsConnector, UdpConnector,
+};
 use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
 
 use crate::resolver::{ExchangeFuture, Upstream, UpstreamError};
 use crate::wire::{self, Message};
@@ -203,24 +207,27 @@ impl UpstreamSpec {
 
     /// Builds the transport this spec describes.
     ///
+    /// `socket_config` is applied to every upstream's netune connector, so a privileged
+    /// daemon's DNS egress carries the same `SO_MARK` as every other dial.
+    ///
     /// # Errors
     ///
     /// Returns [`UpstreamError::Missing`] when the spec names no protocol this build can
     /// speak. Every protocol in [`Protocol`] is implemented, so this can only happen if a
     /// variant is added without an arm here — which is exactly the case a `match` makes
     /// impossible to forget.
-    pub fn build(&self) -> Result<Arc<dyn Upstream>, UpstreamError> {
+    pub fn build(&self, socket_config: SocketConfig) -> Result<Arc<dyn Upstream>, UpstreamError> {
         let upstream: Arc<dyn Upstream> = match self.protocols.as_slice() {
             // A chain is tried in order; the first protocol that is *built* is used, and
             // `Failover` handles the rest at query time.
             [] => return Err(UpstreamError::Missing(self.tag.clone())),
             [only] => match only {
-                Protocol::Udp => Arc::new(UdpUpstream::new(self)),
-                Protocol::Tcp => Arc::new(TcpUpstream::new(self)),
-                Protocol::Tls => Arc::new(TlsUpstream::new(self)?),
-                Protocol::Https => Arc::new(HttpsUpstream::new(self)?),
+                Protocol::Udp => Arc::new(UdpUpstream::new(self, socket_config)),
+                Protocol::Tcp => Arc::new(TcpUpstream::new(self, socket_config)),
+                Protocol::Tls => Arc::new(TlsUpstream::new(self, socket_config)?),
+                Protocol::Https => Arc::new(HttpsUpstream::new(self, socket_config)?),
             },
-            _ => Arc::new(ChainUpstream::new(self)?),
+            _ => Arc::new(ChainUpstream::new(self, socket_config)?),
         };
         Ok(upstream)
     }
@@ -232,14 +239,16 @@ struct Common {
     address: SocketAddr,
     server_name: String,
     timeout: Duration,
+    socket_config: SocketConfig,
 }
 
 impl Common {
-    fn new(spec: &UpstreamSpec) -> Self {
+    fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Self {
         Self {
             address: spec.address,
             server_name: spec.server_name.clone(),
             timeout: DEFAULT_EXCHANGE_TIMEOUT,
+            socket_config,
         }
     }
 
@@ -304,9 +313,9 @@ pub struct UdpUpstream {
 }
 
 impl UdpUpstream {
-    fn new(spec: &UpstreamSpec) -> Self {
+    fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Self {
         Self {
-            common: Common::new(spec),
+            common: Common::new(spec, socket_config),
         }
     }
 
@@ -330,27 +339,34 @@ impl Upstream for UdpUpstream {
             let payload = payload_bytes(query)?;
             let address = self.common.address;
             let exchange = async {
-                // A fresh socket per exchange. Reuse would need its own id-demultiplexing
-                // and a stale-socket story; one socket per query costs a syscall pair and
-                // makes "this reply belongs to this query" true by construction, because
-                // only one datagram can ever arrive on it.
-                let socket = UdpSocket::bind(bind_any_for(address))
+                // A fresh connected session per exchange. Reuse would need its own
+                // id-demultiplexing and a stale-socket story; one session per query makes
+                // "this reply belongs to this query" true by construction, because only one
+                // datagram can ever arrive on it.
+                let connector = UdpConnector::new()
+                    .with_socket_config(self.common.socket_config.clone())
+                    .with_connect_timeout(Some(self.common.timeout));
+                let session = connector
+                    .connect(&address.to_string(), &TraceCollector::disabled())
                     .await
                     .map_err(|error| {
-                        UpstreamError::Failed(format!("bind for {address}: {error}"))
+                        UpstreamError::Failed(format!("connect to {address}: {error}"))
                     })?;
-                socket.connect(address).await.map_err(|error| {
-                    UpstreamError::Failed(format!("connect to {address}: {error}"))
-                })?;
-                socket.send(&payload).await.map_err(|error| {
+                session.datagrams.send(&payload).await.map_err(|error| {
                     UpstreamError::Failed(format!("send to {address}: {error}"))
                 })?;
 
                 // EDNS0 advertises the client's buffer size; without a reply larger than
-                // the classic 512 bytes a large answer can only arrive truncated. 64 KiB is
-                // the practical ceiling for a UDP payload.
-                let mut buffer = vec![0u8; MAX_MESSAGE];
-                let read = socket.recv(&mut buffer).await.map_err(|error| {
+                // the classic 512 bytes a large answer can only arrive truncated. The session
+                // reports the largest payload it can receive.
+                let mut buffer = vec![
+                    0u8;
+                    session
+                        .datagrams
+                        .max_datagram_size()
+                        .clamp(512, MAX_MESSAGE)
+                ];
+                let read = session.datagrams.recv(&mut buffer).await.map_err(|error| {
                     UpstreamError::Failed(format!("receive from {address}: {error}"))
                 })?;
                 buffer.truncate(read);
@@ -368,14 +384,6 @@ impl Upstream for UdpUpstream {
     }
 }
 
-/// The unspecified address of the same family as `peer`.
-fn bind_any_for(peer: SocketAddr) -> SocketAddr {
-    match peer {
-        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
-    }
-}
-
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
 /// DNS over TCP, with a two-byte length prefix.
@@ -385,9 +393,9 @@ pub struct TcpUpstream {
 }
 
 impl TcpUpstream {
-    pub fn new(spec: &UpstreamSpec) -> Self {
+    pub fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Self {
         Self {
-            common: Common::new(spec),
+            common: Common::new(spec, socket_config),
         }
     }
 
@@ -413,12 +421,17 @@ impl Upstream for TcpUpstream {
             let address = self.common.address;
 
             let exchange = async {
-                let mut stream = TcpStream::connect(address).await.map_err(|error| {
-                    UpstreamError::Failed(format!("connect to {address}: {error}"))
-                })?;
-                stream
-                    .set_nodelay(true)
-                    .map_err(|error| UpstreamError::Failed(format!("set TCP_NODELAY: {error}")))?;
+                let connector = TcpConnector::new()
+                    .with_socket_config(self.common.socket_config.clone())
+                    .with_connect_timeout(Some(self.common.timeout));
+                let target = Target::plain(address.to_string());
+                let established = connector
+                    .connect(&target, &TraceCollector::disabled())
+                    .await
+                    .map_err(|error| {
+                        UpstreamError::Failed(format!("connect to {address}: {error}"))
+                    })?;
+                let mut stream = established.stream;
                 write_length_prefixed(&mut stream, length, &payload, address).await?;
                 read_length_prefixed(&mut stream, address).await
             };
@@ -503,15 +516,18 @@ impl fmt::Debug for TlsUpstream {
 }
 
 impl TlsUpstream {
-    fn new(spec: &UpstreamSpec) -> Result<Self, UpstreamError> {
-        let common = Common::new(spec);
-        let connector =
-            TlsConnector::platform(TcpConnector::new().with_connect_timeout(Some(common.timeout)))
-                .map_err(|error| {
-                    UpstreamError::Failed(format!(
-                        "DNS-over-TLS needs a platform trust store: {error}"
-                    ))
-                })?;
+    fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Result<Self, UpstreamError> {
+        let common = Common::new(spec, socket_config.clone());
+        let connector = TlsConnector::platform(
+            TcpConnector::new()
+                .with_socket_config(socket_config)
+                .with_connect_timeout(Some(common.timeout)),
+        )
+        .map_err(|error| {
+            UpstreamError::Failed(format!(
+                "DNS-over-TLS needs a platform trust store: {error}"
+            ))
+        })?;
         Ok(Self { common, connector })
     }
 
@@ -585,15 +601,18 @@ impl fmt::Debug for HttpsUpstream {
 }
 
 impl HttpsUpstream {
-    fn new(spec: &UpstreamSpec) -> Result<Self, UpstreamError> {
-        let common = Common::new(spec);
-        let connector =
-            TlsConnector::platform(TcpConnector::new().with_connect_timeout(Some(common.timeout)))
-                .map_err(|error| {
-                    UpstreamError::Failed(format!(
-                        "DNS-over-HTTPS needs a platform trust store: {error}"
-                    ))
-                })?;
+    fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Result<Self, UpstreamError> {
+        let common = Common::new(spec, socket_config.clone());
+        let connector = TlsConnector::platform(
+            TcpConnector::new()
+                .with_socket_config(socket_config)
+                .with_connect_timeout(Some(common.timeout)),
+        )
+        .map_err(|error| {
+            UpstreamError::Failed(format!(
+                "DNS-over-HTTPS needs a platform trust store: {error}"
+            ))
+        })?;
         let config = ClientConfig {
             // A redirect on a DNS endpoint is a configuration error, not a hop to follow:
             // silently querying a different host would send the query somewhere the
@@ -681,12 +700,12 @@ pub struct ChainUpstream {
 }
 
 impl ChainUpstream {
-    fn new(spec: &UpstreamSpec) -> Result<Self, UpstreamError> {
+    fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Result<Self, UpstreamError> {
         let mut members = Vec::with_capacity(spec.protocols.len());
         for protocol in &spec.protocols {
             let mut single = spec.clone();
             single.protocols = vec![*protocol];
-            members.push(single.build()?);
+            members.push(single.build(socket_config.clone())?);
         }
         Ok(Self {
             tag: spec.tag.clone(),
@@ -727,7 +746,7 @@ mod tests {
     use super::*;
     use crate::wire::{Flags, RecordType};
     use std::net::Ipv4Addr;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
 
     fn query(id: u16) -> Message {
         wire::query(id, "example.com", RecordType::A).expect("builds a query")
@@ -753,12 +772,30 @@ mod tests {
     }
 
     #[test]
+    fn every_upstream_keeps_the_daemons_socket_policy() {
+        let socket_config = SocketConfig::default().with_mark(0x1234);
+        let udp = UdpUpstream::new(&spec("u:udp://1.1.1.1:53"), socket_config.clone());
+        assert_eq!(udp.common.socket_config.mark, Some(0x1234));
+
+        let tcp = TcpUpstream::new(&spec("u:tcp://1.1.1.1:53"), socket_config.clone());
+        assert_eq!(tcp.common.socket_config.mark, Some(0x1234));
+
+        let tls = TlsUpstream::new(&spec("u:tls://1.1.1.1:853"), socket_config.clone())
+            .expect("DoT builds");
+        assert_eq!(tls.common.socket_config.mark, Some(0x1234));
+
+        let https =
+            HttpsUpstream::new(&spec("u:https://1.1.1.1:443"), socket_config).expect("DoH builds");
+        assert_eq!(https.common.socket_config.mark, Some(0x1234));
+    }
+
+    #[test]
     fn every_protocol_builds() {
         // The regression this guards: a protocol that parses and is documented but has no
         // transport, which is the state `udp`, `tls` and `https` were in.
         for token in ["udp", "tcp", "tls", "https"] {
             let spec = spec(&format!("u:{token}://1.1.1.1:53"));
-            let built = spec.build().unwrap_or_else(|error| {
+            let built = spec.build(SocketConfig::default()).unwrap_or_else(|error| {
                 panic!("{token} must build, got {error}");
             });
             let _ = built;
@@ -798,7 +835,7 @@ mod tests {
         // Building must succeed for both members; the chain's behaviour at query time is
         // covered by the `udp+tcp` integration test in `tests/upstreams.rs`.
         let spec = spec("u:udp+tcp://1.1.1.1:53");
-        let built = spec.build().expect("builds");
+        let built = spec.build(SocketConfig::default()).expect("builds");
         drop(built);
     }
 
@@ -816,7 +853,7 @@ mod tests {
         });
 
         let upstream = spec(&format!("local:udp://{address}"))
-            .build()
+            .build(SocketConfig::default())
             .expect("builds");
         let reply = upstream.exchange(&query(7)).await.expect("answers");
         assert_eq!(reply.id, 7);
@@ -836,7 +873,8 @@ mod tests {
         });
 
         let spec = spec(&format!("local:udp://{address}"));
-        let upstream = UdpUpstream::new(&spec).with_timeout(Duration::from_millis(80));
+        let upstream = UdpUpstream::new(&spec, SocketConfig::default())
+            .with_timeout(Duration::from_millis(80));
         let error = upstream.exchange(&query(1)).await.expect_err("must fail");
         assert!(error.to_string().contains("did not answer"), "{error}");
     }
@@ -857,7 +895,7 @@ mod tests {
         });
 
         let upstream = spec(&format!("local:udp://{address}"))
-            .build()
+            .build(SocketConfig::default())
             .expect("builds");
         let error = upstream.exchange(&query(7)).await.expect_err("must reject");
         assert!(error.to_string().contains("does not match"), "{error}");
@@ -884,7 +922,7 @@ mod tests {
         });
 
         let upstream = spec(&format!("local:tcp://{address}"))
-            .build()
+            .build(SocketConfig::default())
             .expect("builds");
         let reply = upstream.exchange(&query(11)).await.expect("answers");
         assert_eq!(reply.id, 11);
@@ -908,7 +946,7 @@ mod tests {
         });
 
         let upstream = spec(&format!("local:tcp://{address}"))
-            .build()
+            .build(SocketConfig::default())
             .expect("builds");
         let error = upstream.exchange(&query(1)).await.expect_err("must reject");
         assert!(error.to_string().contains("malformed"), "{error}");
@@ -927,7 +965,8 @@ mod tests {
         });
 
         let spec = spec(&format!("local:tcp://{address}"));
-        let upstream = TcpUpstream::new(&spec).with_timeout(Duration::from_millis(50));
+        let upstream = TcpUpstream::new(&spec, SocketConfig::default())
+            .with_timeout(Duration::from_millis(50));
         let error = upstream.exchange(&query(1)).await.expect_err("must fail");
         assert!(error.to_string().contains("did not answer"), "{error}");
     }
@@ -941,7 +980,8 @@ mod tests {
         drop(listener);
 
         let spec = spec(&format!("local:tcp://{address}"));
-        let upstream = TcpUpstream::new(&spec).with_timeout(Duration::from_millis(500));
+        let upstream = TcpUpstream::new(&spec, SocketConfig::default())
+            .with_timeout(Duration::from_millis(500));
         let error = upstream.exchange(&query(1)).await.expect_err("must fail");
         assert!(error.to_string().contains("connect"), "{error}");
     }

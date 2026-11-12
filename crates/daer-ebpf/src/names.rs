@@ -10,7 +10,7 @@
 //!
 //! The values are daer's own (ADR-0020). There is no prefix left over from another
 //! project: `daer_ifindex_map`, `tproxy_daer0_ingress` and the rest are named here and
-//! in `ebpf/kern/tproxy.c`, in one commit, because the C source is ours.
+//! in `ebpf/kern/datapath.bpf.c`, in one commit, because the C source is ours.
 
 /// How a map relates to a configuration generation (ADR-0004).
 ///

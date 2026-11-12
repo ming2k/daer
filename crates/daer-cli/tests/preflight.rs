@@ -65,7 +65,7 @@ fn config(tag: &str) -> (Scratch, PathBuf) {
     let path = dir.join("preflight.toml");
     std::fs::write(
         &path,
-        "schema = 1\n\n[global]\nwan-interface = [\"auto\"]\ntproxy-port = 12398\n",
+        "schema = 2\n\n[global]\nwan-interface = [\"auto\"]\n",
     )
     .expect("writes the configuration");
     (dir, path)
@@ -108,9 +108,9 @@ fn unchanged(before: &Option<String>, after: Option<String>, what: &str) {
 
 #[test]
 fn a_dry_run_changes_no_system_state() {
-    let object = workspace_root().join("target/ebpf/datapath.o");
+    let object = workspace_root().join("target/ebpf/datapath.bpf.o");
     if !object.is_file() {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     }
     let (_dir, config) = config("state-changes");
@@ -154,9 +154,9 @@ fn a_dry_run_changes_no_system_state() {
 
 #[test]
 fn a_dry_run_reports_the_object_and_the_privilege_boundary() {
-    let object = workspace_root().join("target/ebpf/datapath.o");
+    let object = workspace_root().join("target/ebpf/datapath.bpf.o");
     if !object.is_file() {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     }
     let (_dir, config) = config("state-report");
@@ -217,9 +217,9 @@ fn daer_ebpf_capabilities_missing() -> bool {
 
 #[test]
 fn check_rejects_an_object_whose_func_info_drifted() {
-    let object = workspace_root().join("target/ebpf/datapath.o");
+    let object = workspace_root().join("target/ebpf/datapath.bpf.o");
     if !object.is_file() {
-        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.o");
+        eprintln!("skipping: run `cargo xtask ebpf` to build target/ebpf/datapath.bpf.o");
         return;
     }
     let (_dir, config) = config("state-funcinfo");

@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use netune::{
     Connector, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError,
-    SocketConfig, Target, TcpConnector, TlsConnector,
+    Target, TlsConnector,
 };
 use netune_trace::TraceCollector;
 use sha2::{Digest, Sha224};
@@ -51,6 +51,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
+use crate::server::ServerConnector;
 use crate::shadowsocks::connector::{encode_address, split_authority};
 
 /// The command byte for a TCP session.
@@ -221,11 +222,8 @@ pub struct TrojanConnector {
     link: Link,
     /// The TLS stack, from netune. Trojan has no confidentiality of its own, so this is not
     /// optional and there is no plaintext constructor.
-    tls: Arc<TlsConnector<TcpConnector>>,
+    tls: Arc<TlsConnector<ServerConnector>>,
     timeout: Duration,
-    /// `global.tls.profile`, applied per `Target` because netune selects the ClientHello
-    /// identity there rather than on the connector.
-    tls_profile: Option<&'static str>,
 }
 
 impl fmt::Debug for TrojanConnector {
@@ -255,21 +253,14 @@ impl TrojanConnector {
             tag: None,
             allow_insecure,
         };
-        let socket = match options.so_mark {
-            Some(mark) => SocketConfig::default().with_mark(mark),
-            None => SocketConfig::default(),
-        };
-        let tcp = TcpConnector::new()
-            .with_socket_config(socket)
-            .with_connect_timeout(Some(options.timeout));
-        let tls = TlsConnector::platform(tcp)
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        let config = crate::security::tls::profile_config(options.tls_profile, allow_insecure)?;
+        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
+            .with_handshake_timeout(None);
 
         Ok(Self {
             link,
             tls: Arc::new(tls),
             timeout: options.timeout,
-            tls_profile: options.tls_profile,
         })
     }
 
@@ -283,29 +274,18 @@ impl TrojanConnector {
     pub fn from_link(link: &str, options: DialerOptions) -> Result<Self, ProxyProtocolError> {
         let parsed = Link::parse(link).map_err(ProxyProtocolError::UnsupportedLink)?;
 
-        let socket = match options.so_mark {
-            Some(mark) => SocketConfig::default().with_mark(mark),
-            None => SocketConfig::default(),
-        };
-        let tcp = TcpConnector::new()
-            .with_socket_config(socket)
-            .with_connect_timeout(Some(options.timeout));
-
-        // The platform trust store, not a pinned set: a node's certificate is verified like any
-        // other HTTPS endpoint. A node with a self-signed certificate must be fronted by a real
-        // one, which is what Trojan servers do anyway.
-        let tls = TlsConnector::platform(tcp)
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        // The platform trust store, not a pinned set, unless the operator explicitly chose
+        // `allow-insecure`. The profile is compiled into the config here, so
+        // `global.tls.profile` reaches the wire for Trojan just as it does for VLESS/VMess.
+        let config =
+            crate::security::tls::profile_config(options.tls_profile, parsed.allow_insecure)?;
+        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
+            .with_handshake_timeout(None);
 
         Ok(Self {
             link: parsed,
             tls: Arc::new(tls),
             timeout: options.timeout,
-            // `global.tls.profile`: the ClientHello this deployment presents. Netune selects it
-            // per `Target`, so it is carried here and attached at dial time. It used to be
-            // accepted by the schema and never applied, so an operator who chose a profile got
-            // netune's default identity with no way to tell (ADR-0006).
-            tls_profile: options.tls_profile,
         })
     }
 
@@ -313,6 +293,21 @@ impl TrojanConnector {
     #[must_use]
     pub fn server(&self) -> &str {
         &self.link.server
+    }
+
+    /// Opens the bare TCP stream to this Trojan server, before TLS and the request header.
+    ///
+    /// A plaintext target makes netune's TLS connector skip the handshake, which is exactly the
+    /// chain/probe primitive: the caller wants the socket, not the protected session.
+    pub async fn connect_server(
+        &self,
+        recorder: &TraceCollector,
+    ) -> Result<Established, ProxyProtocolError> {
+        let target = Target::plain(self.link.server.clone());
+        tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
+            .await
+            .map_err(|_| ProxyProtocolError::Timeout)?
+            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))
     }
 
     /// The TLS name presented for this node.
@@ -339,10 +334,6 @@ impl TrojanConnector {
         // TLS to the node: the target carries the *node's* address and the name to verify,
         // which is exactly what `Target::tls` exists for.
         let target = Target::tls(&self.link.server, &self.link.server_name);
-        let target = match self.tls_profile {
-            Some(profile) => target.with_tls_profile(profile),
-            None => target,
-        };
         let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
             .await
             .map_err(|_| ProxyProtocolError::Timeout)?
@@ -364,6 +355,7 @@ impl TrojanConnector {
             local_port: established.local_port,
             socket: established.socket,
             alpn: established.alpn,
+            alpn_protocol: established.alpn_protocol,
         })
     }
 
@@ -385,10 +377,6 @@ impl TrojanConnector {
         let credential = self.link.credential();
 
         let target = Target::tls(&self.link.server, &self.link.server_name);
-        let target = match self.tls_profile {
-            Some(profile) => target.with_tls_profile(profile),
-            None => target,
-        };
         let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
             .await
             .map_err(|_| NetError::Connect(format!("timeout connecting to {}", self.link.server)))?
@@ -662,6 +650,16 @@ mod tests {
     }
 
     #[test]
+    fn the_udp_request_header_uses_the_associate_command() {
+        let header = request_header_udp("1.2.3.4:53").expect("encodes");
+        assert_eq!(header[0], CMD_UDP_ASSOCIATE);
+        assert_eq!(header[1], 1, "ATYP ipv4");
+        assert_eq!(&header[2..6], &[1, 2, 3, 4]);
+        assert_eq!(&header[6..8], &53u16.to_be_bytes());
+        assert_eq!(&header[8..], b"\r\n");
+    }
+
+    #[test]
     fn broken_links_name_the_broken_part() {
         let cases = [
             ("http://x", "does not start with trojan://"),
@@ -701,5 +699,34 @@ mod tests {
     fn link_detection_is_prefix_based() {
         assert!(is_trojan("trojan://x"));
         assert!(!is_trojan("ss://x"));
+    }
+
+    #[tokio::test]
+    async fn a_udp_datagram_round_trips_with_the_trojan_framing() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, split};
+
+        let target = encode_address("1.2.3.4", 443).expect("address");
+        let payload = b"ping";
+        let mut expected = target.clone();
+        expected.extend_from_slice(&u16::try_from(payload.len()).expect("small").to_be_bytes());
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(payload);
+
+        let (client, mut server) = duplex(4096);
+        let (reader, writer) = split(client);
+        let session = TrojanDatagramSession::new(reader, writer, target);
+
+        let server = tokio::spawn(async move {
+            let mut frame = vec![0u8; expected.len()];
+            server.read_exact(&mut frame).await.expect("reads frame");
+            assert_eq!(frame, expected);
+            server.write_all(&frame).await.expect("echoes frame");
+        });
+
+        assert_eq!(session.send(payload).await.expect("sends"), payload.len());
+        let mut received = [0u8; 64];
+        let read = session.recv(&mut received).await.expect("receives");
+        assert_eq!(&received[..read], payload);
+        server.await.expect("server task");
     }
 }

@@ -24,6 +24,7 @@ mod filter;
 mod group;
 mod latency;
 mod node_dialer;
+mod node_graph;
 mod observe;
 mod property;
 pub mod subscription;
@@ -34,10 +35,11 @@ pub use dialer::Dialer;
 pub use direct::DirectDialer;
 pub use error::OutboundError;
 pub use filter::{Annotation, FilterError, FilterSet};
-pub use group::DialerGroup;
+pub use group::ElectionRuntime;
 pub use latency::{LatenciesN, MovingAverage};
 pub use node_dialer::{DialerOptions, NodeDialer};
-pub use property::{GroupPolicy, Property, Protocol, Security, parse_group_policy};
+pub use node_graph::NodeGraph;
+pub use property::{Property, Protocol, Security};
 
 /// The ClientHello fragmentation plan, re-exported because [`DialerOptions`] carries one.
 ///

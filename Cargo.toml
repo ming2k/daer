@@ -23,8 +23,8 @@ version = "0.0.13"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
-authors = ["daeuniverse Organization <dae@v2raya.org>"]
-repository = "https://github.com/daeuniverse/daer"
+authors = ["daer contributors"]
+repository = "https://github.com/ming2k/daer"
 description = "An eBPF transparent proxy for Linux, with a Rust userspace"
 
 [workspace.lints.rust]
@@ -76,11 +76,12 @@ ipnet = "2.11"
 libc = "0.2"
 # Upstream transport library, locked via Cargo.lock. The tag names the released
 # combination.
-netune = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.24", default-features = false, features = ["ws", "quic", "http3"] }
-netune-trace = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.24" }
-netune-ws = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.24" }
-netune-quic = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.24" }
-netune-http3 = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.24" }
+netune = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28", default-features = false, features = ["ws", "quic", "http3"] }
+netune-http1 = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
+netune-trace = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
+netune-ws = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
+netune-quic = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
+netune-http3 = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
 aho-corasick = "1.1"
 regex = "1.11"
 schemars = "1.2"

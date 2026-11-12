@@ -101,7 +101,7 @@ impl Annotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterInput {
     Name,
-    Subtag,
+    Subscription,
 }
 
 #[derive(Debug)]
@@ -176,7 +176,7 @@ impl FilterSet {
     /// With no filters every node matches with a default annotation, which is
     /// `FilterAndAnnotate`'s early return in Go. `None` means the node is not
     /// selected by the group.
-    pub fn matches(&self, name: &str, subscription_tag: &str) -> Option<Annotation> {
+    pub fn matches(&self, name: &str, subscription_name: &str) -> Option<Annotation> {
         if self.lines.is_empty() {
             return Some(Annotation::default());
         }
@@ -184,7 +184,7 @@ impl FilterSet {
             let hit = line.functions.iter().all(|function| {
                 let subject = match function.input {
                     FilterInput::Name => name,
-                    FilterInput::Subtag => subscription_tag,
+                    FilterInput::Subscription => subscription_name,
                 };
                 let matched = function
                     .matchers
@@ -203,7 +203,7 @@ impl FilterSet {
 fn compile_function(function: &Function) -> Result<FilterFunction, FilterError> {
     let input = match function.name.as_str() {
         "name" => FilterInput::Name,
-        "subtag" => FilterInput::Subtag,
+        "sub" | "subtag" | "subscription" => FilterInput::Subscription,
         other => return Err(FilterError::UnsupportedInput(other.to_owned())),
     };
 
@@ -296,6 +296,13 @@ mod tests {
         let set = compile_set("filter: name(keyword: HK) && subtag(mysub)");
         assert!(set.matches("my_HK_node", "mysub").is_some());
         assert!(set.matches("my_HK_node", "other").is_none());
+
+        let set_sub = compile_set("filter: name(keyword: HK) && sub(mysub)");
+        assert!(set_sub.matches("my_HK_node", "mysub").is_some());
+        assert!(set_sub.matches("my_HK_node", "other").is_none());
+
+        let set_full = compile_set("filter: subscription(mysub)");
+        assert!(set_full.matches("any_node", "mysub").is_some());
     }
 
     #[test]

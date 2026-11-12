@@ -28,9 +28,8 @@ Do not guess repository rules or rely on unverified assumptions. Consult authori
 - Engineering Standards Suite: `docs/dev/standards/README.md`
   - Workspace Architecture & Boundaries: `docs/dev/standards/architecture.md`
   - Invariant & Constraint Policy: `docs/dev/standards/invariants.md`
-  - Engineering Workflow & PR Gates: `docs/dev/standards/workflow.md`
+  - Project Invariant Registry: `docs/dev/invariants.md`
   - Testing & Verification Policy: `docs/adr/0007-verification.md`
-  - Observability & Diagnostic Plane: `docs/dev/standards/observability.md`
   - Markdown & Hyperlink Style: `docs/dev/standards/style.md`
   - Architectural Decision Records: `docs/dev/standards/adr.md`
 - Architecture Decision Records Index: `docs/adr/index.md`

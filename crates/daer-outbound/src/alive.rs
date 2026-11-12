@@ -97,6 +97,15 @@ impl AliveDialerSet {
         self.best.map(|entry| (entry.dialer, entry.sorting_latency))
     }
 
+    /// Whether `id` is currently in the alive set.
+    ///
+    /// `None` means the dialer is not a member of this set at all; `Some(false)` is a
+    /// member that a probe proved dead.
+    #[must_use]
+    pub fn is_alive(&self, id: DialerId) -> Option<bool> {
+        self.index.get(&id).map(|index| *index >= 0)
+    }
+
     /// Builds a set whose members are all **presumed alive until measured**.
     ///
     /// # Why the set starts populated
@@ -240,7 +249,7 @@ impl AliveDialerSet {
     /// reservoir sample so excluding a dialer stays uniform.
     pub fn select(&self, excluded: Option<DialerId>) -> Option<DialerId> {
         match self.policy {
-            SelectionPolicy::Fixed => self
+            SelectionPolicy::Manual => self
                 .entries
                 .iter()
                 .find(|entry| Some(entry.dialer) != excluded)
@@ -433,8 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn fixed_selection_uses_the_first_alive_dialer() {
-        let mut set = set(SelectionPolicy::Fixed, TimeSpan::ZERO);
+    fn manual_selection_uses_the_first_alive_dialer() {
+        let mut set = set(SelectionPolicy::Manual, TimeSpan::ZERO);
         set.notify(DialerId(3), true, None);
         assert_eq!(set.select(None), Some(DialerId(3)));
     }

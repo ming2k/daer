@@ -104,7 +104,7 @@ impl DialObserverSink {
 }
 
 impl TraceSink for DialObserverSink {
-    fn event(&self, event: Event) -> netune_trace::Flow {
+    fn event(&self, _meta: &netune_trace::TraceMeta, event: Event) -> netune_trace::Flow {
         self.observer.observe(&self.dial, event);
         // The observer never rejects an event: dropping one would make the trace window
         // silently narrower than the collector's ring, which is the opposite of what a
@@ -267,7 +267,10 @@ impl ObservedDialer {
 /// `not_applicable`/`not_estimable` rather than becoming a zero.
 fn trace_timings(log: EventLog) -> DerivedTimings {
     let trace = netune_trace::RequestTrace {
-        id: netune_trace::TraceId::new("daer-dial"),
+        meta: netune_trace::TraceMeta::new(
+            netune_trace::TraceId::new("daer-dial"),
+            netune_trace::Direction::Egress,
+        ),
         attempt: netune_trace::AttemptRef {
             round: 1,
             turn: 0,
@@ -285,6 +288,7 @@ fn trace_timings(log: EventLog) -> DerivedTimings {
         schema_version: netune_trace::TRACE_SCHEMA_VERSION,
         fidelity: netune_trace::Fidelity::l0(),
         log,
+        diagnostics: netune_trace::DiagnosticTable::default(),
     };
     derive(&trace)
 }
@@ -406,7 +410,7 @@ mod tests {
             a: 0,
             b: 0,
         };
-        sink.event(event);
+        sink.event(&netune_trace::TraceMeta::egress(), event);
 
         let observed = recorder.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(observed.len(), 1);

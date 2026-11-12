@@ -98,13 +98,12 @@ pub struct Generation {
     policy_hash: [u8; 32],
     rules: usize,
     groups: usize,
+    elections: usize,
     nodes: usize,
-    /// How often to probe nodes, from the configuration this generation was built from.
-    ///
-    /// Carried on the generation rather than read from the file at scheduling time, so a
-    /// generation served with a reloaded interval cannot disagree with the generation that was
-    /// built from the same file.
-    health_interval: daer_config::HealthCheck,
+    /// The shortest probe interval any election asks for; `0` disables probing.
+    health_interval: daer_config::TimeSpan,
+    /// The global probe defaults this generation was built from.
+    probe: daer_config::ProbeSettings,
     build_time: Duration,
     built_at: Instant,
     /// Non-fatal warnings from compilation, for the reload report and snapshot.
@@ -131,10 +130,12 @@ impl Generation {
             id,
             rules: router.matches().len(),
             groups: config.group.len(),
+            elections: config.election.len(),
             nodes: config.node.len(),
             router: Arc::new(router),
             policy_hash,
-            health_interval: config.global.health_check.clone(),
+            health_interval: shortest_probe_interval(config),
+            probe: config.global.probe.clone(),
             build_time: started.elapsed(),
             built_at: Instant::now(),
             warnings,
@@ -150,13 +151,19 @@ impl Generation {
     /// How often this generation wants its nodes probed.
     #[must_use]
     pub const fn health_interval(&self) -> daer_config::TimeSpan {
-        self.health_interval.interval
+        self.health_interval
     }
 
-    /// The health-check table this generation was built from.
+    /// The global probe defaults this generation was built from.
     #[must_use]
-    pub fn health_check(&self) -> daer_config::HealthCheck {
-        self.health_interval.clone()
+    pub fn probe(&self) -> daer_config::ProbeSettings {
+        self.probe.clone()
+    }
+
+    /// The number of elections in this generation.
+    #[must_use]
+    pub const fn elections(&self) -> usize {
+        self.elections
     }
 
     /// The generation identifier.
@@ -220,10 +227,11 @@ impl Generation {
     #[must_use]
     pub fn describe(&self) -> String {
         format!(
-            "{} rules={} groups={} nodes={} built_in={}ms",
+            "{} rules={} groups={} elections={} nodes={} built_in={}ms",
             self.id,
             self.rules,
             self.groups,
+            self.elections,
             self.nodes,
             self.build_time.as_millis()
         )
@@ -242,6 +250,7 @@ pub struct ReloadReport {
     /// Compiled match sets.
     pub rules: usize,
     pub groups: usize,
+    pub elections: usize,
     pub nodes: usize,
     /// Whether the compiled routing policy is semantically different.
     pub routing_changed: bool,
@@ -254,11 +263,12 @@ impl ReloadReport {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "{} → {} rules={} groups={} nodes={} routing={} in {}ms",
+            "{} → {} rules={} groups={} elections={} nodes={} routing={} in {}ms",
             self.previous,
             self.generation,
             self.rules,
             self.groups,
+            self.elections,
             self.nodes,
             if self.routing_changed {
                 "changed"
@@ -342,6 +352,7 @@ impl Generations {
             generation = %generation.id(),
             rules = generation.rules(),
             groups = generation.groups,
+            elections = generation.elections,
             nodes = generation.nodes,
             build_ms = generation.build_time().as_millis(),
             "configuration loaded"
@@ -399,6 +410,7 @@ impl Generations {
             build_time: generation.build_time(),
             rules: generation.rules(),
             groups: generation.groups,
+            elections: generation.elections,
             nodes: generation.nodes,
             routing_changed,
             warnings: generation.warnings().to_vec(),
@@ -412,6 +424,7 @@ impl Generations {
             previous = %report.previous,
             rules = report.rules,
             groups = report.groups,
+            elections = report.elections,
             nodes = report.nodes,
             routing_changed = report.routing_changed,
             build_ms = report.build_time.as_millis(),
@@ -432,6 +445,32 @@ impl Generations {
     pub fn published(&self) -> u64 {
         self.published.load(Ordering::Relaxed)
     }
+}
+
+/// The shortest non-zero probe interval any non-manual election asks for.
+///
+/// A single ticker drives the scheduler; the shortest interval is the only cadence that
+/// cannot make one election miss its own deadline. Each target still carries its own
+/// interval, so a slower election is not probed more often than it asked for.
+fn shortest_probe_interval(config: &Config) -> daer_config::TimeSpan {
+    let mut shortest: Option<daer_config::TimeSpan> = None;
+    for election in &config.election {
+        if election.kind == daer_config::ElectionKind::Manual {
+            continue;
+        }
+        let interval = election.resolved_probe(&config.global.probe).interval;
+        if interval.as_nanos() <= 0 {
+            continue;
+        }
+        shortest = Some(shortest.map_or(interval, |current| {
+            if interval.as_nanos() < current.as_nanos() {
+                interval
+            } else {
+                current
+            }
+        }));
+    }
+    shortest.unwrap_or(daer_config::TimeSpan::ZERO)
 }
 
 #[cfg(test)]
@@ -524,7 +563,7 @@ mod tests {
         // The rule error is the source, not part of the message: an error chain
         // renders it once, and logs get the whole story from `{:#}`.
         assert!(
-            error.source.to_string().contains("not found"),
+            error.source.to_string().contains("nope"),
             "{}",
             error.source
         );

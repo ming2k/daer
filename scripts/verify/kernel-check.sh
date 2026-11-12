@@ -99,10 +99,16 @@ as_builder() {
 
 section "1. environment"
 
-for command in ip tc bpftool clang; do
+for command in ip bpftool clang; do
     command -v "$command" >/dev/null 2>&1 && ok "$command present" || bad "$command is missing"
 done
-ok "kernel $(uname -r)"
+kernel_major="$(uname -r | cut -d. -f1)"
+kernel_minor="$(uname -r | cut -d. -f2)"
+if [[ "$kernel_major" -gt 6 || ( "$kernel_major" -eq 6 && "$kernel_minor" -ge 6 ) ]]; then
+    ok "kernel $(uname -r) supports TCX"
+else
+    bad "daer requires Linux 6.6 or newer for TCX; running $(uname -r)"
+fi
 [[ -f /sys/kernel/btf/vmlinux ]] \
     && ok "BTF available (CO-RE will work)" \
     || bad "no /sys/kernel/btf/vmlinux: the object cannot relocate"
@@ -126,7 +132,7 @@ if [[ "$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo 0)" 
 fi
 
 section "2. datapath object"
-object="${DAER_OBJECT:-target/ebpf/datapath.o}"
+object="${DAER_OBJECT:-target/ebpf/datapath.bpf.o}"
 if [[ ! -f "$object" ]]; then
     bad "$object missing; run 'cargo xtask ebpf' first"
     printf '\n%sCannot continue without the object.%s\n' "$RED" "$OFF"
@@ -205,8 +211,8 @@ run_one() {
 section "4. loading the object (this runs the verifier)"
 run_one the_object_loads_and_verifies "$logs/load.log" "the object loaded and passed the verifier"
 
-section "5. attaching to a real interface"
-run_one a_tc_program_attaches_to_loopback "$logs/attach.log" "a tc program attached to lo"
+section "5. attaching a TCX link to a real interface"
+run_one a_tcx_program_attaches_to_loopback "$logs/attach.log" "a TCX program attached to lo"
 
 section "6. the device pair and PARAM"
 created_pair=0
@@ -234,12 +240,12 @@ fi
 
 section "7. the in-kernel datapath cases (BPF_PROG_TEST_RUN)"
 # Every case is a pktgen/setup/check triple in `ebpf/kern/tests/bpf_test.c`, compiled into
-# `target/ebpf/datapath-test.o` and driven by `crates/daer-ebpf/tests/datapath.rs`. This is
+# `target/ebpf/datapath_test.bpf.o` and driven by `crates/daer-ebpf/tests/datapath.rs`. This is
 # the only part of the suite that executes the datapath's own logic in the kernel.
 if [[ -z "$binary_datapath" ]]; then
     skip "7" "no datapath test binary (run \`cargo xtask ebpf --tests\`)"
-elif [[ ! -f target/ebpf/datapath-test.o ]]; then
-    skip "7" "target/ebpf/datapath-test.o is missing (run \`cargo xtask ebpf --tests\`)"
+elif [[ ! -f target/ebpf/datapath_test.bpf.o ]]; then
+    skip "7" "target/ebpf/datapath_test.bpf.o is missing (run \`cargo xtask ebpf --tests\`)"
 else
     run_one every_datapath_case_passes "$logs/datapath.log" \
         "every in-kernel datapath case passed"

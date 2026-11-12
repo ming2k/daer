@@ -202,9 +202,9 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
         match function.name.as_str() {
             "provider" => {
                 require_bare(function, key)?;
-                for (index, tag) in values.iter().enumerate() {
-                    let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
-                        RoutingError::new(format!("unknown rule provider: {tag}"))
+                for (index, name) in values.iter().enumerate() {
+                    let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
+                        RoutingError::new(format!("unknown rule provider: {name}"))
                     })?;
                     let t = if index + 1 == values.len() {
                         target.clone()
@@ -217,9 +217,9 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
             }
             "domain" => {
                 if key == "provider" {
-                    for (index, tag) in values.iter().enumerate() {
-                        let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
-                            RoutingError::new(format!("unknown rule provider: {tag}"))
+                    for (index, name) in values.iter().enumerate() {
+                        let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
+                            RoutingError::new(format!("unknown rule provider: {name}"))
                         })?;
                         let t = if index + 1 == values.len() {
                             target.clone()
@@ -266,9 +266,9 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
             }
             "ip" => {
                 if key == "provider" {
-                    for (index, tag) in values.iter().enumerate() {
-                        let set = self.providers.and_then(|p| p.get(tag)).ok_or_else(|| {
-                            RoutingError::new(format!("unknown rule provider: {tag}"))
+                    for (index, name) in values.iter().enumerate() {
+                        let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
+                            RoutingError::new(format!("unknown rule provider: {name}"))
                         })?;
                         let t = if index + 1 == values.len() {
                             target.clone()
@@ -364,7 +364,7 @@ fn retired_dat_key(function: &str, key: &str) -> RoutingError {
     RoutingError::new(format!(
         "{function}({key}: ...): the `{key}:` key names a Protobuf .dat file, which this build \
          no longer reads (ADR-0014). Declare the category as a `[[rule-provider]]` and write \
-         `provider(<tag>)`, or `{function}(provider: <tag>)` to use only that provider's \
+         `provider(<name>)`, or `{function}(provider: <name>)` to use only that provider's \
          {}. See `daer-drb`.",
         if function == "domain" {
             "domains"

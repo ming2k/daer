@@ -6,7 +6,7 @@
 //!     cargo xtask <subcommand>
 //!
 //! Subcommands:
-//!     ebpf    - Compiles the eBPF C datapath into target/ebpf/datapath.o
+//!     ebpf    - Compiles the eBPF C datapath into target/ebpf/datapath.bpf.o
 //!     schema  - Prints or writes (--write) the published JSON schema
 //!     events  - Generates the diagnostic event catalog (ADR-0040)
 //!     ci      - Runs the entire CI suite locally (fmt, clippy, tests)
@@ -57,7 +57,7 @@ fn detect_bpf_arch() -> &'static str {
 fn build_ebpf(build_tests: bool) {
     let root = workspace_root();
 
-    // Regenerate the ABI before compiling (ADR-0021). This is not a convenience: `tproxy.c`
+    // Regenerate the ABI before compiling (ADR-0021). This is not a convenience: `datapath.bpf.c`
     // includes the generated header, so a change to `ebpf/abi.toml` would otherwise compile
     // against a stale one without saying so — and a tree where the generated files were
     // removed or hand-edited could not build at all. They are tracked (ADR-0021, amended),
@@ -102,8 +102,8 @@ fn build_ebpf(build_tests: bool) {
     fs::create_dir_all(&build_dir).expect("failed to create build directory");
 
     // Copy the C source and header files into the build directory, preserving the
-    // `src/` and `tests/` subdirectories: `tproxy.c` includes `src/<module>.h`, and
-    // `tests/bpf_test.c` includes `../tproxy.c` (ADR-0028, ADR-0022).
+    // `src/` and `tests/` subdirectories: `datapath.bpf.c` includes `src/<module>.h`, and
+    // `tests/bpf_test.c` includes `../datapath.bpf.c` (ADR-0028, ADR-0022).
     copy_c_and_h(&datapath_src, &build_dir);
     for sub in ["src", "tests"] {
         let from = datapath_src.join(sub);
@@ -125,13 +125,13 @@ fn build_ebpf(build_tests: bool) {
         }
     }
 
-    let out_file = out_dir.join("datapath.o");
+    let out_file = out_dir.join("datapath.bpf.o");
     compile(
         &clang,
         bpf_arch,
         &max_match_set_len,
         &build_dir,
-        &build_dir.join("tproxy.c"),
+        &build_dir.join("datapath.bpf.c"),
         &out_file,
     );
 
@@ -203,9 +203,9 @@ fn copy_c_and_h(from: &Path, to: &Path) {
     }
 }
 
-/// Compiles `ebpf/kern/tests/bpf_test.c` into `target/ebpf/datapath-test.o`.
+/// Compiles `ebpf/kern/tests/bpf_test.c` into `target/ebpf/datapath_test.bpf.o`.
 ///
-/// The test file `#include`s `../tproxy.c`, so it is compiled against the production
+/// The test file `#include`s `../datapath.bpf.c`, so it is compiled against the production
 /// datapath rather than a copy — that is the property that makes the cases worth running.
 fn build_test_object(
     clang: &str,
@@ -220,14 +220,14 @@ fn build_test_object(
         std::process::exit(1);
     }
 
-    // The test file includes `../tproxy.c` and `./bpf_test.h`, so the build tree keeps
+    // The test file includes `../datapath.bpf.c` and `./bpf_test.h`, so the build tree keeps
     // that shape: sources at the root, test sources in `tests/` beside them.
     let test_build = out_dir.join("test-build");
     let _ = fs::remove_dir_all(&test_build);
     fs::create_dir_all(test_build.join("tests")).expect("failed to create test build directory");
     copy_c_and_h(datapath_src, &test_build);
     copy_c_and_h(&tests_src, &test_build.join("tests"));
-    // `tproxy.c` includes `src/<module>.h` (ADR-0028), so the test build needs the
+    // `datapath.bpf.c` includes `src/<module>.h` (ADR-0028), so the test build needs the
     // same subdirectory the production build gets.
     let src_dir = datapath_src.join("src");
     if src_dir.is_dir() {
@@ -245,7 +245,7 @@ fn build_test_object(
         }
     }
 
-    let out_file = out_dir.join("datapath-test.o");
+    let out_file = out_dir.join("datapath_test.bpf.o");
     compile(
         clang,
         bpf_arch,
@@ -353,7 +353,7 @@ fn run_ci() {
 /// This is the unprivileged gate from ADR-0029, exercised the way a packaging script would:
 /// against the artifact on disk rather than against the test fixture in memory.
 fn run_preflight(root: &Path) -> Result<(), String> {
-    let object = root.join("target/ebpf/datapath.o");
+    let object = root.join("target/ebpf/datapath.bpf.o");
     if !object.is_file() {
         return Err(format!(
             "{} is missing; run `cargo xtask ebpf` first (the CI suite builds it in the test              targets, not here)",
@@ -369,7 +369,7 @@ fn run_preflight(root: &Path) -> Result<(), String> {
     }
     fs::write(
         &config,
-        "schema = 1\n\n[global]\nwan-interface = [\"auto\"]\n",
+        "schema = 2\n\n[global]\nwan-interface = [\"auto\"]\n",
     )
     .map_err(|error| format!("failed to write {}: {error}", config.display()))?;
 
@@ -480,11 +480,11 @@ fn install_target_prefix(prefix: &str, destdir: &Path) -> PathBuf {
 /// Copies every installed artifact into `destdir/prefix` and returns the paths written.
 ///
 /// This function is the single definition of an install. `scripts/ops/daer-install-netns.sh`
-/// copies the staged tree rather than listing binaries again, and the test below pins the
-/// exact file set, so a helper that drops out of this list (as `daer-cleanup` did in the
-/// script) fails CI instead of failing on a host.
+/// copies the staged tree rather than listing binaries again, and `packaging/daer.plan.toml`
+/// calls this task instead of restating the artifact list. The test below pins the exact file
+/// set, so a binary that drops out of this list fails CI instead of failing on a host.
 fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathBuf>, String> {
-    let binaries = ["daer", "daer-cleanup", "daer-drb"];
+    let binaries = ["daer", "daer-drb"];
 
     // Validate every source before writing anything: a skipped build step must not leave a
     // half-installed tree whose unit names a binary or object that was never copied.
@@ -495,7 +495,7 @@ fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathB
             ));
         }
     }
-    let src_obj = root.join("target/ebpf/datapath.o");
+    let src_obj = root.join("target/ebpf/datapath.bpf.o");
     if !src_obj.is_file() {
         return Err(format!(
             "{} does not exist. Run `cargo xtask ebpf` first.",
@@ -518,13 +518,12 @@ fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathB
 
     let mut installed = Vec::with_capacity(binaries.len() + 2);
     for name in binaries {
-        // `daer-cleanup` is the unit's `ExecStopPost=` helper; `daer-drb` is the rule-artifact
-        // producer operators need to compile `.rules` (ADR-0031). Omitting either ships half
-        // the surface.
+        // `daer-drb` is the rule-artifact producer operators need to compile `.rules`
+        // (ADR-0031). The daemon itself must never link it; the surface test enforces that.
         installed.push(install_binary(root, &bin_dir, name)?);
     }
 
-    let dest_obj = lib_dir.join("datapath.o");
+    let dest_obj = lib_dir.join("datapath.bpf.o");
     fs::copy(&src_obj, &dest_obj).map_err(|error| {
         format!(
             "cannot copy {} to {}: {error}",
@@ -560,8 +559,8 @@ fn service_unit_for_prefix(unit: &str, prefix: &str) -> String {
     let prefix_root = prefix.trim_end_matches('/');
     unit.replace("/usr/bin/daer", &format!("{prefix_root}/bin/daer"))
         .replace(
-            "/usr/lib/daer/datapath.o",
-            &format!("{prefix_root}/lib/daer/datapath.o"),
+            "/usr/lib/daer/datapath.bpf.o",
+            &format!("{prefix_root}/lib/daer/datapath.bpf.o"),
         )
 }
 
@@ -730,14 +729,12 @@ mod tests {
     #[test]
     fn the_installed_unit_follows_the_requested_prefix() {
         let unit = "[Service]\n\
-                    ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.o\n\
-                    ExecStopPost=/usr/bin/daer-cleanup\n";
+                    ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.bpf.o\n";
         let custom = service_unit_for_prefix(unit, "/usr/local/");
         assert!(custom.contains("ExecStart=/usr/local/bin/daer run"));
-        assert!(custom.contains("--object /usr/local/lib/daer/datapath.o"));
-        assert!(custom.contains("ExecStopPost=/usr/local/bin/daer-cleanup"));
+        assert!(custom.contains("--object /usr/local/lib/daer/datapath.bpf.o"));
         assert!(!custom.contains("/usr/bin/daer"));
-        assert!(!custom.contains("/usr/lib/daer/datapath.o"));
+        assert!(!custom.contains("/usr/lib/daer/datapath.bpf.o"));
 
         // The package build installs under `/usr`; its unit must stay byte-identical.
         assert_eq!(service_unit_for_prefix(unit, "/usr"), unit);
@@ -761,16 +758,16 @@ mod tests {
         for directory in ["target/release", "target/ebpf", "install"] {
             fs::create_dir_all(root.join(directory)).expect("create fake workspace directory");
         }
-        for name in ["daer", "daer-cleanup", "daer-drb"] {
+        for name in ["daer", "daer-drb"] {
             fs::write(root.join("target/release").join(name), b"fake binary")
                 .expect("write fake binary");
         }
-        fs::write(root.join("target/ebpf/datapath.o"), b"fake object").expect("write fake object");
+        fs::write(root.join("target/ebpf/datapath.bpf.o"), b"fake object")
+            .expect("write fake object");
         fs::write(
             root.join("install/daer.service"),
             "[Service]\n\
-             ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.o\n\
-             ExecStopPost=/usr/bin/daer-cleanup\n",
+             ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.bpf.o\n",
         )
         .expect("write fake unit");
         root
@@ -795,9 +792,8 @@ mod tests {
             relative,
             BTreeSet::from([
                 "usr/bin/daer".to_owned(),
-                "usr/bin/daer-cleanup".to_owned(),
                 "usr/bin/daer-drb".to_owned(),
-                "usr/lib/daer/datapath.o".to_owned(),
+                "usr/lib/daer/datapath.bpf.o".to_owned(),
                 "usr/lib/systemd/system/daer.service".to_owned(),
             ])
         );
@@ -808,9 +804,8 @@ mod tests {
 
             for (relative, mode) in [
                 ("usr/bin/daer", 0o755),
-                ("usr/bin/daer-cleanup", 0o755),
                 ("usr/bin/daer-drb", 0o755),
-                ("usr/lib/daer/datapath.o", 0o644),
+                ("usr/lib/daer/datapath.bpf.o", 0o644),
                 ("usr/lib/systemd/system/daer.service", 0o644),
             ] {
                 let actual = fs::metadata(destdir.join(relative))
@@ -824,20 +819,42 @@ mod tests {
 
         let unit = fs::read_to_string(destdir.join("usr/lib/systemd/system/daer.service"))
             .expect("read staged unit");
-        assert!(unit.contains("ExecStopPost=/usr/bin/daer-cleanup"));
+        assert!(!unit.contains("ExecStopPost"), "{unit}");
+        assert!(!unit.contains("daer-cleanup"), "{unit}");
 
         fs::remove_dir_all(&root).expect("remove fake workspace");
     }
 
     #[test]
-    fn a_missing_cleanup_binary_fails_the_install() {
-        // The falsifier for the old script bug: dropping the helper from the set must fail,
-        // not produce a unit whose ExecStopPost points at a file that was never installed.
+    fn the_package_plan_uses_the_install_task_instead_of_a_second_artifact_list() {
+        let plan = fs::read_to_string(workspace_root().join("packaging/daer.plan.toml"))
+            .expect("read the package plan");
+        assert!(
+            plan.contains("cargo run --package xtask -- install"),
+            "the package staging step must call the install task"
+        );
+        for direct in [
+            "install -Dm755 target/release/daer ",
+            "install -Dm755 target/release/daer-drb ",
+            "install -Dm644 target/ebpf/datapath.bpf.o ",
+            "install -Dm644 install/daer.service ",
+        ] {
+            assert!(
+                !plan.contains(direct),
+                "the package plan still duplicates the install set: {direct}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_producer_binary_fails_the_install() {
+        // The falsifier for a partial install: dropping a shipped binary must fail before
+        // writing a tree whose unit or documented workflow names a file that is not there.
         let root = temporary_root();
-        fs::remove_file(root.join("target/release/daer-cleanup")).expect("remove cleanup");
+        fs::remove_file(root.join("target/release/daer-drb")).expect("remove producer");
 
         let error = install_layout(&root, "/usr", &root.join("stage")).expect_err("must fail");
-        assert!(error.contains("daer-cleanup"), "{error}");
+        assert!(error.contains("daer-drb"), "{error}");
 
         fs::remove_dir_all(&root).expect("remove fake workspace");
     }
@@ -847,7 +864,7 @@ mod tests {
         // The unit's ExecStart names this object. Installing the unit without it used to
         // succeed silently; the service then failed only after systemd started it.
         let root = temporary_root();
-        fs::remove_file(root.join("target/ebpf/datapath.o")).expect("remove datapath object");
+        fs::remove_file(root.join("target/ebpf/datapath.bpf.o")).expect("remove datapath object");
 
         let error = install_layout(&root, "/usr", &root.join("stage")).expect_err("must fail");
         assert!(error.contains("cargo xtask ebpf"), "{error}");

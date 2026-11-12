@@ -87,6 +87,10 @@ async fn a_node_dialer_speaks_shadowsocks() {
 
     let dialer = ProxyDialer::from_link(&link, options()).expect("the link is accepted");
     assert_eq!(dialer.protocol(), ProxyProtocol::ShadowSocks);
+    assert!(
+        dialer.datagram_connector().is_some(),
+        "shadowsocks AEAD carries UDP; governance must expose the connector"
+    );
 
     let established = dialer
         .connect("example.com:80")

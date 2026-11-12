@@ -2,7 +2,7 @@
 id: ADR-0015
 title: "The CLI is four verbs: producers are not shipped inside the runtime"
 status: accepted
-amended-by: [ADR-0016, ADR-0041]
+amended-by: [ADR-0016, ADR-0041, ADR-0046, ADR-0047]
 date: 2026-02-15
 scope: [cli/surface, architecture/boundary, routing/drb, dns]
 supersedes: []

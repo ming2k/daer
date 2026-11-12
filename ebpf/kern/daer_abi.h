@@ -4,7 +4,6 @@
 
 /* The load-time parameter struct. */
 struct daer_param {
-	__u32 tproxy_port;
 	__u32 control_plane_pid;
 	__u32 device_ifindex;
 	__u32 netns_id;

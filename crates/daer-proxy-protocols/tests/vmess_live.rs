@@ -321,7 +321,7 @@ async fn vmess_with_authenticated_length_carries_a_round_trip() {
     let (_fixture, port, log) = start(&binary, "authlen", "tcp", "AuthenticatedLength");
 
     let options = DialerOptions::new(None, Duration::from_secs(10));
-    let mut dialer = ProxyDialer::from_link(&link(port, "auto", "tcp"), options)
+    let mut dialer = ProxyDialer::from_link(&link(port, "auto", "tcp"), options.clone())
         .expect("the link is well formed");
     // The setting is a *node* key, not a link parameter, so it is applied the way a configuration
     // would: rebuild the connector with it.

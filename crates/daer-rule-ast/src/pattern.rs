@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Domain pattern representation for Canonical Rule Source (CRS v2, ADR-0036).
+//! Domain pattern representation for Canonical Rule Source (CRS v3, ADR-0036, ADR-0045).
 //!
 //! Under ADR-0031, ADR-0033, and ADR-0036, domain routing patterns are strictly hierarchical:
 //! * `Suffix(SelfAndSubdomains)`: matches `example.com` and `*.example.com` (written as `example.com`).
@@ -128,12 +128,25 @@ fn fold_domain(value: impl AsRef<str>, kind: &str) -> Result<String, AstError> {
             "{kind} pattern {trimmed:?} contains illegal character {bad:?}"
         )));
     }
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(AstError::new(format!(
+            "{kind} pattern {trimmed:?} cannot be purely numeric (RFC 1123/3696)"
+        )));
+    }
+    if let Some(last_label) = trimmed.rsplit('.').next()
+        && !last_label.is_empty()
+        && last_label.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(AstError::new(format!(
+            "{kind} pattern {trimmed:?} has an all-numeric TLD, which is prohibited under RFC 1123/3696"
+        )));
+    }
     Ok(trimmed)
 }
 
 pub fn is_valid_domain_char(ch: char) -> bool {
     (ch.is_ascii() && (ch.is_ascii_lowercase() || ch.is_ascii_digit()))
-        || matches!(ch, '.' | '-' | '_' | '^')
+        || matches!(ch, '.' | '-' | '_')
 }
 
 impl fmt::Display for DomainPattern {

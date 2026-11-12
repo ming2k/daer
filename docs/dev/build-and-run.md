@@ -14,7 +14,7 @@ systemd unit, which this page deliberately does not repeat.
 | Thing | Why |
 | :--- | :--- |
 | Rust 1.95+ (edition 2024) | the workspace's MSRV, enforced by `rust-version` |
-| Linux 5.17+ | `bpf_loop`, and the cgroup hooks the datapath uses |
+| Linux 6.6+ | TCX (`BPF_TCX_INGRESS`/`BPF_TCX_EGRESS`), `bpf_loop`, and the cgroup hooks the datapath uses |
 | `clang` | compiles `ebpf/kern` — there is no prebuilt object in the repository |
 | `bpftool` | dumps the per-kernel `vmlinux.h` the datapath includes |
 | `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON` + `CAP_SYS_ADMIN` | only for the privileged gates in §4; building and the unprivileged gates need nothing. The first three load/attach the datapath; `CAP_SYS_ADMIN` creates and enters the private ingress namespace (ADR-0038) |
@@ -27,11 +27,12 @@ There are two products, and the second one does not come from `cargo build`:
 
 ```bash
 cargo build --release                  # target/release/daer, target/release/daer-drb
-cargo xtask ebpf                       # target/ebpf/datapath.o  (needs clang)
+cargo xtask ebpf                       # target/ebpf/datapath.bpf.o  (needs clang)
 ```
 
-`daer` is the single public binary: `run`, `check`, `route`, `probe`, `status`, `schema`,
-`version` (ADR-0015/ADR-0041, `[INV-CLI-01]`). `daer-drb` is the rule-artifact producer and is
+`daer` is the single public binary: `run`, `check`, `route`, `probe`, `status`, `elect`,
+`schema`, `version` (ADR-0015/ADR-0041/ADR-0047, `[INV-CLI-01]`). `daer-drb` is the
+rule-artifact producer and is
 *not* linked into the daemon — `crates/daer-cli/tests/surface.rs` asserts that closure stays
 empty (ADR-0031).
 
@@ -66,7 +67,7 @@ line that smells wrong is either a stale artifact — regenerate it — or a cha
 
 ```bash
 sudo ./target/release/daer check -c daer.example.toml     # unprivileged: does it compile?
-sudo ./target/release/daer run   -c config.toml --object target/ebpf/datapath.o
+sudo ./target/release/daer run   -c config.toml --object target/ebpf/datapath.bpf.o
 ```
 
 `daer.example.toml` is the annotated reference and the fixture the schema tests read; it fetches
@@ -76,7 +77,7 @@ minimal config, use the shape in [Getting Started](../tutorials/getting-started.
 To ask what the daemon *would* do without touching the box, add `--dry-run`:
 
 ```bash
-daer run -c config.toml --dry-run --object target/ebpf/datapath.o
+daer run -c config.toml --dry-run --object target/ebpf/datapath.bpf.o
 ```
 
 That is the unprivileged half of the verification split in ADR-0029: it builds the generation,
@@ -85,9 +86,10 @@ capabilities the next phase would need — and returns before the port is bound,
 created, the private ingress namespace exists, any sysctl or policy route is written, or `bpf()` is
 called.
 
-A real run creates `daer0ns` and moves `daer0peer` into it before binding the listeners. If the
-listener and the packet are in different namespaces, `bpf_sk_assign` can report success and the
-transport stack still answers `NO_SOCKET`; the namespace is a prerequisite, not an optimization.
+A real run creates `daer0ns` first, then creates the veth pair with `daer0peer` already inside
+it, before binding the listeners. If the listener and the packet are in different namespaces,
+`bpf_sk_assign` can report success and the transport stack still answers `NO_SOCKET`; the
+namespace is a prerequisite, not an optimization.
 The host must already have the forwarding and martian sysctls listed in
 [`docs/how-to/deployment.md#host-sysctls`](../how-to/deployment.md#host-sysctls); the daemon
 checks them and refuses to change them.
@@ -125,15 +127,19 @@ skip into a failure; the keys are in `docs/how-to/deployment.md`. The full scrip
 including the host-level `ops/` helpers, is documented in
 [`scripts/README.md`](../../scripts/README.md).
 
-`DAER_TC_ATTACH=tcx` selects TCX (`bpf_link`) for the host TC hooks. TCX makes the filter
-fd-owned, so it detaches on `SIGKILL`, and creates no `clsact` qdisc. It is **not** the
-default. The delivery check is the real-daemon script
-`sudo DAER_TC_ATTACH=tcx scripts/ops/daer-netns-e2e.sh --config <config>`: it must show the
-proxied HTTPS request returning 200, not merely that the link attached. Run it with
-`--preflight` first (no root): that checks the kernel, tools, release artifacts, and config
-and prints the exact sudo command. The privileged kernel suite adds the TCX attach test.
-Until that delivery check is green on a Linux 6.6+ kernel, classic `cls_bpf` stays the
-default and `daer-cleanup` keeps its host-filter duty.
+The real-host delivery gate and the clean-host preparation checklist are engineering-process
+documents: [Production Readiness](production-readiness.md) and
+[Test Environment Requirements](test-environment.md). They are deliberately not part of the
+public operator how-to surface because they require a disposable host, a site config and a real
+node.
+
+TC attachment is TCX-only (ADR-0042). Every hook is an fd-owned `bpf_link`; there is no
+`clsact` qdisc, no classic `cls_bpf` fallback and no `DAER_TC_ATTACH` switch. The
+real-daemon gate is `sudo scripts/ops/daer-delivery-check.sh --config <config>`: it must show
+`example.com http=200`, then kill the daemon with `SIGKILL` and prove that no TCX link,
+qdisc, veth, namespace or `daer0` sysctl remains and that direct traffic recovers. Run it
+with `--preflight` first (no root): that checks the Linux 6.6+ kernel, tools, release
+artifacts and config and prints the exact sudo command. Attachment alone is not delivery.
 
 ---
 

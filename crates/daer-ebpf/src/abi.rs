@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Kernel-side ABI shared with `ebpf/kern/tproxy.c`.
+//! Kernel-side ABI shared with `ebpf/kern/datapath.bpf.c`.
 //!
 //! Both sides are daer's own source (ADR-0020), so these types have to stay
 //! byte-compatible with the C declarations that live in the same repository, and the
 //! assertions at the bottom of the module fail the build if they ever drift. The C
-//! declarations are the ones in `ebpf/kern/tproxy.c`; the doc blocks below quote them
+//! declarations are the ones in `ebpf/kern/datapath.bpf.c`; the doc blocks below quote them
 //! so a reader can compare without opening a second file.
 
 /// Key of the connection-tracking maps (`fast_sock`, `tcp_offload_pause`,
@@ -61,7 +61,6 @@ pub use daer_common::net::PortRange;
 ///
 /// ```c
 /// struct daer_param {
-///     __u32 tproxy_port;
 ///     __u32 control_plane_pid;
 ///     __u32 daer0_ifindex;
 ///     __u32 daer_netns_id;
@@ -76,7 +75,6 @@ pub use daer_common::net::PortRange;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeParam {
-    pub tproxy_port: u32,
     pub control_plane_pid: u32,
     /// ifindex of the local device the datapath redirects through.
     pub device_ifindex: u32,
@@ -92,7 +90,7 @@ pub struct RuntimeParam {
     pub socket_mark: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<RuntimeParam>() == 32);
+const _: () = assert!(std::mem::size_of::<RuntimeParam>() == 28);
 const _: () = assert!(std::mem::align_of::<RuntimeParam>() == 4);
 
 impl RuntimeParam {
@@ -385,7 +383,7 @@ pub struct RoutingResult {
     pub pid: u32,
     /// The packet's DSCP.
     pub dscp: u8,
-    /// The routing epoch slot, encoded so `0` means unknown (see `tproxy.c`).
+    /// The routing epoch slot, encoded so `0` means unknown (see `datapath.bpf.c`).
     pub routing_epoch_slot: u8,
     /// Which datapath generation wrote this entry.
     pub datapath_generation: u16,
@@ -444,18 +442,18 @@ mod tests {
     #[test]
     fn runtime_param_layout_matches_the_c_struct() {
         let param = RuntimeParam {
-            tproxy_port: 12345,
+            control_plane_pid: 12345,
             datapath_generation: 7,
             peer_mac: [1, 2, 3, 4, 5, 6],
             ..RuntimeParam::default()
         };
         let bytes = param.as_bytes();
-        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes.len(), 28);
         // Field offsets, asserted as little-endian byte ranges.
         assert_eq!(&bytes[0..4], &12345u32.to_le_bytes());
-        assert_eq!(&bytes[16..22], &[1, 2, 3, 4, 5, 6]);
-        assert_eq!(&bytes[26..28], &7u16.to_le_bytes());
-        assert_eq!(&bytes[28..32], &0u32.to_le_bytes());
+        assert_eq!(&bytes[12..18], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&bytes[22..24], &7u16.to_le_bytes());
+        assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
     }
 
     #[test]

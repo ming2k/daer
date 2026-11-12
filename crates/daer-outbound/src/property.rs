@@ -2,10 +2,9 @@
 
 //! Node properties.
 
-use daer_common::SelectionPolicy;
-use daer_config::{Function, FunctionOrString};
+use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Protocol {
     Direct,
     Http,
@@ -85,7 +84,7 @@ pub struct Property {
     pub address: String,
     pub protocol: Protocol,
     pub udp: bool,
-    pub subscription_tag: String,
+    pub subscription_name: String,
     /// How this node protects the session, for diagnostics.
     ///
     /// Derived from the link **without reading the secret**: it names the cipher or the TLS
@@ -95,7 +94,7 @@ pub struct Property {
 }
 
 /// The protection a node provides, as a diagnostic identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Security {
     /// No protection: a `direct` node.
     None,
@@ -105,7 +104,7 @@ pub enum Security {
     Tls {
         /// The name presented in the handshake.
         server_name: String,
-        /// Whether the link asked to skip verification, which this build refuses to honor.
+        /// Whether the link asked to skip certificate verification.
         allow_insecure_requested: bool,
     },
     /// An authenticated cipher inside the proxy protocol.
@@ -151,9 +150,9 @@ impl Security {
             } => {
                 let mut text = format!("tls sni={server_name}");
                 if *allow_insecure_requested {
-                    // Say it rather than honor it: the link asked for something this build
-                    // does not do, and an operator reading a log must see that.
-                    text.push_str(" (allowInsecure ignored)");
+                    // The operator explicitly chose this; the security report must show it
+                    // rather than present a verified-TLS claim that is not true.
+                    text.push_str(" (allowInsecure requested)");
                 }
                 text
             }
@@ -199,7 +198,7 @@ impl Security {
 impl Property {
     /// Builds properties directly from a typed configuration [`daer_config::Node`].
     pub fn from_node(node: &daer_config::Node) -> Self {
-        let name = node.tag.clone().unwrap_or_else(|| node.default_name());
+        let name = node.name.clone().unwrap_or_else(|| node.default_name());
         let (protocol, address, udp, security) = match &node.endpoint {
             daer_config::NodeEndpoint::Direct(_) => {
                 (Protocol::Direct, String::new(), true, Security::None)
@@ -207,7 +206,10 @@ impl Property {
             daer_config::NodeEndpoint::Socks5(n) => (
                 Protocol::Socks5,
                 format!("{}:{}", n.server, n.port),
-                true,
+                // A SOCKS5 UDP associate is a direct session with the proxy server. If the
+                // server is reached through a detour, the associate would take the local UDP
+                // path and bypass the chain; the node is TCP-only (ADR-0044).
+                node.detour.is_none(),
                 Security::Plaintext,
             ),
             daer_config::NodeEndpoint::Http(n) => (
@@ -280,9 +282,21 @@ impl Property {
             address,
             protocol,
             udp,
-            subscription_tag: node.subscription_tag().to_owned(),
+            subscription_name: node.subscription_name().to_owned(),
             security,
         }
+    }
+
+    /// Compatibility accessor for the subscription name.
+    #[must_use]
+    pub fn subscription_tag(&self) -> &str {
+        &self.subscription_name
+    }
+
+    /// The subscription name this node was loaded from, or `""`.
+    #[must_use]
+    pub fn subscription_name(&self) -> &str {
+        &self.subscription_name
     }
 
     /// Derives the static properties of a node link (`node { name: link }`).
@@ -293,7 +307,7 @@ impl Property {
     pub fn from_link(
         name: impl Into<String>,
         link: &str,
-        subscription_tag: impl Into<String>,
+        subscription_name: impl Into<String>,
     ) -> Self {
         let link = link.trim();
         let (protocol, address) = if link.is_empty() || link == "direct" {
@@ -314,7 +328,7 @@ impl Property {
             address,
             protocol,
             udp,
-            subscription_tag: subscription_tag.into(),
+            subscription_name: subscription_name.into(),
             security,
         }
     }
@@ -325,7 +339,7 @@ impl Property {
             address: String::new(),
             protocol: Protocol::Direct,
             udp: true,
-            subscription_tag: String::new(),
+            subscription_name: String::new(),
             security: Security::None,
         }
     }
@@ -449,73 +463,6 @@ fn authority_of(rest: &str) -> String {
         .to_owned()
 }
 
-/// A group's `policy`, including the index a `fixed` policy needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupPolicy {
-    Random,
-    /// `policy: fixed(<index>)` — the index is into the group's filtered dialer
-    /// list.
-    Fixed {
-        index: usize,
-    },
-    MinLastLatency,
-    MinAverage10,
-    MinMovingAverage,
-}
-
-impl GroupPolicy {
-    pub fn selection_policy(self) -> SelectionPolicy {
-        match self {
-            Self::Random => SelectionPolicy::Random,
-            Self::Fixed { .. } => SelectionPolicy::Fixed,
-            Self::MinLastLatency => SelectionPolicy::MinLastLatency,
-            Self::MinAverage10 => SelectionPolicy::MinAverage10,
-            Self::MinMovingAverage => SelectionPolicy::MinMovingAverage,
-        }
-    }
-}
-
-/// Parses `group { policy: … }` exactly like
-/// `NewDialerSelectionPolicyFromGroupParam`.
-pub fn parse_group_policy(policy: &FunctionOrString) -> Result<GroupPolicy, String> {
-    let function = match policy {
-        FunctionOrString::Name(name) => Function::new(name.clone()),
-        FunctionOrString::Functions(functions) if functions.len() == 1 => functions[0].clone(),
-        FunctionOrString::Functions(functions) => {
-            return Err(format!(
-                "policy should be exact 1 function: got {}",
-                functions.len()
-            ));
-        }
-    };
-
-    // Both spellings mean the same policy: `min-moving-avg` is the canonical TOML
-    // spelling, `min_moving_avg` is accepted from existing rule text.
-    match function.name.replace('-', "_").as_str() {
-        "random" => Ok(GroupPolicy::Random),
-        "min" => Ok(GroupPolicy::MinLastLatency),
-        "min_avg10" => Ok(GroupPolicy::MinAverage10),
-        "min_moving_avg" => Ok(GroupPolicy::MinMovingAverage),
-        "fixed" => {
-            if function.negated {
-                return Err(format!(
-                    "policy param does not support not operator: !{}()",
-                    function.name
-                ));
-            }
-            if function.params.len() != 1 || !function.params[0].key.is_empty() {
-                return Err(format!("invalid \"{}\" param format", function.name));
-            }
-            let value = function.params[0].as_literal().unwrap_or_default();
-            let index = value
-                .parse::<usize>()
-                .map_err(|error| format!("invalid \"{}\" param format: {error}", function.name))?;
-            Ok(GroupPolicy::Fixed { index })
-        }
-        _ => Err(format!("unexpected policy: {}", function.name)),
-    }
-}
-
 /// Reports what security layer a parsed node actually applies.
 ///
 /// A report that called every `vless` node REALITY would be wrong for a node over plain TLS,
@@ -565,7 +512,8 @@ mod tests {
         assert_eq!(property.protocol, Protocol::Socks5);
         assert_eq!(property.address, "1.2.3.4:1080");
         assert!(property.udp);
-        assert_eq!(property.subscription_tag, "sub");
+        assert_eq!(property.subscription_name, "sub");
+        assert_eq!(property.subscription_tag(), "sub");
 
         let property = Property::from_link("web", "http://proxy.example:8080", "");
         assert_eq!(property.protocol, Protocol::Http);
@@ -588,28 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_group_policies() {
-        let parse = |value: &str| parse_group_policy(&FunctionOrString::Name(value.to_owned()));
-
-        assert_eq!(parse("min_moving_avg"), Ok(GroupPolicy::MinMovingAverage));
-        assert_eq!(parse("random"), Ok(GroupPolicy::Random));
-        assert!(parse("fastest").is_err());
-
-        // `fixed` needs its index and is written as a function.
-        let fixed = FunctionOrString::Functions(vec![Function::with_params(
-            "fixed",
-            vec![daer_config::Param::bare("2")],
-        )]);
-        assert_eq!(
-            parse_group_policy(&fixed),
-            Ok(GroupPolicy::Fixed { index: 2 })
+    fn a_detoured_socks5_node_does_not_advertise_datagrams() {
+        let mut node =
+            daer_config::Node::from_link("socks5://127.0.0.1:1080#outer").expect("node parses");
+        assert!(
+            Property::from_node(&node).udp,
+            "a direct SOCKS5 node carries UDP"
         );
-
-        let missing = FunctionOrString::Functions(vec![Function::new("fixed")]);
-        assert!(parse_group_policy(&missing).is_err());
-
-        let too_many =
-            FunctionOrString::Functions(vec![Function::new("random"), Function::new("min")]);
-        assert!(parse_group_policy(&too_many).is_err());
+        node.detour = Some("inner".to_owned());
+        assert!(
+            !Property::from_node(&node).udp,
+            "a SOCKS5 UDP associate would bypass the chain, so the node is TCP-only"
+        );
     }
 }

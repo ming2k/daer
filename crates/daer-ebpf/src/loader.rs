@@ -2,7 +2,7 @@
 
 //! Loading the datapath object and wiring its runtime parameters.
 //!
-//! The object is compiled from `control/kern/tproxy.c` by
+//! The object is compiled from `ebpf/kern/datapath.bpf.c` by
 //! `cargo xtask ebpf`; this module does not compile it, so building daer
 //! never needs a clang toolchain or the kernel headers.
 //!
@@ -18,13 +18,10 @@ use aya::maps::Array;
 use aya::maps::MapError;
 use aya::programs::LinkOrder;
 use aya::programs::ProgramError;
-use aya::programs::tc::NlOptions;
 use aya::programs::tc::SchedClassifier;
 use aya::programs::tc::SchedClassifierLinkId;
 use aya::programs::tc::TcAttachOptions;
 use aya::programs::tc::TcAttachType;
-use aya::programs::tc::TcError;
-use aya::programs::tc::qdisc_add_clsact;
 use aya::util::KernelVersion;
 
 use crate::abi::RuntimeParam;
@@ -40,11 +37,9 @@ pub enum LoadError {
     Program(ProgramError),
     /// A map operation failed.
     Map(MapError),
-    /// The clsact qdisc could not be installed or a filter could not attach.
-    Tc(TcError),
     /// The object is missing a map, program or global this crate references.
     NotFound(String),
-    /// The requested attachment mode is not available on this kernel.
+    /// The kernel does not provide the required attachment primitive.
     Unsupported(String),
 }
 
@@ -55,7 +50,6 @@ impl fmt::Display for LoadError {
             Self::Load(err) => write!(f, "failed to load eBPF object: {err}"),
             Self::Program(err) => write!(f, "eBPF program error: {err}"),
             Self::Map(err) => write!(f, "eBPF map error: {err}"),
-            Self::Tc(err) => write!(f, "tc error: {err}"),
             Self::NotFound(name) => write!(f, "eBPF object is missing \"{name}\""),
             Self::Unsupported(message) => write!(f, "unsupported attachment: {message}"),
         }
@@ -69,7 +63,6 @@ impl std::error::Error for LoadError {
             Self::Load(err) => Some(err),
             Self::Program(err) => Some(err),
             Self::Map(err) => Some(err),
-            Self::Tc(err) => Some(err),
             Self::NotFound(_) => None,
             Self::Unsupported(_) => None,
         }
@@ -232,94 +225,64 @@ pub fn set_device_ifindex(ebpf: &mut Ebpf, ifindex: u32) -> Result<(), LoadError
     Ok(())
 }
 
-/// Ensures the `clsact` qdisc exists on `interface`.
+/// Fails unless this kernel can attach TC programs through TCX.
 ///
-/// Returns `true` when **this call created it**, so the owner can remove exactly the qdisc it
-/// added when the datapath detaches. A pre-existing qdisc belongs to the operator (or another
-/// program) and must survive a daer stop; deleting it would remove that program's filters too.
+/// TCX is the only attachment mode daer supports (ADR-0042). It is fd-owned, so a link
+/// disappears when the process exits, including after `SIGKILL`, and it creates no qdisc.
+/// Keeping a classic netlink path would reintroduce persistent host state and the recovery
+/// machinery that state needs.
 ///
 /// # Errors
 ///
-/// Returns [`LoadError::Tc`] for a failure other than the qdisc already existing.
-pub fn ensure_clsact(interface: &str) -> Result<bool, LoadError> {
-    match qdisc_add_clsact(interface) {
-        Ok(()) => Ok(true),
-        // `ip link` and `tc` report an existing qdisc as EEXIST. Aya exposes the raw errno
-        // on its netlink error; matching the error kind alone is not enough because the
-        // netlink wrapper does not preserve a synthetic `AlreadyExists`.
-        Err(TcError::NetlinkError(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-            Ok(false)
-        }
-        Err(TcError::AlreadyAttached) => Ok(false),
-        Err(error) => Err(LoadError::Tc(error)),
-    }
-}
-
-/// How a `SchedClassifier` is attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcMode {
-    /// Classic `cls_bpf` through netlink. The filter outlives the process and is removed by
-    /// the crash journal or the next start.
-    Netlink,
-    /// TCX through `bpf_link`. The link is fd-owned, so closing it detaches the program,
-    /// including when the process is killed.
-    Tcx,
-}
-
-/// Whether the running kernel has the TCX link type.
-fn tcx_supported() -> Result<bool, LoadError> {
+/// Returns [`LoadError::Unsupported`] when the kernel version cannot be read or is older
+/// than 6.6.
+pub fn require_tcx() -> Result<(), LoadError> {
     let current = KernelVersion::current().map_err(|error| {
         LoadError::Unsupported(format!("cannot read the kernel version: {error}"))
     })?;
-    Ok(current >= KernelVersion::new(6, 6, 0))
+    if tcx_available(current) {
+        return Ok(());
+    }
+    Err(LoadError::Unsupported(format!(
+        "daer requires Linux 6.6 or newer for TCX; running {current}"
+    )))
 }
 
-/// Attaches one tc program to `interface` in `direction`.
+/// The version predicate is separate from the syscall so the boundary is testable without
+/// booting a second kernel.
+fn tcx_available(current: KernelVersion) -> bool {
+    current >= KernelVersion::new(6, 6, 0)
+}
+
+/// Attaches one TC program to `interface` in `direction` using a TCX `bpf_link`.
 ///
-/// The classic path creates the `clsact` qdisc on demand; an existing qdisc is not an error.
-/// TCX is a `bpf_link` on the netdev and creates no qdisc.
+/// The returned link is fd-owned by the loaded object: dropping the object, or the process
+/// exiting for any reason, detaches the program. No `clsact` qdisc is created, so there is
+/// no host-side TC state to journal or clean up.
+///
+/// # Errors
+///
+/// Returns [`LoadError::Unsupported`] on a kernel without TCX, or [`LoadError::Program`]
+/// when the verifier or the attachment rejects the program.
 pub fn attach_tc(
     ebpf: &mut Ebpf,
     program_name: &str,
     interface: &str,
     direction: TcAttachType,
-    mode: TcMode,
 ) -> Result<SchedClassifierLinkId, LoadError> {
+    require_tcx()?;
     let program = ebpf
         .program_mut(program_name)
         .ok_or_else(|| LoadError::NotFound(program_name.to_owned()))?;
     let classifier: &mut SchedClassifier = program.try_into().map_err(LoadError::Program)?;
     classifier.load().map_err(LoadError::Program)?;
-    match mode {
-        TcMode::Netlink => {
-            ensure_clsact(interface)?;
-            // The classic TC-ingress path is the one this data path was proven on:
-            // `bpf_sk_assign` is a classic TC helper, and a TCX attach was observed to leave
-            // the assigned packet without reaching the listener's accept queue. TCX is
-            // opt-in until the privileged transparent-path gate proves otherwise.
-            classifier
-                .attach_with_options(
-                    interface,
-                    direction,
-                    TcAttachOptions::Netlink(NlOptions::default()),
-                )
-                .map_err(LoadError::Program)
-        }
-        TcMode::Tcx => {
-            if !tcx_supported()? {
-                return Err(LoadError::Unsupported(
-                    "TCX attachment requires Linux 6.6 or newer".to_owned(),
-                ));
-            }
-            classifier
-                .attach_with_options(
-                    interface,
-                    direction,
-                    TcAttachOptions::TcxOrder(LinkOrder::default()),
-                )
-                .map_err(LoadError::Program)
-        }
-    }
+    classifier
+        .attach_with_options(
+            interface,
+            direction,
+            TcAttachOptions::TcxOrder(LinkOrder::default()),
+        )
+        .map_err(LoadError::Program)
 }
 
 /// Map names present in a loaded object.
@@ -330,4 +293,17 @@ pub fn map_names(ebpf: &Ebpf) -> Vec<&str> {
 /// Program names present in a loaded object.
 pub fn program_names(ebpf: &Ebpf) -> Vec<&str> {
     ebpf.programs().map(|(name, _)| name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tcx_floor_is_exactly_linux_6_6() {
+        assert!(!tcx_available(KernelVersion::new(6, 5, 0)));
+        assert!(tcx_available(KernelVersion::new(6, 6, 0)));
+        assert!(tcx_available(KernelVersion::new(6, 7, 0)));
+        assert!(tcx_available(KernelVersion::new(7, 0, 0)));
+    }
 }

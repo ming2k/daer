@@ -150,7 +150,7 @@ object, and it is the only place a verifier rejection is visible.
 
 ## The netune version boundary
 
-`daer` pins `netune` at a tag (`v0.0.24`) and verifies the lock with `--locked`. The transport
+`daer` pins `netune` at a tag (`v0.0.28`) and verifies the lock with `--locked`. The transport
 observability this change consumes is carried by that release:
 
 * `TraceCollector` is the one cold-path handle (netune ADR-0018); `Recorder` is no longer
@@ -207,6 +207,9 @@ the same reason it already refused a missing TCP or UDP slot. `tests/object.rs` 
 
 ## Addendum — TCX is opt-in until the privileged gate proves it
 
+> Superseded by [ADR-0042](0042-tcx-only-linux-6-6.md): TCX is now the only attachment
+> mode, classic `cls_bpf` and `daer-cleanup` are deleted, and Linux 6.6 is the minimum.
+
 Classic `cls_bpf` is the default because it is the only attachment mode this data path has
 been proven on end to end. `DAER_TC_ATTACH=tcx` selects TCX (`bpf_link`) for the privileged
 transparent-path test: the host filter becomes fd-owned, so a `SIGKILL` detaches it, and no
@@ -229,4 +232,4 @@ start, and the next start cannot distinguish daer's value from the operator's ba
 Those settings are now checked before any mutation and never written; the daemon still owns
 the per-device `daer0`/`daer0peer` knobs and the namespace-local knobs, which die with their
 devices. The operator's prerequisites are in
-[`docs/how-to/deployment.md`](../../how-to/deployment.md#host-sysctls).
+[`docs/how-to/deployment.md`](../how-to/deployment.md#host-sysctls).

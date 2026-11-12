@@ -5,7 +5,7 @@
 //! This is the test the ADR's acceptance criterion names, and it is built so that it can fail:
 //!
 //! 1. [`kernel_eval`] is a line-by-line transcription of `route_loop_cb` +
-//!    `route_eval_match` + `route_finalize_match` from `ebpf/kern/tproxy.c`, reading the bytes
+//!    `route_eval_match` + `route_finalize_match` from `ebpf/kern/datapath.bpf.c`, reading the bytes
 //!    [`daer_routing::kernel::compile`] produced. It knows nothing about `MatchSet`.
 //! 2. A corpus of flows is generated from the same rules the policy was compiled from.
 //! 3. For every flow the transcription and [`daer_routing::first_hit`] must agree on the
@@ -133,7 +133,7 @@ struct Flow {
 enum Verdict {
     /// The datapath's `route()` returned a verdict: the outbound byte plus flags.
     Routed { outbound: u8, mark: u32, must: bool },
-    /// No rule hit: `route()` returns `-EPERM`, which every caller turns into `TC_ACT_SHOT`.
+    /// No rule hit: `route()` returns `-EPERM`, which every caller turns into `DAER_TC_DROP`.
     Drop,
     /// The datapath asked the control plane to decide (`OUTBOUND_CONTROL_PLANE_ROUTING`).
     Defer,
@@ -713,7 +713,7 @@ fn object() -> Option<aya_obj::Object> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/ebpf/datapath.o")
+                .join("../../target/ebpf/datapath.bpf.o")
         });
     if !path.is_file() {
         return None;

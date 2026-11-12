@@ -134,6 +134,104 @@ async fn socks5_server(upstream: SocketAddr) -> SocketAddr {
     addr
 }
 
+/// A minimal SOCKS5 server that dials the target named in the request.
+///
+/// Unlike [`socks5_server`], the target is not fixed: this is what lets a test build a chain
+/// of two proxies and assert which one saw which hop.
+async fn socks5_proxy_server() -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("binds");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 2];
+                if client.read_exact(&mut greeting).await.is_err() || greeting[0] != 5 {
+                    return;
+                }
+                let mut methods = vec![0u8; usize::from(greeting[1])];
+                if client.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                if client.write_all(&[5, 0]).await.is_err() {
+                    return;
+                }
+
+                let mut head = [0u8; 4];
+                if client.read_exact(&mut head).await.is_err() || head[1] != 1 {
+                    return;
+                }
+                let (host, port) = match head[3] {
+                    1 => {
+                        let mut address = [0u8; 4];
+                        if client.read_exact(&mut address).await.is_err() {
+                            return;
+                        }
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        (
+                            Ipv4Addr::from(address).to_string(),
+                            u16::from_be_bytes(port),
+                        )
+                    }
+                    4 => {
+                        let mut address = [0u8; 16];
+                        if client.read_exact(&mut address).await.is_err() {
+                            return;
+                        }
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        (
+                            std::net::Ipv6Addr::from(address).to_string(),
+                            u16::from_be_bytes(port),
+                        )
+                    }
+                    3 => {
+                        let mut len = [0u8; 1];
+                        if client.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut host = vec![0u8; usize::from(len[0])];
+                        if client.read_exact(&mut host).await.is_err() {
+                            return;
+                        }
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        (
+                            String::from_utf8_lossy(&host).into_owned(),
+                            u16::from_be_bytes(port),
+                        )
+                    }
+                    _ => return,
+                };
+                let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
+                    let _ = client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                    return;
+                };
+                if client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    addr
+}
+
 /// Starts the loop for `config`, reporting `destination` for every flow.
 async fn start(config: &str, destination: SocketAddr) -> (SocketAddr, Supervisor) {
     let config = daer_config::toml_config::load_str(config).expect("config loads");
@@ -233,14 +331,15 @@ async fn a_group_rule_dials_through_the_node() {
     let config = format!(
         r#"
 [[node]]
-tag = "n1"
+name = "n1"
 type = "socks5"
 server = "{server}"
 port = {port}
 
-[[group]]
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+node = "n1"
+type = "manual"
 
 [routing]
 rules = []
@@ -270,7 +369,7 @@ fallback = "nope"
     let error = Generations::new(&config, &daer_control::RouterOptions::default())
         .expect_err("must not build");
     // The rule error is the source; the message is about the service.
-    assert!(error.source.to_string().contains("not found"), "{error}");
+    assert!(error.source.to_string().contains("nope"), "{error}");
     // Nothing was ever published, so nothing may claim to be serving.
     assert!(!error.to_string().contains("still serving"), "{error}");
     assert!(error.to_string().contains("nothing is serving"), "{error}");
@@ -280,11 +379,19 @@ fallback = "nope"
 async fn a_group_with_no_selectable_node_fails_the_flow_loudly() {
     // A node whose protocol this build cannot speak must not be used as `direct`.
     let config = r#"
-subscription = ["vless://uuid@example.com:443"]
+[[node]]
+name = "dead"
+type = "socks5"
+server = "127.0.0.1"
+port = 9
 
 [[group]]
+name = "proxy-pool"
+
+[[election]]
 name = "proxy"
-policy = "fixed(0)"
+group = "proxy-pool"
+type = "random"
 
 [routing]
 rules = []
@@ -306,4 +413,29 @@ fallback = "proxy"
     assert_eq!(stats.accepted, 1, "{stats:?}");
     assert_eq!(stats.failed, 1, "{stats:?}");
     let _ = stats.rejected;
+}
+
+#[tokio::test]
+async fn a_flow_traverses_a_detour_chain() {
+    let echo = echo_server().await;
+    let inner = socks5_proxy_server().await;
+    let outer = socks5_proxy_server().await;
+    let config = format!(
+        "schema = 2\n\n\
+         [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
+         [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\ndetour = \"inner\"\n\n\
+         [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
+         [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
+         [routing]\nrules = []\nfallback = \"proxy\"\n",
+        inner.ip(),
+        inner.port(),
+        outer.ip(),
+        outer.port()
+    );
+    let (ingress, _supervisor) = start(&config, echo).await;
+    let mut client = TcpStream::connect(ingress).await.expect("connects");
+    client.write_all(b"hello").await.expect("writes");
+    let mut echoed = [0u8; 5];
+    client.read_exact(&mut echoed).await.expect("reads");
+    assert_eq!(&echoed, b"hello");
 }

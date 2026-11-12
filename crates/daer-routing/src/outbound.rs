@@ -11,7 +11,7 @@ use daer_config::Function;
 use crate::error::RoutingError;
 
 /// Reserved outbound: marks the following rules as "must", without terminating
-/// the rule (see `patchMustOutbound` and `tproxy.c`).
+/// the rule (see `patchMustOutbound` and `datapath.bpf.c`).
 ///
 /// Defined in `daer-common` so the rule lowering, the kernel id mapping and the configuration
 /// validator cannot disagree about the spelling.

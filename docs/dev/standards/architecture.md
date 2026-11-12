@@ -1,85 +1,93 @@
 # System Architecture Governance
 
-This document codifies the workspace topology, subsystem boundaries, and non-negotiable architectural red-lines of `daer`.
+This document defines repository-agnostic rules for workspace topology, subsystem boundaries, and architectural red-lines. It states the rule; each repository records its concrete implementation, identifiers, and enforcement tests in its own ADRs and project documentation.
 
 ---
 
-## 1. Concentric Workspace Topology
+## 1. Layered Workspace Topology
 
-`daer` organizes its Cargo workspace into four concentric layers. Dependencies flow strictly from outer layers inward; backward or circular dependencies across layer boundaries are prohibited:
+A workspace is organized into concentric layers. Dependencies flow from outer layers toward inner foundation layers; backward, sideways-across-boundary, or circular dependencies are prohibited:
 
 ```text
-┌────────────────────────────────────────────────────────────────────────┐
-│  Layer 4: Host Binary & CLI (`crates/daer-cli`)                        │
-│  - Unified single public executable (`daer`)                           │
-│  - Service runtime (`run`, which also serves DNS)                      │
-│  - Inspection & diagnostics (`check`, `route`, `probe`, `schema`)      │
-├────────────────────────────────────────────────────────────────────────┤
-│  Layer 3: Decision Plane & Userspace Data Path                         │
-│  - Routing decisions, node selection, health scheduling:               │
-│    `crates/daer-control`                                               │
-│  - Transparent ingress, splice, UDP sessions, flow supervision:        │
-│    `crates/daer-relay` (ADR-0018)                                      │
-│  - Integrated DNS pipeline & cache: `crates/daer-dns`                  │
-│  - Generation management & zero-downtime hot reload                    │
-├────────────────────────────────────────────────────────────────────────┤
-│  Layer 2: Domain Engines & Capabilities                                │
-│  - Rule lowering & indexed matching: `crates/daer-routing`             │
-│  - Outbound groups, alive sets, probes: `crates/daer-outbound`         │
-│  - Proxy protocol implementations: `crates/daer-proxy-protocols`       │
-│  - Prefix protocol sniffing (TLS SNI, HTTP Host, QUIC): `daer-sniff`   │
-│  - Canonical rule source & DRB producer: `crates/daer-rule-ast`, `crates/daer-drb` │
-├────────────────────────────────────────────────────────────────────────┤
-│  Layer 1: Kernel Datapath & Core Foundation                            │
-│  - eBPF object loader & map ABI: `crates/daer-ebpf`                    │
-│  - C eBPF datapath program: `ebpf/kern/`                               │
-│  - TOML configuration schema & expression AST: `crates/daer-config`    │
-│  - Shared constants & network primitives: `crates/daer-common`         │
-│  - Typed events, correlation IDs, incident primitives: `daer-observe`  │
-└────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 4: Host Interface                                     │
+│   Executables, CLI/API surface, service entry points        │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 3: Control Plane & Data Path                          │
+│   Orchestration, ingress, sessions, lifecycle, handover     │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 2: Domain Engines & Capabilities                      │
+│   Policy, protocol, provider, and media logic               │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 1: Foundation & Platform Primitives                   │
+│   ABI, configuration, shared types, loaders, constants      │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+Rules:
+
+1. An outer layer may depend on an inner layer. An inner layer must not depend on an outer layer.
+2. A layer may consume another layer only through its public contract. Reaching into private modules, or re-exporting an inner capability as if the outer layer owned it, is prohibited.
+3. Layer names and counts are repository decisions; the dependency-direction rule is normative.
+4. Enforcement is a dependency-graph check (workspace metadata, a dependency-policy linter, or equivalent), not review discipline.
 
 ---
 
 ## 2. Architectural Red-Lines
 
-### 2.1 Socket Mark Loop Evasion ([INV-MARK-01])
-- **Red-Line**: All outbound egress dials originating from `daer` must carry `SO_MARK` (`so-mark = 0x0dae`) before the socket connects to origin servers.
-- **Enforcement**: Without the socket mark, traffic dialed by the proxy itself would be recaptured by the redirect firewall rule and forced back into the transparent port, causing an infinite loop that hangs connections without error logs. Enforced via `RouterOptions::with_socket_mark` and netune's `SocketConfig::mark`.
+### 2.1 Egress Identity and Loop Evasion
 
-### 2.2 Single Configuration Loader SSOT ([INV-LOADER-01])
-- **Red-Line**: Diagnostic commands (`daer route`, `daer probe node`, `daer check --nodes`, `daer check`) and the runtime daemon (`daer run`) MUST load and compile configuration through the exact same loader (`daer_control::load_resolved`).
-- **Enforcement**: Diagnostics and runtime share identical generation lowering, alias optimization, subscription and rule-provider caching. A node or rule that appears in `daer route` is guaranteed to exist identically in the running daemon (ADR-0006). `daer probe` adds network I/O to that same generation; it never re-resolves a node from the file on its own.
+- **Red-Line**: Every socket the process creates for its own egress, listeners, or health probes must carry a durable identity that the interception path recognizes before traffic leaves.
+- **Why**: Without that identity, the process's own traffic is recaptured by its redirect rules, producing an infinite loop that hangs connections without a useful error.
+- **Enforcement**: One constructor stamps the identity; a test asserts every egress path carries it; a negative control proves intercepted traffic is distinguished from bypassed traffic.
 
-### 2.3 Kernel Policy Fidelity or Explicit Deferral ([INV-KERNEL-01])
-- **Red-Line**: The eBPF kernel policy table must either be provably equivalent to userspace rule evaluation, or explicitly defer the decision to the userspace control plane with logged reasons (ADR-0005).
-- **Enforcement**: Predicates supported directly by the kernel fast path (`dip`, `sip`, `port`, `sport`, `l4proto`, `ipversion`, `mac`, `dscp`) execute in-kernel at the tc hook. If a configuration uses predicates requiring userspace state (`domain(...)`, `pname(...)`), the datapath policy is published as a deferral, logging a warning and safely relaying through userspace rather than fabricating an incomplete kernel decision.
+### 2.2 Single Resolver and Loader
 
-### 2.4 Netune Boundary Purity ([INV-NETUNE-01])
-- **Red-Line**: Generic network capabilities belong to `netune`; proxy appliance data path, eBPF maps, transparent accept, and proxy protocols stay in `daer` (ADR-0002).
-- **Enforcement**: `daer` consumes `netune` as a pinned dependency. `daer` does not implement generic TLS, HTTP codecs, or raw SOCKS5/CONNECT framing. The only exception is REALITY (ADR-0010), where custom unauthenticated TLS 1.3 client mechanics are owned directly by `daer-proxy-protocols`.
+- **Red-Line**: Runtime and inspection/diagnostic paths must resolve configuration and policy through one loader. There is no second parser, resolver, or compilation path.
+- **Why**: Two loaders drift. A diagnostic command that disagrees with the running process is worse than no diagnostic at all.
+- **Enforcement**: One shared entry point; tests assert inspection output equals the runtime representation; a dependency check forbids an alternative loader.
 
-### 2.5 Dual-Slot Epoch Atomic Handover ([INV-EPOCH-01])
-- **Red-Line**: Kernel policy updates during reload must NEVER mutate live active routing tables in-place.
-- **Enforcement**: The datapath maintains two alternating policy slots (`slot 0` and `slot 1`). The userspace daemon fully compiles and populates the inactive slot before flipping the atomic `active_slot` integer, guaranteeing zero-downtime hot reload without transient policy gaps (ADR-0004).
+### 2.3 Fast-Path Parity or Explicit Deferral
 
-### 2.6 Data Path Stays Stable ([INV-RELAY-01])
-- **Red-Line**: `daer-relay` decides nothing. It must not depend on `daer-config`, `daer-outbound`, `daer-routing` or `daer-proxy-protocols`, and its public seam must not name a routing concept (ADR-0018).
-- **Enforcement**: The seam is `daer_relay::Decide` (a stream per accepted flow) and `daer_relay::DatagramRouter` (a `DatagramLeg` per datagram flow). A `Verdict`, a group or a policy appearing in either signature is a red-line breach: it would make every new selection concept a change to the code that forwards bytes, and it would put the accept loop's failure modes behind a routing configuration instead of a test double. Liveness is separate from layering: the accept loop must not await a decision or a dial, and the datagram relay must not share its task; `serve::tests::a_slow_decision_does_not_block_accepting_the_next_flow` is the falsifier.
+- **Red-Line**: Policy compiled into a fast path must either be provably equivalent to the reference evaluator or explicitly defer to the reference path with a logged reason. Silent truncation or a partial policy is prohibited.
+- **Why**: A fast path that quietly matches a subset of the reference rules is a correctness hole that looks like a performance win.
+- **Enforcement**: Equivalence tests over the encodable subset; an explicit defer-reason type; a counter or log entry for every deferral.
 
-### 2.7 The Transparent Ingress Has One Namespace Boundary ([INV-DATAPATH-01])
-- **Red-Line**: `daer0peer`, the transparent listeners, and table 2023 live in the private `daer0ns` namespace (ADR-0038). The host keeps `daer0`, the forwarding path, and the redirect source. There is no same-namespace fallback.
-- **Enforcement**: `daer-control::netns::PreparedIngress` creates the namespace before `Daemon::bind_in`; `IngressNamespace::with` binds and attaches on a thread that has entered it; `RouteTable` installs `iif daer0peer`, never a mark-keyed rule, which would loop the listener's marked replies.
+### 2.4 Capability Ownership
 
-### 2.8 Proxy Protocols Are Not Re-Exported ([INV-PROTO-01])
-- **Red-Line**: `daer-outbound` owns outbound governance, not protocol implementations, and does not re-export the latter's types (ADR-0017). The only exception is `daer_outbound::fragment`, which `DialerOptions` carries as a value.
-- **Enforcement**: `cargo tree -p daer-outbound --depth 1` must show no `quinn`, `h3`, `rustls`, `x25519-dalek`, `ml-kem` or AEAD crate. A protocol type reachable through the governance crate's root would announce a boundary it does not own, and would let a future selection feature reach a handshake without naming `daer-proxy-protocols`.
+- **Red-Line**: Generic capabilities live in the shared capability layer; product-specific behavior lives in the product layer. Governance or selection layers must not re-export capability types as their own.
+- **Why**: A type reachable through a layer that does not own it announces a boundary that does not exist and lets future features reach the capability without naming its owner.
+- **Enforcement**: Dependency-closure audit, forbidden-dependency list, and a public-surface test.
 
+### 2.5 Atomic State Handover
+
+- **Red-Line**: Live state replacement must never mutate active state in place. Build the replacement fully in an inactive slot, then switch atomically.
+- **Why**: In-place mutation exposes readers to a partially published policy and creates transient gaps that are hard to reproduce.
+- **Enforcement**: Dual-slot or generation-based design; a concurrency test that exercises traffic during the switch; no code path that publishes partial state.
+
+### 2.6 Stable Data Path
+
+- **Red-Line**: The component that forwards bytes decides nothing. It must not depend on configuration, selection, or domain-policy types; decisions arrive through a narrow typed seam.
+- **Liveness**: Ingress and accept loops must not await a decision or a dial. Independent flows must not share a blocking task.
+- **Enforcement**: Dependency firewall; test doubles at the seam; a slow-decision test that proves unrelated flows continue.
+
+### 2.7 Isolation Boundary
+
+- **Red-Line**: Privileged listeners and state that can loop live behind a dedicated process or namespace boundary. The host retains only the minimal forwarding and redirect state. There is no same-namespace fallback.
+- **Why**: The boundary makes ownership and lifetime explicit; removing the fallback prevents a silent degraded mode that behaves differently from the tested path.
+- **Enforcement**: One component creates and owns the boundary; a teardown test proves no state survives process exit; no identity-keyed rule may loop replies.
+
+### 2.8 Protocol Ownership
+
+- **Red-Line**: Protocol implementations are not re-exported through governance or selection crates. Consumers depend on the protocol crate directly; a governance crate may carry only inert values.
+- **Why**: Re-exporting a handshake couples selection policy to wire implementation and makes the dependency direction ambiguous.
+- **Enforcement**: Dependency-closure and public-API tests fail if a protocol type is reachable through the governance crate.
 
 ---
 
-## 3. Crate Addition and Workspace Integrity
+## 3. Workspace Integrity
 
-1. **Single Public Binary**: `daer` is the sole public executable binary produced by the workspace.
-2. **Strict Physical Tiering**: Crates reside exclusively under `crates/*`. No crates reside directly at the root.
-3. **Zero Unconsumed Configuration**: Every configuration key defined in `daer-config` must be consumed by the daemon or rejected by strict validation (enforced by `daer-config::tests::config_keys`).
+1. **One Primary Public Surface**: A workspace exposes one public binary or entry point unless a recorded product decision says otherwise.
+2. **Physical Tiering**: Source packages live under their canonical workspace directory. No package resides directly at the repository root.
+3. **Zero Unconsumed Configuration**: Every accepted configuration key is consumed by the runtime or rejected by schema validation. An accepted key that neither changes behavior nor is rejected is a defect.
+4. **Repository-Specific Red-Lines**: Concrete names, identifiers, commands, and enforcement tests belong in the repository's ADRs and project documentation. This document defines only the neutral rule.

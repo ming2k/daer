@@ -11,19 +11,17 @@
 //! ```text
 //!   config ──▶ Generations ──▶ Router ──┐
 //!                                        ├──▶ serve(ingress, router) ──▶ relay ──▶ node
-//!   datapath.o ──▶ load ──▶ attach tc ──┘
+//!   datapath.bpf.o ──▶ load ──▶ attach tc ──┘
 //! ```
 //!
 //! # The order is not arbitrary
 //!
-//! The kernel program must be attached **before** the listener accepts anything: a flow
-//! that reaches the transparent port without a datapath behind it was not redirected, and
-//! `is_self_connect` would reject it. Attaching first also means the first flow of the
-//! system's life is proxied rather than passed through.
+//! The kernel program must be attached **before** the listener accepts anything: attaching
+//! first means the first flow of the system's life is proxied rather than passed through.
 //!
 //! The listener is bound before the program is attached, though, and that is deliberate:
-//! the `PARAM` global carries the listener's port, so the port has to exist before the
-//! program is loaded. Binding a socket does not accept from it.
+//! the socket file descriptors go into `listen_socket_map`, so the sockets have to exist
+//! before the program is loaded. Binding a socket does not accept from it.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -47,8 +45,6 @@ use crate::generation::{Generations, ReloadError};
 /// does not have to spell the object's field names.
 #[derive(Debug, Clone)]
 pub struct DatapathSettings {
-    /// The transparent port the kernel redirects to.
-    pub tproxy_port: u16,
     /// Interfaces to attach the LAN-side programs to.
     pub lan_interfaces: Vec<String>,
     /// Interfaces to attach the WAN-side programs to.
@@ -214,15 +210,13 @@ impl Daemon {
         let namespace = ingress
             .as_ref()
             .map(|ingress| Arc::clone(&ingress.namespace));
-        let port = config.global.tproxy_port;
-        let protect = config.global.tproxy_port_protect;
         let socket_mark = match options.so_mark {
             Some(mark) => mark,
             None => config.global.so_mark,
         };
         let ids = Arc::new(daer_observe::Ids::new());
-        // Bound before the object is loaded: the port is part of `PARAM`, so it has to be
-        // known first. Binding does not accept, so no flow is served before the datapath
+        // Bound before the object is loaded: the sockets go into `listen_socket_map`, so they
+        // have to exist first. Binding does not accept, so no flow is served before the datapath
         // exists.
         let listener = match &namespace {
             Some(namespace) => {
@@ -230,23 +224,13 @@ impl Daemon {
                 namespace
                     .with(move || {
                         let _entered = handle.enter();
-                        TransparentListener::bind_with_options(
-                            Ipv4Addr::UNSPECIFIED,
-                            port,
-                            protect,
-                            socket_mark,
-                        )
+                        TransparentListener::bind_with_options(Ipv4Addr::UNSPECIFIED, socket_mark)
                     })
                     .map_err(|error| BindError::Ingress(RelayError::Socket(error)))?
                     .map_err(BindError::Ingress)?
             }
-            None => TransparentListener::bind_with_options(
-                Ipv4Addr::UNSPECIFIED,
-                port,
-                protect,
-                socket_mark,
-            )
-            .map_err(BindError::Ingress)?,
+            None => TransparentListener::bind_with_options(Ipv4Addr::UNSPECIFIED, socket_mark)
+                .map_err(BindError::Ingress)?,
         };
         let listener = listener.with_ids(Arc::clone(&ids));
         let port = listener.port();
@@ -262,19 +246,16 @@ impl Daemon {
                         let _entered = handle.enter();
                         TransparentDatagramListener::bind_with_options(
                             Ipv4Addr::UNSPECIFIED,
-                            port,
                             socket_mark,
                         )
                     })
                     .map_err(|error| BindError::Ingress(RelayError::Socket(error)))?
                     .map_err(BindError::Ingress)
             }
-            None => TransparentDatagramListener::bind_with_options(
-                Ipv4Addr::UNSPECIFIED,
-                port,
-                socket_mark,
-            )
-            .map_err(BindError::Ingress),
+            None => {
+                TransparentDatagramListener::bind_with_options(Ipv4Addr::UNSPECIFIED, socket_mark)
+                    .map_err(BindError::Ingress)
+            }
         };
         let datagrams = match datagrams {
             Ok(listener) => {
@@ -319,6 +300,13 @@ impl Daemon {
     #[must_use]
     pub fn generation(&self) -> Arc<crate::generation::Generation> {
         self.generations.current()
+    }
+
+    /// The generation store, for a control-plane client that must read the current one
+    /// per request (the admin socket).
+    #[must_use]
+    pub fn generations(&self) -> Arc<crate::generation::Generations> {
+        Arc::clone(&self.generations)
     }
 
     /// How often to probe nodes, from the configuration the daemon was built with.
@@ -384,13 +372,10 @@ impl Daemon {
         })
     }
 
-    /// The health-check settings of the current generation.
-    ///
-    /// The whole table rather than just the interval: a probe's URL, HTTP method and UDP DNS
-    /// endpoints are configuration, and passing only the interval is how they came to be ignored.
+    /// The probe defaults of the current generation.
     #[must_use]
-    pub fn health_check(&self) -> daer_config::HealthCheck {
-        self.generations.current().health_check()
+    pub fn probe(&self) -> daer_config::ProbeSettings {
+        self.generations.current().probe()
     }
 
     /// Runs the accept loop until `shutdown` resolves.

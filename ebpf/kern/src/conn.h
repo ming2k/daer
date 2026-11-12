@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+// Copyright (c) 2022-2026, daer contributors
 //
 // Part of the datapath translation unit. See ADR-0024 for why the split is by
 // map ownership and attach domain rather than by directory convention.
@@ -491,7 +491,7 @@ tproxy_lan_egress_refresh(struct tuples *tuples, const struct tcphdr *tcph,
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (l4proto == IPPROTO_UDP) {
 		if (udph->source == bpf_htons(53) || udph->dest == bpf_htons(53))
-			return DAE_TC_CONTINUE;
+			return DAER_TC_CONTINUE;
 
 		struct tuples_key reversed_tuples_key;
 
@@ -501,7 +501,7 @@ tproxy_lan_egress_refresh(struct tuples *tuples, const struct tcphdr *tcph,
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
-	return DAE_TC_CONTINUE;
+	return DAER_TC_CONTINUE;
 }
 
 

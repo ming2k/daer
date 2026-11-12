@@ -7,7 +7,7 @@ This tutorial walks through building `daer`, generating the eBPF datapath, autho
 ## 1. Prerequisites
 
 Before starting, ensure your system has:
-- Linux kernel 5.17 or newer (with BTF enabled at `/sys/kernel/btf/vmlinux`).
+- Linux kernel 6.6 or newer with TCX support (and BTF enabled at `/sys/kernel/btf/vmlinux`).
 - Clang and LLVM (`clang`, `llvm-strip`).
 - Rust 1.95+ toolchain.
 - Root or `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` and `CAP_SYS_ADMIN` privileges. The
@@ -24,7 +24,7 @@ Clone the repository and compile both the userspace daemon and the eBPF kernel d
 # 1. Compile the Rust workspace
 cargo build --release
 
-# 2. Compile the eBPF datapath object (produces target/ebpf/datapath.o)
+# 2. Compile the eBPF datapath object (produces target/ebpf/datapath.bpf.o)
 cargo xtask ebpf
 ```
 
@@ -41,16 +41,15 @@ cargo xtask kernel-check
 Create a simple configuration file at `/etc/daer/config.toml` (or locally as `config.toml`):
 
 ```toml
-schema = 1
+schema = 2
 
 [global]
-tproxy-port = 12345
 wan-interface = ["auto"]
 lan-interface = ["eth0"]       # Replace with your client-facing LAN interface
-so-mark = 0x0dae               # Required to avoid proxy self-capture
+so-mark = 0x64616572               # Required to avoid proxy self-capture
 
 [[node]]
-tag = "edge-proxy"
+name = "edge-proxy"
 type = "shadowsocks"
 server = "example.com"
 port = 8388
@@ -58,8 +57,12 @@ method = "chacha20-ietf-poly1305"
 password = "my-secret-password"
 
 [[group]]
+name = "proxy-pool"
+
+[[election]]
 name = "proxy"
-policy = "min-moving-avg"
+group = "proxy-pool"
+type = "min-moving-avg"
 
 [routing]
 rules = [

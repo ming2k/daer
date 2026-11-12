@@ -19,10 +19,10 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Routing matcher performance | ✅ indexed, allocation-free: `suffix` is a label walk over a hash set, `keyword` Aho–Corasick, `regex` a `RegexSet`, `full` a hash set, `dip`/`sip` merged intervals + binary search. Measured on `geosite:cn` (110,249 domains): 368 µs → **89 ns** on a miss, 28.9 µs → **82 ns** on a hit. `tests/hot_path.rs` asserts the cost does not scale with set size and that a decision allocates nothing |
 | Subscriptions (fetch, base64 / SIP008 / plain decoding, `persist` cache) | ✅ `daer-outbound::subscription` + `daer-control::subscription`; resolved before a generation is built, so `Router::new` stays a pure function of its configuration |
 | Datapath object loading (ABI, section normalization, map/program names) | ✅ |
-| Outbound: latency, alive set, groups, policies, direct/SOCKS5/HTTP `CONNECT`, health checks | ✅ |
+| Outbound: latency, alive set, resource pools, elections, direct/SOCKS5/HTTP `CONNECT`, probes | ✅ |
 | Outbound: shadowsocks AEAD (aes-gcm, chacha20-poly1305) | ✅ |
 | Outbound: trojan (TLS to the node via netune) | ✅ |
-| Outbound: chained links (`a -> b`) | ⬜ rejected loudly at validation rather than silently truncated to the first hop |
+| Outbound: chained links (`a -> b`) | ✅ expressed as `[[node]] detour` (ADR-0044); URI chain strings are still rejected loudly |
 | Outbound: anytls | ✅ multiplexed session, framing, datagrams |
 | Outbound: **vless as orthogonal layers** | ✅ per [ADR-0028](../adr/0028-protocol-layering.md): transport (`tcp`, `ws`) × security (`none`, `tls`, `reality`) × flow (`none`, `xtls-rprx-vision`). `tests/layer_matrix.rs` starts one local `xray` with five inbounds and takes a round trip through each reachable row, plus a negative control (a plaintext listener dialled as `security=tls`). Vision over `ws` is **refused at load**: the reference rejects it on both ends ("XTLS only supports TLS and REALITY directly for now"), and the fixture's configured-but-unused inbound is what makes that a test rather than a claim |
 | Outbound: **vmess AEAD** | ✅ per [ADR-0030](../adr/0030-vmess-aead-only.md): the reference's aliasing-hasher KDF (six vectors taken from `aead.KDF` itself), `AuthID`, the sealed header, the three size modes, both ciphers and both data planes. `tests/vmess_live.rs` takes a round trip through a real `xray` VMess inbound for `auto`/`aes-128-gcm`/`chacha20-poly1305`, with `AuthenticatedLength` on and off, and over `ws`. The legacy handshake is not expressible: a non-zero `aid` is a load error |
@@ -30,7 +30,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: `tuic` | ⬜ the one family left: not implemented, listed and reported as unselectable |
 | Outbound: `[global.tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
 | Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
-| Health checks: the configured `tcp-url`, `tcp-method` and `udp-dns` are what probes use | ✅ |
+| Health checks: an election's `mode`/`url`/`method` and `udp-dns` are what probes use; `url` mode measures through the node | ✅ |
 | Outbound: Vision (`xtls-rprx-vision`) | ✅ framing both ways, and the peer's `Direct` is honoured with a raw read (see below). The uplink never claims `Direct` — it sends `End` — because a splice on our side is not implemented; that costs throughput on a TLS stream and nothing else |
 | Outbound: Vision, **inner TLS** | ✅ a TLS stream through the tunnel works (`curl https://…`, three runs, against a local reference node with a local TLS origin). This was broken until the peer's `Direct` was implemented: the node stops encrypting and a client that keeps decrypting reads ciphertext as plaintext (`the record was altered`). Plaintext (HTTP) inside the tunnel always worked, which is exactly why the gap survived — the e2e probe tier was a plaintext GET, so `daer probe node` reported "fully operational" for a node that could not carry a single HTTPS request |
 | Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
@@ -43,7 +43,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | DNS: cache (TTL, stale-while-revalidate, negative answers, bounds) | ✅ |
 | DNS: answer pipeline (routing → cache → transport → response routing) | ✅ |
 | DNS: upstream syntax + DNS over TCP | ✅ |
-| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` is a plain `UdpSocket`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. **No netune change was needed** — the earlier entries in [`netune-requests.md`](netune-requests.md) that blamed netune for these were wrong and are corrected there |
+| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` uses netune's `UdpConnector`, `tcp` uses netune's `TcpConnector`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. Every connector carries the daemon's `SocketConfig`, so DNS egress is marked and traced like any other outbound |
 | DNS: UDP and TCP server sockets | ✅ |
 | DNS: served by `daer run`, upstream usability gated by `daer check` (ADR-0015) | ✅ |
 | DNS: bootstrap resolver | ⬜ |
@@ -100,15 +100,15 @@ The largest piece. Order matters: this is what makes the binary useful.
    the routing table itself into the maps ([ADR-0005](../adr/0005-kernel-policy-encoding.md)).
    The table is either provably equivalent to the userspace evaluator or a one-entry
    deferral, never empty and never partial: an empty table makes `route()` return
-   `-EPERM`, which every caller turns into `TC_ACT_SHOT`, so "no policy" was never a
+   `-EPERM`, which every caller turns into `DAER_TC_DROP`, so "no policy" was never a
    safe state. **Exit:** the encoded table agrees with `first_hit` on a generated flow
    corpus, which `crates/daer-routing/tests/kernel_policy.rs` asserts.
 3. **Routing decision** ✅ — the flow's tuple becomes `MatchFacts`, the compiled
-   program yields a verdict, and `block` / `direct` / group are applied per flow.
+   program yields a verdict, and `block` / `direct` / election are applied per flow.
    Facts the ingress cannot know (sniffed domain, process name, DSCP, source MAC)
    are supplied as unknown, so a rule that needs them cannot match by accident.
    The fallback is a value, not an error: an unmatched flow is *the* fallback.
-4. **Proxied flow** ✅ — a group selects a node through its policy and the node
+4. **Proxied flow** ✅ — an election selects one node from its resource input and the node
    dialer opens the other leg (direct, SOCKS5, HTTP `CONNECT`). Nodes whose
    protocol is not implemented yet are listed but not selectable: an unknown scheme
    is never downgraded to `direct`, which would leak the flow.

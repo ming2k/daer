@@ -112,9 +112,11 @@ fn the_daemon_links_neither_reader_nor_writer() {
 #[test]
 fn text_and_programmatic_construction_produce_identical_bytes() {
     let text = "\
+---
 name: corp
-ip: 10.0.0.0/8
-ip: 192.168.1.0/24
+---
+10.0.0.0/8
+192.168.1.0/24
 example.com
 .sub.example.com
 =api.corp.internal
@@ -150,8 +152,8 @@ example.com
 
 #[test]
 fn deterministic_builds_without_timestamp_divergence() {
-    let text1 = "name: set\nip: 1.1.1.0/24\na.com\n";
-    let text2 = "name: set\na.com\nip: 1.1.1.0/24\n";
+    let text1 = "---\nname: set\n---\n1.1.1.0/24\na.com\n";
+    let text2 = "---\nname: set\n---\na.com\n1.1.1.0/24\n";
 
     let drb1 = DrbSet::from_rule_set(&RuleSet::parse(text1).unwrap()).encode();
     let drb2 = DrbSet::from_rule_set(&RuleSet::parse(text2).unwrap()).encode();
@@ -165,7 +167,7 @@ fn deterministic_builds_without_timestamp_divergence() {
 #[test]
 fn an_artifact_round_trips_through_text() {
     let original = RuleSet::parse(
-        "name: rt\nip: 192.0.2.0/24\nexample.com\n.sub.example.com\n=api.example.com\n",
+        "---\nname: rt\n---\n192.0.2.0/24\nexample.com\n.sub.example.com\n=api.example.com\n",
     )
     .expect("parses");
 

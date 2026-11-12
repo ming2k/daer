@@ -127,6 +127,15 @@ impl CheckUrl {
         &self.path
     }
 
+    /// The `host:port` authority, always with the port and with IPv6 brackets.
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
     /// The `Host` header value: the port is omitted when it is the default.
     pub fn host_header(&self) -> String {
         if self.port == self.scheme.default_port() {

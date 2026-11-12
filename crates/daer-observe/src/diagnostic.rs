@@ -64,7 +64,8 @@ pub mod codes {
     pub const RELAY_DIAL_HANDSHAKE: ErrorCode = ErrorCode::new("daer.relay.dial_handshake");
     pub const RELAY_DIAL_NO_NODE: ErrorCode = ErrorCode::new("daer.relay.dial_no_node");
     pub const RELAY_DIAL_UNSUPPORTED: ErrorCode = ErrorCode::new("daer.relay.dial_unsupported");
-    pub const RELAY_DIAL_UNKNOWN_GROUP: ErrorCode = ErrorCode::new("daer.relay.dial_unknown_group");
+    pub const RELAY_DIAL_UNKNOWN_ELECTION: ErrorCode =
+        ErrorCode::new("daer.relay.dial_unknown_election");
     pub const RELAY_DIAL_NO_DATAGRAM: ErrorCode = ErrorCode::new("daer.relay.dial_no_datagram");
     pub const DNS_UPSTREAM_TIMEOUT: ErrorCode = ErrorCode::new("daer.dns.upstream_timeout");
     pub const DNS_UPSTREAM_CONNECT: ErrorCode = ErrorCode::new("daer.dns.upstream_connect");
@@ -105,7 +106,7 @@ pub enum DialStage {
     Tls,
     /// The proxy protocol handshake did not complete.
     Handshake,
-    /// The decision itself refused the flow (no group, no alive node, no datagram support).
+    /// The decision itself refused the flow (no election, no electable node, no datagram support).
     Policy,
 }
 
@@ -212,7 +213,7 @@ mod tests {
             codes::RELAY_DIAL_HANDSHAKE,
             codes::RELAY_DIAL_NO_NODE,
             codes::RELAY_DIAL_UNSUPPORTED,
-            codes::RELAY_DIAL_UNKNOWN_GROUP,
+            codes::RELAY_DIAL_UNKNOWN_ELECTION,
             codes::RELAY_DIAL_NO_DATAGRAM,
             codes::DNS_UPSTREAM_TIMEOUT,
             codes::DNS_UPSTREAM_CONNECT,

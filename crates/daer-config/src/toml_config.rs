@@ -8,22 +8,28 @@
 //! empty. Unknown keys are rejected at every level.
 //!
 //! ```toml
-//! schema = 1
+//! schema = 2
 //! include = ["conf.d/*.toml"]
 //!
 //! [global]
-//! tproxy-port = 12345
 //! dial-mode = "domain"
 //! lan-interface = ["docker0"]
 //!
 //! [[node]]
-//! tag = "edge"
-//! url = "vless://…"
+//! name = "edge"
+//! type = "vless"
+//! server = "example.com"
+//! port = 443
+//! uuid = "…"
 //!
 //! [[group]]
+//! name = "proxy-pool"
+//! filters = ["sub(sub) && !name(keyword: 'ExpireAt:')"]
+//!
+//! [[election]]
 //! name = "proxy"
-//! policy = "min-moving-avg"
-//! filters = ["subtag(sub) && !name(keyword: 'ExpireAt:')"]
+//! group = "proxy-pool"
+//! type = "min-moving-avg"
 //!
 //! [routing]
 //! rules = ["provider(private) -> direct", "provider(cn) -> direct"]
@@ -432,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_syntax_error_carries_a_position() {
-        let error = load_str("[global]\ntproxy-port =\n").expect_err("must fail");
+        let error = load_str("[global]\nso-mark =\n").expect_err("must fail");
         let rendered = error.to_string();
         assert!(rendered.contains("line 2"), "{rendered}");
     }
@@ -455,7 +461,7 @@ mod tests {
     #[test]
     fn rendering_round_trips() {
         let config = load_str(
-            "[global]\ntproxy-port = 1234\n[[node]]\ntag = \"n\"\ntype = \"shadowsocks\"\n\
+            "[global]\nlog-level = \"debug\"\n[[node]]\nname = \"n\"\ntype = \"shadowsocks\"\n\
              server = \"1.2.3.4\"\nport = 8388\nmethod = \"aes-256-gcm\"\npassword = \"x\"\n\
              [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"direct\"\n",
         )

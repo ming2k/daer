@@ -4,7 +4,7 @@
 //!
 //! The decision loop is a direct port of `RoutingMatcher.Match` in
 //! `control/routing_matcher_userspace.go`, which is itself a copy of the loop in
-//! `control/kern/tproxy.c`. Keep the three in sync.
+//! `ebpf/kern/datapath.bpf.c`. Keep the three in sync.
 //!
 //! # Why the values are compiled types
 //!

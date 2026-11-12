@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org> */
+/* Copyright (c) 2026, daer contributors */
 
-#ifndef __DAE_TCP_OFFLOAD_H
-#define __DAE_TCP_OFFLOAD_H
+#ifndef __DAER_TCP_OFFLOAD_H
+#define __DAER_TCP_OFFLOAD_H
 
 static __always_inline __be16 tcp_offload_remote_port(__u32 port)
 {
@@ -82,4 +82,4 @@ tcp_offload_skb_key(struct sk_buff *skb, struct tuples_key *key)
 	return true;
 }
 
-#endif /* __DAE_TCP_OFFLOAD_H */
+#endif /* __DAER_TCP_OFFLOAD_H */

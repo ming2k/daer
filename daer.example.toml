@@ -8,18 +8,13 @@
 # Unknown keys are errors, not warnings: a typo must fail loudly.
 
 # Schema version. daer refuses a version it does not understand.
-schema = 1
+schema = 2
 
 # Extra files, relative to this one. Tables merge key by key, arrays are
 # concatenated, and a key set twice is an error.
 #include = ["conf.d/*.toml"]
 
 [global]
-# Transparent-proxy port. This is not an HTTP/SOCKS port: the eBPF program
-# redirects intercepted traffic here.
-tproxy-port = 12345
-# Refuse traffic that did not come through the eBPF program.
-tproxy-port-protect = true
 # Socket mark for daer-originated traffic. Omit to let daer pick an internal
 # mark that prevents UDP self-capture.
 #so-mark = 0
@@ -49,24 +44,30 @@ fragment = false
 fragment-length = "50-100"
 fragment-interval = "10-20"
 
-# Health-check defaults; each [[group]] may override any of these.
-[global.health-check]
-# URL first, then optional direct IPs so the probe does not depend on DNS.
-tcp-url = ["http://cp.cloudflare.com", "1.1.1.1", "2606:4700:4700::1111"]
-tcp-method = "HEAD"
+# Probe defaults; each [[election]] may override any of these.
+[global.probe]
+# "server" checks the node's own server port; "url" asks a URL *through* the
+# node and measures the end-to-end path. A latency election should use "url".
+mode = "server"
+# Required when mode = "url"; ignored when mode = "server".
+#url = "https://www.gstatic.com/generate_204"
+method = "HEAD"
 # Bare IPs mean port 53; a name is reported and skipped, never silently resolved.
-udp-dns = ["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]
+udp-dns = ["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]
 interval = "30s"
+timeout = "5s"
 # Shifts the switching threshold of moving averages; may be negative.
 tolerance = "0s"
 
 # Subscriptions are merged into the node pool. Either write bare URLs
 # (`subscription = ["https://…"]`) or these tables, not both.
 #[[subscription]]
-#tag = "my_sub"
+#name = "my_sub"
 #url = "https://www.example.com/subscription/link"
 ## Cache the last successful fetch next to the configuration.
 #persist = false
+## Apply this detour to every node the subscription contributes (ADR-0044).
+#detour = "local"
 
 # Nodes, also merged into the pool.
 #
@@ -75,8 +76,11 @@ tolerance = "0s"
 # trojan://, …) does not need hand-converting: declare it as a `[[subscription]]`
 # and the pool is filled on load and on every reload.
 #
-# A chain (`a -> b`) is NOT supported by this build: it is rejected at validation
-# rather than silently truncated to its first hop. Listing one here is an error.
+# A detour is an outbound chain (ADR-0044): `detour = "<node name>"` makes the
+# outer node's protocol run over the inner node's server leg. The outer protocol
+# still carries the final target; the inner server sees only the outer server.
+# Chains are a DAG: unknown, self-referential and cyclic detours fail at load.
+# URI chain strings (`a -> b`) remain invalid; use structured [[node]] tables.
 #
 # A `vless` or `vmess` node is three orthogonal layers (ADR-0028):
 #
@@ -89,7 +93,7 @@ tolerance = "0s"
 #
 # Structured VLESS over REALITY with Vision:
 #[[node]]
-#tag = "edge"
+#name = "edge"
 #type = "vless"
 #server = "198.51.100.1"
 #port = 443
@@ -103,7 +107,7 @@ tolerance = "0s"
 #
 # Structured VLESS over TLS behind a CDN (wss):
 #[[node]]
-#tag = "cdn"
+#name = "cdn"
 #type = "vless"
 #server = "198.51.100.4"
 #port = 443
@@ -118,7 +122,7 @@ tolerance = "0s"
 #
 # Structured VMess (AEAD only; a non-zero alterId is refused — ADR-0030):
 #[[node]]
-#tag = "vm"
+#name = "vm"
 #type = "vmess"
 #server = "198.51.100.5"
 #port = 443
@@ -132,7 +136,7 @@ tolerance = "0s"
 # `hop-interval` rotates the source port, which is what defeats a per-flow
 # throttle, and needs at least 5s:
 #[[node]]
-#tag = "hy2"
+#name = "hy2"
 #type = "hysteria2"
 #server = "198.51.100.6"
 #ports = "443,20000-20010"
@@ -148,7 +152,7 @@ tolerance = "0s"
 #
 # Structured Shadowsocks example:
 #[[node]]
-#tag = "ss"
+#name = "ss"
 #type = "shadowsocks"
 #server = "198.51.100.2"
 #port = 8388
@@ -157,30 +161,47 @@ tolerance = "0s"
 #
 # Structured SOCKS5 example:
 #[[node]]
-#tag = "local"
+#name = "local"
 #type = "socks5"
 #server = "127.0.0.1"
 #port = 1080
+#
+# A detour chain: the VLESS connection to 198.51.100.1:443 is itself carried by
+# the `local` SOCKS5 node. The VLESS request still names the final target.
+#[[node]]
+#name = "edge-via-local"
+#type = "vless"
+#server = "198.51.100.1"
+#port = 443
+#uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+#detour = "local"
 
-# A group selects nodes from the pool and picks one per connection.
+# A group is only a resource pool: it selects which nodes are candidates.
 [[group]]
-name = "proxy"
-# "random", "fixed(0)", "min", "min-moving-avg", "min-avg10", …
-policy = "min-moving-avg"
+name = "proxy-pool"
 # Filters are OR-ed; each is a conjunction. An annotation is carried into the
 # selected node's properties.
 #filters = [
-#    "subtag(my_sub) && !name(keyword: 'ExpireAt:')",
+#    "sub(my_sub) && !name(keyword: 'ExpireAt:')",
 #    { match = "name(node1)", annotate = { add_latency = "-500ms" } },
 #]
-#
-#[group.health-check]
-#tcp-url = ["http://test.steampowered.com"]
+
+# An election is the routing target. It owns the rule that picks one node from
+# the pool (or from a single node), and the probe it needs.
+[[election]]
+name = "proxy"
+group = "proxy-pool"
+# "random", "min", "min-avg10", "min-moving-avg"; a manual election uses
+# `node = "name"` instead of `group`.
+type = "min-moving-avg"
+# A URL probe measures the path through the node, not just its server port.
+#mode = "url"
+#url = "https://www.gstatic.com/generate_204"
 
 [dns]
 # "4", "6", or 0 for no preference.
 ipversion-prefer = 0
-# Every upstream is `tag:protocol://host:port`, and the tag is what `[dns.request]` rules
+# Every upstream is `name:protocol://host:port`, and the name is what `[dns.request]` rules
 # name. The protocol is required: "UDP unless it fails" is a policy, not a default.
 #
 # Protocols: udp, tcp, tls (DoT), https (DoH), or a `+` chain tried in order.
@@ -237,26 +258,26 @@ fallback = "accept"
 #
 # For a locally managed set, place the file under /var/lib/daer/rules and declare:
 #   [[rule-provider]]
-#   tag = "company"
+#   name = "company"
 #   type = "file"
 #   path = "/var/lib/daer/rules/company.drb"
 #   format = "drb"
 [[rule-provider]]
-tag = "private"
+name = "private"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
-tag = "cn"
+name = "cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
 [[rule-provider]]
-tag = "cn-ip"
+name = "cn-ip"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
 format = "drb"

@@ -47,26 +47,29 @@ pub mod mirror {
     use schemars::JsonSchema;
     use serde::Serialize;
 
-    /// `subscription = ["url"]` or `[[subscription]] tag/url/persist`.
+    /// `subscription = ["url"]` or `[[subscription]] name/url/persist`.
     #[derive(Debug, Serialize, JsonSchema)]
     #[serde(untagged)]
     #[schemars(untagged)]
     pub enum Subscription {
-        /// A bare URL, no tag.
+        /// A bare URL, no name.
         Url(String),
-        /// A tagged subscription.
+        /// A named subscription.
         Table {
-            /// Tag used by `subtag()` filters.
-            #[serde(skip_serializing_if = "Option::is_none")]
-            tag: Option<String>,
+            /// Name used by `sub()` / `subtag()` filters.
+            #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+            name: Option<String>,
             url: String,
             /// Cache the last successful fetch next to the configuration.
             #[serde(default)]
             persist: bool,
+            /// Detour applied to every node this subscription contributes.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            detour: Option<String>,
         },
     }
 
-    /// `[[node]] tag/type/...`.
+    /// `[[node]] name/type/...`.
     pub type Node = crate::model::Node;
 
     /// A `group.filters` entry: an expression, or an expression plus values the
@@ -75,7 +78,7 @@ pub mod mirror {
     #[serde(untagged)]
     #[schemars(untagged)]
     pub enum Filter {
-        /// `subtag(sub) && !name(keyword: 'ExpireAt:')`
+        /// `sub(sub) && !name(keyword: 'ExpireAt:')`
         Expr(String),
         Table {
             /// The predicate conjunction.
@@ -198,7 +201,7 @@ mod tests {
     #[test]
     fn enumerated_values_complete_in_an_editor() {
         // Completion is the point of mirroring this as an enum rather than a string:
-        // `tcp-method` has a closed set of valid values, and a typo should be a squiggle, not a
+        // `method` has a closed set of valid values, and a typo should be a squiggle, not a
         // runtime failure.
         //
         // The set is exactly what the probe can issue. It used to advertise `POST`, `PUT`,

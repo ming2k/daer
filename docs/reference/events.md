@@ -15,7 +15,6 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `daemon.datapath_attached` | `info` | datapath attached | `port`, `namespace`, `device`, `peer`, `lan`, `wan`, `object`, `object_sha256`, `maps`, `programs`, `policy_hash` | — | — | — |
 | `daemon.datapath_rebuilt` | `info` | generation rebuilt with the datapath's flow facts | `generation` | — | — | — |
 | `daemon.datapath_rebuild_failed` | `warn` | could not rebuild the generation with the datapath's flow facts | `error` | `daemon.datapath_rebuild_failed` | `daemon.datapath_rebuild_failed` | mac/dscp/pname rules will not match until the generation rebuild succeeds; fix the reported error and reload. |
-| `daemon.recovery_warning` | `warn` | could not fully recover state from a previous run | `error` | `daemon.recovery_warning` | `daemon.recovery_warning` | Inspect `/run/daer` and run `daer-cleanup`; a stale TC filter or sysctl may still be installed. |
 | `daemon.config_warning` | `warn` | configuration warning | `warning` | `daemon.config_warning` | `daemon.config_warning` | Run `daer check` and fix the reported configuration warning. |
 | `daemon.dns_started` | `info` | dns server started | `plan`, `fake_ip` | — | — | — |
 | `daemon.dns_not_started` | `info` | dns server not started | — | — | — | — |
@@ -47,8 +46,8 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `dryrun.capabilities_present` | `info` | capabilities present | — | — | — | — |
 | `dryrun.privileged_skipped` | `warn` | the privileged phase would not run here | `reason` | `dryrun.privileged_skipped` | `dryrun.privileged_skipped` | Run the privileged gate on a host with CAP_BPF, CAP_NET_ADMIN, CAP_PERFMON and CAP_SYS_ADMIN. |
 | `dryrun.complete` | `info` | dry-run complete | — | — | — | — |
-| `generation.loaded` | `info` | configuration loaded | `generation`, `rules`, `groups`, `nodes`, `build_ms`, `policy_hash` | — | — | — |
-| `generation.reloaded` | `info` | configuration reloaded | `generation`, `previous`, `rules`, `groups`, `nodes`, `routing_changed`, `build_ms`, `policy_hash`, `source` | — | — | — |
+| `generation.loaded` | `info` | configuration loaded | `generation`, `rules`, `groups`, `elections`, `nodes`, `build_ms`, `policy_hash` | — | — | — |
+| `generation.reloaded` | `info` | configuration reloaded | `generation`, `previous`, `rules`, `groups`, `elections`, `nodes`, `routing_changed`, `build_ms`, `policy_hash`, `source` | — | — | — |
 | `generation.startup_rejected` | `error` | configuration rejected; nothing is serving | `generation`, `error`, `error_code` | `generation.startup_rejected` | `generation.startup_rejected` | Run `daer check -c <config>` and fix the reported error; the daemon cannot serve without a generation. |
 | `generation.reload_rejected` | `error` | configuration reload rejected; the running generation is unchanged | `generation`, `serving`, `error`, `error_code` | `generation.reload_rejected` | `generation.reload_rejected` | Run `daer check -c <config>`; the previous generation is still serving, so this is not an outage. |
 | `generation.rule_warning` | `warn` | routing rule compiled with a warning | `warning` | `generation.rule_warning` | `generation.rule_warning` | Run `daer check --why` and fix the rule; a warning means the compiled rule may not match what was written. |
@@ -63,16 +62,15 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `provider.cadence_reread_failed` | `warn` | could not re-read the provider cadence | `error` | `provider.cadence_reread_failed` | `provider.cadence_reread_failed` | The previous cadence is still in use; check the configuration file for a concurrent edit. |
 | `provider.not_modified` | `debug` | rule provider not modified | `tag`, `status` | — | — | — |
 | `provider.cache_fallback` | `warn` | rule provider fetch failed; loaded from cached DRB | `tag`, `error` | `provider.cache_fallback` | `provider.cache_fallback` | The rules are stale but serving; check the provider URL and network. |
-| `provider.unusable_tcp_url` | `warn` | health check: unusable tcp-url entry | `entry`, `error` | `provider.unusable_tcp_url` | `provider.unusable_tcp_url` | Use a literal `ip:port` or a URL; the entry was skipped. |
-| `provider.unusable_tcp_method` | `warn` | health check: unusable tcp-method; falling back to HEAD | `method`, `error` | `provider.unusable_tcp_method` | `provider.unusable_tcp_method` | Use a valid HTTP method for the health probe. |
-| `provider.unresolved_udp` | `debug` | health check: udp-dns entries that are names are not probed | `entries` | — | — | — |
+| `election.probe_method_invalid` | `warn` | probe method is not GET or HEAD; falling back to HEAD | `method`, `error` | `election.probe_method_invalid` | `election.probe_method_invalid` | Use GET or HEAD for an election probe. |
+| `election.probe_udp_name` | `debug` | probe udp-dns entry is a name; not resolved | `entries` | — | — | — |
 | `subscription.link_rejected` | `warn` | unsupported subscription node link (skipped) | `scheme`, `node`, `error` | `subscription.link_rejected` | `subscription.link_rejected` | The link is not usable by this build; remove it or use a supported protocol. The link is redacted. |
 | `flow.dns_mapping` | `debug` | flow resolved via dns mapping | `flow_id`, `generation`, `destination`, `domain` | — | — | — |
 | `flow.sniffed` | `debug` | flow sniffed | `flow_id`, `generation`, `destination`, `sniffed` | — | — | — |
 | `flow.not_sniffed` | `trace` | flow not sniffed | `flow_id`, `generation`, `destination`, `reason` | — | — | — |
 | `flow.decided` | `debug` | flow decided | `flow_id`, `generation`, `source`, `destination`, `rule`, `outbound`, `mark`, `must`, `domain`, `decision_source`, `elapsed_us` | — | — | — |
 | `flow.datagram_decided` | `debug` | datagram flow decided | `flow_id`, `generation`, `source`, `destination`, `rule`, `outbound`, `mark`, `must` | — | — | — |
-| `flow.node_selected` | `trace` | node selected | `flow_id`, `group`, `node`, `protocol`, `policy`, `latency_us` | — | — | — |
+| `flow.node_selected` | `trace` | node selected | `flow_id`, `election`, `node`, `protocol`, `kind`, `latency_us` | — | — | — |
 | `flow.accepted` | `debug` | accepted redirected flow | `flow_id`, `source`, `destination`, `l4` | — | — | — |
 | `flow.rejected` | `debug` | dropped a flow that was not redirected | `flow_id`, `reject`, `reason` | — | — | — |
 | `flow.no_outbound` | `debug` | no outbound leg | `flow_id`, `destination`, `error` | — | — | — |
@@ -83,13 +81,13 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `flow.accept_stopped` | `info` | relay accept loop stopped | `accepted`, `rejected`, `failed` | — | — | — |
 | `flow.dial_finished` | `debug` | dial finished | `flow_id`, `dial`, `node`, `authority`, `dns_us`, `tcp_us`, `tls_us`, `rtt_us` | — | — | — |
 | `flow.dial_finished_without_timings` | `debug` | dial finished without timings | `flow_id`, `dial`, `node`, `authority` | — | — | — |
-| `flow.dial_failed` | `warn` | flow dial failed | `flow_id`, `generation`, `destination`, `group`, `node`, `stage`, `error_code`, `elapsed_ms` | `flow.dial_failed` | `flow.dial_failed` | Check the selected node and the dial stage; run `daer probe node <node>`. |
+| `flow.dial_failed` | `warn` | flow dial failed | `flow_id`, `generation`, `destination`, `election`, `node`, `stage`, `error_code`, `elapsed_ms` | `flow.dial_failed` | `flow.dial_failed` | Check the selected node and the dial stage; run `daer probe node <node>`. |
 | `flow.datagram_ingress_stopped` | `info` | datagram ingress stopped; live sessions keep replying | `in_flight` | — | — | — |
 | `flow.datagram_reaped` | `debug` | reaped idle datagram sessions | `reaped` | — | — | — |
 | `flow.datagram_ingress_failed` | `trace` | ingress datagram failed; continuing | `error` | — | — | — |
 | `flow.datagram_rejected` | `debug` | dropped a datagram that was not redirected | `flow_id`, `reject`, `reason` | — | — | — |
 | `flow.datagram_forward_failed` | `warn` | datagram forward failed | `flow_id`, `error` | `flow.datagram_forward_failed` | `flow.datagram_forward_failed` | The upstream leg failed; check the node and the UDP transport. |
-| `flow.datagram_refused` | `warn` | datagram flow refused | `flow_id`, `destination`, `error`, `error_code` | `flow.datagram_refused` | `flow.datagram_refused` | The group has no selectable datagram-capable node; check the node and policy. |
+| `flow.datagram_refused` | `warn` | datagram flow refused | `flow_id`, `destination`, `error`, `error_code` | `flow.datagram_refused` | `flow.datagram_refused` | The election has no electable datagram-capable node; check the node and probe settings. |
 | `flow.datagram_session_failed` | `warn` | datagram session failed | `flow_id`, `destination`, `error` | `flow.datagram_session_failed` | `flow.datagram_session_failed` | The UDP session could not be opened; inspect the selected node. |
 | `flow.datagram_session_closed` | `debug` | datagram session closed | `flow_id`, `destination`, `error` | — | — | — |
 | `flow.datagram_reply_failed` | `warn` | datagram reply failed | `flow_id`, `destination`, `error` | `flow.datagram_reply_failed` | `flow.datagram_reply_failed` | The reply socket could not send to the client; check the ingress namespace and the reply socket mark. |
@@ -112,31 +110,37 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `dns.resolution_failed` | `warn` | dns resolution failed | `query_id`, `peer`, `transport`, `error`, `timeout` | `dns.resolution_failed` | `dns.resolution_failed` | The resolver could not answer; inspect the upstream event with the same query_id. |
 | `dns.tcp_connection_ended` | `debug` | dns tcp connection ended | `peer`, `error` | — | — | — |
 | `dns.asis_no_reply` | `trace` | asis: no reply | `query_id`, `peer`, `transport` | — | — | — |
-| `health.probe_record_failed` | `warn` | probe result could not be recorded; this generation is stale | `group`, `node`, `error` | `health.probe_record_failed` | `health.probe_record_failed` | The health scheduler holds a stale router; reload the generation and restart the scheduler. |
-| `health.node_alive` | `trace` | node alive | `probe_id`, `group`, `node`, `latency_ns` | — | — | — |
-| `health.probe_failed` | `warn` | node probe failed | `probe_id`, `group`, `node`, `failure`, `consecutive_failures` | `health.probe_failed` | `health.probe_failed` | Run `daer probe node <node>`; the node is not selectable until a probe succeeds. |
-| `health.tcp_url_name` | `debug` | health check: tcp-url entry is a name, not an address | `entry` | — | — | — |
-| `health.node_unprobeable` | `debug` | node has no literal address; not probed | `group`, `node` | — | — | — |
+| `health.probe_record_failed` | `warn` | probe result could not be recorded; this generation is stale | `election`, `node`, `error` | `health.probe_record_failed` | `health.probe_record_failed` | The health scheduler holds a stale router; reload the generation and restart the scheduler. |
+| `health.node_alive` | `trace` | node alive | `probe_id`, `election`, `node`, `latency_ns` | — | — | — |
+| `health.probe_failed` | `warn` | node probe failed | `probe_id`, `election`, `node`, `failure`, `consecutive_failures` | `health.probe_failed` | `health.probe_failed` | Run `daer probe node <node>`; the node is not selectable until a probe succeeds. |
+| `health.node_unprobeable` | `debug` | node has no literal address; not probed | `election`, `node` | — | — | — |
 | `health.scheduler_stopped` | `info` | health scheduler stopped | — | — | — | — |
 | `health.probing_disabled` | `debug` | health probing disabled | `interval` | — | — | — |
 | `datapath.policy_published` | `info` | datapath policy published | `generation`, `slot`, `entries`, `trie_entries`, `policy_hash` | — | — | — |
 | `datapath.policy_deferred` | `warn` | datapath policy published as a deferral | `generation`, `slot`, `entries`, `reasons`, `policy_hash` | `datapath.policy_deferred` | `datapath.policy_deferred` | Traffic is correct but every flow is handed to userspace; rewrite the named predicates or accept the relay hop. |
 | `datapath.republish_failed` | `error` | republishing kernel policy failed | `generation`, `error` | `datapath.republish_failed` | `datapath.republish_failed` | The kernel keeps the previous slot; inspect the object and `daer status` before the next reload. |
 | `datapath.object_missing` | `error` | cannot reach the datapath object | `reason`, `path` | `datapath.object_missing` | `datapath.object_missing` | Run `cargo xtask ebpf` or install the packaged datapath object at the configured path. |
-| `datapath.cleanup_failed` | `warn` | datapath cleanup failed | `step`, `interface`, `path`, `error` | `datapath.cleanup_failed` | `datapath.cleanup_failed` | Run `daer-cleanup`; the recovery journal is kept for ExecStopPost or the next start. |
+| `datapath.cleanup_failed` | `warn` | datapath cleanup failed | `error` | `datapath.cleanup_failed` | `datapath.cleanup_failed` | The ingress namespace is private; stopping the process releases it. Inspect the namespace with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list` while the process lives. |
 | `datapath.ipv6_unavailable` | `warn` | IPv6 datapath is unavailable; IPv4 continues | `component`, `error` | `datapath.ipv6_unavailable` | `datapath.ipv6_unavailable` | Enable IPv6 forwarding/routing on the host if IPv6 clients are expected; IPv4 is unaffected. |
-| `datapath.sysctl_restore_failed` | `warn` | could not restore a host sysctl | `path`, `error` | `datapath.sysctl_restore_failed` | `datapath.sysctl_restore_failed` | Run `daer-cleanup`; the recovery journal is kept for the next start. |
-| `datapath.peer_detach_failed` | `warn` | could not detach the peer ingress link | `error` | `datapath.peer_detach_failed` | `datapath.peer_detach_failed` | Run `daer-cleanup`; inspect the namespace through `/proc/<pid>/root/run/netns` if it remains. |
+| `datapath.sysctl_restore_failed` | `warn` | could not restore a host sysctl | `path`, `error` | `datapath.sysctl_restore_failed` | `datapath.sysctl_restore_failed` | The value is per-device and disappears with `daer0`; inspect `/proc/sys/net/ipv4/conf/daer0` while the device exists. |
+| `datapath.peer_detach_failed` | `warn` | could not detach the peer ingress link | `error` | `datapath.peer_detach_failed` | `datapath.peer_detach_failed` | The link is fd-owned and detaches with the process. Inspect `bpftool link show`; no qdisc or persistent filter is created. |
 | `datapath.telemetry_failed` | `warn` | datapath telemetry read failed | `error` | `datapath.telemetry_failed` | `datapath.telemetry_failed` | The counters or ring are no longer readable; collect the daemon log and inspect the loaded object before the next reload. |
 | `datapath.stats` | `info` | datapath counters | `interval_ms`, `counters` | — | — | — |
 | `datapath.event` | `warn` | datapath event | `event_type`, `counter`, `pid`, `pname`, `outbound`, `l4proto`, `sip`, `dip`, `sport`, `dport`, `monotonic_ns` | `datapath.event` | `datapath.event` | Inspect the named kernel event and counter; repeated overflow or rebind events indicate map or epoch pressure. |
 | `netns.ipv6_unavailable` | `warn` | IPv6 ingress state is unavailable | `component`, `error` | `netns.ipv6_unavailable` | `netns.ipv6_unavailable` | Enable IPv6 on the host and in `daer0ns` if IPv6 clients are expected; IPv4 is unaffected. |
-| `netns.cleanup_failed` | `warn` | could not remove the ingress namespace mount | `error` | `netns.cleanup_failed` | `netns.cleanup_failed` | A stale mount may remain; run `daer-cleanup` and inspect `/proc/<pid>/root/run/netns`. |
+| `netns.cleanup_failed` | `warn` | could not remove the ingress namespace mount | `error` | `netns.cleanup_failed` | `netns.cleanup_failed` | The namespace mount is private to the daemon's mount namespace. Inspect it with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`. |
 | `protocol.anytls_alert` | `warn` | anytls received alert from server | `alert` | `protocol.anytls_alert` | `protocol.anytls_alert` | The node rejected the session; check credentials and the node's policy. |
 | `protocol.anytls_session_error` | `debug` | anytls session error | `phase`, `error` | — | — | — |
 | `observe.ring_dropped` | `warn` | diagnostic ring dropped events | `dropped`, `capacity` | `observe.ring_dropped` | `observe.ring_dropped` | Increase `global.diagnostics.event-buffer` or reduce debug volume; the event stream is incomplete. |
 | `incident.capture_failed` | `warn` | incident bundle could not be written | `trigger`, `error` | `incident.capture_failed` | `incident.capture_failed` | Check that /var/lib/daer/incidents or /run/daer is writable; the panic/signal itself is still reported on stderr. |
 | `incident.capture` | `warn` | incident bundle captured | `incident_id`, `trigger`, `path`, `events`, `redaction` | `incident.capture` | `incident.capture` | Attach the bundle to the incident record; do not paste raw logs separately. |
+| `election.pinned` | `info` | election pinned to a node | `election`, `node`, `previous`, `peer_uid`, `peer_pid`, `generation`, `persisted` | — | — | — |
+| `election.reset` | `info` | election reset to its configured rule | `election`, `previous`, `peer_uid`, `peer_pid`, `generation`, `persisted` | — | — | — |
+| `election.rejected` | `warn` | election change rejected | `election`, `node`, `error`, `peer_uid`, `peer_pid` | `election.rejected` | `election.rejected` | Run `daer status --elections` to inspect valid elections and candidates. |
+| `election.state_rejected` | `warn` | election state file is not usable; starting without overrides | `path`, `schema`, `expected`, `error` | `election.state_rejected` | `election.state_rejected` | Inspect /var/lib/daer/elections.json; a corrupt state file is ignored, never fatal. |
+| `election.state_write_failed` | `warn` | could not persist election state | `error` | `election.state_write_failed` | `election.state_write_failed` | Check that /var/lib/daer is writable and has free space; the running election may not survive a restart. |
+| `election.override_pruned` | `warn` | election override no longer names a valid candidate | `election`, `node` | `election.override_pruned` | `election.override_pruned` | Run `daer status --elections`; the election now follows its configured rule. |
+| `election.socket_failed` | `warn` | could not bind the runtime election admin socket | `path`, `error` | `election.socket_failed` | `election.socket_failed` | Check that /run/daer is writable and that the daemon user owns it; daer elect and the live status views need this socket. |
 
 ## How to read this table
 

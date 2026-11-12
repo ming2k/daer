@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daer_config::{Config, ProviderFormat, ProviderType, RuleProvider};
+use daer_outbound::SocketConfig;
 use daer_routing::{DrbSet, RuleProviderPool};
 
 /// How long one rule provider fetch may take.
@@ -50,7 +51,7 @@ pub fn cache_directory() -> PathBuf {
 /// What resolving one `RuleProvider` produced.
 #[derive(Debug, Clone)]
 pub struct ResolvedRuleProvider {
-    pub tag: String,
+    pub name: String,
     pub provider_type: ProviderType,
     pub format: ProviderFormat,
     pub from_cache: bool,
@@ -60,6 +61,12 @@ pub struct ResolvedRuleProvider {
 }
 
 impl ResolvedRuleProvider {
+    /// Compatibility accessor for the rule provider name.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.name
+    }
+
     #[must_use]
     pub fn is_usable(&self) -> bool {
         self.error.is_none()
@@ -68,7 +75,7 @@ impl ResolvedRuleProvider {
 
 impl fmt::Display for ResolvedRuleProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.tag)?;
+        write!(f, "{}", self.name)?;
         if let Some(err) = &self.error {
             write!(f, " [failed: {err}]")
         } else {
@@ -131,13 +138,21 @@ pub struct ProviderSchedule {
     entries: Vec<ProviderScheduleEntry>,
 }
 
-/// One scheduled provider: its tag and how often it may be re-fetched.
+/// One scheduled provider: its name and how often it may be re-fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderScheduleEntry {
-    /// The `tag` that identifies the provider in the pool and in logs.
-    pub tag: String,
+    /// The `name` that identifies the provider in the pool and in logs.
+    pub name: String,
     /// The declared cadence, always strictly positive.
     pub interval: Duration,
+}
+
+impl ProviderScheduleEntry {
+    /// Compatibility accessor for the provider name.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.name
+    }
 }
 
 impl ProviderSchedule {
@@ -154,7 +169,7 @@ impl ProviderSchedule {
             .filter_map(|provider| {
                 let interval = provider.interval?.as_std()?;
                 (!interval.is_zero()).then(|| ProviderScheduleEntry {
-                    tag: provider.tag.clone(),
+                    name: provider.name.clone(),
                     interval,
                 })
             })
@@ -193,7 +208,7 @@ impl ProviderSchedule {
     pub fn due(&self, last_seen: impl Fn(&str) -> Option<Duration>) -> Vec<&ProviderScheduleEntry> {
         self.entries
             .iter()
-            .filter(|entry| match last_seen(&entry.tag) {
+            .filter(|entry| match last_seen(&entry.name) {
                 None => true,
                 Some(elapsed) => elapsed >= entry.interval,
             })
@@ -217,14 +232,21 @@ pub async fn resolve_rule_providers(
     config: &Config,
     config_directory: &Path,
 ) -> RuleProviderResolution {
-    resolve_rule_providers_with(config, config_directory, DEFAULT_TIMEOUT).await
+    resolve_rule_providers_with(
+        config,
+        config_directory,
+        DEFAULT_TIMEOUT,
+        SocketConfig::default(),
+    )
+    .await
 }
 
-/// Resolves all `[[rule-provider]]` declarations with an explicit timeout.
+/// Resolves all `[[rule-provider]]` declarations with an explicit timeout and socket policy.
 pub async fn resolve_rule_providers_with(
     config: &Config,
     config_directory: &Path,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> RuleProviderResolution {
     let mut resolution = RuleProviderResolution::default();
     if config.rule_provider.is_empty() {
@@ -237,7 +259,7 @@ pub async fn resolve_rule_providers_with(
     let mut pool = RuleProviderPool::new();
 
     for provider in &config.rule_provider {
-        let tag = provider.tag.clone();
+        let name = provider.name.clone();
         let provider_type = provider.provider_type;
         let format = provider.format;
         // `provider.interval` is intentionally absent here: background refresh cadence is a
@@ -249,7 +271,7 @@ pub async fn resolve_rule_providers_with(
             ProviderType::File => {
                 let Some(path_str) = &provider.path else {
                     resolution.providers.push(ResolvedRuleProvider {
-                        tag,
+                        name,
                         provider_type,
                         format,
                         from_cache: false,
@@ -266,13 +288,13 @@ pub async fn resolve_rule_providers_with(
                     config_directory.join(path_str)
                 };
 
-                match load_file_provider(&file_path, &tag, format) {
+                match load_file_provider(&file_path, &name, format) {
                     Ok(set) => {
                         let intervals = set.v4_intervals.len() + set.v6_intervals.len();
                         let domains = set.domain_patterns();
-                        pool.insert(tag.clone(), set);
+                        pool.insert(name.clone(), set);
                         resolution.providers.push(ResolvedRuleProvider {
-                            tag,
+                            name,
                             provider_type,
                             format,
                             from_cache: false,
@@ -283,7 +305,7 @@ pub async fn resolve_rule_providers_with(
                     }
                     Err(err) => {
                         resolution.providers.push(ResolvedRuleProvider {
-                            tag,
+                            name,
                             provider_type,
                             format,
                             from_cache: false,
@@ -297,7 +319,7 @@ pub async fn resolve_rule_providers_with(
             ProviderType::Http => {
                 let Some(url) = &provider.url else {
                     resolution.providers.push(ResolvedRuleProvider {
-                        tag,
+                        name,
                         provider_type,
                         format,
                         from_cache: false,
@@ -308,14 +330,23 @@ pub async fn resolve_rule_providers_with(
                     continue;
                 };
 
-                let cache_file = cache_dir.join(format!("{tag}.drb"));
-                match fetch_http_provider(url, &cache_file, &tag, format, timeout).await {
+                let cache_file = cache_dir.join(format!("{name}.drb"));
+                match fetch_http_provider(
+                    url,
+                    &cache_file,
+                    &name,
+                    format,
+                    timeout,
+                    socket_config.clone(),
+                )
+                .await
+                {
                     Ok((set, from_cache)) => {
                         let intervals = set.v4_intervals.len() + set.v6_intervals.len();
                         let domains = set.domain_patterns();
-                        pool.insert(tag.clone(), set);
+                        pool.insert(name.clone(), set);
                         resolution.providers.push(ResolvedRuleProvider {
-                            tag,
+                            name,
                             provider_type,
                             format,
                             from_cache,
@@ -326,7 +357,7 @@ pub async fn resolve_rule_providers_with(
                     }
                     Err(err) => {
                         resolution.providers.push(ResolvedRuleProvider {
-                            tag,
+                            name,
                             provider_type,
                             format,
                             from_cache: false,
@@ -362,6 +393,7 @@ async fn fetch_http_provider(
     tag: &str,
     format: ProviderFormat,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> Result<(DrbSet, bool), String> {
     let etag_file = cache_file.with_extension("etag");
     let cached_etag = if cache_file.is_file() {
@@ -373,8 +405,13 @@ async fn fetch_http_provider(
     };
 
     // Attempt conditional network fetch
-    match daer_outbound::subscription::fetch_body_conditional(url, cached_etag.as_deref(), timeout)
-        .await
+    match daer_outbound::subscription::fetch_body_conditional(
+        url,
+        cached_etag.as_deref(),
+        timeout,
+        socket_config,
+    )
+    .await
     {
         Ok(daer_outbound::subscription::FetchOutcome::NotModified) => {
             if cache_file.is_file()
@@ -434,8 +471,8 @@ async fn fetch_http_provider(
 /// One provider re-fetched outside the load path, with the decision the caller needs.
 #[derive(Debug)]
 pub struct RefreshedProvider {
-    /// The provider's tag, echoed so a caller can report without re-reading the config.
-    pub tag: String,
+    /// The provider's name, echoed so a caller can report without re-reading the config.
+    pub name: String,
     /// Whether the fetched rule set differs from the one already in use.
     pub outcome: RefreshOutcome,
     /// The freshly fetched set, present whenever the fetch succeeded.
@@ -448,6 +485,12 @@ pub struct RefreshedProvider {
 }
 
 impl RefreshedProvider {
+    /// Compatibility accessor for the provider name.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.name
+    }
+
     /// Whether this refresh should cause a routing generation swap.
     #[must_use]
     pub fn requires_swap(&self) -> bool {
@@ -468,8 +511,9 @@ pub async fn refresh_rule_provider(
     config_directory: &Path,
     current: Option<&DrbSet>,
     timeout: Duration,
+    socket_config: SocketConfig,
 ) -> RefreshedProvider {
-    let tag = provider.tag.clone();
+    let name = provider.name.clone();
     let format = provider.format;
 
     let fetched = match provider.provider_type {
@@ -481,15 +525,15 @@ pub async fn refresh_rule_provider(
                 } else {
                     config_directory.join(path)
                 };
-                load_file_provider(&path, &tag, format)
+                load_file_provider(&path, &name, format)
             }
             None => Err("missing path for file provider".to_owned()),
         },
         ProviderType::Http => match &provider.url {
             Some(url) => {
-                let cache_file = cache_directory().join(format!("{tag}.drb"));
+                let cache_file = cache_directory().join(format!("{name}.drb"));
                 let _ = fs::create_dir_all(cache_directory());
-                fetch_http_provider(url, &cache_file, &tag, format, timeout)
+                fetch_http_provider(url, &cache_file, &name, format, timeout, socket_config)
                     .await
                     .map(|(set, _from_cache)| set)
             }
@@ -505,14 +549,14 @@ pub async fn refresh_rule_provider(
                 RefreshOutcome::Changed
             };
             RefreshedProvider {
-                tag,
+                name,
                 outcome,
                 set: Some(set),
                 error: None,
             }
         }
         Err(error) => RefreshedProvider {
-            tag,
+            name,
             outcome: RefreshOutcome::Failed,
             set: None,
             error: Some(error),
@@ -530,11 +574,11 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("daer-rule-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp);
         let text_path = temp.join("direct.txt");
-        fs::write(&text_path, "ip: 10.0.0.0/8\ncorp.lan\n").unwrap();
+        fs::write(&text_path, "10.0.0.0/8\ncorp.lan\n").unwrap();
 
         let mut config = Config::default();
         config.rule_provider.push(RuleProvider {
-            tag: "corp".to_owned(),
+            name: "corp".to_owned(),
             provider_type: ProviderType::File,
             url: None,
             path: Some(text_path.to_str().unwrap().to_owned()),
@@ -542,7 +586,13 @@ mod tests {
             interval: Some(TimeSpan::from_secs(3600)),
         });
 
-        let res = resolve_rule_providers_with(&config, &temp, Duration::from_secs(1)).await;
+        let res = resolve_rule_providers_with(
+            &config,
+            &temp,
+            Duration::from_secs(1),
+            SocketConfig::default(),
+        )
+        .await;
         assert!(res.all_usable(), "resolution: {:?}", res.describe());
         assert_eq!(res.pool.len(), 1);
 
@@ -557,9 +607,9 @@ mod tests {
     async fn a_relative_file_provider_refreshes_from_the_config_directory() {
         let temp = std::env::temp_dir().join(format!("daer-refresh-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp);
-        fs::write(temp.join("direct.txt"), "ip: 10.0.0.0/8\ncorp.lan\n").unwrap();
+        fs::write(temp.join("direct.txt"), "10.0.0.0/8\ncorp.lan\n").unwrap();
         let provider = RuleProvider {
-            tag: "corp".to_owned(),
+            name: "corp".to_owned(),
             provider_type: ProviderType::File,
             url: None,
             path: Some("direct.txt".to_owned()),
@@ -567,7 +617,14 @@ mod tests {
             interval: None,
         };
 
-        let refreshed = refresh_rule_provider(&provider, &temp, None, Duration::from_secs(1)).await;
+        let refreshed = refresh_rule_provider(
+            &provider,
+            &temp,
+            None,
+            Duration::from_secs(1),
+            SocketConfig::default(),
+        )
+        .await;
         assert_eq!(refreshed.outcome, RefreshOutcome::Changed);
         let set = refreshed.set.expect("the relative path was resolved");
         assert_eq!(set.v4_intervals.len(), 1);
@@ -586,7 +643,7 @@ mod tests {
         let mut config = Config::default();
         for (tag, seconds) in [("fast", 3600), ("slow", 7 * 3600)] {
             config.rule_provider.push(RuleProvider {
-                tag: tag.to_owned(),
+                name: tag.to_owned(),
                 provider_type: ProviderType::Http,
                 url: Some(format!("https://example.invalid/{tag}.txt")),
                 path: None,
@@ -602,8 +659,12 @@ mod tests {
 
         // After one hour only the short provider is due.
         let due = schedule.due(|_| Some(Duration::from_secs(3600)));
-        let tags: Vec<&str> = due.iter().map(|entry| entry.tag.as_str()).collect();
-        assert_eq!(tags, ["fast"], "the 7h provider must not be fetched hourly");
+        let names: Vec<&str> = due.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["fast"],
+            "the 7h provider must not be fetched hourly"
+        );
 
         // Negative control: at seven hours both are due, so the filter is discriminating.
         let due = schedule.due(|_| Some(Duration::from_secs(7 * 3600)));
@@ -624,7 +685,7 @@ mod tests {
     fn schedule_ignores_file_providers_and_zero_intervals() {
         let mut config = Config::default();
         config.rule_provider.push(RuleProvider {
-            tag: "f".to_owned(),
+            name: "f".to_owned(),
             provider_type: ProviderType::File,
             url: None,
             path: Some("/tmp/rules.txt".to_owned()),
@@ -632,7 +693,7 @@ mod tests {
             interval: Some(TimeSpan::from_secs(60)),
         });
         config.rule_provider.push(RuleProvider {
-            tag: "zero".to_owned(),
+            name: "zero".to_owned(),
             provider_type: ProviderType::Http,
             url: Some("https://example.invalid/z.txt".to_owned()),
             path: None,
@@ -640,7 +701,7 @@ mod tests {
             interval: Some(TimeSpan::ZERO),
         });
         config.rule_provider.push(RuleProvider {
-            tag: "unset".to_owned(),
+            name: "unset".to_owned(),
             provider_type: ProviderType::Http,
             url: Some("https://example.invalid/u.txt".to_owned()),
             path: None,
@@ -662,7 +723,7 @@ mod tests {
     #[test]
     fn unchanged_content_does_not_require_a_swap() {
         let unchanged = RefreshedProvider {
-            tag: "p".to_owned(),
+            name: "p".to_owned(),
             outcome: RefreshOutcome::Unchanged,
             set: Some(DrbSet::default()),
             error: None,
@@ -673,7 +734,7 @@ mod tests {
         );
 
         let changed = RefreshedProvider {
-            tag: "p".to_owned(),
+            name: "p".to_owned(),
             outcome: RefreshOutcome::Changed,
             set: Some(DrbSet::default()),
             error: None,
@@ -684,7 +745,7 @@ mod tests {
         );
 
         let failed = RefreshedProvider {
-            tag: "p".to_owned(),
+            name: "p".to_owned(),
             outcome: RefreshOutcome::Failed,
             set: None,
             error: Some("boom".to_owned()),

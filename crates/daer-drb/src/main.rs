@@ -224,7 +224,7 @@ mod tests {
         let rules_file = dir.join("test.rules");
         fs::write(
             &rules_file,
-            "name: my-rules\nip: 192.168.1.0/24\nexample.com\n=auth.corp.internal\n",
+            "---\nname: my-rules\n---\n192.168.1.0/24\nexample.com\n=auth.corp.internal\n",
         )
         .unwrap();
 

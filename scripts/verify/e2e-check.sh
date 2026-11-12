@@ -206,10 +206,10 @@ else
     fi
 fi
 
-# TCX is deliberately not gated here: the transparent tests above drive the userspace relay
-# through an nftables redirect, not the eBPF TC hooks, so setting DAER_TC_ATTACH would change
-# nothing. The real-daemon script `scripts/ops/daer-netns-e2e.sh` is the delivery check
-# (`DAER_TC_ATTACH=tcx`), and the privileged kernel suite has the TCX attach test.
+# TCX delivery is not gated here: the transparent tests above drive the userspace relay
+# through an nftables redirect, not the eBPF TC hooks. The real-daemon script
+# `scripts/ops/daer-delivery-check.sh` is the TCX delivery and SIGKILL-lifetime gate, and the
+# privileged kernel suite has the TCX attach test.
 
 section "4. reload: a SIGHUP must not abort the daemon"
 # `daer run` used to panic on its first `SIGHUP` because `reload` called `block_on` inside the

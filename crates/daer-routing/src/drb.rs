@@ -543,7 +543,7 @@ fn pad_to_16(vec: &mut Vec<u8>) {
     }
 }
 
-/// A read-only pool of preloaded `DrbSet`s, indexed by tag.
+/// A read-only pool of preloaded `DrbSet`s, indexed by rule provider name.
 #[derive(Debug, Clone, Default)]
 pub struct RuleProviderPool {
     providers: std::collections::HashMap<String, Arc<DrbSet>>,
@@ -554,16 +554,16 @@ impl RuleProviderPool {
         Self::default()
     }
 
-    pub fn insert(&mut self, tag: impl Into<String>, set: DrbSet) {
-        self.providers.insert(tag.into(), Arc::new(set));
+    pub fn insert(&mut self, name: impl Into<String>, set: DrbSet) {
+        self.providers.insert(name.into(), Arc::new(set));
     }
 
-    pub fn get(&self, tag: &str) -> Option<&Arc<DrbSet>> {
-        self.providers.get(tag)
+    pub fn get(&self, name: &str) -> Option<&Arc<DrbSet>> {
+        self.providers.get(name)
     }
 
-    pub fn contains(&self, tag: &str) -> bool {
-        self.providers.contains_key(tag)
+    pub fn contains(&self, name: &str) -> bool {
+        self.providers.contains_key(name)
     }
 
     pub fn len(&self) -> usize {
@@ -596,9 +596,9 @@ mod tests {
 
     #[test]
     fn round_trips_intervals_and_domains() {
-        let text = "name: corp\n\
-                    ip: 192.168.1.0/24\n\
-                    ip: 10.0.0.1\n\
+        let text = "---\nname: corp\n---\n\
+                    192.168.1.0/24\n\
+                    10.0.0.1\n\
                     =api.internal.local\n\
                     example.com\n\
                     .sub.example.com\n";
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn lookups_agree_with_the_rules_that_produced_them() {
-        let text = "name: t\n\
+        let text = "---\nname: t\n---\n\
                     example.com\n\
                     .only-sub.example.org\n\
                     =exact.example.com\n";
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn decoding_rejects_a_corrupted_checksum() {
-        let set = DrbSet::from_text("t", "ip: 1.1.1.0/24\n").unwrap();
+        let set = DrbSet::from_text("t", "1.1.1.0/24\n").unwrap();
         let mut bytes = set.encode();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
@@ -683,7 +683,7 @@ mod tests {
         // The checksum covers the payload, not the header. A provider can serve an artifact
         // whose offsets are corrupt even though the payload hash still matches, so every
         // header field must be bounds-checked before it is used as a slice index.
-        let set = DrbSet::from_text("t", "ip: 1.1.1.0/24\nexample.com\n").unwrap();
+        let set = DrbSet::from_text("t", "1.1.1.0/24\nexample.com\n").unwrap();
         let encoded = set.encode();
         let header = |absolute: usize, value: u32| {
             let mut bytes = encoded.clone();

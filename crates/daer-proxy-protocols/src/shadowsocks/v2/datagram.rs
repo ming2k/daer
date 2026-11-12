@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -21,7 +20,7 @@ use crate::shadowsocks::connector::atyp;
 
 /// A datagram session over Shadowsocks 2022.
 pub struct ShadowSocks2022DatagramSession {
-    socket: Arc<tokio::net::UdpSocket>,
+    transport: Box<dyn DatagramTransport>,
     cipher: Cipher,
     psk: Vec<u8>,
     client_session_id: u64,
@@ -41,7 +40,7 @@ impl fmt::Debug for ShadowSocks2022DatagramSession {
 impl ShadowSocks2022DatagramSession {
     #[must_use]
     pub fn new(
-        socket: Arc<tokio::net::UdpSocket>,
+        transport: Box<dyn DatagramTransport>,
         cipher: Cipher,
         psk: Vec<u8>,
         target_addr: Vec<u8>,
@@ -52,7 +51,7 @@ impl ShadowSocks2022DatagramSession {
         let client_session_id = u64::from_be_bytes(session_bytes);
 
         Self {
-            socket,
+            transport,
             cipher,
             psk,
             client_session_id,
@@ -122,7 +121,7 @@ impl DatagramTransport for ShadowSocks2022DatagramSession {
                     let mut wire = Vec::with_capacity(16 + message.len());
                     wire.extend_from_slice(&header);
                     wire.extend_from_slice(&message);
-                    self.socket.send(&wire).await?;
+                    self.transport.send(&wire).await?;
                 }
                 Cipher::Aead2022Blake3ChaCha20Poly1305 => {
                     let mut nonce_bytes = [0u8; 24];
@@ -153,7 +152,7 @@ impl DatagramTransport for ShadowSocks2022DatagramSession {
                     let mut wire = Vec::with_capacity(24 + message.len());
                     wire.extend_from_slice(&nonce_bytes);
                     wire.extend_from_slice(&message);
-                    self.socket.send(&wire).await?;
+                    self.transport.send(&wire).await?;
                 }
                 _ => unreachable!("ShadowSocks2022DatagramSession used for non-2022 cipher"),
             }
@@ -168,7 +167,7 @@ impl DatagramTransport for ShadowSocks2022DatagramSession {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<usize, std::io::Error>> + Send + 'a>> {
         Box::pin(async move {
             let mut raw = vec![0u8; 65535];
-            let read = self.socket.recv(&mut raw).await?;
+            let read = self.transport.recv(&mut raw).await?;
 
             let decrypted = match self.cipher {
                 Cipher::Aead2022Blake3Aes128Gcm | Cipher::Aead2022Blake3Aes256Gcm => {
@@ -349,6 +348,17 @@ impl DatagramTransport for ShadowSocks2022DatagramSession {
     }
 
     fn max_datagram_size(&self) -> usize {
-        65507
+        // SIP022 puts a 16-byte obfuscated header in front of the AES-GCM message, or a
+        // 24-byte nonce in front of the XChaCha20 one; both messages carry session/packet
+        // IDs, the timestamp, the address and the tag. Report the largest payload that can
+        // still fit, not the transport's raw ceiling.
+        let framing = match self.cipher {
+            Cipher::Aead2022Blake3ChaCha20Poly1305 => 67,
+            Cipher::Aead2022Blake3Aes128Gcm | Cipher::Aead2022Blake3Aes256Gcm => 43,
+            _ => unreachable!("ShadowSocks2022DatagramSession used for non-2022 cipher"),
+        };
+        self.transport
+            .max_datagram_size()
+            .saturating_sub(self.target_addr.len() + framing)
     }
 }

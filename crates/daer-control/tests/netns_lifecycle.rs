@@ -158,18 +158,16 @@ async fn the_transparent_listener_binds_inside_the_namespace() {
     set_host_prerequisites();
 
     let ingress = daer_control::PreparedIngress::prepare().expect("prepare the ingress");
-    let port = 30_000 + (std::process::id() % 20_000) as u16;
-    let config = daer_config::toml_config::load_str(&format!(
-        "schema = 1\n\
+    let config = daer_config::toml_config::load_str(
+        "schema = 2\n\
          [global]\n\
-         tproxy-port = {port}\n\
          wan-interface = [\"lo\"]\n\
          lan-interface = [\"lo\"]\n\
          disable-waiting-network = true\n\
          [routing]\n\
          rules = []\n\
-         fallback = \"direct\"\n"
-    ))
+         fallback = \"direct\"\n",
+    )
     .expect("minimal config");
     let options = daer_control::RouterOptions::for_config("netns_lifecycle.toml");
     let daemon = daer_control::Daemon::bind_in(&config, &options, Some(ingress))

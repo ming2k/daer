@@ -261,7 +261,7 @@ fn the_relay_seam_names_no_routing_concept() {
             for word in [
                 "Verdict",
                 "RouterOptions",
-                "DialerGroup",
+                "ElectionRuntime",
                 "NodeDialer",
                 "Property",
             ] {

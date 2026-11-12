@@ -7,7 +7,7 @@
 # Run it as your normal user. The staging half invokes `cargo xtask install` in your
 # environment; the script then re-execs itself under sudo to copy the staged tree, install
 # the configuration, and restart the unit. The file list belongs to `cargo xtask install`,
-# so this script cannot install a different set (for example, forgetting daer-cleanup).
+# so this script cannot install a different set.
 #
 # The configuration is site-specific and may contain node credentials. It is passed
 # explicitly and is never read from the repository: keep it under the ignored `target/`
@@ -23,7 +23,7 @@ usage() {
     cat <<'EOF'
 usage: scripts/ops/daer-install-netns.sh --config <daer.toml>
 
-Stages target/release/{daer,daer-cleanup,daer-drb}, target/ebpf/datapath.o and
+Stages target/release/{daer,daer-drb}, target/ebpf/datapath.bpf.o and
 install/daer.service with `cargo xtask install`, copies the staged tree into /usr,
 installs <daer.toml> as /etc/daer/config.toml, validates the installed object, and
 restarts daer.
@@ -98,6 +98,11 @@ staged="$(cd "$(dirname "$staged")" && pwd)/$(basename "$staged")"
 # otherwise report as "Text file busy".
 cp -Rf --preserve=mode,timestamps "$staged/usr/." /usr/
 
+# Files removed from the install set are removed from the host too. `daer-cleanup` was
+# deleted in ADR-0042; leaving it installed would make an old unit hook or operator command
+# look supported. `datapath.o` is the pre-rename object path.
+rm -f /usr/bin/daer-cleanup /usr/lib/daer/datapath.o
+
 staged_config="$(mktemp)"
 trap 'rm -f "$staged_config"' EXIT
 cp "$config" "$staged_config"
@@ -111,7 +116,7 @@ install -Dm0640 "$staged_config" /etc/daer/config.toml
 
 systemctl daemon-reload
 echo "=== daer check (installed object) ==="
-/usr/bin/daer check -c /etc/daer/config.toml --object /usr/lib/daer/datapath.o --host
+/usr/bin/daer check -c /etc/daer/config.toml --object /usr/lib/daer/datapath.bpf.o --host
 
 systemctl reset-failed daer >/dev/null 2>&1 || true
 systemctl restart daer
