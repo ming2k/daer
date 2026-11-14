@@ -61,5 +61,5 @@ pub use observe::{
     DialId, DialObserver, DialObserverSink, LogObserver, ObservedDialer, ObserverSlot,
 };
 
-pub use daer_common::SelectionPolicy;
 pub use daer_config::TimeSpan;
+pub use daer_primitives::SelectionPolicy;

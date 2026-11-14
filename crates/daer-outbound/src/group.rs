@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 
-use daer_common::SelectionPolicy;
 use daer_config::TimeSpan;
+use daer_primitives::SelectionPolicy;
 
 use crate::alive::{AliveDialerSet, DialerId, NotifyOutcome};
 use crate::dialer::Dialer;

@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 
-use daer_common::SelectionPolicy;
 use daer_config::TimeSpan;
+use daer_primitives::SelectionPolicy;
 
 /// A stable identifier for a dialer inside one set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

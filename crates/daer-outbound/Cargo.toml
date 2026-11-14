@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Outbound dialers, groups and health checks for daer"
 
 [dependencies]
-daer-common.workspace = true
+daer-primitives.workspace = true
 daer-config.workspace = true
 daer-observe.workspace = true
 daer-proxy-protocols.workspace = true

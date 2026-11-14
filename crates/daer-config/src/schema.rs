@@ -57,7 +57,7 @@ pub mod mirror {
         /// A named subscription.
         Table {
             /// Name used by `sub()` / `subtag()` filters.
-            #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+            #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<String>,
             url: String,
             /// Cache the last successful fetch next to the configuration.

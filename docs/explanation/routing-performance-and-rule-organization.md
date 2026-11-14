@@ -76,7 +76,7 @@ A common operator misconception is: *"If I split my routing rules into 100 separ
 In reality, **fragmentation has the exact opposite effect**:
 
 ### 1. Outer Loop Amplification & Cache Thrashing
-When rules are split into 100 separate statements (`match = "rule-set(siteA)"` with `action = { election = "proxy" }`, and the same for site B):
+When rules are split into 100 separate statements (`match = "rule-set(siteA)"` with `action = "proxy"`, and the same for site B):
 - Tier 1 must execute **100 linear iterations** for unmatched traffic.
 - Each iteration performs a function dispatch, evaluates negation, checks target flags, and dereferences separate heap pointers for each index.
 - Instead of a single binary search touching 13 contiguous `u32` elements in one cache line, the CPU is forced to jump across 100 disparate memory locations, causing catastrophic CPU cache misses and pipeline stalls.
@@ -158,7 +158,7 @@ corp.internal
 Compiled via `daer-drb compile corporate.rules -o corporate.drb`, this artifact loads into `daer` under one provider:
 ```toml
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 enabled = true

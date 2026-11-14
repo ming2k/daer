@@ -61,9 +61,9 @@ fn check_rejects_a_domain_rule_without_an_explicit_sniff_answer() {
     let config = write_config(
         &dir,
         r#"
-schema = 5
+schema = 6
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "domain"
 match = "domain(example.com)"
@@ -89,9 +89,9 @@ fn check_rejects_disabled_sniff_with_no_dns_name_source() {
     let config = write_config(
         &dir,
         r#"
-schema = 5
+schema = 6
 [routing]
-fallback = "direct"
+default = "direct"
 [routing.sniff]
 enabled = false
 [[routing.rule]]
@@ -119,9 +119,9 @@ fn check_reports_the_effective_domain_acquisition_plan() {
     let config = write_config(
         &dir,
         r#"
-schema = 5
+schema = 6
 [routing]
-fallback = "direct"
+default = "direct"
 [routing.sniff]
 enabled = true
 timeout = "30ms"
@@ -154,7 +154,7 @@ fn check_rejects_fake_ip_without_an_explicit_dns_bind() {
     let config = write_config(
         &dir,
         r#"
-schema = 5
+schema = 6
 [dns.fake-ip]
 enabled = true
 "#,

@@ -58,7 +58,7 @@ The exact shape of each protocol is in [Node Protocols](node-protocols.md).
 
 ```toml
 [routing]
-fallback = "direct"
+default = "direct"
 
 [routing.sniff]
 enabled = true

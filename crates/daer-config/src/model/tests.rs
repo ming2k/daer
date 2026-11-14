@@ -9,7 +9,7 @@ fn defaults_apply_and_unknown_keys_are_rejected() {
     let parsed = config("");
     assert_eq!(parsed.schema, SCHEMA_VERSION);
     assert_eq!(
-        parsed.routing.fallback,
+        parsed.routing.default,
         OutboundAction::Builtin(BuiltinOutbound::Direct)
     );
 
@@ -49,14 +49,15 @@ fn defaults_apply_and_unknown_keys_are_rejected() {
 }
 
 #[test]
-fn rule_set_table_accepts_the_legacy_alias_and_rejects_rule() {
+fn rule_set_table_rejects_legacy_rule_provider_and_rule() {
     let parsed = config("[[rule-set]]\nname = \"cn\"\npath = \"/tmp/cn.drb\"\n");
     assert_eq!(parsed.rule_provider.len(), 1);
     assert_eq!(parsed.rule_provider[0].name, "cn");
 
-    let legacy = config("[[rule-provider]]\nname = \"cn\"\npath = \"/tmp/cn.drb\"\n");
-    assert_eq!(legacy.rule_provider.len(), 1);
-    assert_eq!(legacy.rule_provider[0].name, "cn");
+    let error =
+        toml::from_str::<Config>("[[rule-provider]]\nname = \"cn\"\npath = \"/tmp/cn.drb\"\n")
+            .expect_err("[[rule-provider]] must be rejected");
+    assert!(error.to_string().contains("rule-provider"), "{error}");
 
     // `[[rule]]` is deliberately not an alias: a rule is the predicate and
     // action in `[routing].rules`, while a rule set is its named data source.
@@ -69,7 +70,7 @@ fn rule_set_table_accepts_the_legacy_alias_and_rejects_rule() {
 ///
 /// `daer run` refuses an empty `wan-interface` ("daer cannot know which interface carries
 /// proxied traffic"), so the default has to be a value `run` can resolve. The falsifier is
-/// one command: `printf 'schema = 5\n' > c.toml && daer run -c c.toml --no-datapath` would
+/// one command: `printf 'schema = 6\n' > c.toml && daer run -c c.toml --no-datapath` would
 /// fail if the default were `Named(Vec::new())`.
 #[test]
 fn the_defaults_are_a_configuration_the_daemon_can_run() {
@@ -113,33 +114,28 @@ fn wan_interface_is_auto_or_an_explicit_list() {
 #[test]
 fn routing_rules_are_named_tables_with_typed_actions() {
     let parsed = config(
-        "[routing]\nfallback = \"direct\"\n\
+        "[routing]\ndefault = \"direct\"\n\
              [[routing.rule]]\nname = \"https-proxy\"\n\
-             match = \"domain(a.com) && dport(443)\"\naction = { election = \"proxy\" }\n",
+             match = \"domain(a.com) && dport(443)\"\naction = \"proxy\"\n",
     );
     let rule = &parsed.routing.rule[0];
     assert_eq!(rule.name, "https-proxy");
     assert_eq!(rule.match_expr.and_functions.len(), 2);
-    assert_eq!(
-        rule.action,
-        OutboundAction::Election(ElectionAction {
-            election: "proxy".to_owned()
-        })
-    );
+    assert_eq!(rule.action, OutboundAction::Election("proxy".to_owned()));
 
     let error = toml::from_str::<Config>(
-            "[routing]\nfallback = \"direct\"\n\
+            "[routing]\ndefault = \"direct\"\n\
              [[routing.rule]]\nname = \"bad\"\nmatch = \"domain(a) -> direct\"\naction = \"direct\"\n",
         )
         .expect_err("an action arrow is not part of the match");
     assert!(error.to_string().contains("unexpected"), "{error}");
 
     let error = toml::from_str::<Config>(
-        "[routing]\nfallback = \"direct\"\n\
-             [[routing.rule]]\nname = \"bad\"\nmatch = \"domain(a)\"\naction = \"proxy\"\n",
+        "[routing]\ndefault = \"direct\"\n\
+             [[routing.rule]]\nname = \"bad\"\nmatch = \"domain(a)\"\naction = { election = \"proxy\" }\n",
     )
-    .expect_err("a bare action string is only a builtin");
-    assert!(error.to_string().contains("proxy"), "{error}");
+    .expect_err("table action wrapper is no longer accepted");
+    assert!(error.to_string().contains("string"), "{error}");
 }
 
 #[test]
@@ -175,13 +171,17 @@ fn subscriptions_accept_both_shapes_and_nodes_require_structured_tables() {
     assert!(tables.subscription[0].persist);
     assert_eq!(tables.node[0].name.as_deref(), Some("n1"));
 
-    // Backwards compatibility alias for `tag`
-    let legacy = config(
-        "[[subscription]]\ntag = \"b_leg\"\nurl = \"https://b/sub\"\n\
-             [[node]]\ntag = \"n_leg\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
-    );
-    assert_eq!(legacy.subscription[0].name.as_deref(), Some("b_leg"));
-    assert_eq!(legacy.node[0].name.as_deref(), Some("n_leg"));
+    // Legacy `tag` alias is rejected
+    let err =
+        toml::from_str::<Config>("[[subscription]]\ntag = \"b_leg\"\nurl = \"https://b/sub\"\n")
+            .expect_err("legacy tag key on subscription must fail");
+    assert!(err.to_string().contains("tag"), "{err}");
+
+    let err = toml::from_str::<Config>(
+        "[[node]]\ntag = \"n_leg\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
+    )
+    .expect_err("legacy tag key on node must fail");
+    assert!(err.to_string().contains("tag"), "{err}");
 
     // Legacy bare URL strings in node are rejected with clear explanation
     let err =
@@ -315,7 +315,7 @@ fn filters_accept_a_string_or_a_table() {
 fn structured_nodes_parse_validate_and_generate_canonical_links() {
     let toml_str = r#"
 [[node]]
-tag = "hk-vless"
+name = "hk-vless"
 type = "vless"
 server = "198.51.100.1"
 port = 443
@@ -328,7 +328,7 @@ public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
 short-id = "ab01cd02"
 
 [[node]]
-tag = "us-ss"
+name = "us-ss"
 type = "shadowsocks"
 server = "198.51.100.2"
 port = 8388
@@ -336,7 +336,7 @@ method = "chacha20-ietf-poly1305"
 password = "secret-password"
 
 [[node]]
-tag = "jp-trojan"
+name = "jp-trojan"
 type = "trojan"
 server = "198.51.100.3"
 port = 443
@@ -347,7 +347,7 @@ sni = "trojan.example.com"
 allow-insecure = true
 
 [[node]]
-tag = "local-socks5"
+name = "local-socks5"
 type = "socks5"
 server = "127.0.0.1"
 port = 1080
@@ -355,13 +355,13 @@ username = "admin"
 password = "123"
 
 [[node]]
-tag = "local-http"
+name = "local-http"
 type = "http"
 server = "127.0.0.1"
 port = 8080
 
 [[node]]
-tag = "local-socks5-alt"
+name = "local-socks5-alt"
 type = "socks5"
 server = "127.0.0.1"
 port = 1081
@@ -457,7 +457,7 @@ fn a_converted_node_reloads_as_the_configuration_it_came_from() {
             !rendered.lines().any(|line| line.starts_with("[reality]")),
             "the sub-table must be scoped to the node:\n{rendered}"
         );
-        let document = format!("schema = 5\n\n{rendered}");
+        let document = format!("schema = 6\n\n{rendered}");
         let parsed: Config =
             toml::from_str(&document).unwrap_or_else(|error| panic!("{link}\n{rendered}\n{error}"));
         assert_eq!(
@@ -626,20 +626,20 @@ fn structured_node_negative_controls() {
 
     // Shadowsocks 2022 with valid 16-byte base64 key succeeds
     let valid_2022 = toml::from_str::<Config>(
-        "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"3L69X4PF2eSL/JSLkoWnXg==\"\n",
+        "[[node]]\nname = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"3L69X4PF2eSL/JSLkoWnXg==\"\n",
     );
     assert!(valid_2022.is_ok(), "{valid_2022:?}");
 
     // Shadowsocks 2022 with wrong key length fails
     let err = toml::from_str::<Config>(
-            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"bm90MTZieXRlcw==\"\n",
+            "[[node]]\nname = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"bm90MTZieXRlcw==\"\n",
         )
         .expect_err("wrong key length must fail");
     assert!(err.to_string().contains("requires a 16-byte"), "{err}");
 
     // Shadowsocks 2022 with invalid base64 fails
     let err = toml::from_str::<Config>(
-            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"not-valid-base64!\"\n",
+            "[[node]]\nname = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"not-valid-base64!\"\n",
         )
         .expect_err("invalid base64 must fail");
     assert!(err.to_string().contains("valid base64"), "{err}");
@@ -648,15 +648,15 @@ fn structured_node_negative_controls() {
 #[test]
 fn every_field_round_trips_through_the_serializer() {
     let original = config(
-        "schema = 5\n\
+        "schema = 6\n\
              [tls]\nprofile = \"chrome\"\n\
              [[subscription]]\nname = \"s\"\nurl = \"https://s\"\n\
              [[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
              [[group]]\nname = \"g\"\n\
              [[election]]\nname = \"e\"\ngroup = \"g\"\ntype = \"random\"\ninterval = \"10s\"\n\
-             [routing]\nfallback = { election = \"e\" }\n\
+             [routing]\ndefault = \"e\"\n\
              [[routing.rule]]\nname = \"nm\"\nmatch = \"pname(NetworkManager)\"\naction = \"direct\"\n\
-             [dns]\nupstream = [\"udp://1.1.1.1:53\"]\n[dns.fixed-domain-ttl]\n\"example.com\" = 60\n",
+             [dns]\nupstream = [\"udp://1.1.1.1:53\"]\n[dns.fixed-domain-ttl]\n\"example.com\" = \"60s\"\n",
     );
     let rendered = toml::to_string(&original).expect("serializes");
     let reparsed = config(&rendered);

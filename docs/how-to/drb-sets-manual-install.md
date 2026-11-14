@@ -127,7 +127,7 @@ The following configuration keeps the existing host keys, `[[node]]`, `[[group]]
 blocks and adds a domestic bypass pipeline. Replace the node values with your own.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 log-level = "info"
@@ -138,7 +138,7 @@ log-level = "info"
 profile = "chrome-current"
 
 [[node]]
-tag = "us-101"
+name = "us-101"
 type = "vless"
 server = "node.example.com"
 port = 443
@@ -181,7 +181,7 @@ path = "/var/lib/daer/rules/geosite-category-ads-all.drb"
 format = "drb"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 # The `cn-sites` and `ads` sets carry domains; DNS/Fake-IP is consulted first,

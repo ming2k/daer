@@ -23,8 +23,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use daer_common::{MacAddr, PortRange};
 use daer_ebpf::abi::{MAX_MATCH_SET_LEN, MatchSet as KernelMatchSet, match_type, outbound};
+use daer_primitives::{MacAddr, PortRange};
 use daer_routing::kernel::{self, DeferReason, Policy};
 use daer_routing::{
     L4ProtoMask, MatchFacts, MatchSet, NormalizedProgram, Outbound, ProcessName, RecordingSink,
@@ -43,9 +43,7 @@ fn action_from_name(name: &str) -> daer_config::OutboundAction {
     match name {
         "direct" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Direct),
         "block" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block),
-        election => daer_config::OutboundAction::Election(daer_config::ElectionAction {
-            election: election.to_owned(),
-        }),
+        election => daer_config::OutboundAction::Election(election.to_owned()),
     }
 }
 

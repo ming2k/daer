@@ -395,7 +395,7 @@ impl RequestRouter {
         let fallback = config
             .dns
             .request
-            .fallback
+            .default
             .as_ref()
             .ok_or(RoutingError::MissingFallback(block))?;
         let fallback = Decision::parse(&fallback_name(fallback)?, &upstreams)?;
@@ -489,7 +489,7 @@ impl ResponseRouter {
         let fallback = config
             .dns
             .response
-            .fallback
+            .default
             .as_ref()
             .ok_or(RoutingError::MissingFallback(block))?;
         let fallback = ResponseAction::parse(&fallback_name(fallback)?, &upstreams)?;
@@ -741,7 +741,7 @@ rules = [
     "qname(cn) -> local",
     "qtype(AAAA) -> reject",
 ]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect("compiles");
@@ -772,7 +772,7 @@ fallback = "remote"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qname(lan) -> asis"]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect("compiles");
@@ -790,7 +790,7 @@ fallback = "remote"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qname(a) -> remtoe"]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect_err("must reject");
@@ -802,7 +802,7 @@ fallback = "remote"
     fn a_missing_fallback_is_an_error_not_an_empty_router() {
         // `daer config validate` and the daemon must agree: no fallback, no router.
         let mut parsed = config(UPSTREAMS);
-        parsed.dns.request.fallback = None;
+        parsed.dns.request.default = None;
         let error = RequestRouter::compile(&parsed).expect_err("must reject");
         assert!(matches!(
             error,
@@ -816,7 +816,7 @@ fallback = "remote"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["dport(53) -> remote"]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect_err("must reject");
@@ -839,7 +839,7 @@ fallback = "remote"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qname(example.com) -> reject"]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect("compiles");
@@ -879,7 +879,7 @@ rules = [
     "ip(10.0.0.0/8) -> reject",
     "upstream(local) && qname(example.com) -> remote",
 ]
-fallback = "accept"
+default = "accept"
 "#
         )))
         .expect("compiles");
@@ -946,7 +946,7 @@ fallback = "accept"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qname(regex: '[') -> remote"]
-fallback = "remote"
+default = "remote"
 "#
         )))
         .expect_err("must reject");
@@ -971,7 +971,7 @@ rules = ["ip(10.0.0.0/33) -> reject"]
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qtype(AAAA, 65) -> remote"]
-fallback = "local"
+default = "local"
 "#
         )))
         .expect("compiles");
@@ -992,7 +992,7 @@ fallback = "local"
             r#"{UPSTREAMS}
 [dns.request]
 rules = ["qtype(BOGUS) -> remote"]
-fallback = "local"
+default = "local"
 "#
         )))
         .expect_err("must reject");

@@ -9,12 +9,12 @@ DNS, and rule assets change for different reasons and at different times.
 ## 1. A single file is valid
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
 [routing]
-fallback = "direct"
+default = "direct"
 ```
 
 A single file is the right choice for a laptop, a test fixture, or a generated container
@@ -42,7 +42,7 @@ node credentials unavoidable.
 `config.toml` holds the schema and the include list:
 
 ```toml
-schema = 5
+schema = 6
 include = ["conf.d/*.toml"]
 ```
 

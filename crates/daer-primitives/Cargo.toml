@@ -1,12 +1,12 @@
 [package]
-name = "daer-common"
+name = "daer-primitives"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Shared constants and networking primitives for daer"
+description = "Zero-dependency shared primitives and constants for the daer workspace"
 
 [dependencies]
 

@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn no_domain_rules_make_an_explicit_policy_unused() {
-        let config = config("[routing.sniff]\nenabled = false\n[routing]\nfallback = \"direct\"\n");
+        let config = config("[routing.sniff]\nenabled = false\n[routing]\ndefault = \"direct\"\n");
         let plan = plan(&config, false).expect("valid");
         assert!(!plan.sniff_enabled());
         assert!(

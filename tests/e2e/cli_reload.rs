@@ -57,14 +57,14 @@ fn binary() -> PathBuf {
 
 /// Writes a configuration that needs no privileges beyond the transparent port itself.
 fn config(path: &std::path::Path) -> String {
-    let text = "schema = 5\n\
+    let text = "schema = 6\n\
          log-level = \"debug\"\n\
          wan-interface = [\"lo\"]\n\
          lan-interface = [\"lo\"]\n\
          disable-waiting-network = true\n\
          [dns]\n\
          [routing]\n\
-         fallback = \"direct\"\n"
+         default = \"direct\"\n"
         .to_string();
     std::fs::write(path, &text).expect("writes the configuration");
     text
@@ -213,7 +213,7 @@ fn the_daemon_survives_a_hangup_and_publishes_a_new_generation() {
     // A typo on the next SIGHUP must be rejected without stopping the daemon. The cadence
     // rebuild reads the file a second time; an error there must not propagate out of the
     // signal handler (the previous implementation did exactly that).
-    std::fs::write(&config_path, "schema = 5\nwan-interface = []\n")
+    std::fs::write(&config_path, "schema = 6\nwan-interface = []\n")
         .expect("writes the invalid configuration");
     hang_up(pid);
     let deadline = Instant::now() + Duration::from_secs(10);

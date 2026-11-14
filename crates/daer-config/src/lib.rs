@@ -25,15 +25,15 @@ pub mod validate;
 pub use error::ParseError;
 pub use expr::{DnsRule, Function, MatchExpr, Param, ParamValue, parse_dns_rule_expr};
 pub use model::{
-    AnyTlsEndpoint, AnyTlsNode, BuiltinOutbound, Config, Dns, DnsRouting, Election, ElectionAction,
-    ElectionKind, FakeIpConfig, Filter, Flow, FunctionOrString, Group, HttpEndpoint, HttpNode,
+    AnyTlsEndpoint, AnyTlsNode, BuiltinOutbound, Config, Dns, DnsRouting, Election, ElectionKind,
+    FakeIpConfig, Filter, Flow, FunctionOrString, Group, HttpEndpoint, HttpNode,
     Hysteria2Bandwidth, Hysteria2Congestion, Hysteria2Endpoint, Hysteria2Node, Hysteria2Obfs,
-    Hysteria2Quic, Hysteria2Tls, Node, NodeEndpoint, NodeTls, OutboundAction, OutboundKind,
-    PortHopping, PortSet, ProbeMode, ProbeSettings, ProviderFormat, ProviderType, RealitySecurity,
-    Routing, RoutingRule, RuleProvider, SCHEMA_VERSION, SecurityConfig, ShadowsocksEndpoint,
-    ShadowsocksNode, SniffConfig, Socks5Endpoint, Socks5Node, StructuredNode, Subscription, Tls,
-    TlsSecurity, TransportConfig, TrojanEndpoint, TrojanNode, VlessEndpoint, VlessNode,
-    VmessCipher, VmessEndpoint, VmessNode, WanInterface, WsTransport, parse_filter_expr,
+    Hysteria2Quic, Hysteria2Tls, IpVersionPrefer, Node, NodeEndpoint, NodeTls, OutboundAction,
+    OutboundKind, PortHopping, PortSet, ProbeMode, ProbeSettings, ProviderFormat, ProviderType,
+    RealitySecurity, Routing, RoutingRule, RuleProvider, SCHEMA_VERSION, SecurityConfig,
+    ShadowsocksEndpoint, ShadowsocksNode, SniffConfig, Socks5Endpoint, Socks5Node, StructuredNode,
+    Subscription, Tls, TlsSecurity, TransportConfig, TrojanEndpoint, TrojanNode, VlessEndpoint,
+    VlessNode, VmessCipher, VmessEndpoint, VmessNode, WanInterface, WsTransport, parse_filter_expr,
     parse_match_expr, parse_value_expr, render_functions,
 };
 pub use scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration, parse_integer};

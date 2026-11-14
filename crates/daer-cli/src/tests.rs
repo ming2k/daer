@@ -1,6 +1,6 @@
 use super::*;
 
-use daer_test_support::Scratch;
+use test_support::Scratch;
 
 #[test]
 fn elect_requires_a_node_or_reset() {
@@ -88,7 +88,7 @@ fn the_reference_example_validates() {
 #[test]
 fn rejects_unknown_formats() {
     let dir = Scratch::new("ext");
-    let config = dir.write_private("config.yaml", b"schema = 5\n");
+    let config = dir.write_private("config.yaml", b"schema = 6\n");
     let error = block_on(validate_config(&config)).expect_err("must fail");
     assert!(
         format!("{error:#}").contains("expected a `.toml`"),
@@ -101,7 +101,7 @@ fn rejects_unknown_elections() {
     let dir = Scratch::new("unknown");
     let config = dir.write_private(
             "config.toml",
-            b"[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"x\"\nmatch = \"dport(443)\"\naction = { election = \"nope\" }\n",
+            b"[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"x\"\nmatch = \"dport(443)\"\naction = \"nope\"\n",
         );
     let error = block_on(validate_config(&config)).expect_err("must fail");
     assert!(format!("{error:#}").contains("not declared"), "{error:#}");
@@ -116,13 +116,13 @@ fn rejects_a_missing_rule_provider_file() {
     let config = dir.write_private(
         "config.toml",
         br#"[[rule-set]]
-tag = "gone"
+name = "gone"
 type = "file"
 path = "does-not-exist.drb"
 format = "drb"
 
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "gone-set"
 match = "rule-set(gone)"
@@ -170,7 +170,7 @@ node = "v"
 type = "manual"
 
 [routing]
-fallback = { election = "g" }
+default = "g"
 "#,
     );
     let error = block_on(validate_config(&config)).expect_err("must fail");
@@ -248,11 +248,11 @@ node = "n1"
 type = "manual"
 
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "https-proxy"
 match = "dport(443)"
-action = { election = "proxy" }
+action = "proxy"
 "#,
     );
 
@@ -264,7 +264,7 @@ action = { election = "proxy" }
     ))
     .expect("explains");
     assert_eq!(explanation.rule, Some(0));
-    assert_eq!(explanation.rule_text, "dport(443) -> election \"proxy\"");
+    assert_eq!(explanation.rule_text, "dport(443) -> proxy");
     assert_eq!(&*explanation.outbound.name, "proxy");
 
     let explanation =
@@ -282,7 +282,7 @@ fn route_explain_reports_an_empty_group_as_a_failure() {
     let dir = Scratch::new("explain-empty-group");
     let config = dir.write_private(
             "config.toml",
-            b"[[group]]\nname = \"empty-pool\"\n\n[[election]]\nname = \"empty\"\ngroup = \"empty-pool\"\ntype = \"min\"\n[routing]\nfallback = { election = \"empty\" }\n",
+            b"[[group]]\nname = \"empty-pool\"\n\n[[election]]\nname = \"empty\"\ngroup = \"empty-pool\"\ntype = \"min\"\n[routing]\ndefault = \"empty\"\n",
         );
     let error = block_on(explain_route(
         &config,
@@ -304,7 +304,7 @@ fn route_explain_reports_a_blocked_flow_as_a_failure() {
     let dir = Scratch::new("explain-block");
     let config = dir.write_private(
             "config.toml",
-            b"[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n",
+            b"[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n",
         );
 
     let error = block_on(explain_route(
@@ -323,7 +323,7 @@ fn route_explain_why_reports_every_rule_and_predicate() {
     let dir = Scratch::new("explain-why");
     let config = dir.write_private(
             "config.toml",
-            b"[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n[[routing.rule]]\nname = \"tcp-direct\"\nmatch = \"l4proto(tcp)\"\naction = \"direct\"\n",
+            b"[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n[[routing.rule]]\nname = \"tcp-direct\"\nmatch = \"l4proto(tcp)\"\naction = \"direct\"\n",
         );
 
     let explanation =
@@ -417,11 +417,11 @@ node = "tj"
 type = "manual"
 
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "https-proxy"
 match = "dport(443)"
-action = { election = "proxy" }
+action = "proxy"
 "#,
     );
 
@@ -448,7 +448,7 @@ fn structured_nodes_integrate_with_routing_and_diagnostics() {
     let config = dir.write_private(
         "config.toml",
         br#"
-schema = 5
+schema = 6
 
 [[node]]
 name = "hk-vless"
@@ -481,7 +481,7 @@ group = "pool"
 type = "min-moving-avg"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 "#,
     );
 
@@ -536,7 +536,7 @@ fn subscription_node_filtering_and_selection() {
     let sub_url = "https://example.com/api/subscribe?token=test";
     let config_toml = format!(
         r#"
-schema = 5
+schema = 6
 
 [[subscription]]
 name = "mysub"
@@ -555,11 +555,11 @@ group = "jp-pool"
 type = "min-moving-avg"
 
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "jp-https"
 match = "dport(443)"
-action = {{ election = "fastest-jp" }}
+action = "fastest-jp"
 "#
     );
     let config = dir.write_private("config.toml", config_toml.as_bytes());
@@ -621,7 +621,7 @@ fn a_direct_verdict_selects_no_node() {
     let config = dir.write_private(
         "config.toml",
         br#"[routing]
-fallback = "direct"
+default = "direct"
 "#,
     );
     let explanation = block_on(explain(
@@ -638,10 +638,7 @@ fallback = "direct"
 #[test]
 fn route_explain_refuses_a_configuration_that_cannot_run() {
     let dir = Scratch::new("explain-bad");
-    let config = dir.write_private(
-        "config.toml",
-        b"[routing]\nfallback = { election = \"nope\" }\n",
-    );
+    let config = dir.write_private("config.toml", b"[routing]\ndefault = \"nope\"\n");
     let error = block_on(explain_route(
         &config,
         "10.0.0.2:40000".parse().expect("source"),
@@ -715,7 +712,7 @@ fn accepts_builtin_outbounds() {
     let dir = Scratch::new("builtin");
     let config = dir.write_private(
             "config.toml",
-            b"[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n",
+            b"[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"https-block\"\nmatch = \"dport(443)\"\naction = \"block\"\n",
         );
     block_on(validate_config(&config)).expect("validates");
 }
@@ -727,7 +724,7 @@ fn rule_provider_integration_with_routing_and_explain() {
     let config = dir.write_private(
         "config.toml",
         br#"
-schema = 5
+schema = 6
 
 [[rule-set]]
 name = "internal-corp"
@@ -740,7 +737,7 @@ enabled = true
 timeout = "30ms"
 
 [routing]
-fallback = "block"
+default = "block"
 [[routing.rule]]
 name = "internal"
 match = "rule-set(internal-corp)"

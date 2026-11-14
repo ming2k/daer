@@ -19,7 +19,7 @@ flow ──▶ rule 0 match? ──yes──▶ action
 
 ```toml
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [[routing.rule]]
 name = "lan"
@@ -54,7 +54,7 @@ action = "direct"
 [[routing.rule]]
 name = "ai-proxy"
 match = "rule-set(openai, anthropic)"
-action = { election = "proxy" }
+action = "proxy"
 ```
 
 Each `[[routing.rule]]` has exactly three fields:
@@ -76,7 +76,7 @@ Each `[[routing.rule]]` has exactly three fields:
 ```text
 action = "direct"                 # built-in local path
 action = "block"                  # built-in drop
-action = { election = "proxy" }  # dynamic: election selects one node
+action = "proxy"  # dynamic: election selects one node
 ```
 
 - `direct` and `block` are **built-in outbounds**, not nodes and not elections.
@@ -84,7 +84,7 @@ action = { election = "proxy" }  # dynamic: election selects one node
   node's dialer carries the flow.
 - A bare string action is only `"direct"` or `"block"`. An election must use the table form.
   `action = "proxy"` is rejected with a message naming the replacement.
-- A group is a candidate pool, never an action. `action = { election = "pool" }` is rejected
+- A group is a candidate pool, never an action. `action = "pool"` is rejected
   unless an election named `pool` exists.
 - Built-in policy names are reserved: `direct`, `block`, `must_rules`, `<OR>`, `<AND>` may not
   be used as node, group, or election names.
@@ -92,13 +92,13 @@ action = { election = "proxy" }  # dynamic: election selects one node
 `fallback` uses the same vocabulary:
 
 ```text
-fallback = "direct"
-fallback = "block"
-fallback = { election = "proxy" }
+default = "direct"
+default = "block"
+default = "proxy"
 ```
 
 The default is `"direct"`. A runtime `daer elect proxy <node>` changes which node the
-`{ election = "proxy" }` action selects; it does not change the rule.
+`"proxy"` action selects; it does not change the rule.
 
 ---
 
@@ -212,10 +212,10 @@ A broad rule before a narrow one makes the narrow rule unreachable:
 ```text
 # Wrong order: the broad rule fires first.
 match = "rule-set(foreign)"
-action = { election = "proxy" }
+action = "proxy"
 
 match = "rule-set(openai, anthropic)"
-action = { election = "proxy" }
+action = "proxy"
 ```
 
 Put the narrow exception before the broad set. `daer route --why` names shadowed rules instead
@@ -305,7 +305,7 @@ rules = [
     "rule-set(ads) -> block",
     "rule-set(ai) -> proxy",
 ]
-fallback = "proxy"
+default = "proxy"
 ```
 
 to:
@@ -313,7 +313,7 @@ to:
 ```toml
 # schema 5
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 enabled = true
@@ -332,7 +332,7 @@ action = "block"
 [[routing.rule]]
 name = "ai-proxy"
 match = "rule-set(ai)"
-action = { election = "proxy" }
+action = "proxy"
 ```
 
 Also replace the retired predicates:
@@ -342,7 +342,7 @@ Also replace the retired predicates:
 - `port(...)` (destination) → `dport(...)`
 - `dip(rule-set:name)` / `domain(rule-set:name)` → `ip-set(name)` / `domain-set(name)`
 
-There is no compatibility shim: every older schema is rejected by `schema = 5` validation.
+There is no compatibility shim: every older schema is rejected by `schema = 6` validation.
 
 ---
 
@@ -350,7 +350,7 @@ There is no compatibility shim: every older schema is rejected by `schema = 5` v
 
 - **Naming a group instead of an election.** Rules target elections; a group is only a pool.
 - **Writing `action = "proxy"`.** A bare action is only `direct`/`block`; elections use
-  `{ election = "proxy" }`.
+  `"proxy"`.
 - **Putting `->` inside `match`.** The action is a separate field.
 - **Using `direct` as a node.** `direct` is a verdict; `[[node]] type = "direct"` is rejected.
 - **Duplicating a rule name.** Names are identities, not comments.

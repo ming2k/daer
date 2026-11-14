@@ -11,7 +11,7 @@ description = "Routing decisions, node selection and health scheduling for daer"
 [dependencies]
 anyhow.workspace = true
 arc-swap.workspace = true
-daer-common.workspace = true
+daer-primitives.workspace = true
 daer-config.workspace = true
 daer-dns.workspace = true
 daer-ebpf.workspace = true

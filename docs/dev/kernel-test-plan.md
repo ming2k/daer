@@ -70,7 +70,7 @@ Save as `/tmp/daer-test.toml`. Replace `wan-interface` with your outbound interf
 (`ip route show default` names it) and `lan-interface` with the one clients use.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = ["eth0"]        # <-- yours
 lan-interface = ["eth1"]        # <-- yours, the network you proxy *from*
@@ -110,7 +110,7 @@ type = "min-moving-avg"
 # `dip(...)` is representable in the kernel; `pname(...)` and `domain(...)` are not,
 # so this pair is what decides the tier. Both are correct, and the startup log says
 # which one you got.
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 enabled = true

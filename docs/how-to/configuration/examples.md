@@ -10,7 +10,7 @@ credentials and rule-set paths before running them.
 Valid offline; it declares one node and one manually selected election.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
@@ -26,7 +26,7 @@ node = "local-socks"
 type = "manual"
 
 [routing]
-fallback = { election = "local" }
+default = "local"
 [[routing.rule]]
 name = "rule-1"
 match = "dip(224.0.0.0/3, 'ff00::/8')"
@@ -46,7 +46,7 @@ daer check -c config.toml --nodes
 Replace the URL and token. This config needs network access when it is loaded.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 log-level = "info"
@@ -68,7 +68,7 @@ mode = "url"
 url = "https://www.gstatic.com/generate_204"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 [[routing.rule]]
 name = "rule-1"
 match = "dip(192.168.0.0/16)"
@@ -97,7 +97,7 @@ action = "block"
 This adds compiled rule sets. The paths must exist on the host.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
@@ -148,7 +148,7 @@ path = "/var/lib/daer/rules/geosite-geolocation-!cn.drb"
 format = "drb"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 # The rule sets below carry domains; DNS is consulted first, then a bounded peek.
@@ -183,7 +183,7 @@ action = "direct"
 [[routing.rule]]
 name = "rule-6"
 match = "rule-set(foreign)"
-action = { election = "proxy" }
+action = "proxy"
 ```
 
 The order matters: private and ads are decided before the broad regional sets, and the
@@ -194,13 +194,13 @@ domestic set is before the foreign set.
 ## 4. DNS with Fake-IP
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
 [dns]
 bind = "127.0.0.1"
-ipversion-prefer = 4
+ipversion-prefer = "ipv4"
 upstream = ["alidns:udp://223.5.5.5:53", "googledns:tcp://8.8.8.8:53"]
 
 [dns.fake-ip]
@@ -210,14 +210,14 @@ exclude = ["local", "localhost", "*.lan", "*.local"]
 
 [dns.request]
 rules = []
-fallback = "alidns"
+default = "alidns"
 
 [dns.response]
 rules = []
-fallback = "accept"
+default = "accept"
 
 [routing]
-fallback = "direct"
+default = "direct"
 ```
 
 On a LAN gateway, change `bind` to the address clients can reach. A client that uses DoH/DoT
@@ -228,7 +228,7 @@ to another resolver bypasses Fake-IP; the flow then relies on `[routing.sniff]` 
 ## 5. Trojan and Hysteria 2 nodes
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
@@ -278,7 +278,7 @@ mode = "url"
 url = "https://www.gstatic.com/generate_204"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 ```
 
 ---
@@ -288,7 +288,7 @@ fallback = { election = "proxy" }
 `/etc/daer/config.toml`:
 
 ```toml
-schema = 5
+schema = 6
 include = ["conf.d/*.toml"]
 ```
 
@@ -326,7 +326,7 @@ url = "https://www.gstatic.com/generate_204"
 
 ```toml
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 ```
 
 Validate the assembled tree, not the files individually:

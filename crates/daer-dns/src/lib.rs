@@ -38,7 +38,7 @@
 //!
 //! [dns.request]
 //! rules = ["qname(ads) -> reject"]
-//! fallback = "local"
+//! default = "local"
 //! "#,
 //! )
 //! .expect("config loads");

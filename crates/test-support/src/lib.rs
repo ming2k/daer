@@ -20,7 +20,7 @@ pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("crates/daer-test-support is two levels below the workspace root")
+        .expect("crates/test-support is two levels below the workspace root")
         .to_path_buf()
 }
 

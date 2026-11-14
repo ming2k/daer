@@ -8,7 +8,7 @@
 //! empty. Unknown keys are rejected at every level.
 //!
 //! ```toml
-//! schema = 5
+//! schema = 6
 //! include = ["conf.d/*.toml"]
 //! lan-interface = ["docker0"]
 //!
@@ -29,7 +29,7 @@
 //! type = "min-moving-avg"
 //!
 //! [routing]
-//! fallback = { election = "proxy" }
+//! default = "proxy"
 //!
 //! [routing.sniff]
 //! enabled = true
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_minimal_document_is_valid() {
         let config = load_str("").expect("empty config");
-        assert_eq!(config.routing.fallback.to_string(), "direct");
+        assert_eq!(config.routing.default.to_string(), "direct");
     }
 
     #[test]
@@ -455,11 +455,8 @@ mod tests {
 
     #[test]
     fn a_semantic_error_names_the_field() {
-        let error = load_str("[dns]\nipversion-prefer = 5\n").expect_err("must fail");
-        assert!(
-            error.to_string().contains("dns.ipversion-prefer"),
-            "{error}"
-        );
+        let error = load_str("[dns]\nmax-cache-size = -1\n").expect_err("must fail");
+        assert!(error.to_string().contains("dns.max-cache-size"), "{error}");
     }
 
     #[test]
@@ -473,7 +470,7 @@ mod tests {
         let config = load_str(
             "log-level = \"debug\"\n[[node]]\nname = \"n\"\ntype = \"shadowsocks\"\n\
              server = \"1.2.3.4\"\nport = 8388\nmethod = \"aes-256-gcm\"\npassword = \"x\"\n\
-             [routing]\nfallback = \"direct\"\n\
+             [routing]\ndefault = \"direct\"\n\
              [[routing.rule]]\nname = \"nm\"\nmatch = \"pname(NetworkManager)\"\naction = \"direct\"\n",
         )
         .expect("valid");

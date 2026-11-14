@@ -267,6 +267,17 @@ fn tcx_available(current: KernelVersion) -> bool {
 /// The default cgroup v2 mount used for the process-name hooks.
 pub const DEFAULT_CGROUP_PATH: &str = "/sys/fs/cgroup";
 
+/// The mode passed to aya when attaching the cgroup hooks.
+///
+/// aya 0.14 forwards this mode to `bpf_link_create` as `link_create.flags`, but a cgroup
+/// link accepts no flags: the kernel rejects any non-zero value with `EINVAL` and always
+/// attaches links with `BPF_F_ALLOW_MULTI` internally. `Single` is the zero-flag mode, so
+/// it is the only value that lets the link attach succeed; the effective attach is still
+/// multi-program because that is the kernel's fixed behavior for cgroup links. Do not
+/// change this to `AllowMultiple` until aya stops forwarding the mode to
+/// `bpf_link_create` (<https://github.com/aya-rs/aya/issues/1078>).
+const CGROUP_LINK_ATTACH_MODE: CgroupAttachMode = CgroupAttachMode::Single;
+
 /// Resolves the cgroup v2 root the process-name hooks attach to.
 ///
 /// `DAER_CGROUP_PATH` is an explicit deployment override for a cgroup namespace
@@ -332,7 +343,7 @@ fn attach_cgroup_sock(ebpf: &mut Ebpf, name: &str, cgroup: &File) -> Result<(), 
     let sock: &mut CgroupSock = program.try_into().map_err(LoadError::Program)?;
     sock.load()
         .map_err(|error| LoadError::Cgroup(format!("cannot load {name}: {error}")))?;
-    sock.attach(cgroup.as_fd(), CgroupAttachMode::AllowMultiple)
+    sock.attach(cgroup.as_fd(), CGROUP_LINK_ATTACH_MODE)
         .map_err(|error| LoadError::Cgroup(format!("cannot attach {name}: {error}")))?;
     Ok(())
 }
@@ -344,7 +355,7 @@ fn attach_cgroup_sock_addr(ebpf: &mut Ebpf, name: &str, cgroup: &File) -> Result
     let sock: &mut CgroupSockAddr = program.try_into().map_err(LoadError::Program)?;
     sock.load()
         .map_err(|error| LoadError::Cgroup(format!("cannot load {name}: {error}")))?;
-    sock.attach(cgroup.as_fd(), CgroupAttachMode::AllowMultiple)
+    sock.attach(cgroup.as_fd(), CGROUP_LINK_ATTACH_MODE)
         .map_err(|error| LoadError::Cgroup(format!("cannot attach {name}: {error}")))?;
     Ok(())
 }
@@ -400,5 +411,14 @@ mod tests {
         assert!(tcx_available(KernelVersion::new(6, 6, 0)));
         assert!(tcx_available(KernelVersion::new(6, 7, 0)));
         assert!(tcx_available(KernelVersion::new(7, 0, 0)));
+    }
+
+    #[test]
+    fn the_cgroup_link_attach_mode_carries_no_link_flags() {
+        // Falsifier: `AllowMultiple` maps to `BPF_F_ALLOW_MULTI`. aya 0.14 forwards the
+        // mode as `link_create.flags`, and the kernel rejects any non-zero value for a
+        // cgroup link with `EINVAL` (aya-rs/aya#1078), so a non-zero mode here makes
+        // every daemon start fail at datapath attach.
+        assert_eq!(u32::from(CGROUP_LINK_ATTACH_MODE), 0);
     }
 }

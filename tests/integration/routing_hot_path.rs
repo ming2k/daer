@@ -23,7 +23,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use daer_common::{MacAddr, PortRange};
+use daer_primitives::{MacAddr, PortRange};
 use daer_routing::{
     MatchFacts, MatchSet, MatchTarget, MatchValue, Outbound, ProcessName, evaluate,
 };

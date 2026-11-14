@@ -34,7 +34,7 @@ fn schema_is_up_to_date() {
 /// `docs/reference/configuration.md` is fed to the loader.
 ///
 /// A block that is deliberately incomplete (a fragment showing one table, not a whole file)
-/// is skipped by name rather than by guess: `schema = 5` and a `[[group]]` are what make a
+/// is skipped by name rather than by guess: `schema = 6` and a `[[group]]` are what make a
 /// snippet loadable, and a snippet without them is a fragment the prose is naming members of.
 #[test]
 fn every_toml_block_in_the_reference_documentation_loads() {
@@ -57,7 +57,7 @@ fn every_toml_block_in_the_reference_documentation_loads() {
                     let document = if block.contains("schema =") {
                         block.clone()
                     } else {
-                        format!("schema = 5\n{block}")
+                        format!("schema = 6\n{block}")
                     };
                     daer_config::toml_config::load_str(&document).unwrap_or_else(|error| {
                         panic!(

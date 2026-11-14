@@ -84,11 +84,11 @@ upstream = ["local:udp://127.0.0.1:53", "remote:udp://127.0.0.1:54"]
 
 [dns.request]
 rules = ["qname(blocked) -> reject", "qname(lan) -> asis"]
-fallback = "local"
+default = "local"
 
 [dns.response]
 rules = []
-fallback = "accept"
+default = "accept"
 "#;
 
 fn resolver(src: &str, local: Arc<FakeUpstream>) -> Resolver {
@@ -235,7 +235,7 @@ upstream = ["remote:udp://127.0.0.1:54"]
 
 [dns.request]
 rules = []
-fallback = "remote"
+default = "remote"
 "#;
     let config = daer_config::toml_config::load_str(src).expect("config loads");
     let error = Resolver::new(&config, []).expect_err("must refuse to build");
@@ -254,7 +254,7 @@ upstream = ["first:udp://127.0.0.1:53", "second:udp://127.0.0.1:54"]
 
 [dns.request]
 rules = []
-fallback = "first"
+default = "first"
 
 [dns.response]
 rules = ["ip(10.0.0.0/8) -> second"]
@@ -294,7 +294,7 @@ upstream = ["only:udp://127.0.0.1:53"]
 
 [dns.request]
 rules = []
-fallback = "only"
+default = "only"
 
 [dns.response]
 rules = ["ip(10.0.0.0/8) -> only"]

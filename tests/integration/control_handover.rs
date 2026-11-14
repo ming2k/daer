@@ -78,7 +78,7 @@ async fn echo_server() -> SocketAddr {
 
 const FIRST: &str = r#"
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "http"
@@ -88,7 +88,7 @@ action = "direct"
 
 const SECOND: &str = r#"
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "http"

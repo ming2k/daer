@@ -47,8 +47,8 @@ bind = "192.168.1.1"
 ```toml
 [dns]
 optimistic-cache = true
-optimistic-cache-ttl = 60
-optimistic-stale-reply-ttl = 30
+optimistic-cache-ttl = "60s"
+optimistic-stale-reply-ttl = "30s"
 max-cache-size = 65536
 ```
 
@@ -63,11 +63,11 @@ refreshes, which trades freshness for latency. `max-cache-size` is the key; ther
 ```toml
 [dns.request]
 rules = ["qname(keyword: ads) -> reject"]
-fallback = "alidns"
+default = "alidns"
 
 [dns.response]
 rules = []
-fallback = "accept"
+default = "accept"
 ```
 
 `[dns.request]` selects or rejects an upstream for a query. `[dns.response]` decides what to
@@ -135,10 +135,10 @@ explicit “never inspect payload” choice, and it requires a DNS service when 
 
 ```toml
 [dns.fixed-domain-ttl]
-".example.com" = 60
+".example.com" = "60s"
 ```
 
-A suffix maps to a TTL in seconds. This is useful for a domain whose upstream TTL is too short
+A suffix maps to a TTL duration. This is useful for a domain whose upstream TTL is too short
 for the deployment's cache behavior.
 
 ---

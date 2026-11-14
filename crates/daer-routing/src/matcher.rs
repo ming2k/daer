@@ -17,7 +17,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use daer_common::{MacAddr, PortRange};
+use daer_primitives::{MacAddr, PortRange};
 
 use crate::domain::DomainTable;
 use crate::error::RoutingError;
@@ -310,8 +310,8 @@ mod tests {
 
     fn outbound(name: &str) -> MatchTarget {
         let kind = match name {
-            daer_common::consts::outbound_name::DIRECT => daer_config::OutboundKind::Direct,
-            daer_common::consts::outbound_name::BLOCK => daer_config::OutboundKind::Block,
+            daer_primitives::consts::outbound_name::DIRECT => daer_config::OutboundKind::Direct,
+            daer_primitives::consts::outbound_name::BLOCK => daer_config::OutboundKind::Block,
             _ => daer_config::OutboundKind::Election,
         };
         MatchTarget::Outbound(intern_outbound(kind, name, 0, false))
@@ -449,9 +449,7 @@ mod tests {
                 daer_config::RoutingRule {
                     name: "four".to_owned(),
                     match_expr: daer_config::parse_match_expr("dport(4)").expect("parses"),
-                    action: daer_config::OutboundAction::Election(daer_config::ElectionAction {
-                        election: "proxy".to_owned(),
-                    }),
+                    action: daer_config::OutboundAction::Election("proxy".to_owned()),
                 },
             ];
             builder.apply(&rules).expect("lowers");

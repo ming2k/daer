@@ -16,11 +16,11 @@
           "inet": "198.18.0.0/15",
           "pool-size": 65535
         },
-        "ipversion-prefer": 0,
+        "ipversion-prefer": "any",
         "max-cache-size": 65536,
         "optimistic-cache": true,
-        "optimistic-cache-ttl": 60,
-        "optimistic-stale-reply-ttl": 30,
+        "optimistic-cache-ttl": "1m",
+        "optimistic-stale-reply-ttl": "30s",
         "request": {
           "rules": []
         },
@@ -71,7 +71,7 @@
     "routing": {
       "$ref": "#/$defs/Routing",
       "default": {
-        "fallback": "direct"
+        "default": "direct"
       }
     },
     "rule-set": {
@@ -84,7 +84,7 @@
       "description": "Schema version. Bumped when a change cannot be expressed as a default.",
       "type": "integer",
       "format": "uint32",
-      "default": 5,
+      "default": 6,
       "minimum": 0
     },
     "subscription": {
@@ -120,14 +120,6 @@
         }
       ]
     },
-    "BuiltinOutbound": {
-      "description": "One built-in routing policy.",
-      "type": "string",
-      "enum": [
-        "direct",
-        "block"
-      ]
-    },
     "Dns": {
       "type": "object",
       "properties": {
@@ -147,18 +139,16 @@
           }
         },
         "fixed-domain-ttl": {
-          "description": "`[dns.fixed-domain-ttl]` — domain to TTL in seconds.",
+          "description": "`[dns.fixed-domain-ttl]` — domain suffix to fixed TTL duration.",
           "type": "object",
           "additionalProperties": {
-            "type": "integer",
-            "format": "int64"
+            "type": "string"
           }
         },
         "ipversion-prefer": {
-          "description": "`4`, `6`, or `0` for no preference.",
-          "type": "integer",
-          "format": "int32",
-          "default": 0
+          "description": "Preferred IP family for DNS answers (`\"any\"`, `\"ipv4\"`, or `\"ipv6\"`).",
+          "$ref": "#/$defs/IpVersionPrefer",
+          "default": "any"
         },
         "max-cache-size": {
           "type": "integer",
@@ -170,14 +160,12 @@
           "default": true
         },
         "optimistic-cache-ttl": {
-          "type": "integer",
-          "format": "int32",
-          "default": 60
+          "type": "string",
+          "default": "1m"
         },
         "optimistic-stale-reply-ttl": {
-          "type": "integer",
-          "format": "int32",
-          "default": 30
+          "type": "string",
+          "default": "30s"
         },
         "request": {
           "$ref": "#/$defs/DnsRouting",
@@ -205,7 +193,7 @@
       "description": "`[dns.request]` / `[dns.response]`.",
       "type": "object",
       "properties": {
-        "fallback": {
+        "default": {
           "type": [
             "string",
             "null"
@@ -306,19 +294,6 @@
       "required": [
         "name",
         "type"
-      ]
-    },
-    "ElectionAction": {
-      "description": "The `{ election = \"name\" }` action table.",
-      "type": "object",
-      "properties": {
-        "election": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "election"
       ]
     },
     "ElectionKind": {
@@ -639,6 +614,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "IpVersionPrefer": {
+      "description": "Preferred IP family for DNS answers (`\"any\"`, `\"ipv4\"`, or `\"ipv6\"`).",
+      "type": "string",
+      "enum": [
+        "any",
+        "ipv4",
+        "ipv6"
+      ]
     },
     "Node": {
       "description": "One `[[node]]` entry.",
@@ -1024,15 +1008,8 @@
       "additionalProperties": false
     },
     "OutboundAction": {
-      "description": "A routing action: the egress a rule sends a matching flow to.\n\nBuilt-ins are bare strings; an election is a table. The table is what keeps the\ntwo namespaces apart: `action = \"direct\"` can only mean the built-in policy, and\n`action = { election = \"direct\" }` would be a different (and reserved-name)\nresource. There is no action string that silently means an election.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/BuiltinOutbound"
-        },
-        {
-          "$ref": "#/$defs/ElectionAction"
-        }
-      ]
+      "description": "A routing action: the egress a rule sends a matching flow to.\n\n`\"direct\"` and `\"block\"` are reserved built-in policies; any other non-empty\nstring names a declared `[[election]]`.",
+      "type": "string"
     },
     "PortHopping": {
       "description": "Hysteria 2's source-port hopping schedule.\n\nHopping changes the client's five-tuple without re-dialling the QUIC connection. The\nreference refuses a schedule shorter than 5 seconds, so the validator does too.",
@@ -1088,7 +1065,8 @@
     "Routing": {
       "type": "object",
       "properties": {
-        "fallback": {
+        "default": {
+          "description": "Default egress when no rule matches.",
           "$ref": "#/$defs/OutboundAction",
           "default": "direct"
         },

@@ -8,8 +8,8 @@
 //! match sets for the userspace evaluator, eBPF map entries, or nothing at all
 //! during validation.
 
-use daer_common::{MacAddr, PortRange};
 use daer_config::{Function, Param, RoutingRule};
+use daer_primitives::{MacAddr, PortRange};
 use ipnet::IpNet;
 
 use crate::domain::DomainTable;
@@ -724,11 +724,7 @@ mod tests {
                     "block" => {
                         daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block)
                     }
-                    election => {
-                        daer_config::OutboundAction::Election(daer_config::ElectionAction {
-                            election: election.to_owned(),
-                        })
-                    }
+                    election => daer_config::OutboundAction::Election(election.to_owned()),
                 };
                 RoutingRule {
                     name: format!("r{index}"),

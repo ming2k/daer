@@ -231,7 +231,7 @@ pub struct Resolver {
     snooper: Arc<crate::fake_ip::DnsSnooper>,
 }
 
-/// `dns.ipversion-prefer`, as a type rather than a raw `i32`.
+/// `dns.ipversion-prefer`, mapped from [`daer_config::IpVersionPrefer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpVersionPreference {
     /// Keep both families.
@@ -243,25 +243,17 @@ pub enum IpVersionPreference {
     V6,
 }
 
-impl IpVersionPreference {
-    /// Parses the configured integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message for a value other than `0`, `4` or `6`. `daer-config` rejects those
-    /// already, so reaching the error means a caller built a configuration by hand.
-    pub fn parse(raw: i32) -> Result<Self, String> {
-        match raw {
-            0 => Ok(Self::None),
-            4 => Ok(Self::V4),
-            6 => Ok(Self::V6),
-            other => Err(format!(
-                "dns.ipversion-prefer is {other}; the accepted values are 0 (no preference), \
-                 4 (prefer IPv4) and 6 (prefer IPv6)"
-            )),
+impl From<daer_config::IpVersionPrefer> for IpVersionPreference {
+    fn from(prefer: daer_config::IpVersionPrefer) -> Self {
+        match prefer {
+            daer_config::IpVersionPrefer::Any => Self::None,
+            daer_config::IpVersionPrefer::Ipv4 => Self::V4,
+            daer_config::IpVersionPrefer::Ipv6 => Self::V6,
         }
     }
+}
 
+impl IpVersionPreference {
     /// Drops the records of the dispreferred family from `message`'s answers.
     ///
     /// Only the *answers* section is touched: authorities and additionals carry NS/SOA/OPT data
@@ -356,8 +348,7 @@ impl Resolver {
             }
         }
 
-        let ipversion_prefer = IpVersionPreference::parse(config.dns.ipversion_prefer)
-            .map_err(ResolverError::Upstream)?;
+        let ipversion_prefer = IpVersionPreference::from(config.dns.ipversion_prefer);
 
         Ok(Self {
             request,

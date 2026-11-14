@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-daer-common.workspace = true
+daer-primitives.workspace = true
 daer-control.workspace = true
 daer-dns.workspace = true
 daer-config = { workspace = true, features = ["schema"] }
@@ -36,4 +36,4 @@ tracing-subscriber.workspace = true
 workspace = true
 
 [dev-dependencies]
-daer-test-support.workspace = true
+test-support.workspace = true

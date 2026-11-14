@@ -252,7 +252,7 @@ proxy. A detoured SOCKS5 node carries TCP only.
 
 ```toml
 [routing]
-fallback = "direct"
+default = "direct"
 
 [routing.sniff]
 enabled = true

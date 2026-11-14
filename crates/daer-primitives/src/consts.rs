@@ -8,9 +8,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// Binary name used by daer's own artifacts.
-pub const APP_NAME: &str = "daer";
-
 /// The `SO_MARK` daer applies to its own sockets, and the value the datapath compares
 /// against its `PARAM.socket_mark`.
 ///
@@ -24,88 +21,6 @@ pub const DEFAULT_SOCKET_MARK: u32 = 0x6461_6572;
 /// kernel routing program evaluates per packet. Overridable at build time with
 /// `MAX_MATCH_SET_LEN=... cargo xtask ebpf`.
 pub const MAX_MATCH_SET_LEN: usize = 1024;
-
-/// How the dial target is chosen for a matched flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DialMode {
-    /// Route and dial by resolved IP only.
-    Ip,
-    /// Use the sniffed/cached domain when it is known to resolve.
-    Domain,
-    /// Always send the sniffed domain to the proxy server.
-    DomainPlus,
-    /// Route by sniffed domain without requiring DNS through daer.
-    DomainCao,
-}
-
-impl DialMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ip => "ip",
-            Self::Domain => "domain",
-            Self::DomainPlus => "domain+",
-            Self::DomainCao => "domain++",
-        }
-    }
-}
-
-impl fmt::Display for DialMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for DialMode {
-    type Err = UnsupportedDialMode;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ip" => Ok(Self::Ip),
-            "domain" => Ok(Self::Domain),
-            "domain+" => Ok(Self::DomainPlus),
-            "domain++" => Ok(Self::DomainCao),
-            other => Err(UnsupportedDialMode {
-                mode: other.to_owned(),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedDialMode {
-    pub mode: String,
-}
-
-impl fmt::Display for UnsupportedDialMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unsupported dial mode: {}", self.mode)
-    }
-}
-
-impl std::error::Error for UnsupportedDialMode {}
-
-/// Routing function names accepted inside `routing { ... }` and `dns { ... }`.
-pub mod function {
-    pub const DOMAIN: &str = "domain";
-    pub const IP: &str = "ip";
-    pub const SOURCE_IP: &str = "sip";
-    pub const PORT: &str = "port";
-    pub const SOURCE_PORT: &str = "sport";
-    pub const L4_PROTO: &str = "l4proto";
-    pub const IP_VERSION: &str = "ipversion";
-    pub const MAC: &str = "mac";
-    pub const PROCESS_NAME: &str = "pname";
-    pub const DSCP: &str = "dscp";
-
-    pub const QNAME: &str = "qname";
-    pub const QTYPE: &str = "qtype";
-    pub const UPSTREAM: &str = "upstream";
-}
-
-/// Outbound parameter keys.
-pub mod outbound_param {
-    pub const MARK: &str = "mark";
-}
 
 /// The names of the outbounds the control plane always provides.
 ///
@@ -181,8 +96,8 @@ impl SelectionPolicy {
             Self::Random => "random",
             Self::Manual => "manual",
             Self::MinLastLatency => "min",
-            Self::MinAverage10 => "min_avg10",
-            Self::MinMovingAverage => "min_moving_avg",
+            Self::MinAverage10 => "min-avg10",
+            Self::MinMovingAverage => "min-moving-avg",
         }
     }
 
@@ -209,8 +124,8 @@ impl FromStr for SelectionPolicy {
             "random" => Ok(Self::Random),
             "manual" => Ok(Self::Manual),
             "min" => Ok(Self::MinLastLatency),
-            "min_avg10" => Ok(Self::MinAverage10),
-            "min_moving_avg" => Ok(Self::MinMovingAverage),
+            "min-avg10" => Ok(Self::MinAverage10),
+            "min-moving-avg" => Ok(Self::MinMovingAverage),
             other => Err(UnsupportedSelectionPolicy {
                 policy: other.to_owned(),
             }),
@@ -246,7 +161,7 @@ mod tests {
     #[test]
     fn every_constant_has_a_reader() {
         // (name, is this constant still expected to exist?)
-        let constants = [("APP_NAME", true), ("MAX_MATCH_SET_LEN", true)];
+        let constants = [("DEFAULT_SOCKET_MARK", true), ("MAX_MATCH_SET_LEN", true)];
 
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

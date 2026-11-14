@@ -279,7 +279,7 @@ async fn a_rule_sends_a_flow_direct() {
     let config = format!(
         r#"
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "upstream"
@@ -300,7 +300,7 @@ action = "direct"
 async fn a_block_rule_drops_the_flow_without_dialing() {
     let config = r#"
 [routing]
-fallback = "block"
+default = "block"
 
 [[routing.rule]]
 name = "block-one"
@@ -350,7 +350,7 @@ node = "n1"
 type = "manual"
 
 [routing]
-fallback = {{ election = "proxy" }}
+default = "proxy"
 "#
     );
     let (addr, metrics) = start(&config, upstream).await;
@@ -364,11 +364,9 @@ fallback = {{ election = "proxy" }}
 
 #[tokio::test]
 async fn a_fallback_naming_a_missing_group_fails_the_generation() {
-    let mut config = daer_config::toml_config::load_str("[routing]\nfallback = \"direct\"\n")
+    let mut config = daer_config::toml_config::load_str("[routing]\ndefault = \"direct\"\n")
         .expect("config loads");
-    config.routing.fallback = daer_config::OutboundAction::Election(daer_config::ElectionAction {
-        election: "nope".to_owned(),
-    });
+    config.routing.default = daer_config::OutboundAction::Election("nope".to_owned());
 
     let error = Generations::new(&config, &daer_control::RouterOptions::default())
         .expect_err("must not build");
@@ -398,7 +396,7 @@ group = "proxy-pool"
 type = "random"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 "#;
     let (addr, metrics) = start(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 443))).await;
 
@@ -424,12 +422,12 @@ async fn a_flow_traverses_a_detour_chain() {
     let inner = socks5_proxy_server().await;
     let outer = socks5_proxy_server().await;
     let config = format!(
-        "schema = 5\n\n\
+        "schema = 6\n\n\
          [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
          [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\ndetour = \"inner\"\n\n\
          [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
          [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
-         [routing]\nfallback = {{ election = \"proxy\" }}\n",
+         [routing]\ndefault = \"proxy\"\n",
         inner.ip(),
         inner.port(),
         outer.ip(),

@@ -127,7 +127,7 @@ enabled = true
 timeout = "200ms"
 
 [routing]
-fallback = "block"
+default = "block"
 
 [[routing.rule]]
 name = "private-block"
@@ -166,7 +166,7 @@ enabled = true
 timeout = "200ms"
 
 [routing]
-fallback = "block"
+default = "block"
 [[routing.rule]]
 name = "sniffed-direct"
 match = "domain(sniffed.example)"
@@ -193,7 +193,7 @@ async fn a_configuration_without_domain_rules_does_not_pay_for_sniffing() {
     let (origin, received) = recording_origin().await;
     let config = r#"
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "https"
 match = "dport(443)"

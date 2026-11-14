@@ -686,8 +686,8 @@ impl Router {
 /// A manual election does not rank candidates; `daer probe` is the on-demand path for a
 /// pinned node. Random needs liveness even though it does not rank latency.
 #[must_use]
-pub fn policy_needs_measurement(policy: daer_common::SelectionPolicy) -> bool {
-    !matches!(policy, daer_common::SelectionPolicy::Manual)
+pub fn policy_needs_measurement(policy: daer_primitives::SelectionPolicy) -> bool {
+    !matches!(policy, daer_primitives::SelectionPolicy::Manual)
 }
 
 /// A node that a group cannot measure is still selectable by `fixed(0)`; this reports
@@ -739,10 +739,10 @@ mod tests {
     fn a_manual_policy_is_not_measured() {
         // `fixed(n)` is explicit intent; a probe must not rewrite it.
         assert!(!policy_needs_measurement(
-            daer_common::SelectionPolicy::Manual
+            daer_primitives::SelectionPolicy::Manual
         ));
         assert!(policy_needs_measurement(
-            daer_common::SelectionPolicy::MinMovingAverage
+            daer_primitives::SelectionPolicy::MinMovingAverage
         ));
     }
 
@@ -751,9 +751,9 @@ mod tests {
         // A domain-named node would need its own resolution; a probe that resolved
         // differently from the data path would measure the wrong destination.
         let router = router(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"example.com\"\nport = 1080\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"example.com\"\nport = 1080\n\n\
              [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = { election = \"g\" }\n",
+             [routing]\ndefault = \"g\"\n",
         );
         let scheduler = Scheduler::new(router, Duration::from_secs(30));
         assert!(
@@ -786,9 +786,9 @@ mod tests {
         let ip = address.ip();
         let port = address.port();
         let router = router(&format!(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
              [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = {{ election = \"g\" }}\n"
+             [routing]\ndefault = \"g\"\n"
         ));
         let scheduler = Scheduler::with_instruments(
             Arc::clone(&router),
@@ -819,9 +819,9 @@ mod tests {
         // A manual election does not rank candidates; probing it would only rewrite a
         // choice the operator made.
         let router = router(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\n\
-             [routing]\nfallback = { election = \"g\" }\n",
+             [routing]\ndefault = \"g\"\n",
         );
         assert!(
             router.probe_table().is_empty(),
@@ -884,9 +884,9 @@ mod tests {
         let ip = address.ip();
         let port = address.port();
         let router = router(&format!(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"{ip}\"\nport = {port}\n\n\
              [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = {{ election = \"g\" }}\n"
+             [routing]\ndefault = \"g\"\n"
         ));
         let scheduler = Scheduler::with_instruments(
             Arc::clone(&router),
@@ -908,9 +908,9 @@ mod tests {
         // Recording a failure is what removes a node from selection; skipping it would
         // leave a dead node alive forever.
         let router = router(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = { election = \"g\" }\n",
+             [routing]\ndefault = \"g\"\n",
         );
         let scheduler = Scheduler::with_instruments(
             Arc::clone(&router),
@@ -933,9 +933,9 @@ mod tests {
     #[tokio::test]
     async fn a_zero_interval_disables_probing_entirely() {
         let router = router(
-            "schema = 5\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
+            "schema = 6\n\n[[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\n\
-             [routing]\nfallback = { election = \"g\" }\n",
+             [routing]\ndefault = \"g\"\n",
         );
         let scheduler = Scheduler::new(router, Duration::ZERO);
         // Returns rather than ticking: a test or a single-node configuration must not
@@ -968,11 +968,11 @@ mod tests {
         let b = answering_dns().await;
 
         let router = router(&format!(
-            "schema = 5\n\n\
+            "schema = 6\n\n\
              [[node]]\nname = \"a\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\
              [[node]]\nname = \"b\"\ntype = \"socks5\"\nserver = \"{}\"\nport = {}\n\n\
              [[group]]\nname = \"gg\"\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = {{ election = \"g\" }}\n",
+             [routing]\ndefault = \"g\"\n",
             a.ip(),
             a.port(),
             b.ip(),
@@ -991,11 +991,11 @@ mod tests {
         // measure a different destination. The target must reach the scheduler; the chain probe
         // is what resolves it, exactly like the data path.
         let router = router(
-            "schema = 5\n\n\
+            "schema = 6\n\n\
              [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 9\n\n\
              [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"outer.example\"\nport = 443\ndetour = \"inner\"\n\n\
              [[group]]\nname = \"gg\"\nfilters = [\"name(outer)\"]\n\n[[election]]\nname = \"g\"\ngroup = \"gg\"\ntype = \"min-moving-avg\"\n\n\
-             [routing]\nfallback = { election = \"g\" }\n",
+             [routing]\ndefault = \"g\"\n",
         );
         let scheduler = Scheduler::new(router, Duration::from_secs(30));
         let targets = scheduler.targets();

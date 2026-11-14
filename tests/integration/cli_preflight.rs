@@ -59,7 +59,7 @@ impl Drop for Scratch {
 fn config(tag: &str) -> (Scratch, PathBuf) {
     let dir = Scratch::new(tag);
     let path = dir.join("preflight.toml");
-    std::fs::write(&path, "schema = 5\n\nwan-interface = \"auto\"\n")
+    std::fs::write(&path, "schema = 6\n\nwan-interface = \"auto\"\n")
         .expect("writes the configuration");
     (dir, path)
 }

@@ -49,7 +49,7 @@ enabled = true
 timeout = "30ms"
 
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "bilibili"
@@ -280,10 +280,10 @@ fn naming_two_sources_of_nodes_is_refused() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        "schema = 5\n\
+        "schema = 6\n\
          [[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
          [[election]]\nname = \"g\"\nnode = \"n\"\ntype = \"manual\"\n\
-         [routing]\nfallback = { election = \"g\" }\n",
+         [routing]\ndefault = \"g\"\n",
     )
     .expect("writes config");
     let sub = temp.path().join("sub.txt");
@@ -316,11 +316,11 @@ fn a_node_named_all_is_probeable_by_name() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        "schema = 5\n\
+        "schema = 6\n\
          [[node]]\nname = \"all\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1\n\
          [[node]]\nname = \"other\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 2\n\
          [[election]]\nname = \"g\"\nnode = \"all\"\ntype = \"manual\"\n\
-         [routing]\nfallback = { election = \"g\" }\n",
+         [routing]\ndefault = \"g\"\n",
     )
     .expect("writes config");
 
@@ -455,7 +455,7 @@ enabled = true
 timeout = "30ms"
 
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "exact-auth"

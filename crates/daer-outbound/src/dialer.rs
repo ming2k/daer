@@ -2,8 +2,8 @@
 
 //! A single outbound node and its measured state.
 
-use daer_common::SelectionPolicy;
 use daer_config::TimeSpan;
+use daer_primitives::SelectionPolicy;
 
 use crate::alive::DialerId;
 use crate::latency::{LatenciesN, MovingAverage};

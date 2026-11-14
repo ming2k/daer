@@ -547,32 +547,28 @@ version = "0.0.14"
 dependencies = [
  "anyhow",
  "clap",
- "daer-common",
  "daer-config",
  "daer-control",
  "daer-dns",
  "daer-ebpf",
  "daer-observe",
  "daer-outbound",
+ "daer-primitives",
  "daer-routing",
- "daer-test-support",
  "libc",
  "netune",
  "serde",
  "serde_json",
+ "test-support",
  "tokio",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "daer-common"
-version = "0.0.14"
-
-[[package]]
 name = "daer-config"
 version = "0.0.14"
 dependencies = [
- "daer-common",
+ "daer-primitives",
  "glob",
  "schemars",
  "serde",
@@ -587,12 +583,12 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "aya",
- "daer-common",
  "daer-config",
  "daer-dns",
  "daer-ebpf",
  "daer-observe",
  "daer-outbound",
+ "daer-primitives",
  "daer-relay",
  "daer-routing",
  "daer-sniff",
@@ -633,7 +629,7 @@ version = "0.0.14"
 dependencies = [
  "aya",
  "aya-obj",
- "daer-common",
+ "daer-primitives",
  "ipnet",
  "libc",
 ]
@@ -650,9 +646,9 @@ dependencies = [
 name = "daer-outbound"
 version = "0.0.14"
 dependencies = [
- "daer-common",
  "daer-config",
  "daer-observe",
+ "daer-primitives",
  "daer-proxy-protocols",
  "fastrand",
  "netune",
@@ -662,6 +658,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "daer-primitives"
+version = "0.0.14"
 
 [[package]]
 name = "daer-proxy-protocols"
@@ -717,9 +717,9 @@ dependencies = [
 name = "daer-routing"
 version = "0.0.14"
 dependencies = [
- "daer-common",
  "daer-config",
  "daer-ebpf",
+ "daer-primitives",
  "daer-rule-ast",
  "ipnet",
  "sha2",
@@ -744,10 +744,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daer-test-support"
-version = "0.0.14"
-
-[[package]]
 name = "daer-tests"
 version = "0.0.14"
 dependencies = [
@@ -759,19 +755,18 @@ dependencies = [
  "blake3",
  "bytes",
  "chacha20poly1305",
- "daer-common",
  "daer-config",
  "daer-control",
  "daer-dns",
  "daer-ebpf",
  "daer-observe",
  "daer-outbound",
+ "daer-primitives",
  "daer-proxy-protocols",
  "daer-relay",
  "daer-routing",
  "daer-rule-ast",
  "daer-sniff",
- "daer-test-support",
  "hkdf",
  "ipnet",
  "libc",
@@ -784,6 +779,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "test-support",
  "tokio",
  "tokio-rustls",
 ]
@@ -1923,6 +1919,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "test-support"
+version = "0.0.14"
 
 [[package]]
 name = "thiserror"

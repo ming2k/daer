@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use daer_common::{MacAddr, PortRange};
+use daer_primitives::{MacAddr, PortRange};
 use ipnet::IpNet;
 
 use crate::error::RoutingError;

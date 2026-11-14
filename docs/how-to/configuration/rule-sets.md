@@ -65,7 +65,7 @@ daer-drb compile cn.rules -o geosite-cn.drb
 
 ```toml
 [routing]
-fallback = "direct"
+default = "direct"
 
 [routing.sniff]
 enabled = true
@@ -79,7 +79,7 @@ action = "block"
 [[routing.rule]]
 name = "rule-2"
 match = "rule-set(openai, anthropic)"
-action = { election = "proxy" }
+action = "proxy"
 
 [[routing.rule]]
 name = "rule-3"

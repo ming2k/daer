@@ -35,12 +35,12 @@ A configuration needs a schema and a routing fallback. It needs a node only if t
 names an election or a proxy pool.
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 
 [routing]
-fallback = "direct"
+default = "direct"
 ```
 
 Validate it without root, without loading the datapath, and without changing the host:

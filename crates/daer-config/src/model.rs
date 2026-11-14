@@ -26,13 +26,15 @@ use crate::error::ParseError;
 use crate::expr::{DnsRule, Function, MatchExpr, Param, ParamValue};
 use crate::scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration};
 
-/// The configuration schema version written as `schema = 5`.
+/// The configuration schema version written as `schema = 6`.
 ///
-/// Version 5 removes the `[global]` wrapper: host and daemon settings live at the
+/// Version 6 simplifies routing actions to bare strings (`"direct"`, `"block"`, or
+/// an election name) and renames `routing.fallback` / `dns.*.fallback` to `default`.
+/// Version 5 removed the `[global]` wrapper: host and daemon settings live at the
 /// top level, TLS defaults live in `[tls]`, and an election owns its probe without a
 /// global defaults table. Version 4 made domain acquisition an explicit routing
 /// policy (`[routing.sniff]`, explicit `[dns].bind` for Fake-IP).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Default UDP endpoints for the server-liveness probe.
 pub const DEFAULT_UDP_CHECK_DNS: &str = "1.1.1.1:53,8.8.8.8:53,2001:4860:4860::8888:53";
@@ -292,13 +294,13 @@ pub enum ElectionKind {
 impl ElectionKind {
     /// The runtime selection policy this election uses.
     #[must_use]
-    pub const fn selection_policy(self) -> daer_common::SelectionPolicy {
+    pub const fn selection_policy(self) -> daer_primitives::SelectionPolicy {
         match self {
-            Self::Manual => daer_common::SelectionPolicy::Manual,
-            Self::Random => daer_common::SelectionPolicy::Random,
-            Self::Min => daer_common::SelectionPolicy::MinLastLatency,
-            Self::MinAvg10 => daer_common::SelectionPolicy::MinAverage10,
-            Self::MinMovingAvg => daer_common::SelectionPolicy::MinMovingAverage,
+            Self::Manual => daer_primitives::SelectionPolicy::Manual,
+            Self::Random => daer_primitives::SelectionPolicy::Random,
+            Self::Min => daer_primitives::SelectionPolicy::MinLastLatency,
+            Self::MinAvg10 => daer_primitives::SelectionPolicy::MinAverage10,
+            Self::MinMovingAvg => daer_primitives::SelectionPolicy::MinMovingAverage,
         }
     }
 
@@ -545,7 +547,7 @@ impl<'de> Deserialize<'de> for WanInterface {
 #[serde(rename_all = "kebab-case")]
 pub struct Subscription {
     /// Name used by `sub(...)` / `subtag()` filters.
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub url: String,
     /// Cache the last successful fetch next to the configuration.
@@ -579,7 +581,6 @@ impl<'de> Deserialize<'de> for Subscription {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields, rename_all = "kebab-case")]
         struct Table {
-            #[serde(alias = "tag")]
             name: Option<String>,
             url: String,
             #[serde(default)]
@@ -612,7 +613,6 @@ impl<'de> Deserialize<'de> for Subscription {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuleProvider {
-    #[serde(alias = "tag")]
     pub name: String,
     #[serde(rename = "type", default)]
     pub provider_type: ProviderType,
@@ -658,7 +658,7 @@ pub enum ProviderFormat {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Node {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(flatten)]
     pub endpoint: NodeEndpoint,
@@ -776,13 +776,11 @@ impl Node {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum NodeEndpoint {
-    #[serde(alias = "socks")]
     Socks5(Socks5Node),
     Http(HttpNode),
-    #[serde(alias = "ss")]
     Shadowsocks(ShadowsocksNode),
     Trojan(TrojanNode),
-    #[serde(rename = "anytls", alias = "any-tls")]
+    #[serde(rename = "anytls")]
     AnyTls(AnyTlsNode),
     Hysteria2(Hysteria2Node),
     Vless(VlessNode),
@@ -1143,7 +1141,7 @@ impl NodeEndpoint {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Socks5Node {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -1173,7 +1171,7 @@ impl Socks5Node {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct HttpNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -1203,7 +1201,7 @@ impl HttpNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ShadowsocksNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -1277,7 +1275,7 @@ impl Hysteria2Tls {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TrojanNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -1315,7 +1313,7 @@ impl TrojanNode {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AnyTlsNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -1734,7 +1732,7 @@ impl Hysteria2Bandwidth {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Hysteria2Node {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     /// One port, a list, or a range (ADR-0029), e.g. `"443,20000-20010"`.
@@ -1934,14 +1932,14 @@ pub struct WsTransport {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub enum Flow {
     #[default]
-    #[serde(rename = "none", alias = "", alias = "xtls-rprx-direct")]
+    #[serde(rename = "none")]
     None,
-    #[serde(rename = "xtls-rprx-vision", alias = "vision")]
+    #[serde(rename = "xtls-rprx-vision")]
     Vision,
     /// Vision with UDP/443 allowed through the tunnel. The reference refuses UDP/443
     /// under plain Vision because a QUIC flow inside XTLS double-encrypts; this is the
     /// opt-out.
-    #[serde(rename = "xtls-rprx-vision-udp443", alias = "vision-udp443")]
+    #[serde(rename = "xtls-rprx-vision-udp443")]
     VisionUdp443,
 }
 
@@ -1974,7 +1972,7 @@ impl Flow {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VlessNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -2020,7 +2018,7 @@ pub enum VmessCipher {
     /// reference's `SecurityType_AUTO`.
     #[default]
     Auto,
-    #[serde(rename = "aes-128-gcm", alias = "aes-128-gcm")]
+    #[serde(rename = "aes-128-gcm")]
     Aes128Gcm,
     #[serde(rename = "chacha20-poly1305")]
     Chacha20Poly1305,
@@ -2031,7 +2029,7 @@ pub enum VmessCipher {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VmessNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub server: String,
     pub port: u16,
@@ -3141,7 +3139,7 @@ impl StructuredNode {
         if link.is_empty() || link == "direct" || link.starts_with("direct://") {
             return Err(
                 "`direct` is a routing verdict, not a node: use `action = \"direct\"` in a \
-                 [[routing.rule]] or as `fallback`"
+                 [[routing.rule]] or as `routing.default`"
                     .to_owned(),
             );
         }
@@ -3504,7 +3502,6 @@ impl<'de> Deserialize<'de> for Node {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "kebab-case")]
                 struct NodeHelper {
-                    #[serde(alias = "tag")]
                     name: Option<String>,
                     detour: Option<String>,
                     #[serde(flatten)]
@@ -3631,7 +3628,7 @@ pub struct DnsRouting {
         default
     )]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
-    pub fallback: Option<FunctionOrString>,
+    pub default: Option<FunctionOrString>,
 }
 
 /// `[dns.fake-ip]` — synthetic IP pool configuration (ADR-0012).
@@ -3665,21 +3662,35 @@ impl Default for FakeIpConfig {
     }
 }
 
+/// Preferred IP family for DNS answers (`"any"`, `"ipv4"`, or `"ipv6"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum IpVersionPrefer {
+    #[default]
+    Any,
+    Ipv4,
+    Ipv6,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct Dns {
-    /// `4`, `6`, or `0` for no preference.
-    pub ipversion_prefer: i32,
-    /// `[dns.fixed-domain-ttl]` — domain to TTL in seconds.
+    /// Preferred IP family for DNS answers (`"any"`, `"ipv4"`, or `"ipv6"`).
+    pub ipversion_prefer: IpVersionPrefer,
+    /// `[dns.fixed-domain-ttl]` — domain suffix to fixed TTL duration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fixed_domain_ttl: BTreeMap<String, i64>,
+    #[cfg_attr(feature = "schema", schemars(with = "BTreeMap<String, String>"))]
+    pub fixed_domain_ttl: BTreeMap<String, TimeSpan>,
     pub upstream: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
     pub optimistic_cache: bool,
-    pub optimistic_cache_ttl: i32,
-    pub optimistic_stale_reply_ttl: i32,
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub optimistic_cache_ttl: TimeSpan,
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub optimistic_stale_reply_ttl: TimeSpan,
     pub max_cache_size: i32,
     pub fake_ip: FakeIpConfig,
     pub request: DnsRouting,
@@ -3689,13 +3700,13 @@ pub struct Dns {
 impl Default for Dns {
     fn default() -> Self {
         Self {
-            ipversion_prefer: 0,
+            ipversion_prefer: IpVersionPrefer::Any,
             fixed_domain_ttl: BTreeMap::new(),
             upstream: Vec::new(),
             bind: None,
             optimistic_cache: true,
-            optimistic_cache_ttl: 60,
-            optimistic_stale_reply_ttl: 30,
+            optimistic_cache_ttl: TimeSpan::from_secs(60),
+            optimistic_stale_reply_ttl: TimeSpan::from_secs(30),
             max_cache_size: 65_536,
             fake_ip: FakeIpConfig::default(),
             request: DnsRouting::default(),
@@ -3728,16 +3739,23 @@ pub enum BuiltinOutbound {
 
 /// A routing action: the egress a rule sends a matching flow to.
 ///
-/// Built-ins are bare strings; an election is a table. The table is what keeps the
-/// two namespaces apart: `action = "direct"` can only mean the built-in policy, and
-/// `action = { election = "direct" }` would be a different (and reserved-name)
-/// resource. There is no action string that silently means an election.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `"direct"` and `"block"` are reserved built-in policies; any other non-empty
+/// string names a declared `[[election]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(untagged)]
+#[cfg_attr(feature = "schema", schemars(with = "String"))]
 pub enum OutboundAction {
     Builtin(BuiltinOutbound),
-    Election(ElectionAction),
+    Election(String),
+}
+
+impl Serialize for OutboundAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.name())
+    }
 }
 
 impl<'de> Deserialize<'de> for OutboundAction {
@@ -3745,30 +3763,16 @@ impl<'de> Deserialize<'de> for OutboundAction {
     where
         D: Deserializer<'de>,
     {
-        let value = toml::Value::deserialize(deserializer)?;
-        match value {
-            toml::Value::String(name) => match name.as_str() {
-                "direct" => Ok(Self::Builtin(BuiltinOutbound::Direct)),
-                "block" => Ok(Self::Builtin(BuiltinOutbound::Block)),
-                other => Err(de::Error::custom(format!(
-                    "routing action {other:?} is not a built-in; write `action = {{ election = \
-                     \"{other}\" }}` for an election"
-                ))),
-            },
-            toml::Value::Table(table) => {
-                let election = ElectionAction::deserialize(toml::Value::Table(table))
-                    .map_err(de::Error::custom)?;
-                if election.election.trim().is_empty() {
-                    return Err(de::Error::custom(
-                        "an election action needs a non-empty election name",
-                    ));
-                }
-                Ok(Self::Election(election))
-            }
-            other => Err(de::Error::custom(format!(
-                "a routing action is `\"direct\"`, `\"block\"`, or `{{ election = \"name\" }}`; \
-                 got {other:?}"
-            ))),
+        let name = String::deserialize(deserializer)?;
+        if name.trim().is_empty() {
+            return Err(de::Error::custom(
+                "a routing action cannot be empty; use \"direct\", \"block\", or an election name",
+            ));
+        }
+        match name.as_str() {
+            "direct" => Ok(Self::Builtin(BuiltinOutbound::Direct)),
+            "block" => Ok(Self::Builtin(BuiltinOutbound::Block)),
+            _ => Ok(Self::Election(name)),
         }
     }
 }
@@ -3794,9 +3798,11 @@ impl OutboundAction {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Builtin(BuiltinOutbound::Direct) => daer_common::consts::outbound_name::DIRECT,
-            Self::Builtin(BuiltinOutbound::Block) => daer_common::consts::outbound_name::BLOCK,
-            Self::Election(election) => &election.election,
+            Self::Builtin(BuiltinOutbound::Direct) => {
+                daer_primitives::consts::outbound_name::DIRECT
+            }
+            Self::Builtin(BuiltinOutbound::Block) => daer_primitives::consts::outbound_name::BLOCK,
+            Self::Election(election) => election,
         }
     }
 
@@ -3804,7 +3810,7 @@ impl OutboundAction {
     #[must_use]
     pub fn election_name(&self) -> Option<&str> {
         match self {
-            Self::Election(election) => Some(&election.election),
+            Self::Election(election) => Some(election),
             Self::Builtin(_) => None,
         }
     }
@@ -3818,22 +3824,8 @@ impl OutboundAction {
 
 impl fmt::Display for OutboundAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Builtin(builtin) => f.write_str(match builtin {
-                BuiltinOutbound::Direct => "direct",
-                BuiltinOutbound::Block => "block",
-            }),
-            Self::Election(election) => write!(f, "election {:?}", election.election),
-        }
+        f.write_str(self.name())
     }
-}
-
-/// The `{ election = "name" }` action table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ElectionAction {
-    pub election: String,
 }
 
 /// One ordered routing rule.
@@ -3894,7 +3886,8 @@ pub struct Routing {
     /// Ordered rules; the first matching rule wins.
     #[serde(rename = "rule", default, skip_serializing_if = "Vec::is_empty")]
     pub rule: Vec<RoutingRule>,
-    pub fallback: OutboundAction,
+    /// Default egress when no rule matches.
+    pub default: OutboundAction,
     /// What routing may do when DNS/Fake-IP cannot name the flow.
     #[serde(default, skip_serializing_if = "SniffConfig::is_default")]
     pub sniff: SniffConfig,
@@ -3938,12 +3931,7 @@ pub struct Config {
     pub group: Vec<Group>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub election: Vec<Election>,
-    #[serde(
-        default,
-        rename = "rule-set",
-        alias = "rule-provider",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, rename = "rule-set", skip_serializing_if = "Vec::is_empty")]
     pub rule_provider: Vec<RuleProvider>,
     pub routing: Routing,
     pub dns: Dns,

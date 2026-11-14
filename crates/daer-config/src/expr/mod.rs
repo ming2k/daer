@@ -10,7 +10,7 @@
 //! | `routing.rule.match` | `predicate && …` | `domain(a.com) && dport(443)` |
 //! | `group.filters` | `predicate && …` | `sub(sub) && !name(keyword: 'ExpireAt:')` |
 //! | `dns.request.rules` | `predicate && … -> upstream` | `qname(ads) -> reject` |
-//! | `dns.*.fallback` | name or call | `fixed(0)`, `min-moving-avg` |
+//! | `dns.*.default` | name or call | `fixed(0)`, `min-moving-avg` |
 //!
 //! They stay expressions because a boolean combination over arbitrary predicates
 //! has no faithful tabular encoding, and because the parsed form — a

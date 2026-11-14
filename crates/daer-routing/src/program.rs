@@ -59,7 +59,7 @@ impl NormalizedProgram {
 mod tests {
     use super::*;
     use crate::builder::RecordingSink;
-    use daer_config::{BuiltinOutbound, ElectionAction};
+    use daer_config::BuiltinOutbound;
 
     fn rule(name: &str, expr: &str, action: OutboundAction) -> RoutingRule {
         RoutingRule {
@@ -127,9 +127,7 @@ mod tests {
             "dport(443)",
             OutboundAction::Builtin(BuiltinOutbound::Direct),
         )];
-        let fallback = OutboundAction::Election(ElectionAction {
-            election: "proxy".to_owned(),
-        });
+        let fallback = OutboundAction::Election("proxy".to_owned());
         let program = NormalizedProgram::new(&rules, fallback.clone(), &[]).expect("normalizes");
         assert_eq!(program.fallback, fallback);
         assert_eq!(program.rules[0].match_expr.and_functions[0].name, "dport");

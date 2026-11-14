@@ -76,9 +76,9 @@ The test file keeps `use super::*;`, so the move is mechanical. Do this when the
 roughly 500+ lines or dominates the file, not pre-emptively: a 200-line test module beside 300
 lines of state machine is proportionate.
 
-### `daer-test-support`
+### `test-support`
 
-`crates/daer-test-support` is the shared infrastructure crate. It is a **dev-dependency** and
+`crates/test-support` is the shared infrastructure crate. It is a **dev-dependency** and
 must never enter a production dependency closure; `tests/integration/test_architecture.rs`
 fails if any crate declares it as a normal dependency.
 
@@ -290,7 +290,7 @@ be the softened claim ADR-0007 exists to prevent.
 1. Decide the layer with the table in §1. If the property needs a socket or a process, it is not
    a unit test.
 2. Put a unit test in the crate. If it is about a large module and bloats the file, use
-   `src/<module>/tests.rs`. If it needs shared infrastructure, use `daer-test-support`.
+   `src/<module>/tests.rs`. If it needs shared infrastructure, use `test-support`.
 3. Put an external test in `tests/integration/` or `tests/e2e/`, add its `mod` line to the
    corresponding `main.rs`, and state its falsifier in the module doc.
 4. Run the narrow nextest filter first, then the layer.

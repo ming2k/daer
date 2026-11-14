@@ -37,10 +37,10 @@
 
 use std::net::IpAddr;
 
-use daer_common::{MacAddr, PortRange};
 use daer_ebpf::abi::{
     LpmKey, MAX_MATCH_SET_LEN, MatchSet as KernelMatchSet, match_type, outbound as kernel_outbound,
 };
+use daer_primitives::{MacAddr, PortRange};
 use ipnet::IpNet;
 
 use crate::matcher::{MatchSet, MatchValue};

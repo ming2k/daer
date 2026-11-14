@@ -8,7 +8,7 @@
 # Unknown keys are errors, not warnings: a typo must fail loudly.
 
 # Schema version. daer refuses a version it does not understand.
-schema = 5
+schema = 6
 
 # Extra files, relative to this one. Tables merge key by key, arrays are
 # concatenated, and a key set twice is an error.
@@ -219,8 +219,8 @@ type = "min-moving-avg"
 #udp-dns = ["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]
 
 [dns]
-# "4", "6", or 0 for no preference.
-ipversion-prefer = 0
+# "any", "ipv4", or "ipv6".
+ipversion-prefer = "any"
 # Every upstream is `name:protocol://host:port`, and the name is what `[dns.request]` rules
 # name. The protocol is required: "UDP unless it fails" is a policy, not a default.
 #
@@ -233,8 +233,8 @@ upstream = ["alidns:udp://223.5.5.5:53", "googledns:tcp://8.8.8.8:53"]
 # not the box's resolver).
 #bind = "0.0.0.0"
 optimistic-cache = true
-optimistic-cache-ttl = 60
-optimistic-stale-reply-ttl = 30
+optimistic-cache-ttl = "60s"
+optimistic-stale-reply-ttl = "30s"
 max-cache-size = 65536
 
 # Synthetic DNS answers. Disabled by default. Enabling it requires an explicit `[dns].bind`
@@ -248,18 +248,18 @@ max-cache-size = 65536
 #pool-size = 65535
 #exclude = ["local"]
 
-# Per-domain TTL overrides, in seconds.
+# Per-domain TTL overrides.
 [dns.fixed-domain-ttl]
-#".example.com" = 60
+#".example.com" = "60s"
 
 [dns.request]
 rules = []
 # Where a request that matches no rule goes.
-fallback = "googledns"
+default = "googledns"
 
 [dns.response]
 rules = []
-fallback = "accept"
+default = "accept"
 
 # Rule Sets (ADR-0014, ADR-0019). A rule set is a compiled `.drb` set or a plain-text rule file,
 # local or remote. This is how `geoip:` / `geosite:` are expressed now: the `.dat` format is
@@ -301,7 +301,7 @@ fallback = "accept"
 [routing]
 # Rules are evaluated top to bottom; the first match wins. Each rule has a
 # stable name, a match expression, and a typed action.
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 # A domain(...) rule needs a name. DNS/Fake-IP is always consulted first; this

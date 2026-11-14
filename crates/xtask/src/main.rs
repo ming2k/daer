@@ -295,7 +295,7 @@ fn run_preflight(root: &Path) -> Result<(), String> {
     if let Some(parent) = config.parent() {
         fs::create_dir_all(parent).expect("failed to create the preflight directory");
     }
-    fs::write(&config, "schema = 5\n\nwan-interface = \"auto\"\n")
+    fs::write(&config, "schema = 6\n\nwan-interface = \"auto\"\n")
         .map_err(|error| format!("failed to write {}: {error}", config.display()))?;
 
     let status = Command::new("cargo")

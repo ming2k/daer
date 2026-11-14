@@ -164,14 +164,29 @@ impl CacheConfig {
         for (domain, ttl) in &config.dns.fixed_domain_ttl {
             let name = Name::parse(domain)
                 .map_err(|error| format!("dns.fixed-domain-ttl: {domain:?}: {error}"))?;
-            let ttl = u32::try_from(*ttl)
-                .map_err(|_| format!("dns.fixed-domain-ttl: {domain:?}: TTL {ttl} is negative"))?;
+            let secs = ttl
+                .as_std()
+                .ok_or_else(|| format!("dns.fixed-domain-ttl: {domain:?}: TTL {ttl} is negative"))?
+                .as_secs();
+            let ttl = u32::try_from(secs).map_err(|_| {
+                format!("dns.fixed-domain-ttl: {domain:?}: TTL {ttl} exceeds u32::MAX seconds")
+            })?;
             fixed_ttl.push((name, ttl));
         }
         Ok(Self {
             optimistic: config.dns.optimistic_cache,
-            stale_ttl: u32::try_from(config.dns.optimistic_stale_reply_ttl).unwrap_or(0),
-            stale_reply_ttl: u32::try_from(config.dns.optimistic_cache_ttl).unwrap_or(0),
+            stale_ttl: config
+                .dns
+                .optimistic_stale_reply_ttl
+                .as_std()
+                .and_then(|d| u32::try_from(d.as_secs()).ok())
+                .unwrap_or(0),
+            stale_reply_ttl: config
+                .dns
+                .optimistic_cache_ttl
+                .as_std()
+                .and_then(|d| u32::try_from(d.as_secs()).ok())
+                .unwrap_or(0),
             max_entries: usize::try_from(config.dns.max_cache_size).unwrap_or(0),
             fixed_ttl,
         })

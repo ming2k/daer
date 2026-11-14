@@ -32,7 +32,7 @@ fn the_test_support_crate_is_dev_only() {
         let name = package["name"].as_str().unwrap_or("<unnamed>");
         for dependency in package["dependencies"].as_array().into_iter().flatten() {
             let dependency_name = dependency["name"].as_str().unwrap_or_default();
-            if dependency_name != "daer-test-support" {
+            if dependency_name != "test-support" {
                 continue;
             }
             // `kind` is null for a normal dependency and "dev" for a dev-dependency.
@@ -43,7 +43,7 @@ fn the_test_support_crate_is_dev_only() {
     }
     assert!(
         offenders.is_empty(),
-        "daer-test-support must be a dev-dependency only; normal dependents: {offenders:?}"
+        "test-support must be a dev-dependency only; normal dependents: {offenders:?}"
     );
 }
 

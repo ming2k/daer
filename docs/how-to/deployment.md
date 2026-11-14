@@ -121,7 +121,7 @@ reinterpreted.
 The minimum that proxies anything:
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = ["eth1"]      # or "auto" when it resolves a different interface
 lan-interface = ["eth0"]      # the network you are proxying traffic *from*
@@ -148,7 +148,7 @@ group = "proxy-pool"
 type = "min-moving-avg"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 enabled = true

@@ -476,8 +476,8 @@ mod tests {
         RouterOptions::default()
     }
 
-    const DIRECT: &str = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"http\"\nmatch = \"dport(80)\"\naction = \"direct\"\n";
-    const CHANGED: &str = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https\"\nmatch = \"dport(443)\"\naction = \"direct\"\n";
+    const DIRECT: &str = "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"http\"\nmatch = \"dport(80)\"\naction = \"direct\"\n";
+    const CHANGED: &str = "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"https\"\nmatch = \"dport(443)\"\naction = \"direct\"\n";
 
     #[test]
     fn the_first_generation_is_published_and_described() {
@@ -494,7 +494,7 @@ mod tests {
         // A warning that only reaches the log is not reviewable after the fact. The report
         // is what a snapshot and an incident bundle carry, so it must not drop the sink.
         let generations = Generations::new(&config(DIRECT), &options()).expect("builds");
-        let warned = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"long\"\nmatch = \"pname(this_process_name_is_too_long)\"\naction = \"direct\"\n";
+        let warned = "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"long\"\nmatch = \"pname(this_process_name_is_too_long)\"\naction = \"direct\"\n";
         let report = generations
             .reload(&config(warned), &options())
             .expect("reloads");
@@ -546,10 +546,7 @@ mod tests {
         // the configuration validator catches this first, and the generation builder
         // must catch it too for callers that construct a `Config` directly.
         let mut broken = config(DIRECT);
-        broken.routing.fallback =
-            daer_config::OutboundAction::Election(daer_config::ElectionAction {
-                election: "nope".to_owned(),
-            });
+        broken.routing.default = daer_config::OutboundAction::Election("nope".to_owned());
         let error = generations
             .reload(&broken, &options())
             .expect_err("must be rejected");

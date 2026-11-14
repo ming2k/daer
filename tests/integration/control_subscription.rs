@@ -87,7 +87,7 @@ fn base64(input: &[u8]) -> String {
 
 fn config(url: &str) -> daer_config::Config {
     daer_config::toml_config::load_str(&format!(
-        "schema = 5\n[[subscription]]\nname = \"airport\"\nurl = \"{url}\"\npersist = true\n"
+        "schema = 6\n[[subscription]]\nname = \"airport\"\nurl = \"{url}\"\npersist = true\n"
     ))
     .expect("config")
 }

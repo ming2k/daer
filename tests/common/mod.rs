@@ -3,7 +3,7 @@
 //! Shared fixtures for the workspace-level integration and E2E test binaries.
 //!
 //! Both `tests/integration/main.rs` and `tests/e2e/main.rs` compile this module through
-//! `#[path = "../common/mod.rs"]`. The helpers themselves live in `daer-test-support` so the
+//! `#[path = "../common/mod.rs"]`. The helpers themselves live in `test-support` so the
 //! in-crate unit tests can use the same scratch-directory and nonce rules.
 
 #![allow(dead_code, unused_imports)]
@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-pub use daer_test_support::{
+pub use test_support::{
     Scratch, binary, daer, daer_drb, nonce, read_workspace, unused_port, wait_until,
     workspace_path, workspace_root,
 };

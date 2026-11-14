@@ -5,8 +5,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use daer_common::{MacAddr, PortRange};
 use daer_config::{Config, OutboundAction};
+use daer_primitives::{MacAddr, PortRange};
 use daer_routing::{
     DeduplicateParamsOptimizer, L4ProtoMask, MatchFacts, NormalizedProgram, PolicyEpoch,
     PolicyIdentity, ProcessName, RecordingSink, RulesBuilder, SortFunctionsOptimizer, evaluate,
@@ -27,7 +27,7 @@ group = "pool"
 type = "random"
 
 [routing]
-fallback = { election = "my_group" }
+default = "my_group"
 
 [routing.sniff]
 enabled = true
@@ -51,7 +51,7 @@ action = "block"
 [[routing.rule]]
 name = "example-proxy"
 match = "domain(example.com)"
-action = { election = "proxy" }
+action = "proxy"
 "#;
 
 fn config(src: &str) -> Config {
@@ -62,7 +62,7 @@ fn program() -> NormalizedProgram {
     let config = config(CONFIG);
     NormalizedProgram::new(
         &config.routing.rule,
-        config.routing.fallback.clone(),
+        config.routing.default.clone(),
         &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
     )
     .expect("normalizes")
@@ -165,21 +165,19 @@ fn unmatched_flows_fall_through() {
     assert_eq!(decide(&program, &base_facts()), None);
     assert_eq!(
         program.fallback,
-        OutboundAction::Election(daer_config::ElectionAction {
-            election: "my_group".to_owned()
-        })
+        OutboundAction::Election("my_group".to_owned())
     );
 }
 
 #[test]
 fn port_ranges_match_inclusively() {
     let config = config(
-        "[routing]\nfallback = \"block\"\n[[routing.rule]]\nname = \"range\"\n\
+        "[routing]\ndefault = \"block\"\n[[routing.rule]]\nname = \"range\"\n\
              match = \"dport(8000-8010)\"\naction = \"direct\"\n",
     );
     let program = NormalizedProgram::new(
         &config.routing.rule,
-        config.routing.fallback.clone(),
+        config.routing.default.clone(),
         &[&SortFunctionsOptimizer],
     )
     .expect("normalizes");
@@ -203,12 +201,12 @@ fn port_ranges_match_inclusively() {
 #[test]
 fn source_port_and_source_ip_are_supported() {
     let config = config(
-        "[routing]\nfallback = \"block\"\n[[routing.rule]]\nname = \"source\"\n\
+        "[routing]\ndefault = \"block\"\n[[routing.rule]]\nname = \"source\"\n\
          match = \"sip(10.0.0.0/8) && sport(1024-2048)\"\naction = \"direct\"\n",
     );
     let program = NormalizedProgram::new(
         &config.routing.rule,
-        config.routing.fallback.clone(),
+        config.routing.default.clone(),
         &[&SortFunctionsOptimizer],
     )
     .expect("normalizes");
@@ -228,12 +226,12 @@ fn source_port_and_source_ip_are_supported() {
 #[test]
 fn ip_version_matching() {
     let config = config(
-        "[routing]\nfallback = \"block\"\n[[routing.rule]]\nname = \"v6\"\n\
+        "[routing]\ndefault = \"block\"\n[[routing.rule]]\nname = \"v6\"\n\
          match = \"ipversion(6)\"\naction = \"direct\"\n",
     );
     let program = NormalizedProgram::new(
         &config.routing.rule,
-        config.routing.fallback.clone(),
+        config.routing.default.clone(),
         &[&SortFunctionsOptimizer],
     )
     .expect("normalizes");
@@ -257,12 +255,12 @@ fn policy_identity_tracks_rule_changes() {
 
     let changed = {
         let config = config(
-            "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https\"\n\
+            "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"https\"\n\
                  match = \"dport(443)\"\naction = \"direct\"\n",
         );
         NormalizedProgram::new(
             &config.routing.rule,
-            config.routing.fallback.clone(),
+            config.routing.default.clone(),
             &[&SortFunctionsOptimizer],
         )
         .expect("normalizes")

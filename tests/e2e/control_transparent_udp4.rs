@@ -636,12 +636,12 @@ impl Drop for Fixture {
 
 fn config() -> daer_config::Config {
     let text = r#"
-schema = 5
+schema = 6
 wan-interface = ["lo"]
 lan-interface = ["lo"]
 disable-waiting-network = true
 [routing]
-fallback = "direct"
+default = "direct"
 "#;
     daer_config::toml_config::load_str(text).expect("the IPv4 UDP configuration parses")
 }

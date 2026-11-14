@@ -562,7 +562,7 @@ upstream = ["local:tcp://127.0.0.1:1"]
 
 [dns.request]
 rules = ["qname(asis) -> asis", "qname(reject) -> reject"]
-fallback = "local"
+default = "local"
 "#,
         )
         .expect("config loads");

@@ -354,16 +354,14 @@ mod tests {
     use super::*;
     use crate::builder::{RecordingSink, RulesBuilder};
     use crate::values::L4ProtoMask;
-    use daer_common::MacAddr;
+    use daer_primitives::MacAddr;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn action(name: &str) -> daer_config::OutboundAction {
         match name {
             "direct" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Direct),
             "block" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block),
-            election => daer_config::OutboundAction::Election(daer_config::ElectionAction {
-                election: election.to_owned(),
-            }),
+            election => daer_config::OutboundAction::Election(election.to_owned()),
         }
     }
 

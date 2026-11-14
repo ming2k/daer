@@ -9,7 +9,7 @@ repository.workspace = true
 description = "eBPF object loading and map ABI for daer"
 
 [dependencies]
-daer-common.workspace = true
+daer-primitives.workspace = true
 ipnet.workspace = true
 aya = { workspace = true, optional = true }
 libc.workspace = true

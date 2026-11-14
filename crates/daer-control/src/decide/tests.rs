@@ -44,7 +44,7 @@ fn flow(destination_port: u16) -> (SocketAddr, SocketAddr) {
 
 const TWO_RULES: &str = r#"
 [routing]
-fallback = "direct"
+default = "direct"
 
 [[routing.rule]]
 name = "https-block"
@@ -123,7 +123,7 @@ fn an_explanation_lists_the_groups_that_exist() {
     let router = router(
         r#"
 [[node]]
-tag = "n1"
+name = "n1"
 type = "socks5"
 server = "127.0.0.1"
 port = 1080
@@ -134,7 +134,7 @@ node = "n1"
 type = "manual"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 "#,
     );
     let (source, destination) = flow(80);
@@ -153,7 +153,7 @@ fn a_domain_rule_only_matches_when_a_domain_is_supplied() {
 enabled = true
 timeout = "30ms"
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "example-block"
 match = "domain(example.com)"
@@ -182,7 +182,7 @@ fn sniffing_is_enabled_only_when_the_generation_asks_for_it() {
     // The plan is built once per generation; a configuration without domain rules
     // spends no syscall and no wait on name acquisition.
     let with_domain = router(
-        "[routing.sniff]\nenabled = true\ntimeout = \"30ms\"\n[routing]\nfallback = \
+        "[routing.sniff]\nenabled = true\ntimeout = \"30ms\"\n[routing]\ndefault = \
              \"direct\"\n[[routing.rule]]\nname = \"domain\"\nmatch = \"domain(a)\"\n\
              action = \"direct\"\n",
     );
@@ -198,7 +198,7 @@ fn sniffing_is_enabled_only_when_the_generation_asks_for_it() {
 #[test]
 fn a_domain_rule_without_an_explicit_answer_is_rejected() {
     let config = daer_config::toml_config::load_str(
-        "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"domain\"\n\
+        "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"domain\"\n\
              match = \"domain(a)\"\naction = \"direct\"\n",
     )
     .expect_err("the loader must reject the missing answer");
@@ -216,7 +216,7 @@ fn an_explanation_can_show_what_a_sniffed_name_changed() {
 enabled = true
 timeout = "30ms"
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "example-block"
 match = "domain(example.com)"
@@ -291,7 +291,7 @@ node = "n1"
 type = "manual"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 [[routing.rule]]
 name = "mac-block"
 match = "mac(00:11:22:33:44:55)"
@@ -342,7 +342,7 @@ node = "n1"
 type = "manual"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 [[routing.rule]]
 name = "curl-block"
 match = "pname(curl)"
@@ -407,12 +407,12 @@ fn a_pid_of_zero_reports_the_process_name_as_unknown() {
 #[test]
 fn a_runtime_election_overrides_the_configured_rule() {
     let router = router(
-        "schema = 5\n\n\
+        "schema = 6\n\n\
              [[node]]\nname = \"n1\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\n\
              [[node]]\nname = \"n2\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\n\n\
              [[group]]\nname = \"pool\"\n\n\
              [[election]]\nname = \"proxy\"\ngroup = \"pool\"\ntype = \"min\"\n\n\
-             [routing]\nfallback = { election = \"proxy\" }\n",
+             [routing]\ndefault = \"proxy\"\n",
     );
     router.elect("proxy", "n2").expect("n2 is a candidate");
     assert_eq!(router.node_identity("proxy").unwrap().node, "n2");
@@ -425,12 +425,12 @@ fn a_runtime_election_overrides_the_configured_rule() {
 #[test]
 fn a_detoured_node_reports_its_inner_hop() {
     let router = router(
-        "schema = 5\n\n\
+        "schema = 6\n\n\
              [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\n\
              [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n\n\
              [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
              [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
-             [routing]\nfallback = { election = \"proxy\" }\n",
+             [routing]\ndefault = \"proxy\"\n",
     );
     let identity = router.node_identity("proxy").expect("selection");
     assert_eq!(identity.node, "outer");
@@ -447,11 +447,11 @@ fn a_detoured_node_reports_its_inner_hop() {
 #[test]
 fn a_broken_detour_fails_the_generation_instead_of_dropping_the_node() {
     let config = daer_config::toml_config::load_str(
-            "schema = 5\n\n\
+            "schema = 6\n\n\
              [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n\n\
              [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
              [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
-             [routing]\nfallback = { election = \"proxy\" }\n",
+             [routing]\ndefault = \"proxy\"\n",
         )
         .expect("parses");
     let error = Router::new(&config, GenerationId::new(7), &RouterOptions::default())

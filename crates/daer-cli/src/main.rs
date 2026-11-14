@@ -619,8 +619,7 @@ fn main() -> ExitCode {
         }
         Command::Version => {
             println!(
-                "{} {} ({}, {})",
-                daer_common::consts::APP_NAME,
+                "daer {} ({}, {})",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
                 std::env::consts::ARCH
@@ -1039,7 +1038,7 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
 
     let program = NormalizedProgram::new(
         &loaded.config.routing.rule,
-        loaded.config.routing.fallback.clone(),
+        loaded.config.routing.default.clone(),
         &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
     )
     .context("invalid routing rules")?;

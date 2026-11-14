@@ -51,7 +51,7 @@ impl std::fmt::Debug for TuplesKey {
 /// ```
 ///
 /// Rust field names differ (`start`/`end`); the two `u16` layout matches.
-pub use daer_common::net::PortRange;
+pub use daer_primitives::net::PortRange;
 
 /// Runtime parameters written to the `PARAM` global before load.
 ///
@@ -296,7 +296,7 @@ impl LpmKey {
     /// with `prefixlen = 128`, so in memory the MAC occupies bytes 10..16 of the 16-byte word:
     /// `data[8..10] == 0` and then the six address bytes, big-endian throughout.
     #[must_use]
-    pub fn lookup_mac(addr: daer_common::MacAddr) -> Self {
+    pub fn lookup_mac(addr: daer_primitives::MacAddr) -> Self {
         let mut data = [0u8; 16];
         data[10..16].copy_from_slice(&addr.0);
         Self {

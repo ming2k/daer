@@ -159,12 +159,12 @@ async fn the_transparent_listener_binds_inside_the_namespace() {
 
     let ingress = daer_control::PreparedIngress::prepare().expect("prepare the ingress");
     let config = daer_config::toml_config::load_str(
-        "schema = 5\n\
+        "schema = 6\n\
          wan-interface = [\"lo\"]\n\
          lan-interface = [\"lo\"]\n\
          disable-waiting-network = true\n\
          [routing]\n\
-         fallback = \"direct\"\n",
+         default = \"direct\"\n",
     )
     .expect("minimal config");
     let options = daer_control::RouterOptions::for_config("netns_lifecycle.toml");

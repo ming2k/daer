@@ -87,7 +87,7 @@ rules = [
     "qname(blocked.example) -> reject",
     "qname(local.example) -> asis",
 ]
-fallback = "origin"
+default = "origin"
 "#
     ))
     .expect("config loads");
@@ -222,7 +222,7 @@ upstream = ["origin:tcp://{origin_address}"]
 
 [dns.request]
 rules = []
-fallback = "origin"
+default = "origin"
 "#
     ))
     .expect("config loads");
@@ -280,7 +280,7 @@ upstream = ["origin:tcp://{dead}"]
 
 [dns.request]
 rules = []
-fallback = "origin"
+default = "origin"
 "#
     ))
     .expect("config loads");
@@ -316,7 +316,7 @@ pool-size = 256
 exclude = ["local.example"]
 
 [dns.request]
-fallback = "origin"
+default = "origin"
 "#
     ))
     .expect("config loads");
@@ -347,7 +347,7 @@ inet6 = "fdfe:dcba:9876::/64"
 pool-size = 256
 
 [dns.request]
-fallback = "origin"
+default = "origin"
 "#
     ))
     .expect("config loads");

@@ -156,9 +156,9 @@ mod tests {
     #[test]
     fn a_chain_is_built_once_and_shared() {
         let config = config(
-            "schema = 5\n\
-             [[node]]\ntag = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
-             [[node]]\ntag = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n",
+            "schema = 6\n\
+             [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
+             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,
@@ -175,8 +175,8 @@ mod tests {
     #[test]
     fn an_unknown_detour_is_an_error() {
         let config = config(
-            "schema = 5\n\
-             [[node]]\ntag = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n",
+            "schema = 6\n\
+             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,
@@ -190,9 +190,9 @@ mod tests {
     #[test]
     fn a_cycle_is_rejected_even_if_the_validator_was_skipped() {
         let config = config(
-            "schema = 5\n\
-             [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n\
-             [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"a\"\n",
+            "schema = 6\n\
+             [[node]]\nname = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n\
+             [[node]]\nname = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"a\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,
@@ -429,10 +429,10 @@ mod tests {
     #[test]
     fn a_chain_can_be_arbitrarily_deep() {
         let config = config(
-            "schema = 5\n\
-             [[node]]\ntag = \"c\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1082\n\
-             [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"c\"\n\
-             [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n",
+            "schema = 6\n\
+             [[node]]\nname = \"c\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1082\n\
+             [[node]]\nname = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"c\"\n\
+             [[node]]\nname = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,
@@ -450,9 +450,9 @@ mod tests {
     #[test]
     fn a_hysteria2_outer_hop_is_refused_with_the_reason() {
         let config = config(
-            "schema = 5\n\
-             [[node]]\ntag = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
-             [[node]]\ntag = \"hy\"\ntype = \"hysteria2\"\nserver = \"127.0.0.1\"\nports = \"443\"\npassword = \"secret\"\ndetour = \"inner\"\n",
+            "schema = 6\n\
+             [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
+             [[node]]\nname = \"hy\"\ntype = \"hysteria2\"\nserver = \"127.0.0.1\"\nports = \"443\"\npassword = \"secret\"\ndetour = \"inner\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,

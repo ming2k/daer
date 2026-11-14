@@ -46,12 +46,12 @@ const IPPROTO_UDP: u8 = 17;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daer_common::net::MacAddr;
 use daer_config::{Config, ElectionKind, OutboundKind, ProbeSettings};
 use daer_outbound::{
     Dialer, DialerId, DialerOptions, DirectDialer, ElectionRuntime, FilterSet, NodeDialer,
     NodeGraph, NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
 };
+use daer_primitives::net::MacAddr;
 
 use daer_relay::relay::DatagramLeg;
 use daer_relay::{Accepted, FlowFacts, RelayError};
@@ -280,7 +280,7 @@ pub struct RouterOptions {
     /// the proxy captures its own traffic.
     ///
     /// The value itself is an internal loop-evasion identity. A privileged run uses
-    /// [`daer_common::consts::DEFAULT_SOCKET_MARK`]; `--no-datapath` and diagnostics pass
+    /// [`daer_primitives::consts::DEFAULT_SOCKET_MARK`]; `--no-datapath` and diagnostics pass
     /// `None`. `Some(mark)` exists for tests and future privileged callers that need a
     /// different identity; `None` means no mark, never "read it from configuration".
     ///
@@ -468,7 +468,7 @@ impl Router {
         // optimizer here that could resurrect the retired format.
         let program = NormalizedProgram::new(
             &config.routing.rule,
-            config.routing.fallback.clone(),
+            config.routing.default.clone(),
             &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
         )?;
 
@@ -509,7 +509,7 @@ impl Router {
                 None => RulesBuilder::new(&mut sink),
             };
             program.lower(&mut builder, |value| {
-                daer_config::validate::check_action_target(config, value, "routing.fallback")
+                daer_config::validate::check_action_target(config, value, "routing.default")
                     .map_err(|error| RoutingError::new(error.to_string()))?;
                 let outbound = Outbound::from_action(value)?;
                 fallback = Some(outbound);

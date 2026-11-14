@@ -3,10 +3,12 @@
 For a task-oriented guide that assembles these tables into a modular `/etc/daer` tree, see the
 [Configuration Guide](../how-to/configuration/index.md).
 
-`daer` uses strictly-typed TOML with `schema = 5`. Unknown keys are rejected with descriptive
+`daer` uses strictly-typed TOML with `schema = 6`. Unknown keys are rejected with descriptive
 errors, and an older schema is rejected rather than silently upgraded. Schema 4 moved domain
 acquisition into `[routing.sniff]` and made `[dns].bind` the only DNS listener switch; schema 5
-removed the `[global]` wrapper and made probe settings election-owned.
+removed the `[global]` wrapper and made probe settings election-owned; schema 6 simplified routing
+actions to bare strings (`"direct"`, `"block"`, or an election name) and renamed
+`routing.fallback` / `dns.*.fallback` to `default`.
 
 The default configuration file path is `/etc/daer/config.toml`.
 
@@ -15,10 +17,10 @@ The default configuration file path is `/etc/daer/config.toml`.
 ## 1. Top-Level Schema
 
 ```toml
-schema = 5
+schema = 6
 ```
 
-- `schema` (integer, required): Schema version. Must be `5`.
+- `schema` (integer, required): Schema version. Must be `6`.
 
 ---
 
@@ -308,14 +310,14 @@ password = "cry_me_a_r1ver"
 
 ```toml
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "cn"
 match = "rule-set(cn)"
 action = "direct"
 ```
 
-Use `direct` as a rule's `action` or as the fallback. A `[[node]] type = "direct"`
+Use `direct` as a rule's `action` or as `routing.default`. A `[[node]] type = "direct"`
 is rejected by name, and a `direct://` link is rejected by `Node::from_link`. The probe still
 accepts `daer probe node direct` as a local-path diagnostic, but it never enters the node pool.
 
@@ -366,7 +368,7 @@ An election is the **routing target** and the rule that elects one node from its
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `name` | string | Required | Unique election name; routing rules and `fallback` reference this name. It cannot shadow a built-in outbound or a group name. |
+| `name` | string | Required | Unique election name; routing rules and `routing.default` reference this name. It cannot shadow a built-in outbound or a group name. |
 | `group` | string | — | Candidate pool. Exactly one of `group`/`node` is required. |
 | `node` | string | — | A singleton candidate set. Exactly one of `group`/`node` is required. |
 | `type` | string | Required | `"manual"` (node input only), `"random"`, `"min"`, `"min-avg10"`, `"min-moving-avg"`. |
@@ -419,12 +421,12 @@ Declares pre-compiled DRB (`.drb`) or human-readable text rule sets from local f
 
 ## 7. `[routing]` Table
 
-Defines an ordered list of routing rules and the fallback action.
+Defines an ordered list of routing rules and the default action.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `rule` | array of tables | `[]` | Ordered `[[routing.rule]]` entries; the first match wins. |
-| `fallback` | action | `"direct"` | `"direct"`, `"block"`, or `{ election = "name" }` when no rule matches. |
+| `default` | action | `"direct"` | `"direct"`, `"block"`, or a declared election name when no rule matches. |
 
 Each `[[routing.rule]]` has exactly:
 
@@ -432,11 +434,11 @@ Each `[[routing.rule]]` has exactly:
 | :--- | :--- | :--- |
 | `name` | string | Required, unique stable identity used by diagnostics and tests. |
 | `match` | string | Predicate conjunction; no `->` and no action. |
-| `action` | action | `"direct"`, `"block"`, or `{ election = "name" }`. |
+| `action` | action | `"direct"`, `"block"`, or a declared election name. |
 
 ```toml
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [[routing.rule]]
 name = "ads"
@@ -446,21 +448,21 @@ action = "block"
 [[routing.rule]]
 name = "ai"
 match = "rule-set(openai, anthropic)"
-action = { election = "proxy" }
+action = "proxy"
 ```
 
 ### Rule Actions
 
-`action` and `fallback` use the same type:
+`action` and `default` use the same string type:
 
 | Value | Meaning |
 | :--- | :--- |
 | `"direct"` | Built-in local path. |
 | `"block"` | Built-in drop verdict. |
-| `{ election = "name" }` | Dynamic outbound: the election selects one node, and that node's dialer is the egress. |
+| `"<election>"` | Dynamic outbound: the named election selects one node, and that node's dialer is the egress. |
 
-A bare action string is only `direct` or `block`. An election is never a bare string; the table
-keeps the built-in and election namespaces apart. A group is a candidate pool, never an action.
+`"direct"` and `"block"` are reserved built-in policies; any other string must name a declared
+`[[election]]`. A group is a candidate pool, never an action.
 `direct`, `block`, `must_rules`, `<OR>` and `<AND>` are reserved as node/group/election names.
 
 ### Rule Names
@@ -537,14 +539,14 @@ Configures the built-in DNS server, caching, and upstream transports.
 | :--- | :--- | :--- | :--- |
 | `bind` | string | unset (no server) | The only switch that starts the DNS listener. Unset means `daer` is not the box's resolver and starts no server. |
 | `upstream` | list of string | `[]` | Upstream resolvers as `tag:protocol://address:port`. Required when `bind` is set. The protocol is required: `udp`, `tcp`, `tls` (DoT), `https` (DoH), or a `+` chain tried in order. A hostname instead of an address is rejected (there is no bootstrap resolver yet). |
-| `ipversion-prefer` | integer | `0` | `4`, `6`, or `0` for no preference. |
+| `ipversion-prefer` | string | `"any"` | `"ipv4"`, `"ipv6"`, or `"any"` for no preference. |
 | `optimistic-cache` | boolean | `true` | Serve stale entries while refreshing. |
-| `optimistic-cache-ttl` | integer | `60` | Seconds an optimistic entry is served. |
-| `optimistic-stale-reply-ttl` | integer | `30` | Seconds a stale answer may be replayed. |
+| `optimistic-cache-ttl` | duration | `"60s"` | How long an optimistic entry is served. |
+| `optimistic-stale-reply-ttl` | duration | `"30s"` | How long a stale answer may be replayed. |
 | `max-cache-size` | integer | `65536` | Bound on the cache. There is no `cache-size` key. |
 
-`[dns.fixed-domain-ttl]` maps a domain suffix to a TTL in seconds. `[dns.request]` and
-`[dns.response]` each take `rules` and a `fallback` (`"asis"` / `"accept"` are the
+`[dns.fixed-domain-ttl]` maps a domain suffix to a TTL duration (e.g. `"60s"`). `[dns.request]` and
+`[dns.response]` each take `rules` and a `default` (`"asis"` / `"accept"` are the
 `[dns.request]` / `[dns.response]` defaults).
 
 ### `[dns.fake-ip]` Sub-Table

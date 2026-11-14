@@ -151,16 +151,16 @@ fn tolerance_belongs_to_the_moving_average_policy() {
 }
 
 #[test]
-fn dns_fallbacks_are_defaulted() {
+fn dns_defaults_are_populated() {
     let mut config = valid();
-    assert!(config.dns.request.fallback.is_none());
+    assert!(config.dns.request.default.is_none());
     normalize(&mut config).expect("valid");
     assert_eq!(
-        config.dns.request.fallback,
+        config.dns.request.default,
         Some(FunctionOrString::Name("asis".to_owned()))
     );
     assert_eq!(
-        config.dns.response.fallback,
+        config.dns.response.default,
         Some(FunctionOrString::Name("accept".to_owned()))
     );
 }
@@ -184,7 +184,7 @@ fn dns_bind_requires_an_upstream() {
 #[test]
 fn a_domain_rule_requires_an_explicit_sniff_answer() {
     let error = crate::toml_config::load_str(
-        "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"d\"\nmatch = \
+        "[routing]\ndefault = \"direct\"\n[[routing.rule]]\nname = \"d\"\nmatch = \
              \"domain(example.com)\"\naction = \"direct\"\n",
     )
     .expect_err("must fail");
@@ -195,7 +195,7 @@ fn a_domain_rule_requires_an_explicit_sniff_answer() {
 #[test]
 fn disabled_sniff_without_dns_is_no_name_source() {
     let error = crate::toml_config::load_str(
-        "[routing.sniff]\nenabled = false\n[routing]\nfallback = \"direct\"\n\
+        "[routing.sniff]\nenabled = false\n[routing]\ndefault = \"direct\"\n\
              [[routing.rule]]\nname = \"d\"\nmatch = \"domain(example.com)\"\n\
              action = \"direct\"\n",
     )
@@ -247,10 +247,10 @@ fn duplicate_and_empty_group_names_are_rejected() {
 /// configuration is not allowed to mean two things.
 /// An empty `wan-interface` is rejected here, not only by the daemon.
 ///
-/// The falsifier is one command pair: `printf 'schema = 5\nwan-interface = []\n'`
+/// The falsifier is one command pair: `printf 'schema = 6\nwan-interface = []\n'`
 /// used to be `check` → `ok` and `run` → exit 1, so the gate that promises "will this
 /// configuration run" disagreed with the process that runs it. The default is `"auto"`,
-/// which is why a plain `schema = 5` file still passes.
+/// which is why a plain `schema = 6` file still passes.
 #[test]
 fn an_empty_wan_interface_fails_validation_even_though_the_default_is_not_empty() {
     let mut config = valid();
@@ -394,12 +394,9 @@ fn a_group_is_not_a_routing_action() {
         name: "pool".to_owned(),
         filters: Vec::new(),
     }];
-    config.routing.fallback =
-        crate::model::OutboundAction::Election(crate::model::ElectionAction {
-            election: "pool".to_owned(),
-        });
+    config.routing.default = crate::model::OutboundAction::Election("pool".to_owned());
     let error = normalize(&mut config).expect_err("a group is not an action");
-    assert_eq!(error.field, "routing.fallback");
+    assert_eq!(error.field, "routing.default");
     assert!(error.message.contains("candidate pool"), "{error}");
 }
 
@@ -419,10 +416,7 @@ fn an_election_action_is_accepted() {
         timeout: None,
         tolerance: None,
     }];
-    config.routing.fallback =
-        crate::model::OutboundAction::Election(crate::model::ElectionAction {
-            election: "proxy".to_owned(),
-        });
+    config.routing.default = crate::model::OutboundAction::Election("proxy".to_owned());
     normalize(&mut config).expect("an election action is valid");
 }
 

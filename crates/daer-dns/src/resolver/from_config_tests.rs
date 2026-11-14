@@ -57,7 +57,7 @@ upstream = ["local:tcp://{address}"]
 
 [dns.request]
 rules = []
-fallback = "local"
+default = "local"
 "#
     ))
     .expect("config loads");
@@ -102,7 +102,7 @@ upstream = ["{entry}"]
 
 [dns.request]
 rules = []
-fallback = "google"
+default = "google"
 "#
         ))
         .expect("config loads");
@@ -123,7 +123,7 @@ upstream = ["google:udp://127.0.0.1:1"]
 
 [dns.request]
 rules = []
-fallback = "google"
+default = "google"
 "#,
     )
     .expect("config loads");

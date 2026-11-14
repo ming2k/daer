@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Routing rule lowering, matching and policy identity for daer"
 
 [dependencies]
-daer-common.workspace = true
+daer-primitives.workspace = true
 daer-config.workspace = true
 daer-rule-ast.workspace = true
 daer-ebpf.workspace = true

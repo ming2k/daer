@@ -15,7 +15,7 @@ default = []
 schema = ["dep:schemars", "dep:serde_json"]
 
 [dependencies]
-daer-common.workspace = true
+daer-primitives.workspace = true
 glob.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true

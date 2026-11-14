@@ -19,7 +19,7 @@ workspace = true
 resolver = "3"
 members = [
     "crates/daer-cli",
-    "crates/daer-common",
+    "crates/daer-primitives",
     "crates/daer-config",
     "crates/daer-control",
     "crates/daer-dns",
@@ -32,7 +32,7 @@ members = [
     "crates/daer-rule-ast",
     "crates/daer-sniff",
     "crates/daer-drb",
-    "crates/daer-test-support",
+    "crates/test-support",
     "crates/xtask",
 ]
 
@@ -54,7 +54,7 @@ dbg_macro = "deny"
 todo = "warn"
 
 [workspace.dependencies]
-daer-common = { path = "crates/daer-common" }
+daer-primitives = { path = "crates/daer-primitives" }
 daer-config = { path = "crates/daer-config" }
 daer-control = { path = "crates/daer-control" }
 daer-dns = { path = "crates/daer-dns" }
@@ -66,7 +66,7 @@ daer-relay = { path = "crates/daer-relay" }
 daer-routing = { path = "crates/daer-routing" }
 daer-rule-ast = { path = "crates/daer-rule-ast" }
 daer-sniff = { path = "crates/daer-sniff" }
-daer-test-support = { path = "crates/daer-test-support" }
+test-support = { path = "crates/test-support" }
 
 aes = "0.8"
 blake2 = "0.10"
@@ -129,7 +129,7 @@ blake2.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
-daer-common.workspace = true
+daer-primitives.workspace = true
 daer-config = { workspace = true, features = ["schema"] }
 daer-control.workspace = true
 daer-dns.workspace = true
@@ -141,7 +141,7 @@ daer-relay.workspace = true
 daer-routing.workspace = true
 daer-rule-ast.workspace = true
 daer-sniff.workspace = true
-daer-test-support.workspace = true
+test-support.workspace = true
 hkdf.workspace = true
 libc.workspace = true
 md-5.workspace = true

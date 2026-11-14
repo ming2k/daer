@@ -104,7 +104,7 @@ daer-drb compile cn-ip.rules -o geoip-cn.drb
 Declare local file or remote HTTP providers in your daemon configuration:
 
 ```toml
-schema = 5
+schema = 6
 
 # 1. Local pre-compiled DRB rule set
 [[rule-set]]
@@ -129,7 +129,7 @@ format = "drb"
 interval = "24h"
 
 [routing]
-fallback = "direct"
+default = "direct"
     # Match both IP intervals and domains from company-direct
 [[routing.rule]]
 name = "rule-1"
@@ -212,7 +212,7 @@ Organize rules strictly by **outbound action** and **independent update lifecycl
 In `daer.toml`:
 ```toml
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "rule-1"
 match = "rule-set(block-ads)"
@@ -236,7 +236,7 @@ action = "direct"
 [[routing.rule]]
 name = "rule-5"
 match = "rule-set(proxy-special)"
-action = { election = "specialized_proxy_group" }
+action = "specialized_proxy_group"
 ```
 
 ### Critical Anti-Patterns to Avoid
@@ -304,7 +304,7 @@ through an artifact shows the same rules without their `@` markers.
 The following configuration deploys the compiled Loyalsoldier rule sets with automated 24-hour background synchronization and line-rate eBPF kernel offload:
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = ["eth0"]
 lan-interface = ["lan0"]
@@ -354,7 +354,7 @@ interval = "24h"
 # ── 2. Evaluation Order (Coarse-Grained Pipeline) ──────────────────────────
 
 [routing]
-fallback = "direct"
+default = "direct"
 
 [routing.sniff]
 # The sets below carry domains; DNS/Fake-IP is consulted first, then a bounded peek.
@@ -388,7 +388,7 @@ action = "direct"
 [[routing.rule]]
 name = "rule-5"
 match = "rule-set(geosite-gfw)"
-action = { election = "proxy" }
+action = "proxy"
 
 
 # 5. Default fallback for unmatched traffic

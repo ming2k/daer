@@ -87,11 +87,11 @@ impl Drop for Fixture {
 
 fn direct_config() -> daer_config::Config {
     let text = r#"
-schema = 5
+schema = 6
 wan-interface = ["lo"]
 log-level = "debug"
 [routing]
-fallback = "direct"
+default = "direct"
 [[routing.rule]]
 name = "loopback"
 match = "dip(127.0.0.1)"
@@ -103,12 +103,12 @@ action = "direct"
 /// A config whose only outbound is `direct`, for the IPv6 data-path test.
 fn direct_config6() -> daer_config::Config {
     let text = r#"
-schema = 5
+schema = 6
 wan-interface = ["lo"]
 lan-interface = ["lo"]
 log-level = "debug"
 [routing]
-fallback = "direct"
+default = "direct"
 "#;
     daer_config::toml_config::load_str(text).expect("the IPv6 probe configuration must parse")
 }

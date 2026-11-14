@@ -884,8 +884,8 @@ fn resolve_object_path_in(
 
 /// The internal socket mark every privileged run applies to daer's own sockets.
 ///
-/// One definition in `daer-common`: `0x6461_6572` is the ASCII bytes `daer`.
-pub use daer_common::consts::DEFAULT_SOCKET_MARK;
+/// One definition in `daer-primitives`: `0x6461_6572` is the ASCII bytes `daer`.
+pub use daer_primitives::consts::DEFAULT_SOCKET_MARK;
 
 /// The daemon state the signal/reload loop needs.
 ///

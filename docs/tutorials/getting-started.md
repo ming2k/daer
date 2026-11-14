@@ -41,7 +41,7 @@ scripts/verify/kernel-check.sh
 Create a simple configuration file at `/etc/daer/config.toml` (or locally as `config.toml`):
 
 ```toml
-schema = 5
+schema = 6
 
 wan-interface = ["eth1"]      # Replace with your upstream interface; "auto" is fine only
                               # when it resolves a different interface than lan-interface
@@ -64,7 +64,7 @@ group = "proxy-pool"
 type = "min-moving-avg"
 
 [routing]
-fallback = { election = "proxy" }
+default = "proxy"
 
 [routing.sniff]
 # The sets below may carry domains; DNS/Fake-IP is consulted first.

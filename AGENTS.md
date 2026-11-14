@@ -10,7 +10,7 @@
   - **Layer 4 (Host CLI)**: `crates/daer-cli` (single public binary, commands, signals, service entry point).
   - **Layer 3 (Control Plane & Ingress)**: `crates/daer-control` (transparent ingress, relay, flow supervisor, handover), `crates/daer-dns` (DNS server, cache, upstreams).
   - **Layer 2 (Domain Capabilities)**: `crates/daer-routing` (rule lowering, indexed matching), `crates/daer-outbound` (dialers, group policies, health check, REALITY), `crates/daer-sniff` (TLS SNI, HTTP Host, QUIC), `crates/daer-rule-ast` (canonical rule source), `crates/daer-drb` (DRB producer).
-  - **Layer 1 (Kernel Datapath & Primitives)**: `crates/daer-ebpf` (map/program ABI, loader), `crates/daer-common` (network primitives, constants), `crates/daer-config` (TOML schema, AST, parser), `ebpf/kern` (C eBPF datapath).
+  - **Layer 1 (Kernel Datapath & Primitives)**: `crates/daer-ebpf` (map/program ABI, loader), `crates/daer-primitives` (network primitives, constants), `crates/daer-config` (TOML schema, AST, parser), `ebpf/kern` (C eBPF datapath).
 - **Socket Mark Loop Evasion ([INV-MARK-01])**: Outbound dials from `daer` must carry `so-mark` before `connect(2)` to prevent the proxy from capturing and redirecting its own egress traffic.
 - **Single Configuration Loader SSOT ([INV-LOADER-01])**: `daer_control::load_resolved` is the single source of truth for both runtime (`run`) and inspection (`daer route`, `daer check --nodes`). Diagnostic commands must never diverge from daemon state.
 - **Kernel Policy Parity or Deferral ([INV-KERNEL-01])**: The kernel policy table is either provably equivalent to userspace evaluation or explicitly defers to the userspace control plane with logged reasons (ADR-0005).

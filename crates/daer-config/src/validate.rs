@@ -211,7 +211,7 @@ fn check_groups(config: &Config) -> Result<(), ConfigError> {
         // A group is a resource pool, not a routing target. It still shares the global
         // outbound namespace with elections and builtins, so a name that can never be
         // routed to is a trap; reject it at the same place the user can fix it.
-        if daer_common::consts::is_builtin_outbound(&group.name) {
+        if daer_primitives::consts::is_builtin_outbound(&group.name) {
             return Err(ConfigError::new(
                 "group.name",
                 format!(
@@ -244,7 +244,7 @@ fn check_elections(config: &Config) -> Result<(), ConfigError> {
         if election.name.trim().is_empty() {
             return Err(ConfigError::new(field, "must not be empty"));
         }
-        if daer_common::consts::is_builtin_outbound(&election.name) {
+        if daer_primitives::consts::is_builtin_outbound(&election.name) {
             return Err(ConfigError::new(
                 field,
                 format!(
@@ -456,7 +456,7 @@ fn check_routing(config: &Config) -> Result<(), ConfigError> {
         check_action_target(config, &rule.action, "routing.rule.action")?;
     }
 
-    check_action_target(config, &config.routing.fallback, "routing.fallback")
+    check_action_target(config, &config.routing.default, "routing.default")
 }
 
 /// Validates the shape of `[routing.sniff]`.
@@ -560,19 +560,13 @@ fn check_dns(config: &mut Config) -> Result<(), ConfigError> {
         ));
     }
 
-    if !matches!(dns.ipversion_prefer, 0 | 4 | 6) {
-        return Err(ConfigError::new(
-            "dns.ipversion-prefer",
-            format!("must be 4, 6 or 0 (got {})", dns.ipversion_prefer),
-        ));
-    }
-    if dns.optimistic_cache_ttl < 0 {
+    if dns.optimistic_cache_ttl.is_negative() {
         return Err(ConfigError::new(
             "dns.optimistic-cache-ttl",
             "must not be negative",
         ));
     }
-    if dns.optimistic_stale_reply_ttl < 0 {
+    if dns.optimistic_stale_reply_ttl.is_negative() {
         return Err(ConfigError::new(
             "dns.optimistic-stale-reply-ttl",
             "must not be negative",
@@ -584,18 +578,22 @@ fn check_dns(config: &mut Config) -> Result<(), ConfigError> {
             "must not be negative",
         ));
     }
-    if let Some((domain, ttl)) = dns.fixed_domain_ttl.iter().find(|(_, ttl)| **ttl < 0) {
+    if let Some((domain, ttl)) = dns
+        .fixed_domain_ttl
+        .iter()
+        .find(|(_, ttl)| ttl.is_negative())
+    {
         return Err(ConfigError::new(
             "dns.fixed-domain-ttl",
             format!("{domain}: TTL must not be negative (got {ttl})"),
         ));
     }
 
-    if dns.request.fallback.is_none() {
-        dns.request.fallback = Some(FunctionOrString::Name("asis".to_owned()));
+    if dns.request.default.is_none() {
+        dns.request.default = Some(FunctionOrString::Name("asis".to_owned()));
     }
-    if dns.response.fallback.is_none() {
-        dns.response.fallback = Some(FunctionOrString::Name("accept".to_owned()));
+    if dns.response.default.is_none() {
+        dns.response.default = Some(FunctionOrString::Name("accept".to_owned()));
     }
     Ok(())
 }
@@ -646,7 +644,7 @@ fn check_endpoints(config: &Config) -> Result<(), ConfigError> {
 /// rule compiler disagree about what the name means. The datapath already reserves the ids, so
 /// the configuration must not create a second owner.
 fn check_reserved_node_name(name: &str) -> Result<(), ConfigError> {
-    if daer_common::consts::is_builtin_outbound(name) {
+    if daer_primitives::consts::is_builtin_outbound(name) {
         return Err(ConfigError::new(
             "node.name",
             format!("{name:?} is a built-in routing policy, not a node name; choose another name"),
