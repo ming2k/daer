@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.15] - 2026-11-14
+
+### Breaking
+
+- **Configuration schema 6 makes routing actions bare strings and renames the defaults.**
+  `routing.fallback`, `dns.request.fallback` and `dns.response.fallback` become `default`.
+  An `action` or `default` is `"direct"`, `"block"`, or the name of a declared `[[election]]`;
+  the `{ election = "name" }` table is rejected. The legacy aliases are removed: `tag` must be
+  `name`, the node types `socks`/`ss`/`any-tls` are no longer accepted, the `vision` and
+  `vision-udp443` flow aliases are gone, and `[[rule-provider]]` must be `[[rule-set]]`.
+  `dns.ipversion-prefer` is `"any"`, `"ipv4"` or `"ipv6"` instead of `0`, `4` or `6`, and DNS
+  TTLs are duration strings (`"60s"`) rather than bare seconds.
+
+### Changed
+
+- **The shared primitive crates are renamed.** `daer-common` is now `daer-primitives`; the
+  dev-only `daer-test-support` crate is now `test-support` and still never enters a production
+  dependency closure. `daer route explain` renders an election action by name.
+
 ## [0.0.14] - 2026-11-14
 
 ### Breaking

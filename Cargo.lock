@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "daer-config"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "daer-primitives",
  "glob",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "bytes",
  "daer-config",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "daer-drb"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aya",
  "aya-obj",
@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "daer-observe"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "fastrand",
  "tracing",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "daer-outbound"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "daer-config",
  "daer-observe",
@@ -661,11 +661,11 @@ dependencies = [
 
 [[package]]
 name = "daer-primitives"
-version = "0.0.14"
+version = "0.0.15"
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "daer-relay"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "daer-observe",
  "libc",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "daer-routing"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "daer-config",
  "daer-ebpf",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "daer-tests"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.0.14"
+version = "0.0.15"
 
 [[package]]
 name = "thiserror"
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "serde",
  "toml",
