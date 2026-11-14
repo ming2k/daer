@@ -3,16 +3,17 @@
 This page is the release gate for putting `daer` in front of real traffic. It is not a
 feature list. A build that passes unit tests is not automatically a production build.
 
-> **Current verdict (2026-11-14): release candidate for staging; not certified for general
+> **Current verdict (2026-11-15): release candidate for staging; not certified for general
 > traffic.**
 >
-> `0.1.0` is the first tagged release candidate. The build and unprivileged contract is green,
-> and the userspace ingress, private-ingress lifecycle and restart behaviour pass inside a
-> disposable user namespace. The privileged delivery, `SIGKILL`, systemd lifecycle, UDP
+> `0.1.1` is the current patch release; `0.1.0` was the first tagged release
+> candidate. The build and unprivileged contract is green, and the userspace ingress,
+> private-ingress lifecycle and restart behaviour pass inside a disposable user namespace.
+> The privileged delivery, `SIGKILL`, systemd lifecycle, UDP
 > two-namespace and soak gates have not been run on a target Linux 6.6+ host, and the known
 > gaps below still exclude several production claims.
 >
-> Current evidence (2026-11-14): `cargo nextest run --workspace`, `cargo test --workspace
+> Current evidence (2026-11-15): `cargo nextest run --workspace`, `cargo test --workspace
 > --doc`, `cargo build --release --workspace --locked`, `cargo deny check`, `cargo xtask
 > preflight`, and the `control_netns_lifecycle` plus IPv4/IPv6 TCP `control_transparent` cases
 > pass under `unshare -Urnm`. The kernel gate includes the six cgroup v2 `pname` hooks. The
