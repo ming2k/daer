@@ -2,6 +2,9 @@
 #ifndef DAER_ABI_H
 #define DAER_ABI_H
 
+/* The IPv4-in-IPv6 word: u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD). */
+#define DAER_IPV4_MAPPED_WORD 0x0000FFFFU
+
 /* The load-time parameter struct. */
 struct daer_param {
 	__u32 control_plane_pid;

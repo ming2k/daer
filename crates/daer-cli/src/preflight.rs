@@ -225,23 +225,48 @@ pub fn privileged_blocker(capabilities: Capabilities) -> Option<String> {
     ))
 }
 
-/// The reason the datapath would defer every flow to userspace, if it would.
+/// What the kernel can decide by itself, as reported by the dry run.
 ///
-/// `None` means the kernel reproduces userspace's verdict exactly (`[INV-KERNEL-01]`).
+/// This is deliberately three states, not two. A partitioned policy executes its prefix rules
+/// in the kernel and hands only the suffix to userspace; reporting it as a full deferral
+/// hid the fact that an entire address family's prefix rules could miss without the message
+/// changing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelTier {
+    /// The kernel reproduces userspace's verdict for every flow.
+    Equivalent,
+    /// Prefix rules execute in the kernel; the gate defers the suffix.
+    Partitioned { reasons: Vec<String> },
+    /// Every flow is handed to the control plane.
+    Deferred { reasons: Vec<String> },
+}
+
+/// The kernel tier a dry run would publish.
 #[must_use]
-pub fn deferral_reason(plan: &Plan) -> Option<String> {
-    let policy = plan.generation.router().kernel_policy();
+pub fn kernel_tier(plan: &Plan) -> KernelTier {
+    kernel_tier_for_router(plan.generation.router())
+}
+
+/// The kernel tier for a built router.
+///
+/// `daer check` and `daer run --dry-run` both report this. Taking the router rather than a
+/// `Plan` is what lets the deployment gate print the same answer without constructing a
+/// second, privilege-bound preflight.
+#[must_use]
+pub fn kernel_tier_for_router(router: &daer_control::decide::Router) -> KernelTier {
+    let policy = router.kernel_policy();
     if policy.equivalent {
-        return None;
+        return KernelTier::Equivalent;
     }
-    let reasons: Vec<String> = policy
-        .reasons
-        .iter()
-        .map(|reason| format!("{reason:?}"))
-        .collect();
-    Some(if reasons.is_empty() {
-        "the kernel policy is not provably equivalent, and no reason was recorded".to_owned()
+    let mut reasons: Vec<String> = policy.reasons.iter().map(ToString::to_string).collect();
+    if reasons.is_empty() {
+        reasons.push(
+            "the kernel policy is not provably equivalent, and no reason was recorded".to_owned(),
+        );
+    }
+    if policy.is_partitioned() {
+        KernelTier::Partitioned { reasons }
     } else {
-        reasons.join(", ")
-    })
+        KernelTier::Deferred { reasons }
+    }
 }

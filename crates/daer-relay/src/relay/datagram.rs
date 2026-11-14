@@ -390,11 +390,13 @@ pub async fn serve_datagrams(
         // and blocking the receive loop on it would stall every other peer.
         let datagrams = Arc::clone(&peer.datagrams);
         let flow_id = peer.flow_id;
+        let destination = original_destination;
         tokio::spawn(async move {
             if let Err(error) = datagrams.send(&payload).await {
                 daer_observe::warn!(
                     daer_observe::EventCode::DatagramForwardFailed,
                     flow_id = %flow_id,
+                    destination = %destination,
                     %error,
                     "datagram forward failed"
                 );
@@ -450,8 +452,9 @@ async fn peer_for(
             daer_observe::warn!(
                 daer_observe::EventCode::DatagramFlowRefused,
                 flow_id = %flow_id,
+                source = %address,
+                destination = %original_destination,
                 %error,
-                %address,
                 "datagram flow refused"
             );
             return None;
@@ -465,8 +468,9 @@ async fn peer_for(
             daer_observe::warn!(
                 daer_observe::EventCode::DatagramSessionFailed,
                 flow_id = %flow_id,
+                source = %address,
+                destination = %original_destination,
                 %error,
-                %address,
                 "datagram session failed"
             );
             return None;
@@ -513,8 +517,9 @@ async fn peer_for(
                     daer_observe::debug!(
                         daer_observe::EventCode::DatagramSessionClosed,
                         flow_id = %flow_id,
+                        source = %address,
+                        destination = %original_destination,
                         %error,
-                        %address,
                         "datagram session closed"
                     );
                     return;
@@ -533,8 +538,9 @@ async fn peer_for(
                 daer_observe::warn!(
                     daer_observe::EventCode::DatagramReplyFailed,
                     flow_id = %flow_id,
+                    source = %address,
+                    destination = %original_destination,
                     %error,
-                    %address,
                     "datagram reply failed"
                 );
                 return;

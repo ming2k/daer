@@ -117,6 +117,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
    * ip -6 rule del fwmark 0x8000000/0x8000000 table 2023
    * ip -6 route del local default dev lo table 2023
    */
+	if (pkt->l4proto == IPPROTO_UDP && udp_is_dhcp(&pkt->udph))
+		return DAER_TC_PASS;
 	if (pkt->l4proto == IPPROTO_TCP &&
 	    !is_new_tcp_connection(&pkt->tcph)) {
 		__u8 outbound;
@@ -475,6 +477,8 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (pkt->udph.source == bpf_htons(53) ||
 		    pkt->udph.dest == bpf_htons(53))
+			return DAER_TC_CONTINUE;
+		if (udp_is_dhcp(&pkt->udph))
 			return DAER_TC_CONTINUE;
 
 		copy_reversed_tuples(&pkt->tuples.five, &reversed_tuples_key);

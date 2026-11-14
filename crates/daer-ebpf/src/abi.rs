@@ -249,12 +249,24 @@ pub struct LpmKey {
     /// The 16 address bytes, in the datapath's own convention.
     ///
     /// The datapath builds these keys from `tuples.five.{s,d}ip.u6_addr32` (16 bytes for both
-    /// families) and searches with `prefixlen = 128`. So the convention is *not* "IPv4
-    /// addresses are 32 bits": an IPv4 address occupies the **last four bytes** with the first
-    /// twelve zero, and to represent a *prefix* the entry's `prefix_len` must be
-    /// `96 + prefix_len`, which is the only form an in-kernel longest-prefix match answers
-    /// correctly for a fixed-width lookup key.
+    /// families) and searches with `prefixlen = 128`. IPv4 is stored as the IPv4-mapped IPv6
+    /// form the parser writes: 64 zero bits, then `00 00 ff ff`, then the four address bytes.
+    /// A *prefix* therefore starts at bit 96, and its stored `prefix_len` is `96 + prefix_len`,
+    /// which is the only form an in-kernel longest-prefix match answers correctly for a
+    /// fixed-width lookup key.
     pub data: [u8; 16],
+}
+
+/// The 16-byte `union ip6` layout the datapath uses for an IPv4 address:
+/// `::ffff:a.b.c.d`, with the four octets in the last four bytes.
+///
+/// The marker comes from `IPV4_MAPPED_WORD` in the generated ABI; keeping the literal
+/// there is what makes the C parser and this encoder the same declaration.
+pub(crate) fn ipv4_mapped_bytes(addr: std::net::Ipv4Addr) -> [u8; 16] {
+    let mut data = [0u8; 16];
+    data[8..12].copy_from_slice(&crate::generated::IPV4_MAPPED_PREFIX);
+    data[12..16].copy_from_slice(&addr.octets());
+    data
 }
 
 impl LpmKey {
@@ -270,8 +282,7 @@ impl LpmKey {
     /// The key that **matches** an IPv4 address: full width, no prefix.
     #[must_use]
     pub fn lookup_ipv4(addr: std::net::Ipv4Addr) -> Self {
-        let mut data = [0u8; 16];
-        data[12..16].copy_from_slice(&addr.octets());
+        let data = ipv4_mapped_bytes(addr);
         // The lookup is always a full-width key: a shorter one would match entries that are
         // *less* specific than intended, because the trie compares the shorter prefix.
         Self {
@@ -307,12 +318,12 @@ impl LpmKey {
 
     /// The entry that covers an IPv4 **prefix**.
     ///
-    /// `prefix + 96` because the address sits in the last four bytes: an entry inserted as
-    /// `1.2.3.0/24` must match any `…1.2.3.x`, and the trie compares only the first
-    /// `prefix_len` bits.
+    /// The first 96 bits are the datapath's `::ffff` marker (see [`Self::lookup_ipv4`]); the
+    /// address bits start at bit 96, so the stored prefix length is `96 + prefix_len`.
     #[must_use]
     pub fn prefix_ipv4(net: ipnet::Ipv4Net) -> Self {
         let mut data = [0u8; 16];
+        data[8..12].copy_from_slice(&crate::generated::IPV4_MAPPED_PREFIX);
         data[12..16].copy_from_slice(&net.network().octets());
         Self {
             prefix_len: 96 + u32::from(net.prefix_len()),
@@ -471,5 +482,22 @@ mod tests {
             std::net::Ipv6Addr::from(key.sip).to_string(),
             "::ffff:192.168.1.2"
         );
+    }
+
+    #[test]
+    fn ipv4_lpm_keys_are_the_datapaths_ipv4_mapped_form() {
+        // Falsifier for the outage where every IPv4 prefix missed in the kernel: the C
+        // parser writes the generated `IPV4_MAPPED_WORD` at `u6_addr32[2]`, so an IPv4 LPM
+        // key has `IPV4_MAPPED_PREFIX` at bytes 8..12. A key with those bytes zero never
+        // matches the datapath's lookup key, no matter how correct the prefix list is.
+        let prefix = LpmKey::prefix_ipv4("100.64.0.0/16".parse().expect("parses"));
+        assert_eq!(prefix.prefix_len, 112);
+        assert_eq!(&prefix.data[8..12], &crate::generated::IPV4_MAPPED_PREFIX);
+        assert_eq!(&prefix.data[12..16], &[100, 64, 0, 0]);
+
+        let lookup = LpmKey::lookup_ipv4("100.64.1.2".parse().expect("parses"));
+        assert_eq!(lookup.prefix_len, 128);
+        assert_eq!(&lookup.data[8..12], &crate::generated::IPV4_MAPPED_PREFIX);
+        assert_eq!(&lookup.data[12..16], &[100, 64, 1, 2]);
     }
 }

@@ -241,11 +241,18 @@ fields = ["generation"]
 name = "DryRunKernelDeferral"
 code = "dryrun.kernel_deferral"
 level = "warn"
-message = "kernel policy is a deferral"
-fields = ["reasons"]
+message = "kernel policy is a full deferral"
+fields = ["generation", "reasons"]
 counter = "dryrun.kernel_deferral"
 rate = "dryrun.kernel_deferral"
-remediation = "Traffic is correct but the kernel fast path is not in effect; rewrite the named predicates or accept the userspace relay hop."
+remediation = "Every flow is handed to userspace; rewrite the named predicates or accept the relay hop."
+
+[[events]]
+name = "DryRunKernelPartitioned"
+code = "dryrun.kernel_partitioned"
+level = "info"
+message = "kernel policy is partitioned"
+fields = ["generation", "reasons"]
 
 [[events]]
 name = "DryRunListen"
@@ -666,7 +673,7 @@ name = "DatagramForwardFailed"
 code = "flow.datagram_forward_failed"
 level = "warn"
 message = "datagram forward failed"
-fields = ["flow_id", "error"]
+fields = ["flow_id", "destination", "error"]
 counter = "flow.datagram_forward_failed"
 rate = "flow.datagram_forward_failed"
 remediation = "The upstream leg failed; check the node and the UDP transport."
@@ -676,7 +683,7 @@ name = "DatagramFlowRefused"
 code = "flow.datagram_refused"
 level = "warn"
 message = "datagram flow refused"
-fields = ["flow_id", "destination", "error", "error_code"]
+fields = ["flow_id", "source", "destination", "error", "error_code"]
 counter = "flow.datagram_refused"
 rate = "flow.datagram_refused"
 remediation = "The election has no electable datagram-capable node; check the node and probe settings."
@@ -686,7 +693,7 @@ name = "DatagramSessionFailed"
 code = "flow.datagram_session_failed"
 level = "warn"
 message = "datagram session failed"
-fields = ["flow_id", "destination", "error"]
+fields = ["flow_id", "source", "destination", "error"]
 counter = "flow.datagram_session_failed"
 rate = "flow.datagram_session_failed"
 remediation = "The UDP session could not be opened; inspect the selected node."
@@ -696,14 +703,14 @@ name = "DatagramSessionClosed"
 code = "flow.datagram_session_closed"
 level = "debug"
 message = "datagram session closed"
-fields = ["flow_id", "destination", "error"]
+fields = ["flow_id", "source", "destination", "error"]
 
 [[events]]
 name = "DatagramReplyFailed"
 code = "flow.datagram_reply_failed"
 level = "warn"
 message = "datagram reply failed"
-fields = ["flow_id", "destination", "error"]
+fields = ["flow_id", "source", "destination", "error"]
 counter = "flow.datagram_reply_failed"
 rate = "flow.datagram_reply_failed"
 remediation = "The reply socket could not send to the client; check the ingress namespace and the reply socket mark."
@@ -922,17 +929,24 @@ name = "DatapathPolicyPublished"
 code = "datapath.policy_published"
 level = "info"
 message = "datapath policy published"
-fields = ["generation", "slot", "entries", "trie_entries", "policy_hash"]
+fields = ["generation", "slot", "entries", "trie_entries"]
 
 [[events]]
 name = "DatapathPolicyDeferred"
 code = "datapath.policy_deferred"
 level = "warn"
-message = "datapath policy published as a deferral"
-fields = ["generation", "slot", "entries", "reasons", "policy_hash"]
+message = "datapath policy published as a full deferral"
+fields = ["generation", "slot", "entries", "reasons"]
 counter = "datapath.policy_deferred"
 rate = "datapath.policy_deferred"
-remediation = "Traffic is correct but every flow is handed to userspace; rewrite the named predicates or accept the relay hop."
+remediation = "Every flow is handed to userspace. Rewrite the named predicates or accept the relay hop."
+
+[[events]]
+name = "DatapathPolicyPartitioned"
+code = "datapath.policy_partitioned"
+level = "info"
+message = "datapath policy published as a partition"
+fields = ["generation", "slot", "entries", "reasons"]
 
 [[events]]
 name = "DatapathRepublishFailed"

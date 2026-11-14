@@ -9,6 +9,26 @@ static __always_inline __u8 ipv4_get_dscp(const struct iphdr *iph)
 	return (iph->tos & 0xfc) >> 2;
 }
 
+/* DHCP is a link-local control protocol, not a proxyable transport.
+ *
+ * The client broadcasts from 0.0.0.0:68 before it has an address; neither that source nor
+ * the broadcast destination can be reproduced by a userspace connected UDP socket (the
+ * socket would need SO_BROADCAST, port 68, and a 0.0.0.0 source). It must therefore never
+ * enter the proxy path, even when the routing policy defers every flow to userspace.
+ * Both DHCPv4 (67/68) and DHCPv6 (546/547) are covered; checking both ends handles client
+ * requests, server replies, and relayed packets without caring about direction. */
+static __always_inline bool udp_is_dhcp(const struct udphdr *udph)
+{
+	return udph->source == bpf_htons(67) ||
+	       udph->source == bpf_htons(68) ||
+	       udph->dest == bpf_htons(67) ||
+	       udph->dest == bpf_htons(68) ||
+	       udph->source == bpf_htons(546) ||
+	       udph->source == bpf_htons(547) ||
+	       udph->dest == bpf_htons(546) ||
+	       udph->dest == bpf_htons(547);
+}
+
 /* Raw-byte accessors for the UAPI header bitfields.
  *
  * struct iphdr/struct tcphdr declare ihl/version and doff/fin/syn/rst/... as
@@ -65,10 +85,10 @@ get_tuples(const struct __sk_buff *skb, struct tuples *tuples,
 	// Read the version/ihl byte raw, then classify; iph is a stack copy of
 	// the header and both branches below use raw-byte helpers.
 	if (iphdr_version(iph) == 4) {
-		tuples->five.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		tuples->five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		tuples->five.sip.u6_addr32[3] = iph->saddr;
 
-		tuples->five.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		tuples->five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		tuples->five.dip.u6_addr32[3] = iph->daddr;
 
 		tuples->dscp = ipv4_get_dscp(iph);

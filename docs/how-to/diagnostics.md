@@ -20,6 +20,18 @@ UDP sessions, exact event counters and the userspace mirror of the datapath coun
 read-only: it cannot start, stop or reload anything (ADR-0041). `/run/daer/events.jsonl` is
 the JSONL flight recorder; `daer status --flow <ID>` prints every event for one flow from it.
 
+The same versioned contract is available before the daemon runs:
+
+```sh
+daer check --json -c /etc/daer/config.toml   # deployment gate: schema, kernel tier, warnings
+daer route --json 93.184.216.34:443          # decision + rule + trace, for scripts
+```
+
+`check --json` reports `kernel_policy.tier` as `equivalent`, `partitioned` or
+`full_deferral`; a partitioned policy is not an outage, a full deferral means the kernel
+fast path is unused. `route --json` keeps the process exit status (a `block` or an
+undeliverable election is nonzero) while still printing the decision.
+
 ## 1. "What is running?"
 
 ```

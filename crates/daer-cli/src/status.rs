@@ -90,8 +90,8 @@ pub async fn run(options: StatusOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The state path, with a test-only override.
-fn state_path() -> PathBuf {
+/// The state path, with a test/deployment override.
+pub(crate) fn state_path() -> PathBuf {
     std::env::var_os("DAER_STATUS_STATE").map_or_else(|| PathBuf::from(STATE_PATH), PathBuf::from)
 }
 

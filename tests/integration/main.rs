@@ -14,6 +14,7 @@ mod common;
 
 mod cli_architecture;
 mod cli_domain_policy;
+mod cli_json;
 mod cli_logging;
 mod cli_preflight;
 mod cli_route;

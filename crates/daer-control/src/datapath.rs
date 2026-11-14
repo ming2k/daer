@@ -1060,6 +1060,7 @@ pub fn republish_policy(
     if policy.equivalent {
         daer_observe::info!(
             daer_observe::EventCode::DatapathPolicyPublished,
+            generation = generation,
             slot = target.index(),
             entries = published.entries,
             trie_entries = policy.lpms.len(),
@@ -1067,15 +1068,27 @@ pub fn republish_policy(
         );
     } else {
         let reasons: Vec<String> = policy.reasons.iter().map(ToString::to_string).collect();
-        daer_observe::warn!(
-            daer_observe::EventCode::DatapathPolicyDeferred,
-            slot = target.index(),
-            entries = published.entries,
-            reasons = ?reasons,
-            "datapath policy published as a deferral: every flow is handed to the control \
-             plane, because the kernel cannot reproduce these rules faithfully. Traffic is \
-             correct; the kernel-side split is not in effect"
-        );
+        if policy.is_partitioned() {
+            daer_observe::info!(
+                daer_observe::EventCode::DatapathPolicyPartitioned,
+                generation = generation,
+                slot = target.index(),
+                entries = published.entries,
+                reasons = ?reasons,
+                "datapath policy published as a partition: the prefix rules execute in the \
+                 kernel and the deferral gate hands the suffix to the control plane"
+            );
+        } else {
+            daer_observe::warn!(
+                daer_observe::EventCode::DatapathPolicyDeferred,
+                generation = generation,
+                slot = target.index(),
+                entries = published.entries,
+                reasons = ?reasons,
+                "datapath policy published as a full deferral: every flow is handed to the \
+                 control plane because the kernel cannot reproduce these rules faithfully"
+            );
+        }
     }
     Ok(())
 }

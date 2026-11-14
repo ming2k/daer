@@ -44,16 +44,11 @@ mod status;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use daer_config::{Config, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_NAMES, OutboundAction};
-use daer_outbound::FilterSet;
-use daer_routing::{
-    DeduplicateParamsOptimizer, NormalizedProgram, RoutingError, RulesBuilder,
-    SortFunctionsOptimizer, ValidationSink, outbound_name,
-};
+use daer_config::{Config, DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_NAMES};
+use daer_routing::outbound_name;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -144,6 +139,13 @@ enum Command {
         /// start should pass it.
         #[arg(long)]
         host: bool,
+        /// Print a versioned JSON report instead of the human summary.
+        ///
+        /// The report is stable for scripts: `schema`, `config`, `rules`, `files`,
+        /// `kernel_policy`, `domain`, `object`, `host` and `warnings`. Human-only views
+        /// (`--nodes`) are rejected rather than embedded in an unstable shape.
+        #[arg(long, conflicts_with = "nodes")]
+        json: bool,
     },
     /// Route a flow, IP, or domain through the routing engine without running the daemon.
     ///
@@ -165,6 +167,12 @@ enum Command {
         /// Show every rule and every predicate, not just the winner.
         #[arg(long)]
         why: bool,
+        /// Print a versioned JSON decision instead of the human explanation.
+        ///
+        /// The trace is always included: `--json` is the machine-readable form of
+        /// `route --why`, and a consumer that has to ask twice is not a contract.
+        #[arg(long)]
+        json: bool,
     },
     /// Probe network reachability, protocol handshake, or end-to-end connectivity.
     Probe {
@@ -477,8 +485,10 @@ fn main() -> ExitCode {
             nodes,
             object,
             host,
-        } => resolve_config(config)
-            .and_then(|path| block_on(async move { check(&path, nodes, object, host).await })),
+            json,
+        } => resolve_config(config).and_then(|path| {
+            block_on(async move { check(&path, nodes, object, host, json).await })
+        }),
         Command::Route {
             target,
             destination,
@@ -486,6 +496,7 @@ fn main() -> ExitCode {
             config,
             domain,
             why,
+            json,
         } => resolve_config(config).and_then(|path| {
             let flow = parse_route_target(&target, destination.as_deref(), source, domain)?;
             block_on(async move {
@@ -494,6 +505,7 @@ fn main() -> ExitCode {
                     flow.source,
                     flow.destination,
                     why,
+                    json,
                     flow.domain.as_deref(),
                 )
                 .await
@@ -680,14 +692,16 @@ async fn check(
     nodes: bool,
     object: Option<PathBuf>,
     host: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let report = validate_config(path).await?;
-    for warning in &report.warnings {
-        eprintln!("warning: {warning}");
-    }
-
-    if nodes {
-        list_nodes(path).await?;
+    if !json {
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+        if nodes {
+            list_nodes(path).await?;
+        }
     }
 
     // The object half of the gate (ADR-0029). It runs by default: "not asked for" and "asked
@@ -703,31 +717,76 @@ async fn check(
             "target/ebpf/datapath.bpf.o",
         ))),
     };
-    if let Some(object) = object.as_deref() {
-        match daer_ebpf::inspect_object(object) {
-            Ok(detail) => println!(
-                "{}: ok, {} maps, {} programs (names, sections and BTF func_info match the ABI)",
-                object.display(),
-                detail.maps,
-                detail.programs
-            ),
+    let object_report = match object.as_deref() {
+        Some(object) => match daer_ebpf::inspect_object(object) {
+            Ok(detail) => {
+                if !json {
+                    println!(
+                        "{}: ok, {} maps, {} programs (names, sections and BTF func_info match the ABI)",
+                        object.display(),
+                        detail.maps,
+                        detail.programs
+                    );
+                }
+                Some(serde_json::json!({
+                    "path": object.display().to_string(),
+                    "maps": detail.maps,
+                    "programs": detail.programs,
+                }))
+            }
             Err(error) => anyhow::bail!("{}: {error}", object.display()),
-        }
-    }
+        },
+        None => None,
+    };
 
-    if host {
+    let host_report = if host {
         // The host gate includes the kernel baseline as well as the sysctls: both are
         // properties of the machine, not of the configuration or the object. A packaged
         // build uses `daer check` without `--host`, so validating an object never requires
         // the builder's kernel to match the target's (ADR-0042).
         daer_ebpf::require_tcx()?;
-        println!("kernel: TCX (Linux 6.6+): ok");
         let cgroup = daer_ebpf::loader::cgroup_v2_path()?;
-        println!("cgroup v2: {}: ok", cgroup.display());
         daer_control::datapath::check_host_sysctls().map_err(|error| anyhow::anyhow!("{error}"))?;
-        println!("host sysctl prerequisites: ok");
+        if !json {
+            println!("kernel: TCX (Linux 6.6+): ok");
+            println!("cgroup v2: {}: ok", cgroup.display());
+            println!("host sysctl prerequisites: ok");
+        }
+        Some(serde_json::json!({
+            "tcx": "ok",
+            "cgroup": cgroup.display().to_string(),
+            "sysctls": "ok",
+        }))
+    } else {
+        None
+    };
+
+    if json {
+        let value = serde_json::json!({
+            "schema": 1,
+            "kind": "check",
+            "config": path.display().to_string(),
+            "rules": report.rules,
+            "files": report.files,
+            "kernel_policy": kernel_policy_json(&report.kernel_tier),
+            "domain": report.domain.describe(),
+            "object": object_report,
+            "host": host_report,
+            "warnings": report.warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
+    match &report.kernel_tier {
+        preflight::KernelTier::Equivalent => println!("kernel policy: equivalent"),
+        preflight::KernelTier::Partitioned { reasons } => {
+            println!("kernel policy: partitioned ({})", reasons.join("; "));
+        }
+        preflight::KernelTier::Deferred { reasons } => {
+            println!("kernel policy: full deferral ({})", reasons.join("; "));
+        }
+    }
     println!("domain acquisition: {}", report.domain.describe());
     println!(
         "{}: ok, {} routing rule(s), {} file(s)",
@@ -736,6 +795,21 @@ async fn check(
         report.files
     );
     Ok(())
+}
+
+/// The kernel tier in the versioned JSON shape shared by `check --json` and `route --json`.
+fn kernel_policy_json(tier: &preflight::KernelTier) -> serde_json::Value {
+    match tier {
+        preflight::KernelTier::Equivalent => {
+            serde_json::json!({"tier": "equivalent", "reasons": []})
+        }
+        preflight::KernelTier::Partitioned { reasons } => {
+            serde_json::json!({"tier": "partitioned", "reasons": reasons})
+        }
+        preflight::KernelTier::Deferred { reasons } => {
+            serde_json::json!({"tier": "full_deferral", "reasons": reasons})
+        }
+    }
 }
 
 /// Resolves `--config`, falling back to the first conventional path that exists.
@@ -754,29 +828,6 @@ pub(crate) fn resolve_config(explicit: Option<PathBuf>) -> anyhow::Result<PathBu
         "no configuration found in {DEFAULT_CONFIG_DIR} (tried {}); pass --config",
         DEFAULT_CONFIG_NAMES.join(", ")
     )
-}
-
-/// A loaded configuration and where it came from.
-#[derive(Debug)]
-struct LoadedConfig {
-    config: Config,
-    files: Vec<PathBuf>,
-    warnings: Vec<String>,
-    rule_providers: Option<Arc<daer_routing::RuleProviderPool>>,
-}
-
-fn load_config(path: &Path) -> anyhow::Result<LoadedConfig> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-        anyhow::bail!("{}: expected a `.toml` configuration", path.display());
-    }
-    let loaded = daer_config::toml_config::load(path)
-        .with_context(|| format!("failed to load {}", path.display()))?;
-    Ok(LoadedConfig {
-        config: loaded.config,
-        files: loaded.files,
-        warnings: loaded.warnings,
-        rule_providers: None,
-    })
 }
 
 struct RouteFlow {
@@ -862,39 +913,51 @@ async fn explain_route(
     source: SocketAddr,
     destination: SocketAddr,
     why: bool,
+    json: bool,
     domain: Option<&str>,
 ) -> anyhow::Result<()> {
     let explanation = explain(path, &source.to_string(), &destination.to_string(), domain).await?;
-    println!("{explanation}");
-    if why {
-        // The trace is what turns "it went to proxy" into "rule 3's domain predicate
-        // is the one that did not match".
-        println!();
-        print!("{}", explanation.trace);
-        let shadowed = explanation.trace.shadowed();
-        if !shadowed.is_empty() {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&route_json(&explanation))?
+        );
+    } else {
+        println!("{explanation}");
+        if why {
+            // The trace is what turns "it went to proxy" into "rule 3's domain predicate
+            // is the one that did not match".
             println!();
-            for rule in shadowed {
-                println!(
-                    "rule {} would also have matched; it is reachable only if rule {} stops matching",
-                    rule.rule,
-                    explanation.rule.unwrap_or_default()
-                );
+            print!("{}", explanation.trace);
+            let shadowed = explanation.trace.shadowed();
+            if !shadowed.is_empty() {
+                println!();
+                for rule in shadowed {
+                    println!(
+                        "rule {} would also have matched; it is reachable only if rule {} stops matching",
+                        rule.rule,
+                        explanation.rule.unwrap_or_default()
+                    );
+                }
             }
         }
     }
     if &*explanation.outbound.name == outbound_name::BLOCK {
-        println!("  verdict    : dropped by a rule");
+        if !json {
+            println!("  verdict    : dropped by a rule");
+        }
         anyhow::bail!("the flow would be blocked");
     }
     // An empty group is a decision that cannot be carried out: the flow has a
     // destination, and there is no node to send it to. Reporting that as success
     // would make the exit status useless as a check — the whole reason it exists.
     if !explanation.outbound_is_actionable() {
-        println!(
-            "  verdict    : undeliverable, election {:?} has no electable node",
-            explanation.outbound.name
-        );
+        if !json {
+            println!(
+                "  verdict    : undeliverable, election {:?} has no electable node",
+                explanation.outbound.name
+            );
+        }
         anyhow::bail!(
             "the flow would be dropped: election {:?} has no electable node",
             explanation.outbound.name
@@ -903,30 +966,81 @@ async fn explain_route(
     Ok(())
 }
 
-/// Loads a configuration with every `[[subscription]]` resolved.
-///
-/// Every inspection command goes through this, because a diagnostic that reads a
-/// different configuration than the daemon serves is worse than no diagnostic: it
-/// answers confidently about a node pool that does not exist.
-async fn load_resolved(path: &Path) -> anyhow::Result<LoadedConfig> {
-    // One loader for every entry point (ADR-0006). This used to be a second implementation that
-    // resolved subscriptions differently from `daer run` and never warned about an empty group,
-    // which is how `route nodes` and the daemon came to disagree about the node pool.
-    let resolved = daer_control::load_resolved(path).await?;
-    Ok(LoadedConfig {
-        config: resolved.config,
-        files: resolved.files,
-        warnings: resolved.warnings,
-        rule_providers: Some(resolved.rule_providers.pool),
+/// The versioned JSON decision shared by `daer route --json`.
+fn route_json(explanation: &daer_control::Explanation) -> serde_json::Value {
+    let kind = match explanation.outbound.kind {
+        daer_config::OutboundKind::Direct => "direct",
+        daer_config::OutboundKind::Block => "block",
+        daer_config::OutboundKind::Election => "election",
+    };
+    let selected = explanation.selected.as_ref().map(|node| {
+        serde_json::json!({
+            "node": node.node,
+            "group": node.group,
+            "election": node.election,
+            "protocol": node.protocol.as_str(),
+            "security": node.security.describe(),
+            "udp": node.udp,
+        })
+    });
+    let trace: Vec<serde_json::Value> = explanation
+        .trace
+        .rules
+        .iter()
+        .map(|rule| {
+            let predicates: Vec<serde_json::Value> = rule
+                .predicates
+                .iter()
+                .map(|predicate| {
+                    serde_json::json!({
+                        "predicate": predicate.predicate,
+                        "matched": predicate.matched,
+                        "negated": predicate.negated,
+                        "held": predicate.held(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "rule": rule.rule,
+                "fired": rule.fired,
+                "shadowed": rule.shadowed,
+                "internal": rule.internal,
+                "predicates": predicates,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema": 1,
+        "kind": "route",
+        "source": explanation.source.to_string(),
+        "destination": explanation.destination.to_string(),
+        "generation": explanation.generation.to_string(),
+        "rule": {
+            "index": explanation.rule,
+            "name": explanation.rule_name,
+            "text": explanation.rule_text,
+        },
+        "outbound": {
+            "name": explanation.outbound.name.as_ref(),
+            "kind": kind,
+            "mark": explanation.outbound.mark,
+            "must": explanation.outbound.must,
+        },
+        "selected": selected,
+        "actionable": explanation.outbound_is_actionable(),
+        "trace": trace,
     })
 }
 
 /// Lists every node with its protocol and security identity.
 async fn list_nodes(path: &Path) -> anyhow::Result<()> {
-    let loaded = load_resolved(path).await?;
+    let resolved = daer_control::load_resolved(path).await?;
+    for warning in &resolved.warnings {
+        eprintln!("warning: {warning}");
+    }
     let options = daer_control::RouterOptions::for_config(path)
-        .with_rule_providers(loaded.rule_providers.clone());
-    let generations = daer_control::Generations::new(&loaded.config, &options)
+        .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
+    let generations = daer_control::Generations::new(&resolved.config, &options)
         .with_context(|| path.display().to_string())?;
     let router = generations.current();
     let nodes = router.router().nodes();
@@ -980,10 +1094,13 @@ async fn explain(
 ) -> anyhow::Result<daer_control::Explanation> {
     let source: SocketAddr = source.parse().context("invalid source address")?;
     let destination: SocketAddr = destination.parse().context("invalid destination address")?;
-    let loaded = load_resolved(path).await?;
+    let resolved = daer_control::load_resolved(path).await?;
+    for warning in &resolved.warnings {
+        eprintln!("warning: {warning}");
+    }
     let options = daer_control::RouterOptions::for_config(path)
-        .with_rule_providers(loaded.rule_providers.clone());
-    let generations = daer_control::Generations::new(&loaded.config, &options)
+        .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
+    let generations = daer_control::Generations::new(&resolved.config, &options)
         .with_context(|| path.display().to_string())?;
     Ok(generations
         .current()
@@ -996,6 +1113,7 @@ struct ValidationReport {
     rules: usize,
     files: usize,
     domain: daer_control::DomainPlan,
+    kernel_tier: preflight::KernelTier,
     warnings: Vec<String>,
 }
 
@@ -1006,7 +1124,17 @@ struct ValidationReport {
 /// the same resolution a run would, or it is verifying a different configuration
 /// than the one that will serve.
 async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
-    let mut loaded = load_config(path)?;
+    // The extension is the CLI's contract: a `.yaml` file is not a TOML configuration even
+    // if its bytes happen to parse. `load_resolved` deliberately accepts any path it is given,
+    // so the gate states this rule once, here.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+        anyhow::bail!("{}: expected a `.toml` configuration", path.display());
+    }
+    // [INV-LOADER-01]: `check` is the deployment gate and must consume the same resolved
+    // configuration as `run` and `run --dry-run`. Re-implementing the loader here is how a
+    // file-backed `rule-set(...)`, a subscription, or a provider cache silently diverged
+    // between the gate and the daemon.
+    let loaded = daer_control::load_resolved(path).await?;
     // `daer check` is the deployment gate. A filter directive that the daemon would reject
     // at startup must fail here, where the operator is looking, not after a restart.
     tracing_subscriber::EnvFilter::try_new(&loaded.config.log_level).map_err(|error| {
@@ -1015,114 +1143,28 @@ async fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
             loaded.config.log_level
         )
     })?;
-    let mut warnings = loaded.warnings.clone();
-
-    let config_dir = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-
-    let provider_res = daer_control::resolve_rule_providers(&loaded.config, &config_dir).await;
-    if !provider_res.providers.is_empty() {
-        if provider_res.all_usable() {
-            warnings.push(format!("rule providers: {}", provider_res.describe()));
-        } else {
-            anyhow::bail!(
-                "{} of {} rule provider(s) could not be loaded and no cache was available: {}",
-                provider_res.failed().len(),
-                provider_res.providers.len(),
-                provider_res.describe()
-            );
-        }
-    }
-
-    let program = NormalizedProgram::new(
-        &loaded.config.routing.rule,
-        loaded.config.routing.default.clone(),
-        &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
-    )
-    .context("invalid routing rules")?;
-
-    let mut sink = ValidationSink::default();
-    {
-        let mut builder = RulesBuilder::with_providers(&mut sink, &provider_res.pool);
-        program
-            .lower(&mut builder, |fallback| {
-                resolve_action(&loaded.config, fallback)
-            })
-            .context("invalid routing rules")?;
-    }
-    warnings.extend(sink.warnings);
-
-    for rule in &program.rules {
-        resolve_action(&loaded.config, &rule.action).context("invalid routing rules")?;
-    }
-
-    validate_groups(&loaded.config)?;
-
-    // Resolve subscriptions before checking the node pool, so a node that only a
-    // subscription provides is checked like any other.
-    let resolution = daer_control::resolve_subscriptions(&mut loaded.config, &config_dir).await;
-    if !resolution.subscriptions.is_empty() {
-        if resolution.all_usable() {
-            warnings.push(format!(
-                "subscriptions: {} ({} node(s) added)",
-                resolution.describe(),
-                resolution.from_subscription
-            ));
-        } else {
-            anyhow::bail!(
-                "{} of {} subscription(s) produced no node and no cache could supply one: {}",
-                resolution.failed().len(),
-                resolution.subscriptions.len(),
-                resolution.describe()
-            );
-        }
-    }
+    let mut warnings = loaded.warnings;
 
     validate_runtime(&loaded.config, &mut warnings)?;
 
-    // Build the same generation the daemon will serve. This is the only way
-    // `daer check` can reject an election whose node input is unsupported or whose
-    // election graph cannot be assembled; the static checks above cannot see the
-    // resolved node graph.
+    // Build the same generation the daemon will serve. `Generations::new` compiles every
+    // group, every rule and every outbound, so a duplicate lowering pass here would be a
+    // second implementation that can only drift.
     let options = daer_control::RouterOptions::for_config(path)
-        .with_rule_providers(Some(provider_res.pool.clone()));
+        .with_rule_providers(Some(loaded.rule_providers.pool.clone()));
     let generations = daer_control::Generations::new(&loaded.config, &options)
         .context("configuration rejected by the generation builder")?;
     warnings.extend(generations.current().warnings().iter().cloned());
     let domain = generations.current().router().domain_plan().clone();
+    let kernel_tier = preflight::kernel_tier_for_router(generations.current().router());
 
     Ok(ValidationReport {
         rules: loaded.config.routing.rule.len(),
         files: loaded.files.len(),
         domain,
+        kernel_tier,
         warnings,
     })
-}
-
-/// Validates `group` filters the way the run path builds them.
-fn validate_groups(config: &Config) -> anyhow::Result<()> {
-    for group in &config.group {
-        let filters: Vec<Vec<daer_config::Function>> = group
-            .filters
-            .iter()
-            .map(|filter| filter.functions.clone())
-            .collect();
-        let annotations: Vec<Vec<daer_config::Param>> = group
-            .filters
-            .iter()
-            .map(|filter| filter.annotate.clone())
-            .collect();
-        FilterSet::compile(&filters, &annotations)
-            .map_err(|error| anyhow::anyhow!("group {:?}: {error}", group.name))?;
-    }
-    Ok(())
-}
-
-fn resolve_action(config: &Config, action: &OutboundAction) -> Result<(), RoutingError> {
-    daer_config::validate::check_action_target(config, action, "routing.action")
-        .map_err(|error| RoutingError::new(error.to_string()))
 }
 
 /// Fails on anything the run path would refuse, so `daer check` is a real gate.

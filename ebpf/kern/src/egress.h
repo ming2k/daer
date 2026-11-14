@@ -237,6 +237,8 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	scratch->flag[6] = tuples->dscp;
 	if (pid_is_control_plane(skb, &pid_pname))
 		return DAER_TC_CONTINUE;
+	if (udp_is_dhcp(udph))
+		return DAER_TC_CONTINUE;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen_with_status(
@@ -467,9 +469,9 @@ load_redirect_tuple_fast(struct __sk_buff *skb,
 		if ((void *)(iph + 1) > data_end)
 			return LOAD_REDIRECT_TUPLE_FALLBACK;
 		// Use IPv4-mapped IPv6 format with ffff marker to match insert side
-		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		redirect_tuple->sip.u6_addr32[3] = iph->daddr;
-		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		redirect_tuple->dip.u6_addr32[3] = iph->saddr;
 		return 0;
 	}
@@ -495,7 +497,7 @@ load_redirect_tuple_slow(struct __sk_buff *skb,
 
 	if (skb->protocol == bpf_htons(ETH_P_IP)) {
 		// Set ffff marker first for IPv4-mapped IPv6 format
-		__u32 ffff_marker = bpf_htonl(0x0000ffff);
+		__u32 ffff_marker = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 
 		redirect_tuple->sip.u6_addr32[2] = ffff_marker;
 		redirect_tuple->dip.u6_addr32[2] = ffff_marker;

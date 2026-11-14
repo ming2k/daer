@@ -399,9 +399,9 @@ check_redirect_with_listener_l4proto_and_track_ipv4(struct __sk_buff *skb,
 	}
 
 	struct redirect_tuple tuple = {};
-	tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuple.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuple.sip.u6_addr32[3] = ip->saddr;
-	tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuple.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuple.dip.u6_addr32[3] = ip->daddr;
 
 	struct redirect_entry *entry =
@@ -481,9 +481,9 @@ check_tcp_conn_state_ipv4_tcp(struct __sk_buff *skb,
 	}
 
 	struct tuples tuples = {};
-	tuples.five.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.sip.u6_addr32[3] = ip->saddr;
-	tuples.five.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.dip.u6_addr32[3] = ip->daddr;
 	tuples.five.sport = tcp->source;
 	tuples.five.dport = tcp->dest;
@@ -575,9 +575,9 @@ check_tcp_conn_state_ipv4_tcp_dscp(struct __sk_buff *skb,
 	}
 
 	struct tuples tuples = {};
-	tuples.five.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.sip.u6_addr32[3] = ip->saddr;
-	tuples.five.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.dip.u6_addr32[3] = ip->daddr;
 	tuples.five.sport = tcp->source;
 	tuples.five.dport = tcp->dest;
@@ -818,9 +818,9 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 
 	if (expected_status_code == DAER_TC_REDIRECT) {
 		struct tuples tuples = {};
-		tuples.five.sip.u6_addr32[2] = bpf_htonl(0xffff);
+		tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		tuples.five.sip.u6_addr32[3] = ip->saddr;
-		tuples.five.dip.u6_addr32[2] = bpf_htonl(0xffff);
+		tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		tuples.five.dip.u6_addr32[3] = ip->daddr;
 		tuples.five.sport = tcp->source;
 		tuples.five.dport = tcp->dest;
@@ -914,9 +914,9 @@ check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 	}
 
 	struct tuples tuples = {};
-	tuples.five.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.sip.u6_addr32[3] = ip->saddr;
-	tuples.five.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.dip.u6_addr32[3] = ip->daddr;
 	tuples.five.sport = udp->source;
 	tuples.five.dport = udp->dest;

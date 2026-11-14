@@ -128,9 +128,9 @@ fill_redirect_tuple_from_forward_packet(const struct __sk_buff *skb,
 {
 	__builtin_memset(redirect_tuple, 0, sizeof(*redirect_tuple));
 	if (skb->protocol == bpf_htons(ETH_P_IP)) {
-		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		redirect_tuple->sip.u6_addr32[3] = tuples->five.sip.u6_addr32[3];
-		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 		redirect_tuple->dip.u6_addr32[3] = tuples->five.dip.u6_addr32[3];
 	} else {
 		__builtin_memcpy(&redirect_tuple->sip, &tuples->five.sip,

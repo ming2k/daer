@@ -12,6 +12,17 @@
 
 schema = 1
 
+# The IPv4-in-IPv6 representation.
+#
+# The C datapath stores an IPv4 address in `union ip6` as `::ffff:a.b.c.d`:
+# `u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD)` and the four octets in
+# `u6_addr32[3]`. The same bytes are a conntrack key, a handoff key, and — because the
+# datapath reuses the tuple — the lookup key for the routing LPM trie. Declaring the word
+# here is what keeps the C parser and the Rust LPM/tuple encoders from drifting apart:
+# the generated `DAER_IPV4_MAPPED_WORD` and `IPV4_MAPPED_WORD` are the only literals.
+[ipv4]
+mapped_word = 0x0000FFFF
+
 # The `const volatile` global the loader overrides before `BPF_PROG_LOAD`.
 [params]
 global = "PARAM"

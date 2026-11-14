@@ -270,3 +270,181 @@ fn check_rejects_an_object_whose_func_info_drifted() {
         "the failure must name the func_info invariant; log:\n{log}"
     );
 }
+
+/// A dry run must load the same rule-provider pool the daemon loads.
+///
+/// # The defect this pins
+///
+/// `run --dry-run` called `RouterOptions::for_config` without `.with_rule_providers(...)`,
+/// so the exact production configuration resolved by `daer check` and `daer route` failed
+/// with `in 'rule-set(private-ips)': unknown rule set: private-ips`. The daemon then loaded
+/// it normally, which is the [INV-LOADER-01] divergence this test makes impossible to
+/// reintroduce: the dry run, the deployment gate, and the route diagnostic all consume the
+/// same provider pool.
+#[test]
+fn a_dry_run_resolves_file_rule_sets_like_check_and_route() {
+    let dir = Scratch::new("dry-run-provider");
+
+    // A real DRB artifact, compiled by the producer binary. A hand-written file would test
+    // the test's idea of the format, not the format the operator installs.
+    let rules = dir.join("private.rules");
+    std::fs::write(&rules, "---\nname: private\n---\n10.0.0.0/8\n")
+        .expect("writes the rule source");
+    let drb = dir.join("private.drb");
+    let compile = crate::common::daer_drb_cmd()
+        .args([
+            "compile",
+            rules.to_str().expect("utf-8 rule path"),
+            "-o",
+            drb.to_str().expect("utf-8 drb path"),
+        ])
+        .status()
+        .expect("runs daer-drb compile");
+    assert!(compile.success(), "daer-drb compile must succeed");
+
+    let config = dir.join("config.toml");
+    let text = format!(
+        "schema = 6\n\
+         wan-interface = [\"lo\"]\n\
+         disable-waiting-network = true\n\
+         \n\
+         [[rule-set]]\n\
+         name = \"private\"\n\
+         type = \"file\"\n\
+         path = {path:?}\n\
+         \n\
+         [routing]\n\
+         default = \"direct\"\n\
+         \n\
+         [[routing.rule]]\n\
+         name = \"private\"\n\
+         match = \"rule-set(private)\"\n\
+         action = \"direct\"\n",
+        path = drb.display().to_string()
+    );
+    std::fs::write(&config, text).expect("writes the configuration");
+
+    // No object and no datapath: this test is about the loader, not the kernel. It must run
+    // on an unprivileged machine without `cargo xtask ebpf` having produced an artifact.
+    let dry_run = daer()
+        .args(["run", "--dry-run", "--no-datapath", "--config"])
+        .arg(&config)
+        .output()
+        .expect("runs daer run --dry-run");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(
+        dry_run.status.success(),
+        "a dry run must resolve the file-backed rule set; log:\n{log}"
+    );
+    assert!(log.contains("configuration compiles"), "log:\n{log}");
+    assert!(
+        log.contains("rules=1"),
+        "the generation must contain the rule; log:\n{log}"
+    );
+    assert!(
+        log.contains("kernel policy: equivalent"),
+        "an all-IP rule set must publish an equivalent kernel policy; log:\n{log}"
+    );
+
+    let check = daer()
+        .args(["check", "--config"])
+        .arg(&config)
+        .args(["--object", "none"])
+        .output()
+        .expect("runs daer check");
+    assert!(
+        check.status.success(),
+        "check must accept the same configuration; stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let check_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(
+        check_log.contains("kernel policy: equivalent"),
+        "check must report the same kernel tier as the dry run; log:\n{check_log}"
+    );
+
+    let route = daer()
+        .args(["route", "--config"])
+        .arg(&config)
+        .args(["--source", "10.0.0.1:1234", "10.1.2.3:80"])
+        .output()
+        .expect("runs daer route");
+    let route_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&route.stdout),
+        String::from_utf8_lossy(&route.stderr)
+    );
+    assert!(
+        route.status.success(),
+        "the file-backed rule must route successfully; log:\n{route_log}"
+    );
+    assert!(
+        route_log.contains("outbound   : direct"),
+        "10.1.2.3 must be direct through the compiled range; log:\n{route_log}"
+    );
+}
+
+/// A partitioned policy must be reported as partitioned, not as a full deferral.
+///
+/// The old dry-run message said "every flow is handed to the control plane" whenever the
+/// kernel policy was not provably equivalent. With a bug that made every IPv4 prefix miss,
+/// that message was accidentally true, so the output could not distinguish the intended
+/// userspace relay hop for a domain suffix from a data-path failure for an entire address
+/// family. The three-state report is what makes the difference visible.
+#[test]
+fn a_dry_run_reports_a_partitioned_policy_as_partitioned() {
+    let dir = Scratch::new("dry-run-tier");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "schema = 6\n\
+         wan-interface = [\"lo\"]\n\
+         disable-waiting-network = true\n\
+         \n\
+         [routing.sniff]\n\
+         enabled = true\n\
+         timeout = \"30ms\"\n\
+         \n\
+         [routing]\n\
+         default = \"direct\"\n\
+         \n\
+         [[routing.rule]]\n\
+         name = \"private\"\n\
+         match = \"dip(10.0.0.0/8)\"\n\
+         action = \"direct\"\n\
+         \n\
+         [[routing.rule]]\n\
+         name = \"named\"\n\
+         match = \"domain(example.com)\"\n\
+         action = \"direct\"\n",
+    )
+    .expect("writes the configuration");
+
+    let output = daer()
+        .args(["run", "--dry-run", "--no-datapath", "--config"])
+        .arg(&config)
+        .output()
+        .expect("runs daer run --dry-run");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "dry run failed; log:\n{log}");
+    assert!(
+        log.contains("kernel policy: partitioned"),
+        "the IP rule before the domain boundary must be reported as in-kernel; log:\n{log}"
+    );
+    assert!(
+        !log.contains("kernel policy: full deferral"),
+        "a partitioned policy is not a full deferral; log:\n{log}"
+    );
+}

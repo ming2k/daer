@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **Datagram diagnostic events carry both endpoints.** `flow.datagram_refused`,
+  `flow.datagram_session_failed`, `flow.datagram_session_closed` and
+  `flow.datagram_reply_failed` now report `source` and `destination`;
+  `flow.datagram_forward_failed` reports `destination`. The previous `address` field was
+  the client source and could not distinguish a DHCP broadcast from a client flow.
+- **`daer check` reports the kernel tier.** It now prints `kernel policy: equivalent`,
+  `partitioned (…)` or `full deferral (…)` and uses the same resolved loader as `daer run`
+  and `daer route` ([INV-LOADER-01]).
+
+### Added
+
+- **`daer check --json` and `daer route --json`.** Both commands now emit a versioned
+  (`schema = 1`) JSON document for deployment gates and scripts. `route --json` always
+  carries the rule trace; `check --json` carries the kernel tier, domain plan, object and
+  host summaries, and warnings. Human-only `--nodes` is rejected with `check --json`
+  rather than embedded in an unstable shape.
+
+### Fixed
+
+- **IPv4 routing rules now match in the kernel.** The Rust LPM and handoff encoders use the
+  datapath's IPv4-mapped IPv6 form (`::ffff:a.b.c.d`, `u6_addr32[2] = 0x0000ffff`) instead
+  of a zero-filled prefix. Every IPv4 prefix rule previously missed, handing all IPv4 flows
+  to userspace. The encoding is declared once in `ebpf/abi.toml`.
+- **DHCP is never proxied.** The datapath passes BOOTP/DHCPv4 (UDP 67/68) and DHCPv6
+  (UDP 546/547) through on both WAN egress and ingress, and on LAN ingress. This prevents a
+  lease renewal from being re-originated by the userspace UDP relay, which cannot send the
+  broadcast and left the host without an address after the lease expired.
+- **A partitioned kernel policy is no longer reported as a full deferral.** The daemon and
+  the dry run distinguish prefix rules that execute in the kernel from a policy that hands
+  every flow to userspace.
+
 ## [0.1.0] - 2026-11-14
 
 The first release candidate for staging deployment. The unprivileged contract and the

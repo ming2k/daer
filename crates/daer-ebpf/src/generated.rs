@@ -6,6 +6,12 @@
 /// The name of the `const volatile` global the loader overrides.
 pub const PARAM_GLOBAL: &str = "PARAM";
 
+/// The 32-bit word the C datapath writes to `u6_addr32[2]` for an IPv4 address.
+pub const IPV4_MAPPED_WORD: u32 = 0x0000FFFF;
+
+/// The byte form of [`IPV4_MAPPED_WORD`] at offsets 8..12 of the 16-byte key.
+pub const IPV4_MAPPED_PREFIX: [u8; 4] = IPV4_MAPPED_WORD.to_be_bytes();
+
 /// Every map name, as the object declares it.
 pub mod map {
     pub const OUTBOUND_CONNECTIVITY: &str = "outbound_connectivity_map";

@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 pub struct Abi {
     pub schema: u32,
     pub params: Params,
+    /// The IPv4-in-IPv6 representation shared by the C parser and the Rust encoders.
+    pub ipv4: Ipv4,
     #[serde(default)]
     pub maps: Vec<Map>,
     #[serde(default)]
@@ -53,6 +55,12 @@ pub struct Params {
     pub global: String,
     pub c_struct: String,
     pub fields: Vec<Field>,
+}
+
+/// The IPv4-in-IPv6 word `get_tuples` writes into `u6_addr32[2]`.
+#[derive(Debug, serde::Deserialize)]
+pub struct Ipv4 {
+    pub mapped_word: u32,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -245,6 +253,13 @@ impl Abi {
              #ifndef {guard}\n#define {guard}\n"
         );
 
+        let _ = writeln!(
+            out,
+            "/* The IPv4-in-IPv6 word: u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD). */\n\
+             #define DAER_IPV4_MAPPED_WORD 0x{:08X}U\n",
+            self.ipv4.mapped_word
+        );
+
         let _ = writeln!(out, "/* The load-time parameter struct. */");
         let _ = writeln!(out, "struct {} {{", self.params.c_struct);
         for field in &self.params.fields {
@@ -390,6 +405,24 @@ impl Abi {
             out,
             "pub const PARAM_GLOBAL: &str = {:?};\n",
             self.params.global
+        );
+
+        let _ = writeln!(
+            out,
+            "/// The 32-bit word the C datapath writes to `u6_addr32[2]` for an IPv4 address."
+        );
+        let _ = writeln!(
+            out,
+            "pub const IPV4_MAPPED_WORD: u32 = 0x{:08X};\n",
+            self.ipv4.mapped_word
+        );
+        let _ = writeln!(
+            out,
+            "/// The byte form of [`IPV4_MAPPED_WORD`] at offsets 8..12 of the 16-byte key."
+        );
+        let _ = writeln!(
+            out,
+            "pub const IPV4_MAPPED_PREFIX: [u8; 4] = IPV4_MAPPED_WORD.to_be_bytes();\n"
         );
 
         let _ = writeln!(out, "/// Every map name, as the object declares it.");

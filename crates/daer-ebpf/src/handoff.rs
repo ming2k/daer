@@ -22,9 +22,9 @@
 //!
 //! `routing_handoff_map` is keyed by `struct tuples_key`, the C's five-tuple. For a redirected
 //! TCP flow the accepted socket's peer address is the client and its local address is the
-//! original destination, so the key can be rebuilt exactly. The C zero-fills `sip`/`dip` for
-//! an IPv4 flow (`union ip6` holding a v4 address in its low bytes), which
-//! [`TuplesKey::of`] reproduces.
+//! original destination, so the key can be rebuilt exactly. The C writes `sip`/`dip` for
+//! an IPv4 flow as the IPv4-mapped IPv6 form `::ffff:a.b.c.d` (the generated
+//! `DAER_IPV4_MAPPED_WORD`), which [`TuplesKey::of`] reproduces.
 
 use aya::Ebpf;
 use aya::maps::{HashMap as BpfHashMap, MapData};
@@ -89,9 +89,9 @@ impl TuplesKey {
     /// The handoff key for an accepted TCP flow.
     ///
     /// `source` is the client (`peer_addr`) and `destination` the original destination
-    /// (`local_addr` on a transparent socket). IPv4 addresses are stored the way the C stores
-    /// them: zero-filled 16-byte arrays with the four octets in the **last** four bytes, which
-    /// is what `union ip6` looks like when the C reads a `struct iphdr`.
+    /// (`local_addr` on a transparent socket). IPv4 addresses are stored exactly as
+    /// `get_tuples` stores them: the IPv4-mapped IPv6 form `::ffff:a.b.c.d`, with the
+    /// `00 00 ff ff` marker at bytes 8..12 and the four octets in the last four bytes.
     #[must_use]
     pub fn of(
         source: std::net::SocketAddr,
@@ -111,11 +111,7 @@ impl TuplesKey {
 /// A v4-mapped or v6 address in the C's `union ip6` layout.
 fn ip_bytes(ip: std::net::IpAddr) -> [u8; 16] {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            let mut bytes = [0u8; 16];
-            bytes[12..16].copy_from_slice(&v4.octets());
-            bytes
-        }
+        std::net::IpAddr::V4(v4) => crate::abi::ipv4_mapped_bytes(v4),
         std::net::IpAddr::V6(v6) => v6.octets(),
     }
 }
@@ -127,18 +123,22 @@ mod tests {
 
     #[test]
     fn an_ipv4_key_matches_the_c_union_layout() {
-        // The C reads a v4 `iphdr` into `union ip6`, so the address lands in the last four
-        // bytes and the first twelve stay zero. A key built any other way never matches, and
-        // the lookup would fail silently for every IPv4 flow — which is most of them.
+        // The C reads a v4 `iphdr` into `union ip6` as `::ffff:a.b.c.d`: the `00 00 ff ff`
+        // marker at bytes 8..12, then the four octets. A key with a zeroed prefix never
+        // matches `get_tuples`'s handoff key, and the lookup fails silently for every IPv4
+        // flow — which is most of them.
         let key = TuplesKey::of(
             "192.0.2.9:40000".parse::<SocketAddr>().expect("addr"),
             "198.51.100.7:443".parse::<SocketAddr>().expect("addr"),
             6,
         );
-        assert_eq!(key.sip, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 2, 9]);
+        assert_eq!(
+            key.sip,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 9]
+        );
         assert_eq!(
             key.dip,
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 198, 51, 100, 7]
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 198, 51, 100, 7]
         );
         assert_eq!(key.sport, 40000);
         assert_eq!(key.dport, 443);

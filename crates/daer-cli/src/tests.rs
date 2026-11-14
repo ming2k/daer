@@ -55,7 +55,7 @@ fn the_reference_example_validates() {
     // `daer explain` reports an empty group instead of pretending. What this asserts is the
     // diagnostic, not a silent success: the failure mode being guarded against is a default
     // policy that selects nothing **without** anyone noticing.
-    let resolution = block_on(load_resolved(&config)).expect("resolves");
+    let resolution = block_on(daer_control::load_resolved(&config)).expect("resolves");
     assert!(
         resolution
             .warnings
@@ -73,9 +73,9 @@ fn the_reference_example_validates() {
         std::fs::read_to_string(&config).expect("reads the rewritten example")
     );
     let config_with_node = dir.write_private("with-node.toml", text.as_bytes());
-    let resolved = block_on(load_resolved(&config_with_node)).expect("resolves");
+    let resolved = block_on(daer_control::load_resolved(&config_with_node)).expect("resolves");
     let options = daer_control::RouterOptions::for_config(&config_with_node)
-        .with_rule_providers(resolved.rule_providers.clone());
+        .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
     let generations = daer_control::Generations::new(&resolved.config, &options).expect("builds");
     let node = generations
         .current()
@@ -289,6 +289,7 @@ fn route_explain_reports_an_empty_group_as_a_failure() {
         "10.0.0.2:40000".parse().expect("source"),
         "93.184.216.34:443".parse().expect("destination"),
         false,
+        false,
         None,
     ))
     .expect_err("an empty group must not exit 0");
@@ -311,6 +312,7 @@ fn route_explain_reports_a_blocked_flow_as_a_failure() {
         &config,
         "10.0.0.2:40000".parse().expect("source"),
         "93.184.216.34:443".parse().expect("destination"),
+        false,
         false,
         None,
     ))
@@ -365,7 +367,7 @@ port = 1080
 "#,
     );
 
-    let loaded = load_config(&config).expect("loads");
+    let loaded = daer_config::toml_config::load(&config).expect("loads");
     let options = daer_control::RouterOptions::for_config(&config);
     let generations = daer_control::Generations::new(&loaded.config, &options).expect("builds");
     let nodes = generations.current().router().nodes();
@@ -488,7 +490,7 @@ default = "proxy"
     let report = block_on(validate_config(&config)).expect("validates structured node config");
     assert_eq!(report.files, 1);
 
-    let loaded = load_config(&config).expect("loads");
+    let loaded = daer_config::toml_config::load(&config).expect("loads");
     assert_eq!(loaded.config.node.len(), 2);
     let options = daer_control::RouterOptions::for_config(&config);
     let generations = daer_control::Generations::new(&loaded.config, &options).expect("builds");
@@ -564,7 +566,7 @@ action = "fastest-jp"
     );
     let config = dir.write_private("config.toml", config_toml.as_bytes());
 
-    let resolved = block_on(load_resolved(&config)).expect("resolves subscription");
+    let resolved = block_on(daer_control::load_resolved(&config)).expect("resolves subscription");
     assert_eq!(resolved.config.node.len(), 4);
 
     // Verify group mentions node
@@ -643,6 +645,7 @@ fn route_explain_refuses_a_configuration_that_cannot_run() {
         &config,
         "10.0.0.2:40000".parse().expect("source"),
         "93.184.216.34:443".parse().expect("destination"),
+        false,
         false,
         None,
     ))
@@ -768,6 +771,7 @@ action = "direct"
         &config,
         "10.0.0.1:1234".parse().unwrap(),
         "1.1.1.1:80".parse().unwrap(),
+        false,
         false,
         Some("other.com"),
     ))

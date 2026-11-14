@@ -153,11 +153,13 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: Install the fixture tools
-        run: sudo apt-get update && sudo apt-get install -y nftables curl
+        run: sudo apt-get update && sudo apt-get install -y nftables curl clang dnsmasq busybox
       - name: Build the E2E test binary and the daemon
         run: |
           cargo build -p daer-cli --bin daer --locked
           cargo test -p daer-tests --test e2e --no-run --locked
+      - name: Build the datapath object
+        run: cargo xtask ebpf
       - name: Transparent data path, private ingress, and SIGHUP
         # The module prefixes select every non-ignored test in the file. The ignored
         # single-namespace UDP fixture is deliberately left out; the two-namespace
@@ -173,7 +175,9 @@ jobs:
             control_transparent_udp4:: \
             control_transparent_udp6:: \
             control_netns_lifecycle:: \
-            cli_reload:: 2>&1 | tee /tmp/e2e-ingress.log
+            cli_reload:: \
+            cli_live:: \
+            control_dhcp:: 2>&1 | tee /tmp/e2e-ingress.log
           if grep -q "skipped: " /tmp/e2e-ingress.log; then
             echo "::error::a privileged ingress test skipped; the gate must run"
             exit 1

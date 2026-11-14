@@ -11,7 +11,9 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod cli_live;
 mod cli_reload;
+mod control_dhcp;
 mod control_netns_lifecycle;
 mod control_transparent;
 mod control_transparent_udp4;

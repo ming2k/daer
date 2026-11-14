@@ -449,6 +449,50 @@ fn the_kernel_and_userspace_agree_on_every_representable_rule_set() {
     }
 }
 
+#[test]
+fn an_ipv4_rule_matches_the_key_the_datapath_builds() {
+    // The encoder and the datapath must agree on the IPv4-in-IPv6 convention. `get_tuples`
+    // writes `::ffff:a.b.c.d` (the generated `DAER_IPV4_MAPPED_WORD`), so a key without the
+    // `00 00 ff ff` marker never matches. This is the exact failure that made the kernel
+    // bypass every IPv4 prefix rule and hand all IPv4 flows to userspace.
+    let (_sets, _fallback, compiled) = compile(&["dip(10.0.0.0/8) -> direct"], "proxy");
+    let index = compiled
+        .policy
+        .lpms
+        .iter()
+        .find(|(index, _)| {
+            compiled
+                .policy
+                .entries
+                .get(*index as usize)
+                .is_some_and(|entry| entry.kind == match_type::IP_SET)
+        })
+        .map(|(index, _)| *index)
+        .expect("the dip rule publishes an LPM trie");
+
+    let mut lookup = daer_ebpf::abi::LpmKey {
+        prefix_len: 128,
+        data: [0u8; 16],
+    };
+    // Deliberately spelled out instead of calling `LpmKey::lookup_ipv4`: using the same
+    // helper the encoder uses would let one wrong convention make both sides agree.
+    lookup.data[10] = 0xff;
+    lookup.data[11] = 0xff;
+    lookup.data[12..16].copy_from_slice(&[10, 1, 2, 3]);
+
+    let keys = compiled
+        .policy
+        .lpms
+        .iter()
+        .find(|(entry, _)| *entry == index)
+        .map(|(_, keys)| keys.as_slice())
+        .expect("the trie is addressed by the entry index");
+    assert!(
+        keys.iter().any(|key| prefix_covers(key, &lookup)),
+        "an IPv4 prefix must match the datapath's ::ffff lookup key; keys: {keys:?}"
+    );
+}
+
 /// A rule the kernel cannot represent defers the *whole* program, with a reason that names it.
 #[test]
 fn a_domain_rule_defers_and_says_why() {

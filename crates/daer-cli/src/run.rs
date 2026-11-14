@@ -96,6 +96,11 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // running daemon.
     let resolved = daer_control::load_resolved(&options.config).await?;
     crate::incident::set_config_path(&options.config);
+    // The same resolved pool serves the dry run and the daemon. Cloning the handle before the
+    // configuration is moved keeps the dry run from silently compiling a different program:
+    // without it, a file-backed `rule-set(...)` is "unknown" in `--dry-run` while the daemon
+    // resolves it normally (ADR-0006 / [INV-LOADER-01]).
+    let rule_providers = resolved.rule_providers.pool.clone();
     let loaded = resolved.config;
     // The bootstrap subscriber was installed before `load_resolved`, so subscription and
     // provider warnings are visible. This applies the configuration's level; a malformed
@@ -145,7 +150,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // kernel (BPF load, tc attach). Returning before the first mutation is what makes
     // "--dry-run" mean "changed nothing" rather than "did everything, then exited".
     if options.dry_run {
-        return report_plan(&loaded, &options, &lan, &wan).await;
+        return report_plan(&loaded, &rule_providers, &options, &lan, &wan).await;
     }
 
     notifier.status("preparing the private ingress");
@@ -189,7 +194,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         // by netune and dropped, so "why is this node slow" has no answer in any log — which is
         // exactly the state the daemon was in before the observer existed.
         .with_dial_observer(Some(std::sync::Arc::new(daer_outbound::LogObserver)))
-        .with_rule_providers(Some(resolved.rule_providers.pool.clone()));
+        .with_rule_providers(Some(rule_providers));
     // The ingress namespace is created before the listeners: a socket belongs to the
     // network namespace that was current when it was created, and `bpf_sk_assign` can only
     // hand a redirected packet to a listener in the packet's namespace. `--no-datapath`
@@ -417,14 +422,14 @@ fn write_state(
         }),
     });
 
+    let state_path = crate::status::state_path();
     let result = (|| -> std::io::Result<()> {
-        let path = Path::new(crate::status::STATE_PATH);
-        crate::private_fs::write_atomic(path, &serde_json::to_vec_pretty(&value)?)
+        crate::private_fs::write_atomic(&state_path, &serde_json::to_vec_pretty(&value)?)
     })();
     if let Err(error) = result {
         daer_observe::debug!(
             daer_observe::EventCode::DaemonStateWriteFailed,
-            path = crate::status::STATE_PATH,
+            path = %state_path.display(),
             %error,
             "could not write the runtime state snapshot"
         );
@@ -680,11 +685,13 @@ impl DnsHandle {
 /// exists to prevent.
 async fn report_plan(
     loaded: &daer_config::Config,
+    rule_providers: &std::sync::Arc<daer_routing::RuleProviderPool>,
     options: &RunOptions,
     lan: &[String],
     wan: &[String],
 ) -> anyhow::Result<()> {
-    let router_options = RouterOptions::for_config(&options.config);
+    let router_options = RouterOptions::for_config(&options.config)
+        .with_rule_providers(Some(std::sync::Arc::clone(rule_providers)));
     let object = resolve_object_path(&options.object);
     let object_arg = (!options.no_datapath).then_some(object.as_path());
 
@@ -704,16 +711,24 @@ async fn report_plan(
 
     // The tier is a performance property with a large blast radius (ADR-0005/ADR-0011), and
     // before this line it was only discoverable from a running daemon's log.
-    match preflight::deferral_reason(&plan) {
-        None => daer_observe::info!(
+    match preflight::kernel_tier(&plan) {
+        preflight::KernelTier::Equivalent => daer_observe::info!(
             daer_observe::EventCode::DryRunKernelEquivalent,
+            generation = %plan.generation.describe(),
             "kernel policy: equivalent — the datapath reproduces userspace's verdict for every flow"
         ),
-        Some(reason) => daer_observe::warn!(
+        preflight::KernelTier::Partitioned { reasons } => daer_observe::info!(
+            daer_observe::EventCode::DryRunKernelPartitioned,
+            generation = %plan.generation.describe(),
+            reasons = %reasons.join("; "),
+            "kernel policy: partitioned — prefix rules execute in the kernel; the deferral \
+             gate hands the suffix to the control plane"
+        ),
+        preflight::KernelTier::Deferred { reasons } => daer_observe::warn!(
             daer_observe::EventCode::DryRunKernelDeferral,
-            %reason,
-            "kernel policy: defer — every flow is handed to the control plane, so the kernel \
-             fast path is not used"
+            generation = %plan.generation.describe(),
+            reasons = %reasons.join("; "),
+            "kernel policy: full deferral — every flow is handed to the control plane"
         ),
     }
 

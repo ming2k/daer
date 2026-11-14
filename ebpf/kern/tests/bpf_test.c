@@ -87,9 +87,9 @@ setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
 		return DAER_TC_DROP;
 
 	__builtin_memset(ctx, 0, sizeof(*ctx));
-	ctx->key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	ctx->key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	ctx->key.sip.u6_addr32[3] = bpf_htonl(saddr);
-	ctx->key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	ctx->key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	ctx->key.dip.u6_addr32[3] = bpf_htonl(daddr);
 	ctx->key.sport = bpf_htons(sport);
 	ctx->key.dport = bpf_htons(dport);
@@ -214,7 +214,7 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 
 	// The packet generator below targets 198.51.100.20.
 	ip_key.slot = slot;
-	ip_key.addr[2] = bpf_htonl(0xffff);
+	ip_key.addr[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	ip_key.addr[3] = bpf_htonl(0xc6336414);
 	projection = bpf_map_lookup_elem(&test_domain_routing_scratch_map,
 					 &scratch_key);
@@ -267,9 +267,9 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 					  expected_outbound, 0, true))
 		return DAER_TC_DROP;
 
-	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(saddr);
-	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(daddr);
 	key.sport = bpf_htons(sport);
 	key.dport = bpf_htons(dport);
@@ -389,7 +389,7 @@ int testsetup_ipset_match(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 112, // */16
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0x64400000); // 100.64.0.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -433,7 +433,7 @@ int testsetup_ipset_mismatch(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 112, // */16
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0x64400000); // 100.64.0.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -477,7 +477,7 @@ int testsetup_source_ipset_match(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 120,
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0xc0a83200); // 192.168.50.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -521,7 +521,7 @@ int testsetup_source_ipset_mismatch(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 120,
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0xc0a83200); // 192.168.50.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -737,9 +737,9 @@ int testcheck_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb
 
 	if (check_redirect_non_syn_tcp(skb) != DAER_TC_PASS)
 		return DAER_TC_DROP;
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,1));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,9));
 	key.sport = bpf_htons(34567);
 	key.dport = bpf_htons(443);
@@ -833,9 +833,9 @@ int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 	if (check_redirect_with_listener_l4proto_and_track_ipv4(
 			skb, IPPROTO_UDP, 1) != DAER_TC_PASS)
 		return DAER_TC_DROP;
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,3));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,11));
 	key.sport = bpf_htons(34569);
 	key.dport = bpf_htons(443);
@@ -845,6 +845,59 @@ int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 		return DAER_TC_DROP;
 	}
 	return DAER_TC_PASS;
+}
+
+/* DHCPv4 broadcast: 0.0.0.0:68 -> 255.255.255.255:67.
+ *
+ * The routing fallback is a proxy, so without the link-local bypass this packet is
+ * redirected. That is exactly the incident shape: the deferral gate hands the DHCP
+ * request to userspace, where a connected UDP socket cannot broadcast, and the host's
+ * lease silently expires. The check requires TCX_NEXT with no mark. */
+SEC("classifier/pktgen/wan_egress_dhcpv4_broadcast_passthrough")
+int testpktgen_wan_egress_dhcpv4_broadcast_passthrough(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(skb,
+					       IPV4(0,0,0,0),
+					       IPV4(255,255,255,255),
+					       68, 67, 0);
+}
+
+SEC("classifier/setup/wan_egress_dhcpv4_broadcast_passthrough")
+int testsetup_wan_egress_dhcpv4_broadcast_passthrough(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return DAER_TC_PASS;
+}
+
+SEC("classifier/check/wan_egress_dhcpv4_broadcast_passthrough")
+int testcheck_wan_egress_dhcpv4_broadcast_passthrough(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, DAER_TC_CONTINUE, 0);
+}
+
+/* DHCPv6 client -> All_DHCP_Relay_Agents_and_Servers: [fe80::1]:546 -> [ff02::1:2]:547. */
+SEC("classifier/pktgen/wan_egress_dhcpv6_multicast_passthrough")
+int testpktgen_wan_egress_dhcpv6_multicast_passthrough(struct __sk_buff *skb)
+{
+	return set_ipv6_udp_fastpath_with_dscp(skb,
+					       0xfe800000, 0, 0, 1,
+					       0xff020000, 0, 0, 0x00010002,
+					       546, 547, 0);
+}
+
+SEC("classifier/setup/wan_egress_dhcpv6_multicast_passthrough")
+int testsetup_wan_egress_dhcpv6_multicast_passthrough(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return DAER_TC_PASS;
+}
+
+SEC("classifier/check/wan_egress_dhcpv6_multicast_passthrough")
+int testcheck_wan_egress_dhcpv6_multicast_passthrough(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, DAER_TC_CONTINUE, 0);
 }
 
 SEC("classifier/pktgen/wan_egress_udp_expired_state_recreates_handoff")
@@ -892,9 +945,9 @@ int testcheck_wan_egress_udp_expired_state_recreates_handoff(
 
 	if (check_redirect_with_listener_l4proto(skb, IPPROTO_UDP) != DAER_TC_PASS)
 		return DAER_TC_DROP;
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,11,3));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,12));
 	key.sport = bpf_htons(34570);
 	key.dport = bpf_htons(8443);
@@ -972,9 +1025,9 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	__u64 now, before, rerouted_before;
 
 	(void)skb;
-	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,2));
-	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,20,0,2));
 	key.sport = bpf_htons(41001);
 	key.dport = bpf_htons(443);
@@ -1209,9 +1262,9 @@ int testcheck_wan_udp_cached_outbound_survives_connectivity_change(
 	if (check_redirect_with_listener_l4proto_and_track_ipv4(
 			skb, IPPROTO_UDP, 1) != DAER_TC_PASS)
 		return DAER_TC_DROP;
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,6));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,20,0,6));
 	key.sport = bpf_htons(41005);
 	key.dport = bpf_htons(8443);
@@ -1754,9 +1807,9 @@ int testsetup_wan_egress_direct_mark_reroute(struct __sk_buff *skb)
 	__u32 mark = TPROXY_MARK;
 	__u8 must = 0;
 
-	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,0,1));
-	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,9));
 	key.sport = bpf_htons(24567);
 	key.dport = bpf_htons(80);
@@ -2273,7 +2326,7 @@ int testsetup_and_match_1(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 112, // */16
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0x01010000); // 1.1.0.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -2353,7 +2406,7 @@ int testsetup_and_match_2(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 112, // */16
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0x01010000); // 1.1.0.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -2433,7 +2486,7 @@ int testsetup_and_mismatch(struct __sk_buff *skb)
 	struct lpm_key lpm_key = {
 		.prefixlen = 112, // */16
 	};
-	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	lpm_key.data[3] = bpf_ntohl(0x01010000); // 1.1.0.0
 	__u32 lpm_value = bpf_ntohl(0x01000000);
 
@@ -2952,9 +3005,9 @@ static __always_inline void
 ab_redirect_key_ipv4(struct redirect_tuple *key, const struct tuples_key *five)
 {
 	__builtin_memset(key, 0, sizeof(*key));
-	key->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key->sip.u6_addr32[3] = five->sip.u6_addr32[3];
-	key->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key->dip.u6_addr32[3] = five->dip.u6_addr32[3];
 }
 
@@ -2975,9 +3028,9 @@ int test_ab_redirect_rebind_lock(struct __sk_buff *skb)
 	if (ab_build_ipv4(skb, IPPROTO_TCP, IPV4(192, 168, 0, 1),
 			  IPV4(8, 8, 8, 8), 0, TCP_HLEN, &ip, &l4))
 		return 1;
-	tuples.five.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.sip.u6_addr32[3] = ip->saddr;
-	tuples.five.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.dip.u6_addr32[3] = ip->daddr;
 	tuples.five.sport = bpf_htons(23456);
 	tuples.five.dport = bpf_htons(443);
@@ -3074,9 +3127,9 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 	struct conn_state *state;
 	__u64 before;
 
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 1));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 2));
 	key.sport = bpf_htons(40000);
 	key.dport = bpf_htons(80);
@@ -3139,9 +3192,9 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 static __always_inline void
 ab_rebind_key(struct tuples_key *key, __u16 sport)
 {
-	key->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key->sip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 1));
-	key->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key->dip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 2));
 	key->sport = bpf_htons(sport);
 	key->dport = bpf_htons(80);
@@ -3364,9 +3417,9 @@ int test_ab_redirect_reply_refresh_publisher(struct __sk_buff *skb)
 	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 0, 1), IPV4(8, 8, 8, 8),
 			      12345, 443, 5, TCPH_SYN, 0))
 		return 1;
-	tuples.five.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.sip.u6_addr32[3] = bpf_htonl(IPV4(192, 168, 0, 1));
-	tuples.five.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	tuples.five.dip.u6_addr32[3] = bpf_htonl(IPV4(8, 8, 8, 8));
 	tuples.five.sport = bpf_htons(12345);
 	tuples.five.dport = bpf_htons(443);
@@ -3530,9 +3583,9 @@ int test_ab_unsolicited_udp_wan_ingress(struct __sk_buff *skb)
 			      40000, 50000, 0))
 		return 1;
 	/* The key the WAN-ingress refresh would have written. */
-	reversed.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	reversed.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	reversed.sip.u6_addr32[3] = bpf_htonl(IPV4(192, 168, 1, 50));
-	reversed.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	reversed.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	reversed.dip.u6_addr32[3] = bpf_htonl(IPV4(203, 0, 113, 9));
 	reversed.sport = bpf_htons(50000);
 	reversed.dport = bpf_htons(40000);
@@ -3678,9 +3731,9 @@ int test_ab_udp_refresh_bypasses_routing_args(struct __sk_buff *skb)
 	__u32 mark = 0x12345678;
 	__u8 status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
 
-	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,40,1));
-	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[2] = bpf_htonl(DAER_IPV4_MAPPED_WORD);
 	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,40,0,1));
 	key.sport = bpf_htons(44001);
 	key.dport = bpf_htons(8443);

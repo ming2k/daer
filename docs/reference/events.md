@@ -36,7 +36,8 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `dryrun.report` | `info` | dry-run report | `stage` | — | — | — |
 | `dryrun.config_compiles` | `info` | configuration compiles | `generation`, `rules` | — | — | — |
 | `dryrun.kernel_equivalent` | `info` | kernel policy is equivalent | `generation` | — | — | — |
-| `dryrun.kernel_deferral` | `warn` | kernel policy is a deferral | `reasons` | `dryrun.kernel_deferral` | `dryrun.kernel_deferral` | Traffic is correct but the kernel fast path is not in effect; rewrite the named predicates or accept the userspace relay hop. |
+| `dryrun.kernel_deferral` | `warn` | kernel policy is a full deferral | `generation`, `reasons` | `dryrun.kernel_deferral` | `dryrun.kernel_deferral` | Every flow is handed to userspace; rewrite the named predicates or accept the relay hop. |
+| `dryrun.kernel_partitioned` | `info` | kernel policy is partitioned | `generation`, `reasons` | — | — | — |
 | `dryrun.listen` | `info` | would listen for redirected flows | `port`, `so_mark`, `namespace`, `generation` | — | — | — |
 | `dryrun.interfaces` | `info` | would attach to these interfaces | `lan`, `wan` | — | — | — |
 | `dryrun.host_sysctl_missing` | `warn` | host sysctl prerequisite is not met | `error` | `dryrun.host_sysctl_missing` | `dryrun.host_sysctl_missing` | Run `daer check --dry-run` on the host that will serve traffic; a real run would refuse to start. |
@@ -86,11 +87,11 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `flow.datagram_reaped` | `debug` | reaped idle datagram sessions | `reaped` | — | — | — |
 | `flow.datagram_ingress_failed` | `trace` | ingress datagram failed; continuing | `error` | — | — | — |
 | `flow.datagram_rejected` | `debug` | dropped a datagram that was not redirected | `flow_id`, `reject`, `reason` | — | — | — |
-| `flow.datagram_forward_failed` | `warn` | datagram forward failed | `flow_id`, `error` | `flow.datagram_forward_failed` | `flow.datagram_forward_failed` | The upstream leg failed; check the node and the UDP transport. |
-| `flow.datagram_refused` | `warn` | datagram flow refused | `flow_id`, `destination`, `error`, `error_code` | `flow.datagram_refused` | `flow.datagram_refused` | The election has no electable datagram-capable node; check the node and probe settings. |
-| `flow.datagram_session_failed` | `warn` | datagram session failed | `flow_id`, `destination`, `error` | `flow.datagram_session_failed` | `flow.datagram_session_failed` | The UDP session could not be opened; inspect the selected node. |
-| `flow.datagram_session_closed` | `debug` | datagram session closed | `flow_id`, `destination`, `error` | — | — | — |
-| `flow.datagram_reply_failed` | `warn` | datagram reply failed | `flow_id`, `destination`, `error` | `flow.datagram_reply_failed` | `flow.datagram_reply_failed` | The reply socket could not send to the client; check the ingress namespace and the reply socket mark. |
+| `flow.datagram_forward_failed` | `warn` | datagram forward failed | `flow_id`, `destination`, `error` | `flow.datagram_forward_failed` | `flow.datagram_forward_failed` | The upstream leg failed; check the node and the UDP transport. |
+| `flow.datagram_refused` | `warn` | datagram flow refused | `flow_id`, `source`, `destination`, `error`, `error_code` | `flow.datagram_refused` | `flow.datagram_refused` | The election has no electable datagram-capable node; check the node and probe settings. |
+| `flow.datagram_session_failed` | `warn` | datagram session failed | `flow_id`, `source`, `destination`, `error` | `flow.datagram_session_failed` | `flow.datagram_session_failed` | The UDP session could not be opened; inspect the selected node. |
+| `flow.datagram_session_closed` | `debug` | datagram session closed | `flow_id`, `source`, `destination`, `error` | — | — | — |
+| `flow.datagram_reply_failed` | `warn` | datagram reply failed | `flow_id`, `source`, `destination`, `error` | `flow.datagram_reply_failed` | `flow.datagram_reply_failed` | The reply socket could not send to the client; check the ingress namespace and the reply socket mark. |
 | `dns.request_routed` | `debug` | dns request routed | `query_id`, `peer`, `question`, `decision` | — | — | — |
 | `dns.answer_routed` | `debug` | dns answer routed | `query_id`, `peer`, `question`, `upstream`, `action`, `elapsed_ms`, `rcode` | — | — | — |
 | `dns.upstream_failed` | `warn` | dns upstream failed | `query_id`, `peer`, `question`, `upstream`, `transport`, `error`, `error_code`, `elapsed_ms` | `dns.upstream_failed` | `dns.upstream_failed` | Check the upstream address, transport and network; the query was answered with SERVFAIL. |
@@ -116,8 +117,9 @@ Run `cargo xtask events --check` to fail on catalog drift.
 | `health.node_unprobeable` | `debug` | node has no literal address; not probed | `election`, `node` | — | — | — |
 | `health.scheduler_stopped` | `info` | health scheduler stopped | — | — | — | — |
 | `health.probing_disabled` | `debug` | health probing disabled | `interval` | — | — | — |
-| `datapath.policy_published` | `info` | datapath policy published | `generation`, `slot`, `entries`, `trie_entries`, `policy_hash` | — | — | — |
-| `datapath.policy_deferred` | `warn` | datapath policy published as a deferral | `generation`, `slot`, `entries`, `reasons`, `policy_hash` | `datapath.policy_deferred` | `datapath.policy_deferred` | Traffic is correct but every flow is handed to userspace; rewrite the named predicates or accept the relay hop. |
+| `datapath.policy_published` | `info` | datapath policy published | `generation`, `slot`, `entries`, `trie_entries` | — | — | — |
+| `datapath.policy_deferred` | `warn` | datapath policy published as a full deferral | `generation`, `slot`, `entries`, `reasons` | `datapath.policy_deferred` | `datapath.policy_deferred` | Every flow is handed to userspace. Rewrite the named predicates or accept the relay hop. |
+| `datapath.policy_partitioned` | `info` | datapath policy published as a partition | `generation`, `slot`, `entries`, `reasons` | — | — | — |
 | `datapath.republish_failed` | `error` | republishing kernel policy failed | `generation`, `error` | `datapath.republish_failed` | `datapath.republish_failed` | The kernel keeps the previous slot; inspect the object and `daer status` before the next reload. |
 | `datapath.object_missing` | `error` | cannot reach the datapath object | `reason`, `path` | `datapath.object_missing` | `datapath.object_missing` | Run `cargo xtask ebpf` or install the packaged datapath object at the configured path. |
 | `datapath.cleanup_failed` | `warn` | datapath cleanup failed | `error` | `datapath.cleanup_failed` | `datapath.cleanup_failed` | The ingress namespace is private; stopping the process releases it. Inspect the namespace with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list` while the process lives. |
