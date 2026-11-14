@@ -35,16 +35,13 @@
 //! # Environment gating
 //!
 //! The test skips with an explicit reason when the host cannot create network namespaces or
-//! lacks `nft`. `scripts/verify/e2e-check.sh` runs it privileged and
-//! `DAER_REQUIRE=3-udp4` makes a skip a CI failure. A capability is a skip; a failure after
-//! the probe is a real test failure, not a skip.
+//! lacks `nft`. The privileged CI job runs the same `e2e` binary as root and fails on a
+//! `skipped: ` line. A capability is a skip; a failure after the probe is a real test failure,
+//! not a skip.
 //!
-//! For a disposable local run:
-//!
-//! ```sh
-//! unshare -Urnm sh -c 'mount -t tmpfs tmpfs /run/netns; \
-//!   cargo test -p daer-control --test transparent_udp4 -- --nocapture'
-//! ```
+//! For a disposable local run, use the privileged ingress command in
+//! [Testing §5](../../../docs/dev/testing.md#5-ignored-tests-and-privileged-gates) and
+//! select the `control_transparent_udp4` module.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};

@@ -137,3 +137,7 @@ half of this ADR:
 - A fixture whose origin accepted datagrams and never replied made three attempts to prove UDP
   fail. The product was fine; the fixture was mute. That is the negative-control lesson again,
   one layer down.
+
+> Implementation note (2026-11-14): the runner scripts named in this record were removed. The
+> tests still live in `tests/e2e/`; privileged CI jobs run the `e2e` binary directly and fail
+> on a `skipped: ` line. See the amendment in [ADR-0052](0052-layered-test-architecture.md).

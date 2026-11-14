@@ -1044,32 +1044,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Connection<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A socket write may accept a prefix, so an unfinished frame is retained and
-        // finished before any new frame is produced. Without this a partial write would
-        // silently truncate a record and corrupt the stream.
-        if self.awaiting_write.is_empty() {
-            let take = buf.len().min(super::record::MAX_PLAINTEXT);
-            match self.layer.frame(ContentType::ApplicationData, &buf[..take]) {
-                Ok(framed) => {
-                    self.awaiting_write = framed;
-                    self.written = 0;
-                }
-                Err(error) => return Poll::Ready(Err(std::io::Error::other(error))),
+        // A socket write may accept a prefix or return Pending, so an unfinished frame is
+        // drained before any new plaintext is accepted. Once `buf[..take]` is framed into
+        // `awaiting_write`, `take` bytes of caller plaintext are consumed even if the socket
+        // goes Pending mid-frame; otherwise returning Pending after buffering and Ok(0) on the
+        // next poll triggers `WriteZero` in `copy_bidirectional`.
+        if !self.awaiting_write.is_empty() {
+            match self.drive_write(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
             }
-            // The caller's plaintext is consumed once the frame exists; how much of the
-            // frame the socket took is our problem, not theirs.
-            let plaintext_len = take;
-            return self.drive_write(cx, plaintext_len);
         }
-        let plaintext_len = 0;
-        self.drive_write(cx, plaintext_len)
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let take = buf.len().min(super::record::MAX_PLAINTEXT);
+        match self.layer.frame(ContentType::ApplicationData, &buf[..take]) {
+            Ok(framed) => {
+                self.awaiting_write = framed;
+                self.written = 0;
+            }
+            Err(error) => return Poll::Ready(Err(std::io::Error::other(error))),
+        }
+
+        match self.drive_write(cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(take)),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.awaiting_write.is_empty() {
-            match self.drive_write(cx, 0) {
+            match self.drive_write(cx) {
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(())) => {}
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -1078,9 +1088,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Connection<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.awaiting_write.is_empty() {
-            match self.drive_write(cx, 0) {
+            match self.drive_write(cx) {
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(())) => {}
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -1090,17 +1100,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Connection<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Connection<S> {
     /// Pushes the retained frame into the socket until it is gone.
-    ///
-    /// Reports `plaintext_len` to the caller, which is the number of *its* bytes that were
-    /// accepted — not the number of framed bytes written.
-    fn drive_write(
-        &mut self,
-        cx: &mut Context<'_>,
-        plaintext_len: usize,
-    ) -> Poll<std::io::Result<usize>> {
+    fn drive_write(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         while self.written < self.awaiting_write.len() {
-            let mut write_buf = ReadBuf::new(&mut []);
-            let _ = &mut write_buf;
             match Pin::new(&mut self.io).poll_write(cx, &self.awaiting_write[self.written..]) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -1115,7 +1116,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Connection<S> {
         }
         self.awaiting_write.clear();
         self.written = 0;
-        Poll::Ready(Ok(plaintext_len))
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1434,5 +1435,90 @@ mod tests {
             .expect("read must not fail");
         assert_eq!(read, 0, "an empty record carries no data");
         assert!(got.is_empty(), "no bytes may be invented");
+    }
+
+    /// A sink that returns `Pending` every second write and accepts at most 7 bytes per write.
+    struct BackpressureSink {
+        written: Vec<u8>,
+        pending_next: bool,
+    }
+
+    impl AsyncRead for BackpressureSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for BackpressureSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.pending_next {
+                self.pending_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.pending_next = true;
+            let take = buf.len().min(7);
+            self.written.extend_from_slice(&buf[..take]);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_write_under_backpressure_never_returns_write_zero() {
+        let sink = BackpressureSink {
+            written: Vec::new(),
+            pending_next: true,
+        };
+        let key = [0x5au8; 32];
+        let iv = [0x3cu8; 12];
+        let mut peer = RecordLayer::new();
+        peer.read_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("read key"));
+
+        let mut conn = Tls13Connection {
+            io: sink,
+            layer: RecordLayer::new(),
+            reading: Reading::Header {
+                filled: 0,
+                bytes: [0u8; RecordHeader::LEN],
+            },
+            awaiting_write: Vec::new(),
+            written: 0,
+            raw_read: Arc::new(AtomicBool::new(false)),
+        };
+        conn.layer.write_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("write key"));
+
+        let payload = b"GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        tokio::io::AsyncWriteExt::write_all(&mut conn, payload)
+            .await
+            .expect("write_all must not fail with WriteZero when underlying sink returns Pending");
+        tokio::io::AsyncWriteExt::flush(&mut conn)
+            .await
+            .expect("flush must drain the buffered TLS record");
+
+        // Negative control: verify the full record actually reached the sink and decrypts intact.
+        let header = RecordHeader::parse(&conn.io.written[..RecordHeader::LEN]).expect("header");
+        let body =
+            &conn.io.written[RecordHeader::LEN..RecordHeader::LEN + usize::from(header.length)];
+        let (ct, plaintext) = peer
+            .unframe(&header, body)
+            .expect("complete TLS record must be present and valid");
+        assert_eq!(ct, ContentType::ApplicationData);
+        assert_eq!(plaintext, payload);
     }
 }

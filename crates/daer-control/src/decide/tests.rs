@@ -458,3 +458,106 @@ fn a_broken_detour_fails_the_generation_instead_of_dropping_the_node() {
         .expect_err("an explicitly named missing hop is not an unselectable leaf");
     assert!(error.to_string().contains("missing"), "{error}");
 }
+
+#[tokio::test]
+async fn direct_unwraps_fake_ip_to_real_upstream_address_and_preserves_literal_ips() {
+    #[derive(Debug)]
+    struct StaticUpstream(std::net::Ipv4Addr);
+
+    impl daer_dns::Upstream for StaticUpstream {
+        fn exchange<'a>(&'a self, query: &'a daer_dns::Message) -> daer_dns::ExchangeFuture<'a> {
+            let mut reply = daer_dns::Message::reply_to(query, daer_dns::ResponseCode::NOERROR);
+            if let Some(question) = query.questions.first() {
+                reply.answers.push(daer_dns::Record {
+                    name: question.name.clone(),
+                    rtype: daer_dns::RecordType::A,
+                    class: question.qclass,
+                    ttl: 60,
+                    rdata: self.0.octets().to_vec(),
+                });
+            }
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+
+    let config = daer_config::toml_config::load_str(
+        r#"
+schema = 6
+
+[dns]
+bind = "127.0.0.1"
+upstream = ["cn:udp://223.5.5.5:53"]
+
+[dns.fake-ip]
+enabled = true
+inet = "198.18.0.0/15"
+
+[dns.request]
+rules = []
+default = "cn"
+
+[dns.response]
+rules = []
+default = "accept"
+
+[routing]
+default = "direct"
+"#,
+    )
+    .expect("parses");
+
+    let real_ip: std::net::Ipv4Addr = "220.181.38.148".parse().expect("real ip");
+    let resolver = Arc::new(
+        daer_dns::Resolver::new(
+            &config,
+            [(
+                "cn".to_owned(),
+                Arc::new(StaticUpstream(real_ip)) as Arc<dyn daer_dns::Upstream>,
+            )],
+        )
+        .expect("resolver builds"),
+    );
+    let options = RouterOptions::default()
+        .with_fake_ip(Some(Arc::clone(resolver.fake_ip())))
+        .with_dns_snooper(Some(Arc::clone(resolver.snooper())))
+        .with_dns_resolver(Some(Arc::clone(&resolver)));
+    let router = Router::new(&config, GenerationId::new(1), &options).expect("router builds");
+
+    let fake_ip = resolver.fake_ip().allocate("www.baidu.com");
+    let fake_dest = SocketAddr::new(std::net::IpAddr::V4(fake_ip), 443);
+
+    // 1. Fake-IP + domain -> resolves to real upstream IP (never dials 198.18.x.x).
+    let resolved = router
+        .resolve_direct_destination(
+            daer_observe::FlowId::new(1),
+            fake_dest,
+            Some("www.baidu.com"),
+            Some(DomainSource::FakeIp),
+        )
+        .await
+        .expect("fake-ip unwraps to real ip");
+    assert_eq!(
+        resolved,
+        SocketAddr::new(std::net::IpAddr::V4(real_ip), 443)
+    );
+
+    // 2. Real IP (e.g. DnsSnooper / Sniff) -> preserved literally without re-resolving.
+    let literal_dest: SocketAddr = "1.2.3.4:443".parse().expect("literal");
+    let preserved = router
+        .resolve_direct_destination(
+            daer_observe::FlowId::new(2),
+            literal_dest,
+            Some("www.baidu.com"),
+            Some(DomainSource::DnsSnooper),
+        )
+        .await
+        .expect("literal ip preserved");
+    assert_eq!(preserved, literal_dest);
+
+    // 3. Negative control: Fake-IP with no domain mapping fails fast instead of dialing 198.18.x.x.
+    let err = router
+        .resolve_direct_destination(daer_observe::FlowId::new(3), fake_dest, None, None)
+        .await
+        .expect_err("fake-ip without domain must fail");
+    assert!(err.to_string().contains("no domain mapping"), "{err}");
+}

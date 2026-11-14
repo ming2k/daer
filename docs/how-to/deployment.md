@@ -56,20 +56,23 @@ cargo xtask ebpf           # -> target/ebpf/datapath.bpf.o  (needs clang + a vml
 cargo build --release      # -> target/release/{daer,daer-drb}
 ```
 
-To install the built artifacts and the unit under `/usr`:
+To build and install the artifacts and the unit under `/usr`:
 
 ```sh
-cargo xtask install                      # /usr/bin, /usr/lib/daer, /usr/lib/systemd/system
-cargo xtask install --prefix /usr/local  # unit paths follow the prefix
-cargo xtask install --destdir /tmp/pkg   # stage a package tree
+scripts/install.sh
 ```
 
-`cargo xtask install` installs the exact set the unit names; it does not write
-`/etc/daer/config.toml`, enable the unit, or start it. It runs as the
-invoking user, so writing `/usr` needs the permissions to do so. Use
-`scripts/ops/daer-install-netns.sh --config <path>` for those activation steps: it stages
-with `cargo xtask install` and uses `sudo` only for the copy and the service restart. The
-script is not a second artifact list; `xtask` remains the SSOT for what gets installed.
+Run it as your normal user. It builds the release binaries and the datapath object, stages
+the install tree as you, then uses `sudo` only to install each staged file, remove the two
+legacy paths and run `systemctl daemon-reload`. `cargo xtask install` remains the single
+definition of the
+installed file set; the script invokes it and does not restate the list. Use
+`cargo xtask install --prefix /usr/local` or `--destdir /tmp/pkg` directly for a non-default
+prefix or a staged package tree.
+
+The script does not write `/etc/daer/config.toml` or start the daemon. Install a
+configuration, then start it with `sudo systemctl start daer` (or `restart` if it is already
+running).
 
 The package plan (`packaging/daer.plan.toml`) calls `cargo xtask install` for the same
 reason, then adds only distribution files such as the example configuration and JSON schema.
@@ -213,25 +216,75 @@ before draining, so `systemctl status` shows the real lifecycle rather than `act
 proxy that has not finished starting. A reload that fails to build publishes nothing, so a
 typo cannot stop a working proxy.
 
-## The DNS server, and when it starts
+## The DNS resolver, transparent interception, and `dns.bind`
 
 `daer run` builds the resolver, its Fake-IP pool, and its DNS snooper **always**, because they
 are the contract between the DNS half and the data path: the resolver writes a name-to-address
 mapping and the router reads it back.
 
-It *listens* only when the configuration asks for it:
-
-| Configuration | DNS listener |
+| Configuration | DNS behaviour |
 | --- | --- |
-| `dns.bind` set | started on that address (port 53) |
-| `[dns.fake-ip] enabled = true` without `dns.bind` | **load error**; Fake-IP is an answer mode, not a listener |
-| `dns.bind` unset | **not** started; the daemon logs at `INFO` that it is not the box's resolver |
+| `dns.upstream` set (`intercept` unset or `true`) | **transparent interception** active on `:53` UDP/TCP flows; no `/etc/resolv.conf` edit needed |
+| `dns.bind` set | additionally starts an explicit UDP/TCP `:53` listener on that address |
+| `dns.intercept = false` without `dns.bind` | DNS ingress inactive; `:53` flows route as ordinary traffic |
+| `[dns.fake-ip] enabled = true` without active DNS ingress | **load error**; Fake-IP is an answer mode, not a standalone ingress |
 
-Binding `0.0.0.0:53` unconditionally would be a regression, not a convenience: a box already
-running `systemd-resolved` would see `daer run` fail with `EADDRINUSE`, and a box that does not
-want daer as its resolver would have one installed anyway. Fake-IP does not imply a listener:
-the synthetic address is useless unless the operator chooses the interface and port that hand
-it to clients.
+With transparent interception active (the default whenever `[dns].upstream` is declared),
+non-`must` `:53` queries leaving the host or arriving from the LAN are answered in-process by
+`daer-dns` without modifying `/etc/resolv.conf` or conflicting with `systemd-resolved`. Queries
+matching `asis` in `[dns.request]` fall through to the client's original destination resolver.
+When `daer` stops, the eBPF hooks detach and normal host DNS resolution resumes immediately.
+
+### Optional: pointing the host at an explicit `dns.bind` listener
+
+If your host sends DNS queries to `127.0.0.1:53` (loopback traffic does not traverse
+`wan-interface` eBPF) or you want LAN clients to query `daer` explicitly, set `dns.bind` and
+point the host resolver at it:
+
+Make the host resolver forward to daer. If `/etc/resolv.conf` is a static file, point it at
+the listener directly:
+
+```sh
+sudo cp -a /etc/resolv.conf /etc/resolv.conf.bak
+sudo tee /etc/resolv.conf >/dev/null <<'EOF'
+nameserver 127.0.0.1
+options edns0 trust-ad
+EOF
+```
+
+With `systemd-resolved` (daer binds `127.0.0.1:53`, the resolved stub is on `127.0.0.53:53`,
+so both can coexist), configure the global resolver:
+
+```sh
+sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo tee /etc/systemd/resolved.conf.d/daer.conf >/dev/null <<'EOF'
+[Resolve]
+DNS=127.0.0.1
+Domains=~.
+EOF
+sudo systemctl restart systemd-resolved
+resolvectl flush-caches
+```
+
+`systemd-resolved` prefers a link's DHCP-provided DNS server over the global one. If
+`resolvectl dns` still shows the uplink's old server, override it for that link (or set
+`ipv4.ignore-auto-dns yes` and `ipv4.dns 127.0.0.1` in the network manager):
+
+```sh
+resolvectl dns wlan0 127.0.0.1
+resolvectl flush-caches
+```
+
+Then a proxied name must resolve to a Fake-IP address, not to a forged one:
+
+```sh
+resolvectl query www.google.com     # expected: 198.18.0.0/15
+getent hosts www.google.com         # the glibc path most applications use
+daer probe node 66-la --url https://www.google.com
+```
+
+Keep the resolver reachable only from this host (`dns.bind = "127.0.0.1"`); a LAN gateway
+must bind its LAN address and set `lan-interface` instead.
 
 ## The socket mark is internal
 
@@ -469,7 +522,7 @@ tighten artifacts created by an older build.
 A pre-TCX install may have `/run/daer/restore` (or a versioned recovery journal) and a host
 `clsact` filter/table-2023 rule. Current daer does not replay that journal or adopt the host
 state. Stop the old service and let its `daer-cleanup` finish, or remove the old qdisc/filter
-explicitly, before installing 0.0.15. The installer removes the old helper and object so they
+explicitly, before installing 0.1.0. The installer removes the old helper and object so they
 cannot be invoked by the wrong unit; it does not guess whether old host state is safe to
 delete.
 
@@ -509,6 +562,13 @@ and read-only (ADR-0041, ADR-0047). The daemon persists overrides to
 without dropping a connection. A runtime `daer elect` does not reload the configuration; it
 only changes the named election's current choice.
 
+A restart can briefly overlap with the previous run's teardown: deleting the private namespace
+and unregistering its veth pair are separate kernel operations. `daer` waits up to 10 seconds
+for the old `daer0` to disappear before it reports a conflict, so `systemctl restart` does not
+turn that window into a start-limit failure. If the same error persists past the wait, another
+daemon is running or the names exist for a reason outside daer; stop it or remove the link
+explicitly.
+
 The unit does **not** run `daer check` as an `ExecStartPre=`. `daer run` performs the same
 `load_resolved` validation before it binds a socket or mutates kernel state, and `Type=notify`
 makes systemd wait for the daemon's `READY=1`. A separate check would repeat every subscription
@@ -521,29 +581,24 @@ before a manual edit; it is still the command that answers "will this configurat
 Three gates, three questions. They are separate because a failure in one must not be readable
 as a failure in the other:
 
-| Script | Question | Depends on |
+| Command | Question | Depends on |
 | --- | --- | --- |
-| `sudo ./scripts/verify/kernel-check.sh` | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
-| `sudo ./scripts/verify/e2e-check.sh` | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
-| `sudo ./scripts/ops/daer-delivery-check.sh --config <site.toml>` | does the real daemon deliver through TCX, and does `SIGKILL` release the host state? | a clean test host, a real node, `root` |
+| privileged `e2e` kernel filters (`ebpf_kernel::*`, `ebpf_datapath::*`) | does the eBPF object load and behave? | `daer-ebpf` + `clang` |
+| privileged `e2e` ingress filters (`control_transparent*`, `control_netns_lifecycle`, `cli_reload`) | does a redirected flow reach the daemon and come back? | `daer-control`, `daer-cli`, the relay, nftables |
+| `sudo ./scripts/delivery-check.sh --config <site.toml>` | does the real daemon deliver through TCX, and does `SIGKILL` release the host state? | a clean test host, a real node, `root` |
 
-The delivery check changes host networking and needs a site-specific config on a clean,
-disposable test host. Do not run it on a production machine.
+The exact privileged commands are in
+[Testing §5](../dev/testing.md#5-ignored-tests-and-privileged-gates). The delivery check
+changes host networking and needs a site-specific config on a clean, disposable test host. Do
+not run it on a production machine.
 
-Run the kernel one before `daer run` on a new machine:
-
-```sh
-sudo ./scripts/verify/kernel-check.sh
-```
-
-The steps that matter are 4 and 7:
+Run the kernel one before `daer run` on a new machine; it must print no `skipped: ` line.
 
 ```text
-4. loading the object (this runs the verifier)
-  ok   the object loaded and passed the verifier
-
-7. the in-kernel datapath cases (BPF_PROG_TEST_RUN)
-  ok   every in-kernel datapath case passed
+the object loaded and passed the verifier
+a TCX program attached to lo
+the six pname cgroup hooks attached to cgroup v2
+every in-kernel datapath case passed
 ```
 
 Step 7 runs the self-checking BPF programs (`pktgen`/`setup`/`check` triples from

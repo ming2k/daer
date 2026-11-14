@@ -219,8 +219,8 @@ pub fn privileged_blocker(capabilities: Capabilities) -> Option<String> {
     }
     Some(format!(
         "the kernel datapath cannot be attached here: {} not in the effective capability set \
-         (this is the privilege boundary, not a defect — run `sudo ./scripts/verify/kernel-check.sh` \
-         or `sudo daer run` on a machine with them)",
+         (this is the privilege boundary, not a defect — run the privileged `e2e` tests or \
+         `sudo daer run` on a machine with them)",
         missing.join(" and ")
     ))
 }

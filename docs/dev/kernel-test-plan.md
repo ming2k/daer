@@ -7,8 +7,8 @@ no `CAP_NET_ADMIN`:
 2. that the full path works — a packet redirected by the datapath reaching the listener, being
    decided, and coming back.
 
-`scripts/verify/kernel-check.sh` covers (1) and the attach mechanics. (2) is what the steps
-below do on a real box. Everything that *can* be verified without privilege is, and is written
+The privileged `tests/e2e/ebpf_kernel.rs` and `tests/e2e/ebpf_datapath.rs` cases cover (1) and
+the attach mechanics. (2) is what the steps below do on a real box. Everything that *can* be verified without privilege is, and is written
 to fail when it is wrong: the kernel policy table against the userspace evaluator
 (`tests/integration/routing_kernel_policy.rs`), the ABI against the compiled object, and the
 transparent path with a real `nftables tproxy` rule plus a negative control
@@ -37,32 +37,34 @@ Needs `clang`, `bpftool`, `ip`, and `go` (only for the optional `docs/how-to/vis
 ## Step 1 — does the object load?
 
 ```sh
-./scripts/verify/kernel-check.sh          # it re-execs itself under sudo
+cargo xtask ebpf --tests
+cargo test -p daer-tests --test e2e --no-run
+sudo "$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+  -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)" \
+  --include-ignored --nocapture --test-threads=1 \
+  ebpf_kernel::the_object_loads_and_verifies \
+  ebpf_kernel::a_tcx_program_attaches_to_loopback \
+  ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy \
+  ebpf_datapath::every_datapath_case_passes
 ```
 
-Run it **without** `sudo`: `cargo` and `rustup` usually live in your home, and `sudo cargo`
-does not find them. The script builds the test binaries as you and puts `sudo` only around
-the binaries, which is the split that works. Logs go to `~/daer-kernel-check/` (or
-`$DAER_LOG_DIR`), never to a `/tmp` file that may be owned by someone else.
+The test binary is built as you, so `cargo` and `rustup` stay findable; only the binary runs
+under `sudo`. A `skipped: ` line means the privilege or fixture prerequisite was missing, and
+is not coverage.
 
 Expected:
 
 ```text
-3. loading the object into the kernel (this runs the verifier)
-  ok  the object loaded and passed the verifier
-       loaded 22 maps
-       loaded 16 programs
-4. attaching a TCX link to a real interface
-  ok  a TCX program attached to lo
-5a. attaching the pname cgroup hooks
-  ok  the six pname cgroup hooks attached to cgroup v2
+loaded 22 maps
+loaded 16 programs
+attached TCX as link id ...
+cgroup hooks attached to ...
+every in-kernel datapath case passed
 ```
 
-**Send me this output either way.** If step 3 fails, the log at
-`~/daer-kernel-check/load.log` (or `$DAER_LOG_DIR/load.log`) names the map or the struct
-offset and that tells me exactly what to change. This is the
-first time this object will meet a real verifier, so a failure here is expected information,
-not a surprise.
+**Send me this output either way.** If loading fails, the verifier output names the map or the
+struct offset and that tells me exactly what to change. This is the first time this object
+will meet a real verifier, so a failure here is expected information, not a surprise.
 
 ## Step 2 — a config that proxies to your REALITY node
 
@@ -245,7 +247,7 @@ Any of these, whichever is the first thing that does not match:
 
 | Symptom | Send |
 | --- | --- |
-| step 1 fails | the whole `kernel-check.sh` output + `~/daer-kernel-check/load.log` |
+| step 1 fails | the whole privileged `ebpf_kernel`/`ebpf_datapath` test output |
 | step 3 exits | `/tmp/daer-run.log` |
 | step 5 times out | `/tmp/daer-run.log` with `log-level = "debug"`, plus `nft list ruleset` |
 | step 5 reaches the wrong egress IP | `daer route --why` for the same flow, plus the log |
@@ -257,8 +259,9 @@ Not bugs to chase — known gaps, so a test does not get spent on them:
 * **UDP datagrams are proven through `tproxy` only by the privileged two-namespace tests.**
   `tests/e2e/control_transparent_udp4.rs` and `tests/e2e/control_transparent_udp6.rs` build real client/origin
   namespaces; a single-namespace fixture is invalid because `TPROXY` matches on the ingress
-  interface. The unprivileged workspace suite still skips the UDP end-to-end cases, so use
-  `scripts/verify/e2e-check.sh` (or the CI `3-udp4`/`3-udp6` gates) before claiming UDP coverage.
+  interface. The unprivileged workspace suite still skips the UDP end-to-end cases, so run
+  the privileged ingress `e2e` filters in [Testing §5](testing.md#5-ignored-tests-and-privileged-gates)
+  before claiming UDP coverage.
 * **vmess / plain vless / anytls / hysteria2 / tuic** are not implemented. Only
   `vless + REALITY + Vision`, `trojan`, `shadowsocks` and `socks5`/`http` dial.
 * **A `domain(...)` or `pname(...)` rule puts every flow on the userspace path.** The kernel

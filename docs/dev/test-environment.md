@@ -271,12 +271,12 @@ and the test fixture rules separate.
 
 ```bash
 # Non-root checks: kernel, tools, artifacts, config, object.
-scripts/ops/daer-delivery-check.sh \
+scripts/delivery-check.sh \
   --config target/daer-us101-e2e.toml \
   --preflight
 
 # Real delivery + SIGKILL lifecycle check.
-sudo scripts/ops/daer-delivery-check.sh \
+sudo scripts/delivery-check.sh \
   --config target/daer-us101-e2e.toml
 ```
 

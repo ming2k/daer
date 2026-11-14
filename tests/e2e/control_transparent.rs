@@ -21,9 +21,9 @@
 //! # Why it installs its own redirect
 //!
 //! `tproxy` needs `nftables` and `CAP_NET_ADMIN`. Both are available inside
-//! `unshare -Urn`, which is what the module's own invocation uses. When neither is available the
-//! test **skips with a reason**, and `scripts/verify/kernel-check.sh` is what runs it in CI — an
-//! ignored test nobody runs is how the vacuous version survived.
+//! `unshare -Urn`, which is what the module's own invocation uses. When neither is available
+//! the test **skips with a reason**; the privileged CI job runs the same `e2e` binary as root
+//! and fails on that line. An ignored test nobody runs is how the vacuous version survived.
 
 use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -578,6 +578,11 @@ async fn request_at(address: SocketAddr) -> std::io::Result<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_redirected_flow_is_proxied_by_the_daemon() {
     let _fixture = Fixture::acquire();
+    // A fresh `unshare -Urn` namespace starts with `lo` down. The origin is on
+    // `127.0.0.1`, so bring the loopback up before binding; on a normal host this is a no-op.
+    let _ = Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
     let config = direct_config();
     // The same mark the redirect rule excludes. Without it daer's own dial to the origin is
     // captured by its own tproxy rule and the flow loops (see `RouterOptions::so_mark`).

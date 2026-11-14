@@ -166,11 +166,31 @@ fn dns_defaults_are_populated() {
 }
 
 #[test]
-fn fake_ip_requires_an_explicit_dns_bind() {
+fn fake_ip_without_active_ingress_or_upstream_is_rejected() {
     let error =
-        crate::toml_config::load_str("[dns.fake-ip]\nenabled = true\n").expect_err("must fail");
+        crate::toml_config::load_str("[dns]\nintercept = false\n[dns.fake-ip]\nenabled = true\n")
+            .expect_err("must fail");
     let message = error.to_string();
     assert!(message.contains("dns.fake-ip.enabled"), "{message}");
+
+    let error = crate::toml_config::load_str("[dns.fake-ip]\nenabled = true\n")
+        .expect_err("must fail without upstream");
+    let message = error.to_string();
+    assert!(message.contains("dns.upstream"), "{message}");
+
+    let config = crate::toml_config::load_str(
+        "[dns]\nupstream = [\"local:udp://223.5.5.5:53\"]\n[dns.fake-ip]\nenabled = true\n",
+    )
+    .expect("fake-ip with upstream works via transparent interception without bind");
+    assert!(config.dns.effective_intercept());
+    assert!(config.dns.is_active());
+}
+
+#[test]
+fn dns_intercept_explicit_true_requires_an_upstream() {
+    let error = crate::toml_config::load_str("[dns]\nintercept = true\n").expect_err("must fail");
+    let message = error.to_string();
+    assert!(message.contains("dns.upstream"), "{message}");
 }
 
 #[test]

@@ -145,6 +145,13 @@
             "type": "string"
           }
         },
+        "intercept": {
+          "description": "Transparently intercept `:53` UDP and TCP flows into the built-in DNS resolver.\n\nWhen omitted (`None`), interception is active whenever `upstream` is non-empty or\nFake-IP is enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "ipversion-prefer": {
           "description": "Preferred IP family for DNS answers (`\"any\"`, `\"ipv4\"`, or `\"ipv6\"`).",
           "$ref": "#/$defs/IpVersionPrefer",

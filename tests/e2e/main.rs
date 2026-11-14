@@ -3,9 +3,10 @@
 //! Privileged end-to-end tests: a real daemon, a real redirect, the real kernel.
 //!
 //! Every module here skips with a reason when the host cannot supply the capability it needs.
-//! CI turns a skip into a failure with `DAER_REQUIRE`; `scripts/verify/*.sh` own that contract.
-//! Keeping them in one binary means one link step for the layer; the tests that must not run
-//! concurrently are serialised by the nextest `e2e` test group.
+//! The privileged CI jobs run this binary as root and fail on a `skipped: ` line, because a
+//! suite that skips is not coverage (ADR-0007). Keeping every case in one binary means one
+//! link step for the layer; tests that must not run concurrently use `--test-threads=1` in
+//! those jobs or the nextest `e2e` test group.
 
 #[path = "../common/mod.rs"]
 mod common;

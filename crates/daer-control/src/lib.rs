@@ -69,6 +69,7 @@
 pub mod daemon;
 pub mod datapath;
 pub mod decide;
+pub mod dns_intercept;
 pub mod domain;
 pub mod election;
 pub mod generation;

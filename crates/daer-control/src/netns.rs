@@ -181,11 +181,65 @@ fn format_mac(mac: [u8; 6]) -> String {
         .join(":")
 }
 
+const DAEMON_LOCK_PATH: &str = "/run/daer/daer.lock";
+
+/// Exclusive non-blocking process lock proving this process is the sole `daer` daemon.
+#[derive(Debug)]
+pub(crate) struct DaemonLock {
+    _file: File,
+}
+
+impl DaemonLock {
+    fn acquire() -> Result<Self, DatapathError> {
+        Self::acquire_at(Path::new(DAEMON_LOCK_PATH))
+    }
+
+    fn acquire_at(path: &Path) -> Result<Self, DatapathError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                DatapathError::Device(format!(
+                    "cannot create daemon lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| {
+                DatapathError::Device(format!(
+                    "cannot open daemon lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        // SAFETY: `file.as_raw_fd()` is a live descriptor owned by `file`.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Err(DatapathError::Device(format!(
+                    "another daer daemon is already running (lock held on {})",
+                    path.display()
+                )));
+            }
+            return Err(DatapathError::Device(format!(
+                "cannot lock {}: {err}",
+                path.display()
+            )));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// A named network namespace owned by this daemon.
 #[derive(Debug)]
 pub struct IngressNamespace {
     name: String,
     path: PathBuf,
+    _lock: DaemonLock,
 }
 
 impl IngressNamespace {
@@ -200,6 +254,7 @@ impl IngressNamespace {
     /// Returns [`DatapathError::Device`] with the failing `ip` command when the namespace
     /// cannot be created, or when its loopback cannot be brought up.
     pub fn create() -> Result<Self, DatapathError> {
+        let lock = DaemonLock::acquire()?;
         // The namespace mount has to be private before `ip netns add` creates it. `main`
         // does this before the runtime starts; the call here covers the privileged test and
         // any caller that reaches the guard without going through `main`.
@@ -240,6 +295,7 @@ impl IngressNamespace {
         let namespace = Self {
             name: INGRESS_NETNS.to_owned(),
             path: namespace_path(INGRESS_NETNS),
+            _lock: lock,
         };
         namespace.link_up("lo")?;
         Ok(namespace)
@@ -475,6 +531,7 @@ pub(crate) fn remove_ingress_namespace() {
 
 impl Drop for IngressNamespace {
     fn drop(&mut self) {
+        datapath::delete_device_if_exists(datapath::DEVICE);
         remove_ingress_namespace();
     }
 }
@@ -547,5 +604,19 @@ mod tests {
             format_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
             "02:00:00:00:00:01"
         );
+    }
+
+    #[test]
+    fn daemon_lock_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("daer-lock-test-{}", std::process::id()));
+        let lock_path = dir.join("daer.lock");
+        let first = DaemonLock::acquire_at(&lock_path).expect("first lock succeeds");
+        let err = DaemonLock::acquire_at(&lock_path).expect_err("second lock must fail");
+        assert!(err.to_string().contains("already running"), "{err}");
+        drop(first);
+        let reacquired =
+            DaemonLock::acquire_at(&lock_path).expect("lock succeeds after first is dropped");
+        drop(reacquired);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

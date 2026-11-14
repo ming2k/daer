@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-11-14
+
+The first release candidate for staging deployment. The unprivileged contract and the
+userspace ingress path are green; the target-host kernel, delivery and soak gates in
+[Production Readiness](docs/dev/production-readiness.md) still define whether it is
+certified for general traffic.
+
+### Breaking
+
+- **DNS interception is active by default whenever `[dns].upstream` is declared.** `:53`
+  UDP and TCP flows reaching the control plane are now answered by `daer-dns` without
+  requiring `[dns].bind` or changes to `/etc/resolv.conf`. Set `[dns].intercept = false` to
+  keep the old pass-through behaviour, or when only the explicit `[dns].bind` listener
+  should answer queries ([ADR-0054](docs/adr/0054-transparent-dns-interception.md)).
+- **Fake-IP no longer requires `[dns].bind`.** It requires an active DNS ingress
+  (`[dns].intercept` or `[dns].bind`) and at least one `[dns].upstream`. A configuration
+  that enables Fake-IP with no upstream is now a load error.
+
+### Added
+
+- **Transparent DNS interception (`[dns].intercept`).** UDP and TCP `:53` queries are
+  answered in-process, including Fake-IP, `[dns.request]` routing and the cache. `asis`
+  falls through to the client's original resolver without consuming TCP bytes. The
+  optional `[dns].bind` listener remains available for hosts that also want a local
+  resolver socket ([ADR-0054](docs/adr/0054-transparent-dns-interception.md)).
+- **Direct outbound Fake-IP unwrapping.** A `direct` TCP or UDP flow whose destination is
+  a synthetic `198.18.0.0/15` address is resolved to a real address through the configured
+  DNS upstreams, respecting `so-mark` and `[dns.request]`, instead of dialing a synthetic
+  address ([ADR-0055](docs/adr/0055-direct-fake-ip-unwrapping.md)).
+- **Single-instance daemon ownership.** The daemon takes an exclusive
+  `/run/daer/daer.lock` before creating the private ingress, deletes `daer0` synchronously
+  on drop, and reclaims a stale link before creating a new pair. This removes the
+  `systemctl restart` race that could trip `start-limit-hit`
+  ([ADR-0056](docs/adr/0056-single-instance-ingress-ownership.md)).
+
+### Fixed
+
+- **TLS 1.3 and Vision writes no longer fail under backpressure.** A partial socket write
+  or `Pending` after framing now retains and drains the frame instead of returning
+  `Ok(0)`, which made `copy_bidirectional` fail with `WriteZero` and corrupt long-lived
+  streams.
+- **The IPv4 transparent ingress test brings `lo` up** in a fresh user namespace, matching
+  the IPv6 fixture.
+
+### Changed
+
+- **One install entry point and no project-specific test runner.** `scripts/install.sh`
+  builds and installs the release artifacts; `scripts/delivery-check.sh` is the privileged
+  real-delivery and `SIGKILL` gate. The old `scripts/verify/` and `scripts/ops/` runners
+  are removed. Privileged CI runs the `e2e` binary directly and fails on any `skipped: `
+  line, so a skip cannot read as coverage ([ADR-0052](docs/adr/0052-layered-test-architecture.md)).
+
 ## [0.0.15] - 2026-11-14
 
 ### Breaking

@@ -352,6 +352,59 @@ fn a_cache_can_be_swept_and_cleared_through_the_resolver() {
     assert_eq!(resolver.cache_len(), 0);
 }
 
+#[tokio::test]
+async fn resolve_real_ips_bypasses_fake_ip_and_returns_upstream_address() {
+    let fake_ip_cfg = r#"
+schema = 6
+
+[dns]
+bind = "127.0.0.1"
+upstream = ["local:udp://223.5.5.5:53"]
+
+[dns.fake-ip]
+enabled = true
+inet = "198.18.0.0/15"
+
+[dns.request]
+rules = []
+default = "local"
+
+[dns.response]
+rules = []
+default = "accept"
+
+[routing]
+default = "direct"
+"#;
+    let upstream = FakeUpstream::answering(&[[220, 181, 38, 148]], 60);
+    let resolver = resolver(fake_ip_cfg, Arc::clone(&upstream));
+
+    // Normal client query gets a synthetic Fake-IP.
+    let Resolution::Answer(fake_reply) = resolver
+        .resolve_test(&query("www.baidu.com", RecordType::A))
+        .await
+        .expect("fake-ip resolves")
+    else {
+        panic!("expected answer");
+    };
+    let fake_ip = extract_answer_ips(&fake_reply)[0];
+    assert!(
+        matches!(fake_ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19)),
+        "normal resolve must still synthesize a Fake-IP, got {fake_ip}"
+    );
+
+    // Direct outbound unwrapping must bypass Fake-IP and return the real upstream address.
+    let real_ips = resolver
+        .resolve_real_ips("www.baidu.com", false)
+        .await
+        .expect("real ips resolve");
+    assert_eq!(
+        real_ips,
+        vec!["220.181.38.148".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert_eq!(resolver.stats().snapshot().upstream_calls, 1);
+}
+
 #[test]
 fn stats_describe_an_idle_resolver() {
     let resolver = resolver(BASE, FakeUpstream::answering(&[[1, 2, 3, 4]], 60));

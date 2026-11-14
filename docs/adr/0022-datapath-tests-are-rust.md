@@ -74,3 +74,7 @@ programs need.
 - `bpf_test.c` keeps its `#include "../datapath.bpf.c"`, so the tests continue to compile against
   the production datapath rather than a copy. That is the property that makes them worth
   porting.
+
+> Implementation note (2026-11-14): the runner scripts named in this record were removed. The
+> harness remains in `tests/e2e/`, and the privileged CI job runs it directly as root. See the
+> amendment in [ADR-0052](0052-layered-test-architecture.md).

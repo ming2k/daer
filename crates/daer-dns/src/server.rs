@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 
 use crate::resolver::{Resolution, Resolver, ResolverError};
 use crate::wire::{self, Message, ResponseCode};
@@ -184,73 +184,85 @@ pub async fn serve_udp_on(
             },
         };
 
-        let context = resolver.begin_query(peer);
-        let Ok(query) = wire::parse(&buffer[..read]) else {
-            // A malformed datagram has no id to answer to; dropping it is the only
-            // correct response. It still gets a query ID so the drop is attributable.
-            daer_observe::debug!(
-                daer_observe::EventCode::DnsMalformedQuery,
+        let resolver = Arc::clone(&resolver);
+        let socket = Arc::clone(&socket);
+        let payload = buffer[..read].to_vec();
+        tokio::spawn(async move {
+            if let Some(bytes) = resolve_datagram(&resolver, &payload, peer).await
+                && let Err(error) = socket.send_to(&bytes, peer).await
+            {
+                daer_observe::warn!(
+                    daer_observe::EventCode::DnsSendFailed,
+                    %error,
+                    peer = %peer,
+                    transport = "udp",
+                    "udp send failed"
+                );
+            }
+        });
+    }
+}
+
+/// Resolves a single DNS UDP datagram, returning the encoded reply bytes if one should be sent.
+///
+/// Returns `None` for malformed queries, `asis` decisions, timeouts, or upstream failures.
+pub async fn resolve_datagram(
+    resolver: &Resolver,
+    payload: &[u8],
+    peer: SocketAddr,
+) -> Option<Vec<u8>> {
+    let context = resolver.begin_query(peer);
+    let Ok(query) = wire::parse(payload) else {
+        // A malformed datagram has no id to answer to; dropping it is the only
+        // correct response. It still gets a query ID so the drop is attributable.
+        daer_observe::debug!(
+            daer_observe::EventCode::DnsMalformedQuery,
+            query_id = %context.id,
+            peer = %peer,
+            transport = "udp",
+            bytes = payload.len(),
+            "dropped a malformed dns datagram"
+        );
+        return None;
+    };
+
+    let limit = udp_payload_limit(&query);
+    match tokio::time::timeout(REQUEST_TIMEOUT, resolver.resolve(&query, context)).await {
+        Ok(Ok(Resolution::Answer(answer))) => encode_datagram(&answer, limit),
+        Ok(Ok(Resolution::AsIs)) => {
+            // Silence is the correct expression of `asis` on a datagram socket.
+            daer_observe::trace!(
+                daer_observe::EventCode::DnsAsisNoReply,
                 query_id = %context.id,
                 peer = %peer,
                 transport = "udp",
-                bytes = read,
-                "dropped a malformed dns datagram"
+                "asis: no reply"
             );
-            continue;
-        };
-
-        let limit = udp_payload_limit(&query);
-        let resolver = Arc::clone(&resolver);
-        let socket = Arc::clone(&socket);
-        tokio::spawn(async move {
-            match tokio::time::timeout(REQUEST_TIMEOUT, resolver.resolve(&query, context)).await {
-                Ok(Ok(Resolution::Answer(answer))) => {
-                    if let Some(bytes) = encode_datagram(&answer, limit)
-                        && let Err(error) = socket.send_to(&bytes, peer).await
-                    {
-                        daer_observe::warn!(
-                            daer_observe::EventCode::DnsSendFailed,
-                            %error,
-                            query_id = %context.id,
-                            peer = %peer,
-                            transport = "udp",
-                            "udp send failed"
-                        );
-                    }
-                }
-                Ok(Ok(Resolution::AsIs)) => {
-                    // Silence is the correct expression of `asis` on a datagram socket.
-                    daer_observe::trace!(
-                        daer_observe::EventCode::DnsAsisNoReply,
-                        query_id = %context.id,
-                        peer = %peer,
-                        transport = "udp",
-                        "asis: no reply"
-                    );
-                }
-                Ok(Err(error)) => {
-                    daer_observe::warn!(
-                        daer_observe::EventCode::DnsResolutionFailed,
-                        %error,
-                        query_id = %context.id,
-                        peer = %peer,
-                        transport = "udp",
-                        timeout = false,
-                        "dns resolution failed"
-                    );
-                }
-                Err(_) => {
-                    daer_observe::warn!(
-                        daer_observe::EventCode::DnsResolutionFailed,
-                        query_id = %context.id,
-                        peer = %peer,
-                        transport = "udp",
-                        timeout = true,
-                        "dns resolution timed out"
-                    );
-                }
-            }
-        });
+            None
+        }
+        Ok(Err(error)) => {
+            daer_observe::warn!(
+                daer_observe::EventCode::DnsResolutionFailed,
+                %error,
+                query_id = %context.id,
+                peer = %peer,
+                transport = "udp",
+                timeout = false,
+                "dns resolution failed"
+            );
+            None
+        }
+        Err(_) => {
+            daer_observe::warn!(
+                daer_observe::EventCode::DnsResolutionFailed,
+                query_id = %context.id,
+                peer = %peer,
+                transport = "udp",
+                timeout = true,
+                "dns resolution timed out"
+            );
+            None
+        }
     }
 }
 
@@ -300,20 +312,33 @@ pub async fn serve_tcp_on(
 
         let resolver = Arc::clone(&resolver);
         tokio::spawn(async move {
-            if let Err(error) = handle_tcp_connection(stream, peer, resolver).await {
+            if let Err(error) = stream.set_nodelay(true) {
+                daer_observe::debug!(daer_observe::EventCode::DnsTcpConnectionEnded,%error, peer = %peer, "dns tcp connection ended");
+                return;
+            }
+            if let Err(error) = serve_tcp_stream(stream, peer, resolver).await {
                 daer_observe::debug!(daer_observe::EventCode::DnsTcpConnectionEnded,%error, peer = %peer, "dns tcp connection ended");
             }
         });
     }
 }
 
-/// Serves one TCP connection: a sequence of length-prefixed queries.
-async fn handle_tcp_connection(
-    mut stream: TcpStream,
+/// Serves one TCP DNS stream: a sequence of length-prefixed queries.
+///
+/// Used both by [`serve_tcp_on`] for explicit TCP listeners and by `daer-control` for
+/// transparently intercepted `:53` TCP flows.
+///
+/// # Errors
+///
+/// Returns an I/O error if reading from or writing to `stream` fails unexpectedly.
+pub async fn serve_tcp_stream<S>(
+    mut stream: S,
     peer: SocketAddr,
     resolver: Arc<Resolver>,
-) -> io::Result<()> {
-    stream.set_nodelay(true)?;
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     for _ in 0..TCP_QUERIES_PER_CONNECTION {
         let mut length = [0u8; 2];
         match stream.read_exact(&mut length).await {
@@ -431,6 +456,7 @@ mod tests {
     use super::*;
     use crate::wire::{Flags, Name, Question, Record, RecordType};
     use std::net::Ipv4Addr;
+    use tokio::net::TcpStream;
 
     fn query(edns_size: Option<u16>) -> Message {
         let mut query = Message {

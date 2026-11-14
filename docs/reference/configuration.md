@@ -537,8 +537,9 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `bind` | string | unset (no server) | The only switch that starts the DNS listener. Unset means `daer` is not the box's resolver and starts no server. |
-| `upstream` | list of string | `[]` | Upstream resolvers as `tag:protocol://address:port`. Required when `bind` is set. The protocol is required: `udp`, `tcp`, `tls` (DoT), `https` (DoH), or a `+` chain tried in order. A hostname instead of an address is rejected (there is no bootstrap resolver yet). |
+| `bind` | string | unset (no listener) | Optional explicit UDP/TCP `:53` listener address (for example `"127.0.0.1"` or a LAN IP). Not required for transparent `:53` interception. |
+| `intercept` | boolean | auto (`true` when `upstream` or `fake-ip` is configured) | Transparently intercept `:53` UDP and TCP flows into the built-in DNS resolver (ADR-0054). Set `false` to serve only on `bind` or route `:53` as ordinary traffic. |
+| `upstream` | list of string | `[]` | Upstream resolvers as `tag:protocol://address:port`. Required when `intercept` or `bind` is active. The protocol is required: `udp`, `tcp`, `tls` (DoT), `https` (DoH), or a `+` chain tried in order. A hostname instead of an address is rejected (there is no bootstrap resolver yet). |
 | `ipversion-prefer` | string | `"any"` | `"ipv4"`, `"ipv6"`, or `"any"` for no preference. |
 | `optimistic-cache` | boolean | `true` | Serve stale entries while refreshing. |
 | `optimistic-cache-ttl` | duration | `"60s"` | How long an optimistic entry is served. |
@@ -553,7 +554,7 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Requires an explicit `[dns].bind`; it never starts the listener by itself. |
+| `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Requires an active DNS ingress (`[dns].intercept` or `[dns].bind`) and at least one `[dns].upstream`. |
 | `inet` | string | `"198.18.0.0/15"` | The IPv4 pool prefix. |
 | `inet6` | string | unset | Optional IPv6 pool prefix. When set, `AAAA` queries receive synthetic addresses too; when unset, `AAAA` is answered with an empty NOERROR so clients fall back to the synthetic `A`. |
 | `pool-size` | integer | `65535` | Number of synthetic addresses per address family. |

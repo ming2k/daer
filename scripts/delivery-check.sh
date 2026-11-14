@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot privileged check for a daer build with the private ingress namespace.
 #
-#   sudo scripts/ops/daer-delivery-check.sh --config target/daer-e2e.toml
+#   sudo scripts/delivery-check.sh --config target/daer-e2e.toml
 #
 # The script owns daer0ns/daer0 and temporarily stops daer. It snapshots the host
 # network state it can change and restores the original service state on every exit
@@ -14,13 +14,13 @@
 #   DAER_E2E_RESTORE_DIR  host-state snapshot directory (default: target/daer-e2e-restore)
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 config=""
 preflight=0
 
 usage() {
     cat <<'EOF'
-usage: scripts/ops/daer-delivery-check.sh --config <daer.toml> [--preflight]
+usage: scripts/delivery-check.sh --config <daer.toml> [--preflight]
 
 Runs the private-ingress end-to-end diagnostic against a locally built daemon.
 The config file is required and may contain node credentials; keep it out of git.

@@ -31,7 +31,15 @@ cargo xtask ebpf
 Verify that the eBPF object passes the kernel verifier before running:
 
 ```bash
-scripts/verify/kernel-check.sh
+cargo xtask ebpf --tests
+cargo test -p daer-tests --test e2e --no-run
+sudo "$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+  -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)" \
+  --include-ignored --nocapture --test-threads=1 \
+  ebpf_kernel::the_object_loads_and_verifies \
+  ebpf_kernel::a_tcx_program_attaches_to_loopback \
+  ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy \
+  ebpf_datapath::every_datapath_case_passes
 ```
 
 ---

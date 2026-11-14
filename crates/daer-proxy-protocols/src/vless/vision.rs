@@ -422,6 +422,8 @@ pub(super) struct VisionStream<S> {
     read: ReadSide,
     write: WriteSide,
     state: TrafficState,
+    awaiting_write: Vec<u8>,
+    written: usize,
     /// The record layer's raw-copy switch, when the layer below has one.
     ///
     /// `None` for a plaintext or rustls-backed stream: neither has a splice path, and a
@@ -460,6 +462,8 @@ impl<S> VisionStream<S> {
             read,
             write: WriteSide::new(uuid),
             state: TrafficState::new(),
+            awaiting_write: Vec::new(),
+            written: 0,
             raw_read,
         }
     }
@@ -555,12 +559,43 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
     }
 }
 
+impl<S: AsyncWrite + Unpin> VisionStream<S> {
+    fn drive_write(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.written < self.awaiting_write.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.awaiting_write[self.written..]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "the underlying transport accepted no bytes of a Vision frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => self.written += written,
+            }
+        }
+        self.awaiting_write.clear();
+        self.written = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if !self.awaiting_write.is_empty() {
+            match self.drive_write(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         if !self.write.padding {
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
@@ -592,22 +627,35 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
         // `frame` needs `&mut self.write` and `&self.state` at once; reading the flag it uses
         // into a local keeps the borrows disjoint.
         let long_padding = self.state.is_tls;
-        let framed = self.write.frame(buf, command, long_padding);
-        match Pin::new(&mut self.inner).poll_write(cx, &framed) {
-            // The report is about the caller's bytes, not the framed length: a caller that
-            // asked to write 100 bytes must be told 100, or it retries the remainder of a
-            // block that has already gone out and the peer sees it twice.
-            Poll::Ready(Ok(_written)) => Poll::Ready(Ok(buf.len())),
+        self.awaiting_write = self.write.frame(buf, command, long_padding);
+        self.written = 0;
+        match self.drive_write(cx) {
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
+            // Once framed into `awaiting_write`, all `buf.len()` caller bytes are accepted;
+            // returning Pending here would make the caller re-frame and double-send `buf`.
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if !self.awaiting_write.is_empty() {
+            match self.drive_write(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if !self.awaiting_write.is_empty() {
+            match self.drive_write(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -863,5 +911,61 @@ mod tests {
             read.push(&block(Some(UUID), command, b"x", 4));
             assert!(!read.saw_direct, "{command:?} must not enable a raw copy");
         }
+    }
+
+    struct PartialPendingSink {
+        written: Vec<u8>,
+        pending_next: bool,
+    }
+
+    impl AsyncWrite for PartialPendingSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.pending_next {
+                self.pending_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.pending_next = true;
+            let take = buf.len().min(5);
+            self.written.extend_from_slice(&buf[..take]);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_write_buffers_across_pending_and_partial_writes() {
+        let sink = PartialPendingSink {
+            written: Vec::new(),
+            pending_next: true,
+        };
+        let mut stream = VisionStream::new_answering(sink, UUID, None);
+        let first = b"first-block";
+        let second = b"second-block";
+
+        tokio::io::AsyncWriteExt::write_all(&mut stream, first)
+            .await
+            .expect("first write succeeds");
+        tokio::io::AsyncWriteExt::write_all(&mut stream, second)
+            .await
+            .expect("second write succeeds");
+        tokio::io::AsyncWriteExt::flush(&mut stream)
+            .await
+            .expect("flush drains remaining buffered Vision frame");
+
+        let mut reader = ReadSide::new(UUID);
+        reader.push(&stream.inner.written);
+        assert_eq!(reader.ready, b"first-blocksecond-block");
     }
 }

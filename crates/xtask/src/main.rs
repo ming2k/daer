@@ -378,10 +378,10 @@ fn install_target_prefix(prefix: &str, destdir: &Path) -> PathBuf {
 
 /// Copies every installed artifact into `destdir/prefix` and returns the paths written.
 ///
-/// This function is the single definition of an install. `scripts/ops/daer-install-netns.sh`
-/// copies the staged tree rather than listing binaries again, and `packaging/daer.plan.toml`
-/// calls this task instead of restating the artifact list. The test below pins the exact file
-/// set, so a binary that drops out of this list fails CI instead of failing on a host.
+/// This function is the single definition of an install. `scripts/install.sh` invokes this
+/// task rather than listing binaries again, and `packaging/daer.plan.toml` calls it instead of
+/// restating the artifact list. The test below pins the exact file set, so a binary that drops
+/// out of this list fails CI instead of failing on a host.
 fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathBuf>, String> {
     let binaries = ["daer", "daer-drb"];
 

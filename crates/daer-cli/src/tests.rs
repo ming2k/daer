@@ -48,7 +48,7 @@ fn the_reference_example_validates() {
     assert_eq!(report.files, 1);
     assert!(report.domain.has_domain_rules());
     assert!(report.domain.sniff_enabled());
-    assert!(!report.domain.dns_service());
+    assert!(report.domain.dns_service());
 
     // ADR-0006/ADR-0007: a configuration whose group can select no node must *say so*, and
     // the shipped example is exactly that shape — its nodes are commented out on purpose, so

@@ -82,8 +82,8 @@ pub use routing::{
     upstream_tags,
 };
 pub use server::{
-    ServerError, UDP_MAX_LIMIT, UDP_PLAIN_LIMIT, encode_datagram, serve_tcp, serve_tcp_on,
-    serve_udp, serve_udp_on, udp_payload_limit,
+    ServerError, UDP_MAX_LIMIT, UDP_PLAIN_LIMIT, encode_datagram, resolve_datagram, serve_tcp,
+    serve_tcp_on, serve_tcp_stream, serve_udp, serve_udp_on, udp_payload_limit,
 };
 pub use transport::{
     ChainUpstream, DEFAULT_DOH_PATH, HttpsUpstream, Protocol, TcpUpstream, TlsUpstream,

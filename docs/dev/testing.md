@@ -31,7 +31,7 @@ crate owns its unit tests, and every skip has an owner.**
 | **L1 doc** | Do the examples an operator copies actually compile? | rustdoc fences | `cargo test --workspace --doc` | `test` job |
 | **L2 integration** | Do the real components compose across their seam? | `tests/integration/` | `cargo nextest run --workspace -E 'binary(integration)'` | `integration` job |
 | **L3 E2E** | Does a real process, a real redirect, and the real kernel produce the client-visible result? | `tests/e2e/` | `cargo nextest run --workspace -E 'binary(e2e)'` | `kernel-datapath`, `e2e-ingress`, `ebpf-object` jobs |
-| **Soak / delivery** | Does it survive sustained traffic and a real node? | `scripts/ops/` + site config | `sudo scripts/ops/daer-delivery-check.sh` | release gate, not per-PR |
+| **Soak / delivery** | Does it survive sustained traffic and a real node? | `scripts/delivery-check.sh` + site config | `sudo scripts/delivery-check.sh` | release gate, not per-PR |
 
 nextest has no doctest support. `cargo test --workspace --doc` is the one native Cargo command
 in the test flow, and it exists because nextest cannot replace it.
@@ -173,42 +173,44 @@ redirect rule.
 
 ---
 
-## 5. Skips, ignored tests, and `DAER_REQUIRE`
+## 5. Ignored tests and privileged gates
 
 An `#[ignore]` attribute is a debt with an owner. It must name the capability or fixture it
 needs in the attribute itself:
 
 ```rust
-#[ignore = "needs CAP_BPF and CAP_NET_ADMIN; scripts/verify/kernel-check.sh runs it privileged"]
+#[ignore = "needs CAP_BPF and CAP_NET_ADMIN; run the e2e binary as root"]
 #[test]
 fn the_object_loads_and_verifies() { /* ... */ }
 ```
 
 A bare `#[ignore]` fails `test_architecture::every_ignored_test_names_its_prerequisite`.
 
-The privileged scripts print `skip` with a key instead of failing when a fixture is missing, and
-`DAER_REQUIRE=<key,...>` turns that skip into a failure. The keys are part of the CI contract:
+There is no project-specific runner script. The privileged cases are ordinary tests in
+`tests/e2e/`; they skip with a `skipped: ` line when the host cannot supply the capability.
+The privileged CI jobs run the `e2e` binary as root and fail if that line appears, because a
+suite that skips is not coverage (ADR-0007). The exact job commands are in
+`.github/workflows/ci.yml`; locally, select the same tests with the binary directly:
 
-- every key in a workflow's `DAER_REQUIRE` must be emitted by a script;
-- every key a script emits must either be required by CI or be listed in
-  `tests/integration/test_architecture.rs`'s `MANUAL_SKIP_KEYS` with a reason.
+```sh
+cargo build -p daer-cli --bin daer
+cargo test -p daer-tests --test e2e --no-run
+binary="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+  -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
 
-Current keys:
+# Kernel datapath: verifier, TCX, cgroup hooks and in-kernel cases.
+sudo "$binary" --include-ignored --nocapture --test-threads=1 \
+  ebpf_kernel::the_object_loads_and_verifies \
+  ebpf_kernel::a_tcx_program_attaches_to_loopback \
+  ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy \
+  ebpf_datapath::every_datapath_case_passes
 
-| Key | Script | Check | CI |
-| :--- | :--- | :--- | :--- |
-| `kernel-binary` | `kernel-check.sh` | the datapath object exists and the loader binary is built | required |
-| `7` | `kernel-check.sh` | in-kernel datapath cases (`BPF_PROG_TEST_RUN`) | required |
-| `3-tcp` | `e2e-check.sh` | redirected IPv4 TCP flow reaches the daemon and returns the nonce | required |
-| `3-tcp6` | `e2e-check.sh` | the same over IPv6 loopback | required |
-| `3-udp` | `e2e-check.sh` | single-namespace IPv4 UDP; deliberately manual because that fixture is invalid | manual |
-| `3-udp4` | `e2e-check.sh` | two-namespace IPv4 UDP `tproxy` topology | required |
-| `3-udp6` | `e2e-check.sh` | two-namespace IPv6 UDP `tproxy` topology | required |
-| `3-netns` | `e2e-check.sh` | private ingress namespace, peer move, return route, teardown | required |
-| `4` | `e2e-check.sh` | a real `SIGHUP` does not abort the daemon | required |
-
-A new skip key must be added to a `DAER_REQUIRE` list or to `MANUAL_SKIP_KEYS` with a reason;
-`test_architecture::every_daer_require_key_is_emitted_by_a_script` is the gate.
+# Userspace data path, namespaces and a real SIGHUP.
+DAER_NETNS_TEST=1 sudo --preserve-env=DAER_NETNS_TEST "$binary" \
+  --nocapture --test-threads=1 \
+  control_transparent:: control_transparent_udp4:: control_transparent_udp6:: \
+  control_netns_lifecycle:: cli_reload::
+```
 
 ---
 
@@ -240,14 +242,8 @@ integration CI job does this explicitly.
 
 ### Privileged gates
 
-```bash
-scripts/verify/kernel-check.sh    # object loads, TCX attaches, in-kernel cases
-scripts/verify/e2e-check.sh       # real tproxy redirect, namespaces, SIGHUP
-```
-
-Both scripts build the root `e2e` target, find the one binary under `target/debug/deps/e2e-*`,
-and select individual tests by their module-qualified names. A skip is reported with a key;
-`DAER_REQUIRE` makes it fatal. Host preparation is
+There is no runner script. Build the same binary and select the modules shown in section 5;
+the commands there are the precise local equivalents of the CI jobs. Host preparation is
 [Test Environment Requirements](test-environment.md); the manual kernel procedure is
 [Testing the kernel datapath](kernel-test-plan.md).
 
@@ -295,6 +291,7 @@ be the softened claim ADR-0007 exists to prevent.
    corresponding `main.rs`, and state its falsifier in the module doc.
 4. Run the narrow nextest filter first, then the layer.
 5. Run `cargo nextest run --workspace -E 'binary(integration)'`; the architecture test checks the
-   new ignore reason, harness location, and `DAER_REQUIRE` key.
+   new ignore reason and harness location. If the test needs privilege, add its module or exact
+   name to the matching CI job's `e2e` command.
 6. If the test changes a system invariant, update `docs/dev/invariants.md` and the ADR that
    owns it.

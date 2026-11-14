@@ -2,7 +2,7 @@
 
 //! The test architecture is itself a test: no ignored test without an owner, no crate-local
 //! external test directory, no production dependency on the dev-only test-support crate, and
-//! no `DAER_REQUIRE` key that no script emits.
+//! both harness layers selected in CI.
 //!
 //! This replaces the former `cargo xtask test --audit`. Keeping it here means it runs under
 //! the same nextest invocation as every other integration test, and it cannot quietly stop
@@ -14,15 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::{cargo_metadata, workspace_path, workspace_root};
 
-const VERIFY_SCRIPTS: &str = "scripts/verify";
 const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
-
-/// Skip keys deliberately not required in CI, each with the reason.
-const MANUAL_SKIP_KEYS: &[(&str, &str)] = &[(
-    "3-udp",
-    "the single-namespace IPv4 UDP fixture is invalid; control_transparent_udp4/6 own the \
-     two-namespace datagram paths",
-)];
 
 #[test]
 fn the_test_support_crate_is_dev_only() {
@@ -125,42 +117,6 @@ fn every_ignored_test_names_its_prerequisite() {
 }
 
 #[test]
-fn every_daer_require_key_is_emitted_by_a_script() {
-    let emitted = emitted_skip_keys();
-    let required = required_ci_keys();
-
-    let mut failures = Vec::new();
-    for key in &required {
-        if !emitted.contains(key) {
-            failures.push(format!(
-                "CI requires `{key}` but no script emits it; the gate could never fail for the \
-                 reason it claims"
-            ));
-        }
-    }
-
-    let manual: BTreeSet<&str> = MANUAL_SKIP_KEYS.iter().map(|(key, _)| *key).collect();
-    for key in &emitted {
-        if required.contains(key) || manual.contains(key.as_str()) {
-            continue;
-        }
-        failures.push(format!(
-            "`{key}` can be skipped but no CI job requires it and it is not in \
-             MANUAL_SKIP_KEYS"
-        ));
-    }
-    for (key, _) in MANUAL_SKIP_KEYS {
-        if required.contains(*key) {
-            failures.push(format!(
-                "`{key}` is listed as manual but CI requires it; one list is stale"
-            ));
-        }
-    }
-
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
 fn ci_runs_both_harness_layers() {
     let workflow =
         fs::read_to_string(workspace_path(CI_WORKFLOW)).expect("CI workflow is readable");
@@ -197,56 +153,6 @@ fn collect(directory: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-fn emitted_skip_keys() -> BTreeSet<String> {
-    let mut keys = BTreeSet::new();
-    for entry in fs::read_dir(workspace_path(VERIFY_SCRIPTS)).expect("verify scripts are readable")
-    {
-        let path = entry.expect("script entry").path();
-        if path.extension().is_none_or(|extension| extension != "sh") {
-            continue;
-        }
-        let text = fs::read_to_string(&path).expect("script is UTF-8");
-        for line in text.lines() {
-            let line = line.trim_start();
-            let Some(rest) = line.strip_prefix("skip ") else {
-                continue;
-            };
-            let Some(rest) = rest.trim_start().strip_prefix('"') else {
-                continue;
-            };
-            let Some((key, _)) = rest.split_once('"') else {
-                panic!("{}: a skip call has no closing quote", path.display());
-            };
-            keys.insert(key.to_owned());
-        }
-    }
-    keys
-}
-
-fn required_ci_keys() -> BTreeSet<String> {
-    let text = fs::read_to_string(workspace_path(CI_WORKFLOW)).expect("CI workflow is readable");
-    let mut keys = BTreeSet::new();
-    for line in text.lines() {
-        let Some((_, value)) = line.split_once("DAER_REQUIRE:") else {
-            continue;
-        };
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .unwrap_or(value);
-        for key in value
-            .split(',')
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-        {
-            keys.insert(key.to_owned());
-        }
-    }
-    assert!(!keys.is_empty(), "CI declares no DAER_REQUIRE keys");
-    keys
 }
 
 /// A convenience used by other modules that need the per-package metadata map.

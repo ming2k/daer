@@ -125,18 +125,33 @@ unprivileged preflight (`cargo xtask preflight`). `.github/workflows/ci.yml` run
 steps, with tests selected by nextest filtersets.
 
 [Test Architecture](testing.md) defines what belongs in each layer, the unit-test placement
-rules, the skip policy, and the `DAER_REQUIRE` key contract. The two privileged gates answer
+rules, the skip policy, and the privileged test commands. The two privileged gates answer
 different questions over different dependency closures, so neither substitutes for the other:
 
 ```bash
-scripts/verify/kernel-check.sh   # does the eBPF object load and behave?
-scripts/verify/e2e-check.sh      # does a redirected flow reach the daemon and come back?
+cargo build -p daer-cli --bin daer
+cargo test -p daer-tests --test e2e --no-run
+binary="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+  -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
+
+# does the eBPF object load and behave?
+cargo xtask ebpf --tests
+sudo "$binary" --include-ignored --nocapture --test-threads=1 \
+  ebpf_kernel::the_object_loads_and_verifies \
+  ebpf_kernel::a_tcx_program_attaches_to_loopback \
+  ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy \
+  ebpf_datapath::every_datapath_case_passes
+
+# does a redirected flow reach the daemon and come back?
+DAER_NETNS_TEST=1 sudo --preserve-env=DAER_NETNS_TEST "$binary" \
+  --nocapture --test-threads=1 \
+  control_transparent:: control_transparent_udp4:: control_transparent_udp6:: \
+  control_netns_lifecycle:: cli_reload::
 ```
 
-Both re-exec themselves under `sudo` and both report `skip` with a reason when a fixture is
-missing. A skip is a fact on a laptop and a hole in CI, so `DAER_REQUIRE=<key,...>` turns a named
-skip into a failure; the keys are in [Test Architecture](testing.md#5-skips-ignored-tests-and-daer_require).
-The full script layout, including the host-level `ops/` helpers, is documented in
+The tests skip with a reason when a fixture is missing. A skip is a fact on a laptop and a
+hole in CI, so the privileged CI jobs run the same binary and fail on the `skipped: ` line.
+The remaining non-test entry points are documented in
 [`scripts/README.md`](../../scripts/README.md).
 
 ## 5. Diagnosing a flow

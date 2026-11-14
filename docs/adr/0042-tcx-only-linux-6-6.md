@@ -86,7 +86,7 @@ no `daer-cleanup` compatibility window.
    inspect or mutate old host state to make a migration appear seamless.
 
 8. **Two privileged gates are release requirements, not optional diagnostics.**
-   - `scripts/ops/daer-delivery-check.sh` must show `example.com http=200` through the real
+   - `scripts/delivery-check.sh` must show `example.com http=200` through the real
      daemon. Attachment alone is not delivery; the earlier TCX trial attached but did not
      put the assigned packet on the listener's accept queue.
    - The same script kills the daemon with `SIGKILL` and asserts that no TCX link, qdisc,

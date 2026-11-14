@@ -168,7 +168,7 @@ fn cgroup_hooks_attach_to_the_unified_hierarchy() {
 
 /// TCX is the only attachment mode. This proves it attaches on Linux 6.6+, not that
 /// `bpf_sk_assign` delivers a flow: the real-daemon delivery check is
-/// `scripts/ops/daer-delivery-check.sh`.
+/// `scripts/delivery-check.sh`.
 #[test]
 #[ignore = "needs CAP_BPF and CAP_NET_ADMIN; TCX needs Linux 6.6+"]
 fn a_tcx_program_attaches_to_loopback() {

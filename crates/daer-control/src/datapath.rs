@@ -46,6 +46,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use daer_ebpf::loader;
 
@@ -53,6 +54,31 @@ use daer_ebpf::loader;
 pub const DEVICE: &str = "daer0";
 /// Its peer, which the transparent listener is reachable through.
 pub const PEER: &str = "daer0peer";
+
+/// How long a start waits for a previous run's veth pair to be released.
+///
+/// Deleting the private ingress namespace unmounts it synchronously, but the kernel unregisters
+/// the veth peer and its host end asynchronously. A `systemctl restart` can therefore start the
+/// next daemon while the previous run's `daer0` is still visible in the host namespace. The pair
+/// cannot be deleted here: it may belong to another daemon. Waiting for it to disappear is the
+/// only action that is safe in both cases.
+const PAIR_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often [`create_device_pair`] checks whether the previous pair has been released.
+const PAIR_RELEASE_POLL: Duration = Duration::from_millis(20);
+
+/// True when `ip link add` failed because the interface name is already taken.
+///
+/// `ip` prints the kernel's `strerror`, so the English text is not a stable API. It is only a
+/// hint for the one race that `interface_exists` cannot observe: the old pair can disappear
+/// between the failed add and the check, and treating that as a permanent error would turn a
+/// successful restart into a start-limit failure.
+fn is_name_conflict(error: &DatapathError) -> bool {
+    matches!(
+        error,
+        DatapathError::Command { message, .. } if message.contains("File exists")
+    )
+}
 
 /// The ARPHRD type of an interface, which decides how many link-layer bytes precede the
 /// IP header.
@@ -377,6 +403,16 @@ pub fn interface_exists(interface: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Deletes `interface` if it currently exists in the host namespace.
+///
+/// Safe only when the caller holds the single-instance [`crate::netns::DaemonLock`], which
+/// guarantees no other `daer` process owns the device.
+pub(crate) fn delete_device_if_exists(interface: &str) {
+    if interface_exists(interface) {
+        let _ = run(&["ip", "link", "del", interface]);
+    }
+}
+
 /// Creates the veth pair with the peer already inside the private ingress namespace.
 ///
 /// The namespace is created first, and the peer is placed in it in the same netlink
@@ -385,25 +421,49 @@ pub fn interface_exists(interface: &str) -> bool {
 /// after this call leaves both ends owned by the namespace and the kernel removes the pair
 /// when the namespace dies.
 ///
+/// Because [`crate::netns::DaemonLock`] guarantees this process is the sole `daer` instance,
+/// any pre-existing `daer0` in the host namespace belongs to a dead run (for example, a
+/// `SIGKILL`ed daemon or an async kernel `cleanup_net` waiting on orphan sockets) and is
+/// deleted immediately before retrying.
+///
 /// # Errors
 ///
 /// Returns [`DatapathError`] naming the command that failed. `ip` is required; there is no
 /// netlink fallback because a partial implementation of "create a veth pair" is a much
 /// larger surface than one `ip` invocation.
 pub fn create_device_pair(namespace: &str) -> Result<(), DatapathError> {
-    // A pair in the host namespace cannot belong to this run: the peer is created inside
-    // the namespace. It is either another daemon or state from a pre-TCX release. Fail with
-    // an actionable message instead of letting netlink report EEXIST.
-    if interface_exists(DEVICE) || interface_exists(PEER) {
-        return Err(DatapathError::Device(format!(
-            "{DEVICE}/{PEER} already exists in the host namespace; stop the other daemon or \
-             remove the stale link with `ip link del {DEVICE}` before starting daer"
-        )));
+    let deadline = Instant::now() + PAIR_RELEASE_TIMEOUT;
+    let mut cleaned_stale = false;
+    loop {
+        match run(&[
+            "ip", "link", "add", DEVICE, "type", "veth", "peer", "name", PEER, "netns", namespace,
+        ]) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                // Only an occupied name is retryable. A missing `ip`, a missing namespace or
+                // a permission failure is the real answer and must not be hidden behind the
+                // timeout.
+                if !is_name_conflict(&error)
+                    && !(interface_exists(DEVICE) || interface_exists(PEER))
+                {
+                    return Err(error);
+                }
+                if !cleaned_stale {
+                    cleaned_stale = true;
+                    delete_device_if_exists(DEVICE);
+                    continue;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(DatapathError::Device(format!(
+                "{DEVICE}/{PEER} still exists in the host namespace after {}s; \
+                 remove the stale link with `ip link del {DEVICE}` and start daer again",
+                PAIR_RELEASE_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(PAIR_RELEASE_POLL);
     }
-    run(&[
-        "ip", "link", "add", DEVICE, "type", "veth", "peer", "name", PEER, "netns", namespace,
-    ])
-    .map(|_| ())
 }
 
 /// Brings a host-visible link up.

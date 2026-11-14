@@ -256,17 +256,17 @@ impl DomainPlan {
             }
         };
 
-        let dns_service = config.dns.bind.is_some();
+        let dns_service = config.dns.is_active();
         let fake_ip = config.dns.fake_ip.enabled;
         if fake_ip && !dns_service {
             return Err(DomainPlanError::new(
-                "dns.fake-ip.enabled: Fake-IP requires an explicit [dns].bind",
+                "dns.fake-ip.enabled: Fake-IP requires an active DNS ingress",
             ));
         }
         if domain_rules && !enabled && !dns_service {
             return Err(DomainPlanError::new(
                 "routing.sniff.enabled: domain(...) rules have no name source; set enabled = \
-                 true or configure [dns].bind",
+                 true or configure [dns]",
             ));
         }
 
@@ -420,6 +420,16 @@ impl DomainResolver {
     #[must_use]
     pub const fn plan(&self) -> &DomainPlan {
         &self.plan
+    }
+
+    /// Whether `ip` belongs to the active Fake-IP pool.
+    #[must_use]
+    pub fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
+        self.plan.fake_ip
+            && self
+                .fake_ip
+                .as_ref()
+                .is_some_and(|pool| pool.contains_ip(ip))
     }
 
     /// The DNS-only lookup, used by diagnostics and by both transport paths.

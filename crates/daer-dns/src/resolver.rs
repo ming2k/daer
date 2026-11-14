@@ -469,6 +469,15 @@ impl Resolver {
         }
     }
 
+    /// Returns `true` when `[dns.request]` evaluates `query` to `asis`.
+    ///
+    /// Used by transparent `:53` interception to let the client's original destination
+    /// resolver handle the query without hijacking the flow.
+    #[must_use]
+    pub fn is_asis(&self, query: &Message) -> bool {
+        matches!(self.request.decide(query), Decision::AsIs)
+    }
+
     /// Answers `query`.
     ///
     /// # Errors
@@ -557,6 +566,69 @@ impl Resolver {
             }
         }
 
+        self.resolve_upstream(query, &context, &tag, started).await
+    }
+
+    /// Resolves `domain` to real IP addresses using the configured DNS upstreams and cache,
+    /// deliberately bypassing Fake-IP synthesis.
+    ///
+    /// Used when unwrapping a Fake-IP destination for a `direct` outbound (`[INV-DIRECT-FAKEIP-01]`):
+    /// `direct` cannot dial a synthetic `198.18.0.0/15` address, and calling system DNS would
+    /// loop back into `daer`'s own `:53` interception.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolverError::Unserviceable`] if `domain` is not a valid DNS name or is
+    /// rejected by `[dns.request]`.
+    pub async fn resolve_real_ips(
+        &self,
+        domain: &str,
+        prefer_v6: bool,
+    ) -> Result<Vec<std::net::IpAddr>, ResolverError> {
+        let families = if prefer_v6 {
+            [RecordType::AAAA, RecordType::A]
+        } else {
+            [RecordType::A, RecordType::AAAA]
+        };
+        let peer: SocketAddr = "127.0.0.1:0".parse().expect("loopback socket addr");
+        for qtype in families {
+            let query = crate::wire::query(1, domain, qtype)
+                .map_err(|_| ResolverError::Unserviceable(ResponseCode::FORMERR))?;
+            let tag = match self.request.decide(&query) {
+                Decision::Upstream(tag) => tag,
+                Decision::Reject => {
+                    return Err(ResolverError::Unserviceable(ResponseCode::REFUSED));
+                }
+                Decision::AsIs => match self.request.fallback() {
+                    Decision::Upstream(tag) => tag.clone(),
+                    _ => match self.upstreams.keys().next() {
+                        Some(tag) => tag.clone(),
+                        None => return Err(ResolverError::Unserviceable(ResponseCode::SERVFAIL)),
+                    },
+                },
+            };
+            let context = self.begin_query(peer);
+            let Resolution::Answer(answer) = self
+                .resolve_upstream(&query, &context, &tag, Instant::now())
+                .await?
+            else {
+                continue;
+            };
+            let ips = extract_answer_ips(&answer);
+            if !ips.is_empty() {
+                return Ok(ips);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    async fn resolve_upstream(
+        &self,
+        query: &Message,
+        context: &QueryContext,
+        tag: &str,
+        started: Instant,
+    ) -> Result<Resolution, ResolverError> {
         let key = Key::of(query);
         if let Some(key) = &key {
             match self.lookup(key) {
@@ -580,7 +652,7 @@ impl Resolver {
             }
         }
 
-        let answer = match self.ask(&tag, query).await {
+        let answer = match self.ask(tag, query).await {
             Ok(answer) => answer,
             Err(error) => {
                 daer_observe::warn!(
@@ -600,7 +672,7 @@ impl Resolver {
             }
         };
 
-        let action = self.respond(&answer, query, &tag);
+        let action = self.respond(&answer, query, tag);
         daer_observe::debug!(daer_observe::EventCode::DnsAnswerRouted,
             query_id = %context.id,
             peer = %context.peer,
@@ -794,6 +866,22 @@ fn cap_ttls(message: &mut Message, ttl: u32) {
         }
         record.ttl = record.ttl.min(ttl);
     }
+}
+
+fn extract_answer_ips(message: &Message) -> Vec<std::net::IpAddr> {
+    message
+        .answers
+        .iter()
+        .filter_map(|record| match record.rtype {
+            RecordType::A => <[u8; 4]>::try_from(record.rdata.as_slice())
+                .ok()
+                .map(|octets| std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets))),
+            RecordType::AAAA => <[u8; 16]>::try_from(record.rdata.as_slice())
+                .ok()
+                .map(|octets| std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Makes an answer ready for the client that asked: same id, response flags.

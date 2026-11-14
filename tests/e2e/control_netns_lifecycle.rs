@@ -4,12 +4,8 @@
 //!
 //! This test creates and deletes `daer0ns` and `daer0`/`daer0peer`, so it is gated on
 //! `DAER_NETNS_TEST=1` rather than running in the ordinary workspace suite. The privileged
-//! e2e job sets it; a developer can run it inside a disposable user namespace:
-//!
-//! ```sh
-//! unshare -Urnm sh -c 'mount -t tmpfs tmpfs /run/netns && \
-//!   DAER_NETNS_TEST=1 cargo test -p daer-control --test netns_lifecycle'
-//! ```
+//! e2e job sets it; a developer can run it inside a disposable user namespace with the
+//! command in [Testing §5](../../../docs/dev/testing.md#5-ignored-tests-and-privileged-gates).
 //!
 //! The falsifiers are concrete: a namespace that is not created, a peer still visible in the
 //! host, a policy rule keyed by mark instead of ingress, a missing return route, a namespace
@@ -17,6 +13,17 @@
 //! that is visible in the host's mount namespace instead of being private to the daemon.
 
 use std::time::{Duration, Instant};
+
+/// Serialises the tests in this file when they run under a runner that does not honour the
+/// nextest `e2e-serial` group. They all own `daer0ns` and `daer0`/`daer0peer`, so running two
+/// at once is a fixture collision, not a product failure.
+static NETNS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialise_netns_test() -> std::sync::MutexGuard<'static, ()> {
+    NETNS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Sets the host-global prerequisites the daemon requires in this test's network namespace.
 ///
@@ -48,6 +55,7 @@ fn prepare_and_drop_the_private_ingress() {
         );
         return;
     }
+    let _serial = serialise_netns_test();
     set_host_prerequisites();
 
     // Started before `prepare` unshares the mount namespace, so this process stays in the
@@ -145,6 +153,80 @@ fn prepare_and_drop_the_private_ingress() {
     );
 }
 
+/// A restart must wait for a pair the kernel is still releasing.
+///
+/// Deleting the private namespace and unregistering the veth pair are not one synchronous
+/// kernel operation. This test creates the pair the previous run leaves in the host
+/// namespace, removes it after a short delay, and asserts that `prepare` waits for it
+/// instead of reporting a second daemon. Without the wait, `prepare` fails on the host link
+/// and `systemctl restart` turns a short teardown race into a start-limit failure.
+#[test]
+fn prepare_waits_for_a_pair_the_kernel_is_still_releasing() {
+    if std::env::var_os("DAER_NETNS_TEST").is_none() {
+        eprintln!(
+            "skipping: set DAER_NETNS_TEST=1 in a disposable namespace; this test owns \
+             daer0ns and daer0/daer0peer"
+        );
+        return;
+    }
+    let _serial = serialise_netns_test();
+    set_host_prerequisites();
+
+    // Start from a clean pair: a previous interrupted run in the same namespace must not
+    // make the test's own setup ambiguous.
+    let _ = std::process::Command::new("ip")
+        .args(["link", "del", "daer0"])
+        .output();
+    let added = std::process::Command::new("ip")
+        .args([
+            "link",
+            "add",
+            "daer0",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "daer0peer",
+        ])
+        .output()
+        .expect("create the simulated previous-run pair");
+    assert!(
+        added.status.success(),
+        "create the simulated previous-run pair: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let remover = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        let output = std::process::Command::new("ip")
+            .args(["link", "del", "daer0"])
+            .output()
+            .expect("delete the simulated previous-run pair");
+        assert!(
+            output.status.success(),
+            "delete the simulated previous-run pair: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+
+    let ingress = daer_control::PreparedIngress::prepare()
+        .expect("prepare must wait for the previous pair instead of reporting another daemon");
+    remover.join().expect("the remover thread must not panic");
+
+    drop(ingress);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !daer_control::datapath::interface_exists("daer0") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !daer_control::datapath::interface_exists("daer0"),
+        "dropping the guard must remove the host veth end"
+    );
+}
+
 /// The listener is created by `Daemon::bind_in`, not by a host-side `bind`.
 ///
 /// A direct loopback connection from inside `daer0ns` proves the socket is reachable there.
@@ -155,6 +237,7 @@ async fn the_transparent_listener_binds_inside_the_namespace() {
         eprintln!("skipping: set DAER_NETNS_TEST=1 in a disposable namespace");
         return;
     }
+    let _serial = serialise_netns_test();
     set_host_prerequisites();
 
     let ingress = daer_control::PreparedIngress::prepare().expect("prepare the ingress");

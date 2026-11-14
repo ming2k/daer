@@ -3686,6 +3686,12 @@ pub struct Dns {
     pub upstream: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
+    /// Transparently intercept `:53` UDP and TCP flows into the built-in DNS resolver.
+    ///
+    /// When omitted (`None`), interception is active whenever `upstream` is non-empty or
+    /// Fake-IP is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<bool>,
     pub optimistic_cache: bool,
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub optimistic_cache_ttl: TimeSpan,
@@ -3704,6 +3710,7 @@ impl Default for Dns {
             fixed_domain_ttl: BTreeMap::new(),
             upstream: Vec::new(),
             bind: None,
+            intercept: None,
             optimistic_cache: true,
             optimistic_cache_ttl: TimeSpan::from_secs(60),
             optimistic_stale_reply_ttl: TimeSpan::from_secs(30),
@@ -3712,6 +3719,22 @@ impl Default for Dns {
             request: DnsRouting::default(),
             response: DnsRouting::default(),
         }
+    }
+}
+
+impl Dns {
+    /// Whether transparent `:53` interception is active for this configuration.
+    #[must_use]
+    pub fn effective_intercept(&self) -> bool {
+        self.intercept
+            .unwrap_or(!self.upstream.is_empty() || self.fake_ip.enabled)
+    }
+
+    /// Whether the built-in DNS service has at least one active query ingress
+    /// (transparent interception or an explicit `bind` listener).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.effective_intercept() || self.bind.is_some()
     }
 }
 

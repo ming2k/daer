@@ -475,10 +475,10 @@ fn check_sniff_shape(config: &Config, has_explicit_domain_rule: bool) -> Result<
              bounded payload inspection, or enabled = false to route by the facts already known",
         ));
     }
-    if has_explicit_domain_rule && sniff.enabled == Some(false) && config.dns.bind.is_none() {
+    if has_explicit_domain_rule && sniff.enabled == Some(false) && !config.dns.is_active() {
         return Err(ConfigError::new(
             "routing.sniff.enabled",
-            "domain(...) rules have no name source: set enabled = true or configure [dns].bind",
+            "domain(...) rules have no name source: set enabled = true or configure [dns]",
         ));
     }
 
@@ -541,15 +541,26 @@ pub fn check_action_target(
 fn check_dns(config: &mut Config) -> Result<(), ConfigError> {
     let dns = &mut config.dns;
 
-    // Fake-IP is an answer mode of the DNS server, not a routing mode. Without a listener
-    // there is no channel to hand a synthetic address to a client and no reverse mapping to
-    // read later, so enabling it alone used to start an implicit `0.0.0.0:53` listener.
-    // That side effect is gone: the listener is the operator's explicit decision.
-    if dns.fake_ip.enabled && dns.bind.is_none() {
+    // Fake-IP is an answer mode of the DNS resolver, not a standalone routing mode.
+    // It requires an active DNS ingress (transparent `:53` interception or `[dns].bind`)
+    // and at least one upstream.
+    if dns.fake_ip.enabled && !dns.is_active() {
         return Err(ConfigError::new(
             "dns.fake-ip.enabled",
-            "Fake-IP requires an explicit [dns].bind; a synthetic address is only useful when \
-             daer answers the client's queries",
+            "Fake-IP requires an active DNS ingress: enable `[dns].intercept` or set `[dns].bind`",
+        ));
+    }
+    if dns.fake_ip.enabled && dns.upstream.is_empty() {
+        return Err(ConfigError::new(
+            "dns.upstream",
+            "Fake-IP requires at least one `[dns].upstream`",
+        ));
+    }
+    if dns.intercept == Some(true) && dns.upstream.is_empty() {
+        return Err(ConfigError::new(
+            "dns.upstream",
+            "`[dns].intercept = true` activates the resolver but no upstream is declared; add \
+             at least one upstream or set `intercept = false`",
         ));
     }
     if dns.bind.is_some() && dns.upstream.is_empty() {

@@ -173,7 +173,8 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // synthetic addresses were unknown to the router, so Fake-IP could never work through
     // the daemon. One pool for the process also survives a reload, which is what a client's
     // open connections to a synthetic address require.
-    let (dns, fake_ip, snooper) = start_dns(&loaded, &options, socket_config.clone()).await?;
+    let (dns, fake_ip, snooper, dns_resolver) =
+        start_dns(&loaded, &options, socket_config.clone()).await?;
     // Runtime election overrides are process state, not configuration. Load them before
     // the first generation so a pinned election is serving from the first packet, and
     // share the same handle across reloads so a pin does not disappear on SIGHUP.
@@ -182,6 +183,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         .with_socket_mark(so_mark)
         .with_fake_ip(fake_ip)
         .with_dns_snooper(Some(snooper))
+        .with_dns_resolver(dns_resolver)
         .with_overrides(Arc::clone(&overrides))
         // A dial's span reaches the journal. Without this the transport's recorder is filled
         // by netune and dropped, so "why is this node slow" has no answer in any log — which is
@@ -546,6 +548,7 @@ async fn start_dns(
     Option<DnsHandle>,
     Option<std::sync::Arc<daer_dns::FakeIpPool>>,
     std::sync::Arc<daer_dns::DnsSnooper>,
+    Option<std::sync::Arc<daer_dns::Resolver>>,
 )> {
     // The pool is built from the configuration even when Fake-IP is disabled: the type
     // reports `is_enabled()`, and building it unconditionally means a reload that turns
@@ -559,6 +562,7 @@ async fn start_dns(
     // The listener is the operator's explicit decision. Fake-IP is a mode of that listener,
     // not a second way to start one: validation rejects Fake-IP without `dns.bind`, so the
     // daemon never binds port 53 as a side effect of enabling an answer mode.
+    let intercept_dns = config.dns.effective_intercept();
     let wants_server = config.dns.bind.is_some();
     let transports = crate::dns::transports(config, socket_config)?;
     let resolver = std::sync::Arc::new(
@@ -570,14 +574,23 @@ async fn start_dns(
         )
         .map_err(|error| anyhow::anyhow!("cannot build the dns resolver: {error}"))?,
     );
+    let intercepted_resolver = intercept_dns.then(|| std::sync::Arc::clone(&resolver));
 
     if !wants_server {
-        daer_observe::info!(
-            daer_observe::EventCode::DaemonDnsNotStarted,
-            "dns server not started: `dns.bind` is unset, so this daemon is not the box's \
-             resolver (set `dns.bind` to serve; Fake-IP requires it too)"
-        );
-        return Ok((None, Some(fake_ip), snooper));
+        if intercept_dns {
+            daer_observe::info!(
+                daer_observe::EventCode::DaemonDnsStarted,
+                fake_ip = fake_ip.is_enabled(),
+                "transparent dns interception active: :53 flows are answered in-process \
+                 without `dns.bind` or /etc/resolv.conf changes"
+            );
+        } else {
+            daer_observe::info!(
+                daer_observe::EventCode::DaemonDnsNotStarted,
+                "dns service inactive: neither `dns.intercept` nor `dns.bind` is enabled"
+            );
+        }
+        return Ok((None, Some(fake_ip), snooper, intercepted_resolver));
     }
 
     let plan = crate::dns::Plan::resolve(config).map_err(anyhow::Error::msg)?;
@@ -618,6 +631,7 @@ async fn start_dns(
         }),
         Some(fake_ip),
         snooper,
+        intercepted_resolver,
     ))
 }
 

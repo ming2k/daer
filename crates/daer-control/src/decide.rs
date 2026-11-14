@@ -295,6 +295,8 @@ pub struct RouterOptions {
     pub fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
     /// Observational DNS Snooper for Real-IP mode (ADR-0011).
     pub dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
+    /// Built-in DNS resolver for transparent `:53` interception (ADR-0054).
+    pub dns_resolver: Option<Arc<daer_dns::Resolver>>,
     /// The datapath's per-flow facts, when a datapath is attached.
     ///
     /// `None` is the honest state for `--no-datapath`, the diagnostics, and every test: the
@@ -369,6 +371,13 @@ impl RouterOptions {
         self
     }
 
+    /// Supplies the built-in DNS resolver for transparent `:53` interception.
+    #[must_use]
+    pub fn with_dns_resolver(mut self, dns_resolver: Option<Arc<daer_dns::Resolver>>) -> Self {
+        self.dns_resolver = dns_resolver;
+        self
+    }
+
     /// Supplies the datapath's per-flow facts.
     #[must_use]
     pub fn with_kernel_observer(mut self, observer: Option<Arc<dyn KernelObserver>>) -> Self {
@@ -439,6 +448,8 @@ pub struct Router {
     dial_observer: daer_outbound::ObserverSlot,
     /// The mark every socket daer creates carries, including health probes.
     so_mark: Option<u32>,
+    /// Built-in DNS resolver for transparent `:53` interception (ADR-0054).
+    dns_resolver: Option<Arc<daer_dns::Resolver>>,
     /// Non-fatal compile warnings, so a reload report and a snapshot can carry them.
     warnings: Vec<String>,
 }
@@ -589,6 +600,7 @@ impl Router {
             kernel_observer: options.kernel_observer.clone(),
             dial_observer: options.dial_observer.clone(),
             so_mark,
+            dns_resolver: options.dns_resolver.clone(),
             warnings,
         })
     }
@@ -662,6 +674,20 @@ impl Router {
     /// has no selectable node, or when the dial fails. The flow is closed by the
     /// caller in every one of those cases.
     pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, RelayError> {
+        if flow.destination.port() == crate::dns_intercept::DNS_PORT
+            && let Some(resolver) = &self.dns_resolver
+        {
+            let verdict = self.verdict_for_flow(flow.source, flow.destination, None);
+            if verdict.outbound.kind == OutboundKind::Block {
+                return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
+                    destination: flow.destination,
+                }));
+            }
+            if let Some(upstream) = crate::dns_intercept::try_intercept_tcp(flow, resolver).await? {
+                return Ok(upstream);
+            }
+        }
+
         // The resolver owns the whole policy: Fake-IP, the DNS snooper, and the bounded
         // payload fallback. This path only consumes its answer.
         let outcome = self
@@ -670,7 +696,7 @@ impl Router {
             .await;
         self.log_domain(&flow.flow_id, flow.destination, &outcome);
         let verdict = self.verdict_for_flow(flow.source, flow.destination, outcome.domain());
-        self.dial_with_authority(flow, verdict, outcome.domain())
+        self.dial_with_authority(flow, verdict, outcome.domain(), outcome.source())
             .await
     }
 
@@ -715,7 +741,71 @@ impl Router {
 
     /// Dials the outbound leg for a decided flow.
     pub async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, RelayError> {
-        self.dial_with_authority(flow, verdict, None).await
+        self.dial_with_authority(flow, verdict, None, None).await
+    }
+
+    /// Resolves the concrete `SocketAddr` for a `direct` outbound.
+    ///
+    /// When the flow's destination is a real IP (DNS snooping, payload sniffing, or raw IP),
+    /// that IP is authoritative and dialed as-is. When it is a synthetic Fake-IP, `direct`
+    /// cannot connect to `198.18.0.0/15` and must unwrap the Fake-IP to its domain and resolve
+    /// the real IP through `daer-dns` (bypassing Fake-IP synthesis) `[INV-DIRECT-FAKEIP-01]`.
+    async fn resolve_direct_destination(
+        &self,
+        flow_id: daer_observe::FlowId,
+        destination: SocketAddr,
+        domain: Option<&str>,
+        domain_source: Option<DomainSource>,
+    ) -> Result<SocketAddr, RelayError> {
+        let is_fake =
+            domain_source == Some(DomainSource::FakeIp) || self.domain.is_fake_ip(destination.ip());
+        if !is_fake {
+            return Ok(destination);
+        }
+
+        let Some(name) = domain else {
+            return Err(dial_error(
+                flow_id,
+                destination,
+                "direct",
+                OutboundError::Connect(format!(
+                    "fake-ip destination {destination} has no domain mapping for direct dial"
+                )),
+            ));
+        };
+        let Some(resolver) = &self.dns_resolver else {
+            return Err(dial_error(
+                flow_id,
+                destination,
+                "direct",
+                OutboundError::Connect(
+                    "direct fake-ip unwrapping requires an active DNS resolver".to_owned(),
+                ),
+            ));
+        };
+
+        let ips = resolver
+            .resolve_real_ips(name, destination.is_ipv6())
+            .await
+            .map_err(|error| {
+                dial_error(
+                    flow_id,
+                    destination,
+                    "direct",
+                    OutboundError::Connect(format!("direct dns lookup for {name} failed: {error}")),
+                )
+            })?;
+        let Some(real_ip) = ips.into_iter().next() else {
+            return Err(dial_error(
+                flow_id,
+                destination,
+                "direct",
+                OutboundError::Connect(format!(
+                    "direct dns lookup for {name} returned no addresses"
+                )),
+            ));
+        };
+        Ok(SocketAddr::new(real_ip, destination.port()))
     }
 
     /// Dials the outbound leg, overriding authority when unwrapping Fake-IP.
@@ -724,6 +814,7 @@ impl Router {
         flow: &Accepted,
         verdict: Verdict,
         domain_override: Option<&str>,
+        domain_source: Option<DomainSource>,
     ) -> Result<Upstream, RelayError> {
         let outbound = &verdict.outbound;
         // One structured event per decision: the first thing anyone needs when
@@ -747,7 +838,15 @@ impl Router {
         }
 
         if outbound.kind == OutboundKind::Direct {
-            let direct_authority = flow.destination.to_string();
+            let direct_dest = self
+                .resolve_direct_destination(
+                    flow.flow_id,
+                    flow.destination,
+                    domain_override,
+                    domain_source,
+                )
+                .await?;
+            let direct_authority = direct_dest.to_string();
             let established = self
                 .direct
                 .connect(&direct_authority)
@@ -757,14 +856,14 @@ impl Router {
                     daer_observe::warn!(
                         daer_observe::EventCode::FlowDialFailed,
                         flow_id = %flow.flow_id,
-                        destination = %flow.destination,
+                        destination = %direct_dest,
                         election = "direct",
                         stage = %failure.stage,
                         error_code = %failure.code,
                         "flow dial failed"
                     );
                     RelayError::Dial {
-                        destination: flow.destination,
+                        destination: direct_dest,
                         failure,
                     }
                 })?;
@@ -875,35 +974,6 @@ impl Router {
         )
     }
 
-    /// The authority a datagram flow should be dialed to.
-    ///
-    /// # Why the datagram half needs this and TCP could do without it
-    ///
-    /// TCP's [`Router::resolve`] walks the same sources of a name — Fake-IP, a unique
-    /// DNS-snooper candidate, then the explicit `[routing.sniff]` fallback — and passes the
-    /// winner to [`Router::dial_with_authority`]. The datagram relay used to skip all of it and dial
-    /// `original_destination`, which is correct only when the destination is a real
-    /// address. With Fake-IP enabled the destination is a synthetic `198.18.0.0/15`
-    /// address, so dialing it sends the flow to a host that does not exist; with DNS
-    /// snooping the name is known and dialing the IP silently discards it, which breaks
-    /// every `domain(...)` rule for UDP and makes the flow's own SNI/Host irrelevant to
-    /// where it goes.
-    ///
-    /// The `direct` outbound keeps dialing the literal address: a direct flow is a flow
-    /// whose destination is authoritative, and turning a known domain into a direct dial
-    /// by name would re-resolve through a resolver the user did not ask for.
-    #[must_use]
-    pub fn dial_target(&self, facts: FlowFacts, domain: Option<&str>) -> String {
-        let verdict = self.verdict_for_datagram(facts, domain);
-        if verdict.outbound.kind == OutboundKind::Direct {
-            return facts.destination.to_string();
-        }
-        match domain {
-            Some(name) => format!("{name}:{}", facts.destination.port()),
-            None => facts.destination.to_string(),
-        }
-    }
-
     /// Opens a datagram leg from the flow's first payload.
     ///
     /// This is the one entry point the relay calls. Name acquisition, including the
@@ -917,12 +987,29 @@ impl Router {
         facts: FlowFacts,
         payload: &[u8],
     ) -> Result<DatagramLeg, RelayError> {
+        if facts.destination.port() == crate::dns_intercept::DNS_PORT
+            && let Some(resolver) = &self.dns_resolver
+        {
+            let verdict = self.verdict_for_datagram(facts, None);
+            if verdict.outbound.kind == OutboundKind::Block {
+                return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
+                    destination: facts.destination,
+                }));
+            }
+            if let Some(leg) =
+                crate::dns_intercept::try_intercept_datagram(facts, payload, resolver)
+            {
+                return Ok(leg);
+            }
+        }
+
         let outcome = self
             .domain
             .resolve_datagram(facts.source, facts.destination, payload);
         self.log_domain(&facts.flow_id, facts.destination, &outcome);
         let verdict = self.verdict_for_datagram(facts, outcome.domain());
-        self.open_datagram(facts, &verdict, outcome.domain()).await
+        self.open_datagram_with_source(facts, &verdict, outcome.domain(), outcome.source())
+            .await
     }
 
     /// Opens the datagram leg for a decided flow.
@@ -943,6 +1030,17 @@ impl Router {
         verdict: &Verdict,
         domain: Option<&str>,
     ) -> Result<DatagramLeg, RelayError> {
+        self.open_datagram_with_source(facts, verdict, domain, None)
+            .await
+    }
+
+    async fn open_datagram_with_source(
+        &self,
+        facts: FlowFacts,
+        verdict: &Verdict,
+        domain: Option<&str>,
+        domain_source: Option<DomainSource>,
+    ) -> Result<DatagramLeg, RelayError> {
         let outbound = &verdict.outbound;
         daer_observe::debug!(daer_observe::EventCode::FlowDatagramDecided,
             flow_id = %facts.flow_id,
@@ -962,19 +1060,22 @@ impl Router {
             }));
         }
 
-        // The target is *this* decision's answer and is returned with the connector. The
-        // relay must not ask again: a reload between two calls would let the flow be dialed
-        // to a target the rule that opened the leg never chose.
-        let target = self.dial_target(facts, domain);
-
         if outbound.kind == OutboundKind::Direct {
+            let direct_dest = self
+                .resolve_direct_destination(facts.flow_id, facts.destination, domain, domain_source)
+                .await?;
             // The mark is already baked into `datagram_direct` when the generation
             // was built, so a per-flow copy would only add a rebuild.
             return Ok(DatagramLeg {
-                target,
+                target: direct_dest.to_string(),
                 connector: Arc::new(self.datagram_direct.clone()),
             });
         }
+
+        let target = match domain {
+            Some(name) => format!("{name}:{}", facts.destination.port()),
+            None => facts.destination.to_string(),
+        };
 
         let group_name = outbound.name.clone();
         let node = self.select_node(facts.flow_id, facts.destination, &group_name)?;

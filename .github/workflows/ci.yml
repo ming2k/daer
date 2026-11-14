@@ -69,11 +69,10 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # The kernel datapath and the REALITY interop are fixtures CI exercises, and until this
-  # job existed that claim was false: `cargo test
-  # --workspace` runs `tests/transparent.rs` on a stock runner where it skips itself (no
-  # CAP_NET_ADMIN), and it does not install `xray`, so `tests/reality_interop.rs` skipped too.
-  # Two green ticks over two skips is exactly what ADR-0007 forbids, so both get a job here and
-  # `DAER_REQUIRE` turns a skip in either into a failure.
+  # job existed that claim was false: an unprivileged `cargo test --workspace` skips the
+  # kernel cases (no CAP_BPF/CAP_NET_ADMIN) and the interop cases (no `xray`). Two green ticks
+  # over two skips is exactly what ADR-0007 forbids, so both get a job here and a `skipped: `
+  # line fails the step.
   kernel-datapath:
     runs-on: ubuntu-latest
     steps:
@@ -94,20 +93,29 @@ jobs:
           sudo unzip -o -q /tmp/xray.zip xray -d /usr/local/bin
           xray version
       - name: Build the datapath objects (the production one and the test one)
-        # `kernel-check.sh` needs both: `datapath.bpf.o` for the verifier and attach cases, and
-        # `datapath_test.bpf.o` — which only `--tests` compiles — for the in-kernel cases. The
-        # `--tests` half used to be missing here, so section 7 skipped and `DAER_REQUIRE`
-        # never named a key that would have noticed.
+        # `datapath.bpf.o` is used by the verifier/attach cases; `datapath_test.bpf.o`, which
+        # only `--tests` compiles, drives the in-kernel `BPF_PROG_TEST_RUN` cases.
         run: cargo xtask ebpf --tests
-      - name: Kernel datapath (verifier, tc attach, in-kernel cases)
-        # The keys are the script's own (`scripts/verify/kernel-check.sh`), not section numbers: a
-        # key in `DAER_REQUIRE` turns its *skip* into a failure. This list said
-        # `7-tcp,8` — neither of which this script emits — so every check could skip and
-        # the job still exited zero. The UDP half of the in-kernel cases still has a named
-        # prerequisite this runner cannot meet, which is why `7` is the key and not `7-udp`.
-        env:
-          DAER_REQUIRE: "kernel-binary,7"
-        run: scripts/verify/kernel-check.sh
+      - name: Build the E2E test binary
+        run: cargo test -p daer-tests --test e2e --no-run --locked
+      - name: Kernel datapath (verifier, TCX, cgroup, in-kernel cases)
+        # The test functions live in tests/e2e/ebpf_kernel.rs and tests/e2e/ebpf_datapath.rs.
+        # They are `#[ignore]` because they need CAP_BPF/CAP_NET_ADMIN; the job runs the same
+        # binary as root and fails on a skip instead of accepting a green run that proved
+        # nothing (ADR-0007).
+        run: |
+          set -euo pipefail
+          binary="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+            -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+          sudo "$binary" --include-ignored --nocapture --test-threads=1 \
+            ebpf_kernel::the_object_loads_and_verifies \
+            ebpf_kernel::a_tcx_program_attaches_to_loopback \
+            ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy \
+            ebpf_datapath::every_datapath_case_passes 2>&1 | tee /tmp/kernel-datapath.log
+          if grep -q "skipped: " /tmp/kernel-datapath.log; then
+            echo "::error::a kernel datapath test skipped; the privileged gate must run"
+            exit 1
+          fi
       - name: REALITY + Vision interop against the reference node
         # Captured, then inspected: the test skips itself when it cannot find `xray`, and a skip
         # that reads as a pass is the failure this job exists to end.
@@ -132,12 +140,10 @@ jobs:
             exit 1
           fi
 
-  # The user-space ingress path. `e2e-check.sh` answers a different question from
-  # `kernel-check.sh` — does a real tproxy redirect reach `daer run` and come back — and it
-  # is the only job that runs `tests/e2e/control_transparent.rs` and `tests/e2e/cli_reload.rs`
-  # with the capability they need. Both skip themselves on the `test` job above, and a suite
-  # that skips is not coverage (ADR-0007), so without this job the ingress path and the
-  # `SIGHUP` fix had no CI evidence at all.
+  # The user-space ingress path: a real tproxy redirect reaches `daer run` and comes back,
+  # the two-namespace UDP topologies run, the private ingress lifecycle is exercised, and a
+  # real SIGHUP does not abort the daemon. Those tests skip themselves in the unprivileged
+  # `test` job, so this job runs the same `e2e` binary as root and fails on a skip.
   e2e-ingress:
     runs-on: ubuntu-latest
     steps:
@@ -148,16 +154,30 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Install the fixture tools
         run: sudo apt-get update && sudo apt-get install -y nftables curl
-      - name: The transparent data path and a real SIGHUP
-        # `3-udp` is deliberately absent: the old single-namespace IPv4 fixture is invalid
-        # (the origin and the transparent reply socket must own the same address and port).
-        # `3-udp4` and `3-udp6` are the two-namespace datagram gates. `3-netns` is required
-        # because the private ingress lifecycle is a production claim, not an optional
-        # convenience; it was emitted by the script but absent from this list, so it could
-        # skip while the job stayed green.
+      - name: Build the E2E test binary and the daemon
+        run: |
+          cargo build -p daer-cli --bin daer --locked
+          cargo test -p daer-tests --test e2e --no-run --locked
+      - name: Transparent data path, private ingress, and SIGHUP
+        # The module prefixes select every non-ignored test in the file. The ignored
+        # single-namespace UDP fixture is deliberately left out; the two-namespace
+        # control_transparent_udp4/6 modules are the real datagram gates.
         env:
-          DAER_REQUIRE: "3-tcp,3-tcp6,3-udp4,3-udp6,3-netns,4"
-        run: scripts/verify/e2e-check.sh
+          DAER_NETNS_TEST: "1"
+        run: |
+          set -euo pipefail
+          binary="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+            -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+          sudo --preserve-env=DAER_NETNS_TEST "$binary" --nocapture --test-threads=1 \
+            control_transparent:: \
+            control_transparent_udp4:: \
+            control_transparent_udp6:: \
+            control_netns_lifecycle:: \
+            cli_reload:: 2>&1 | tee /tmp/e2e-ingress.log
+          if grep -q "skipped: " /tmp/e2e-ingress.log; then
+            echo "::error::a privileged ingress test skipped; the gate must run"
+            exit 1
+          fi
 
   # The datapath is C from upstream; the object test is the ABI contract with it.
   # It is a separate job because it needs clang and the kernel headers, which the

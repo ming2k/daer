@@ -161,3 +161,7 @@ The unprivileged gate is unchanged: `daer check` and `daer run --dry-run` still 
 namespace creation. The preflight reports `CAP_SYS_ADMIN` alongside the three datapath
 capabilities, and the dry-run mutation boundary now begins at `PreparedIngress::prepare`
 rather than at `Daemon::bind`.
+
+> Implementation note (2026-11-14): the runner scripts named in this record were removed. The
+> privileged tests remain in `tests/e2e/`, and CI runs the same binary directly as root. See
+> the amendment in [ADR-0052](0052-layered-test-architecture.md).

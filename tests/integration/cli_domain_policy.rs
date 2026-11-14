@@ -149,12 +149,14 @@ action = "direct"
 }
 
 #[test]
-fn check_rejects_fake_ip_without_an_explicit_dns_bind() {
-    let dir = TempDir::new("fake-ip-bind");
+fn check_rejects_fake_ip_without_active_dns_ingress() {
+    let dir = TempDir::new("fake-ip-ingress");
     let config = write_config(
         &dir,
         r#"
 schema = 6
+[dns]
+intercept = false
 [dns.fake-ip]
 enabled = true
 "#,
@@ -163,11 +165,36 @@ enabled = true
     let output = check(&config);
     assert!(
         !output.status.success(),
-        "Fake-IP without a listener is a load error"
+        "Fake-IP without an active DNS ingress is a load error"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("dns.fake-ip.enabled"),
         "the refusal must name the field: {stderr}"
+    );
+}
+
+#[test]
+fn check_accepts_fake_ip_with_transparent_interception_and_no_bind() {
+    let dir = TempDir::new("fake-ip-intercept");
+    let config = write_config(
+        &dir,
+        r#"
+schema = 6
+wan-interface = ["lo"]
+[dns]
+upstream = ["local:udp://223.5.5.5:53"]
+[dns.fake-ip]
+enabled = true
+[routing]
+default = "direct"
+"#,
+    );
+
+    let output = check(&config);
+    assert!(
+        output.status.success(),
+        "Fake-IP with upstream works via transparent interception without dns.bind: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

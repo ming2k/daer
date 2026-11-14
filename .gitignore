@@ -13,8 +13,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Test / debug logs and check artifacts
-daer-kernel-check/
+# Test / debug logs
 *.log
 
 # Site-specific daer configurations (may contain credentials or node links).

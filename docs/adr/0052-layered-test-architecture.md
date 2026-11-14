@@ -109,6 +109,15 @@ find its binary under `target/debug/deps/e2e-*`, and select tests by module-qual
 They still own `DAER_REQUIRE`, sudo, nftables and network namespaces. The old
 `cargo xtask kernel-check` / `cargo xtask e2e-check` aliases are deleted.
 
+> **Amended 2026-11-14: the two runner scripts were removed.** CI now invokes the same `e2e`
+> binary directly with module filters and `--test-threads=1`, and fails on a `skipped: `
+> line. The `DAER_REQUIRE` and emitted-key audit are gone with the scripts;
+> `tests/integration/test_architecture.rs` keeps the ignore-reason, harness-placement and
+> CI-layer checks. `scripts/install.sh` is the only non-test entry point for the normal
+> install; `scripts/delivery-check.sh` remains a manual release gate and
+> `scripts/rules/dat_to_rules.py` remains a producer tool. The privileged *tests* still live in `tests/e2e/`; only the
+> project-specific runner layer was deleted.
+
 ## Consequences
 
 - CI has explicit layer jobs: unit/doc, integration, kernel, ingress, object. A failure names

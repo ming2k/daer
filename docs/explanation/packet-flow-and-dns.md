@@ -274,8 +274,8 @@ There are two different things that can look like "DNS egress":
 
 ```text
 1. A client's query to an external resolver
-   client ──▶ eBPF/relay ──▶ 8.8.8.8:53
-   This is an ordinary flow and is subject to [routing].
+   client ──▶ eBPF ──▶ daer-control (:53 intercept) ──▶ daer-dns (if dns.intercept active)
+                                                        └─ asis / intercept=false ──▶ 8.8.8.8:53
 
 2. daer-dns asking its configured upstream
    daer-dns ──▶ netune ──▶ upstream resolver
@@ -283,8 +283,11 @@ There are two different things that can look like "DNS egress":
    recaptured by daer's own datapath.
 ```
 
-The built-in resolver does **not** intercept the first kind. It only answers clients that use
-it as their resolver.
+When `[dns].intercept` is active (the default whenever `[dns].upstream` is declared), `:53`
+flows arriving at `daer-control` are answered in-process by `daer-dns::Resolver` without
+requiring `[dns].bind` or `/etc/resolv.conf` changes (ADR-0054). Queries that evaluate to
+`asis` in `[dns.request]` fall through to normal `[routing]` and dial the client's original
+destination resolver.
 
 ---
 
@@ -350,7 +353,7 @@ recurse through the proxy, and leak traffic. The local map exists precisely to a
 | Dimension | DNS's position |
 | :--- | :--- |
 | **Layer** | Name plane / control plane, not a payload relay. |
-| **Starts when** | `dns.bind` is set, or `[dns.fake-ip] enabled = true`. |
+| **Starts when** | `[dns].intercept` is active (default when `upstream` is set) or `dns.bind` is set. |
 | **Input** | Client DNS query, `[dns]` configuration, upstream answers. |
 | **Output** | DNS answer, `FakeIpPool` mapping, `DnsSnooper` mapping, `QueryId` events. |
 | **Consumers** | `daer-control::known_domain()`, `[routing]`, and the outbound dial authority. |
@@ -368,8 +371,9 @@ when DNS cannot name the flow. The cost is that domain rules become later and le
 Fake-IP is also optional, and it is **disabled by default**: `[dns.fake-ip]` starts with
 `enabled = false` (ADR-0012, `[INV-FAKEIP-01]`). When it is off, the pool is inert:
 `contains_ip()` returns false, `reverse_lookup()` returns `None`, and `198.18.0.0/15` is
-treated as ordinary address space. Fake-IP is an answer mode of the DNS listener, so it
-requires an explicit `dns.bind`; enabling it never starts the listener by itself.
+treated as ordinary address space. Fake-IP is an answer mode of the DNS resolver, so it
+requires an active DNS ingress (`[dns].intercept` or `[dns].bind`); enabling it never starts
+an explicit listener by itself.
 
 Real-IP plus the DNS snooper preserves domain facts without synthetic addresses, but a shared
 CDN address can map to more than one domain. Fake-IP removes that ambiguity by construction:

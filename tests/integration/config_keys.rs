@@ -192,9 +192,9 @@ fn every_configuration_key_has_a_consumer() {
     // `[node.bandwidth]`, `[node.port-hopping]`) took it to 131, schema 4 moved the two
     // global sniff knobs into `[routing.sniff]` (one policy key plus its timeout), and schema 5
     // flattened `[global]` into `Config`, removed `ProbeSettings.tolerance`, and made the
-    // socket mark internal rather than a configuration key.
+    // socket mark internal rather than a configuration key. ADR-0054 added `Dns.intercept`.
     assert_eq!(
-        total, 128,
-        "expected exactly 128 configuration fields to be verified"
+        total, 129,
+        "expected exactly 129 configuration fields to be verified"
     );
 }

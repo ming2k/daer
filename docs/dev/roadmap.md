@@ -133,8 +133,8 @@ The largest piece. Order matters: this is what makes the binary useful.
    panic the daemon (`reload` called `block_on` from inside the runtime), which no unit test
    saw because none of them signalled a running process. `tests/e2e/cli_reload.rs`
    now starts the real binary, sends `SIGHUP`, and asserts the process is alive **and** that
-   generation 2 was published; `scripts/verify/kernel-check.sh` section 8 runs it where the
-   transparent port can bind. **Exit:** 1000 reloads under a long-lived connection with zero
+   generation 2 was published; the privileged CI ingress job runs it where the transparent
+   port can bind. **Exit:** 1000 reloads under a long-lived connection with zero
    drops, and a kernel-tier assertion that the table was rewritten rather than merely
    republished in userspace. A reload is also synchronous inside the signal loop, so a slow
    subscription fetch delays new accepts (they queue in the listener's backlog rather than
@@ -355,4 +355,4 @@ is not needed and remains deliberately unused: the ring buffer is the structured
 | Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | [`netune-requests.md`](netune-requests.md) |
 | QUIC implementation for hysteria2/tuic | **resolved** — netune owns the QUIC/H3 client transport (netune ADR-0016); daer consumes `netune-quic`/`netune-http3` and keeps only product protocol layers (ADR-0035) | milestone 5 |
 | Matcher data structures | performance ceiling of the data path | milestone 6 |
-| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/e2e/control_transparent.rs`, `scripts/verify/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |
+| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` or the privileged CI filters with it (`tests/e2e/control_transparent.rs`, `tests/e2e/ebpf_kernel.rs`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |
