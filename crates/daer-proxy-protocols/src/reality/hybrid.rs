@@ -4,9 +4,11 @@
 //!
 //! # Why this is not optional
 //!
-//! REALITY servers from `xtls/reality` v0.0.0-20260908062103 onward **require** this group.
-//! The server's authentication loop refuses to try at all when the ClientHello carries no
-//! `X25519MLKEM768` share:
+//! Current REALITY servers from `xtls/reality` v0.0.0-20260908062103 onward **require**
+//! this group for their own TLS exchange. Older nodes only inspect a plain `X25519` share,
+//! so the client offers both over the same ephemeral secret; the authentication tag is
+//! valid for either. A current server's authentication loop refuses a hello that carries
+//! no `X25519MLKEM768` share:
 //!
 //! ```text
 //!   if peerPub2 == nil {
@@ -108,6 +110,33 @@ impl Client {
         self.x25519_secret.to_bytes()
     }
 
+    /// The X25519 public key, for the classic share offered beside the hybrid one.
+    ///
+    /// Current REALITY servers require `X25519MLKEM768`, but older nodes only inspect a
+    /// plain `X25519` key share. Offering both, over the same ephemeral secret, keeps the
+    /// tag valid for either server without weakening the current one.
+    #[must_use]
+    pub fn x25519_public(&self) -> [u8; 32] {
+        PublicKey::from(&self.x25519_secret).to_bytes()
+    }
+
+    /// Completes a plain X25519 exchange when the server selected the classic group.
+    pub fn complete_x25519(&self, server_share: &[u8]) -> Result<[u8; 32], String> {
+        let peer = PublicKey::from(
+            <[u8; 32]>::try_from(server_share)
+                .map_err(|_| "x25519 server share is not 32 bytes".to_owned())?,
+        );
+        let shared = self.x25519_secret.diffie_hellman(&peer);
+        if !shared.was_contributory() {
+            return Err(
+                "the server's X25519 share produced a non-contributory secret \
+                 (it may be a low-order point)"
+                    .to_owned(),
+            );
+        }
+        Ok(shared.to_bytes())
+    }
+
     /// Completes the exchange against the server's share.
     ///
     /// # Errors
@@ -203,6 +232,32 @@ mod tests {
         // The X25519 half is the last 32 bytes, per the draft.
         let expected = PublicKey::from(&client.x25519_secret).to_bytes();
         assert_eq!(&share[MLKEM_ENCAPSULATION_KEY_LEN..], &expected);
+    }
+
+    #[test]
+    fn the_classic_share_reuses_the_hybrid_x25519_key() {
+        // Both key_share entries must commit to the same X25519 secret: the server may
+        // authenticate from either one, and a second secret would make the REALITY tag
+        // valid for only one of them.
+        let mut rng = Fixed(0x51d);
+        let client = Client::generate(&mut rng);
+        let hybrid = client.client_share();
+        let classic = client.x25519_public();
+        assert_eq!(
+            &hybrid[MLKEM_ENCAPSULATION_KEY_LEN..],
+            &classic,
+            "the hybrid tail and the classic share must be the same public key"
+        );
+
+        let server_secret = StaticSecret::from([0x17; 32]);
+        let server_public = PublicKey::from(&server_secret).to_bytes();
+        let shared = client
+            .complete_x25519(&server_public)
+            .expect("classic exchange completes");
+        let expected = server_secret
+            .diffie_hellman(&PublicKey::from(classic))
+            .to_bytes();
+        assert_eq!(shared, expected);
     }
 
     #[test]

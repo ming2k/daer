@@ -8,11 +8,8 @@
 //! empty. Unknown keys are rejected at every level.
 //!
 //! ```toml
-//! schema = 2
+//! schema = 5
 //! include = ["conf.d/*.toml"]
-//!
-//! [global]
-//! dial-mode = "domain"
 //! lan-interface = ["docker0"]
 //!
 //! [[node]]
@@ -32,8 +29,21 @@
 //! type = "min-moving-avg"
 //!
 //! [routing]
-//! rules = ["provider(private) -> direct", "provider(cn) -> direct"]
-//! fallback = "proxy"
+//! fallback = { election = "proxy" }
+//!
+//! [routing.sniff]
+//! enabled = true
+//! timeout = "30ms"
+//!
+//! [[routing.rule]]
+//! name = "private"
+//! match = "rule-set(private)"
+//! action = "direct"
+//!
+//! [[routing.rule]]
+//! name = "cn"
+//! match = "rule-set(cn)"
+//! action = "direct"
 //! ```
 //!
 //! # `include`
@@ -133,8 +143,8 @@ impl std::error::Error for LoadError {
             // and returning it here made `anyhow`'s `{:#}` (the CLI's error format) print the same
             // sentence twice:
             //
-            //   failed to load c.toml: invalid configuration: global.wan-interface: must name …
-            //                          : global.wan-interface: must name …
+            //   failed to load c.toml: invalid configuration: wan-interface: must name …
+            //                          : wan-interface: must name …
             //
             // `Display` is the one place this message is composed; a chain that repeats it is a
             // bug the operator sees on every validation failure.
@@ -438,7 +448,7 @@ mod tests {
 
     #[test]
     fn a_syntax_error_carries_a_position() {
-        let error = load_str("[global]\nso-mark =\n").expect_err("must fail");
+        let error = load_str("[tls]\nprofile =\n").expect_err("must fail");
         let rendered = error.to_string();
         assert!(rendered.contains("line 2"), "{rendered}");
     }
@@ -461,9 +471,10 @@ mod tests {
     #[test]
     fn rendering_round_trips() {
         let config = load_str(
-            "[global]\nlog-level = \"debug\"\n[[node]]\nname = \"n\"\ntype = \"shadowsocks\"\n\
+            "log-level = \"debug\"\n[[node]]\nname = \"n\"\ntype = \"shadowsocks\"\n\
              server = \"1.2.3.4\"\nport = 8388\nmethod = \"aes-256-gcm\"\npassword = \"x\"\n\
-             [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"direct\"\n",
+             [routing]\nfallback = \"direct\"\n\
+             [[routing.rule]]\nname = \"nm\"\nmatch = \"pname(NetworkManager)\"\naction = \"direct\"\n",
         )
         .expect("valid");
         let rendered = to_string(&config);

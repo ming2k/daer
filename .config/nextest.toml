@@ -1,0 +1,33 @@
+# nextest configuration (ADR-0052)
+#
+# The workspace has two external test binaries: `integration` (unprivileged composition) and
+# `e2e` (privileged, real daemon/kernel). Unit tests stay in their crates and are selected
+# with a nextest filterset, not a custom runner:
+#
+#   cargo nextest run --workspace -E 'kind(lib) + kind(bin)'
+#   cargo nextest run --workspace -E 'binary(integration)'
+#   cargo nextest run --workspace -E 'binary(e2e)'
+#
+# nextest has no doctest support; `cargo test --workspace --doc` remains the one native
+# command in the test flow.
+
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = 0
+
+# E2E tests install nftables tables, create network namespaces and bind fixed addresses.
+# Running two of them concurrently produces fixture collisions that look like product bugs,
+# so this group serialises them without forcing the integration layer to be serial.
+[[profile.default.overrides]]
+filter = 'binary(e2e)'
+test-group = 'e2e-serial'
+
+[test-groups.e2e-serial]
+max-threads = 1
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "180s", terminate-after = 2 }
+# A flaky test is a defect to fix, not a retry to hide. ADR-0007.
+retries = 0

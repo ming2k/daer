@@ -26,7 +26,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use daer_config::Config;
+use daer_config::{Config, WanInterface};
 
 use daer_relay::relay::datagram::{
     DatagramService, DatagramStats as DatagramCounters, RelayOptions,
@@ -210,10 +210,7 @@ impl Daemon {
         let namespace = ingress
             .as_ref()
             .map(|ingress| Arc::clone(&ingress.namespace));
-        let socket_mark = match options.so_mark {
-            Some(mark) => mark,
-            None => config.global.so_mark,
-        };
+        let socket_mark = options.so_mark;
         let ids = Arc::new(daer_observe::Ids::new());
         // Bound before the object is loaded: the sockets go into `listen_socket_map`, so they
         // have to exist first. Binding does not accept, so no flow is served before the datapath
@@ -370,12 +367,6 @@ impl Daemon {
             tcp6: self.listener.raw_fd_v6(),
             udp6,
         })
-    }
-
-    /// The probe defaults of the current generation.
-    #[must_use]
-    pub fn probe(&self) -> daer_config::ProbeSettings {
-        self.generations.current().probe()
     }
 
     /// Runs the accept loop until `shutdown` resolves.
@@ -552,27 +543,19 @@ impl std::fmt::Debug for DatagramRouterForGeneration {
 }
 
 impl daer_relay::DatagramRouter for DatagramRouterForGeneration {
-    fn known_domain(&self, destination: SocketAddr) -> Option<String> {
-        self.generations
-            .current()
-            .router()
-            .known_domain(destination)
-    }
-
     fn open_datagram<'a>(
         &'a self,
         facts: FlowFacts,
-        domain: Option<&'a str>,
+        initial_payload: &'a [u8],
     ) -> daer_relay::OpenDatagram<'a> {
         // The generation is pinned into an `Arc` *before* the future is created: it is what
         // keeps this session's rules alive, and what stops a reload landing between the
         // verdict and the dial from changing where the flow goes.
         let generation = self.generations.current();
         Box::pin(async move {
-            let router = generation.router();
-            let verdict = router.verdict_for_datagram(facts, domain);
-            router
-                .open_datagram(facts, &verdict, domain)
+            generation
+                .router()
+                .open_datagram_with_payload(facts, initial_payload)
                 .await
                 .map_err(|error| match error {
                     RelayError::Dial { failure, .. } => failure,
@@ -586,7 +569,7 @@ impl daer_relay::DatagramRouter for DatagramRouterForGeneration {
     }
 }
 
-/// Resolves `wan-interface = ["auto"]` to the interface carrying the default route.
+/// Resolves `wan-interface = "auto"` to the interface carrying the default route.
 ///
 /// # Errors
 ///
@@ -623,27 +606,33 @@ pub fn detect_wan_interface() -> Result<String, String> {
         .ok_or_else(|| "no default route: cannot detect the WAN interface".to_owned())
 }
 
-/// Expands `auto` in the configured interface lists.
+/// Expands `wan-interface = "auto"` or passes an explicit interface list through.
 ///
 /// # Errors
 ///
 /// As [`detect_wan_interface`], when `auto` is asked for and no default route exists.
 pub fn resolve_interfaces(
     lan: &[String],
-    wan: &[String],
+    wan: &WanInterface,
 ) -> Result<(Vec<String>, Vec<String>), String> {
-    let mut resolved_wan = Vec::with_capacity(wan.len());
-    for entry in wan {
-        if entry == "auto" {
+    let resolved_wan = match wan {
+        WanInterface::Auto => {
             let detected = detect_wan_interface()?;
             daer_observe::info!(daer_observe::EventCode::DaemonWanDetected,interface = %detected, "detected the WAN interface");
-            if !resolved_wan.contains(&detected) {
-                resolved_wan.push(detected);
-            }
-        } else {
-            resolved_wan.push(entry.clone());
+            vec![detected]
         }
-    }
+        WanInterface::Named(names) => {
+            // Validation rejects duplicates, but this function is also reachable from tests
+            // and library callers; collapsing here keeps a duplicate out of the datapath.
+            let mut unique = Vec::with_capacity(names.len());
+            for name in names {
+                if !unique.contains(name) {
+                    unique.push(name.clone());
+                }
+            }
+            unique
+        }
+    };
     Ok((lan.to_vec(), resolved_wan))
 }
 
@@ -661,7 +650,7 @@ mod tests {
     fn auto_resolves_to_one_interface() {
         // Only asserts the shape, not the name: the test box's default route is not the
         // developer's. A box with no route is skipped rather than failed.
-        let (lan, wan) = match resolve_interfaces(&[], &["auto".to_owned()]) {
+        let (lan, wan) = match resolve_interfaces(&[], &WanInterface::Auto) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 eprintln!("skipped: {reason}");
@@ -675,17 +664,18 @@ mod tests {
 
     #[test]
     fn a_named_interface_is_passed_through() {
-        let (_, wan) = resolve_interfaces(&[], &["eth0".to_owned()]).expect("resolves");
+        let (_, wan) = resolve_interfaces(&[], &WanInterface::Named(vec!["eth0".to_owned()]))
+            .expect("resolves");
         assert_eq!(wan, ["eth0"]);
     }
 
     #[test]
-    fn a_duplicate_auto_is_collapsed() {
-        // Two `auto` entries would attach the same program to the same interface twice,
-        // which the kernel rejects as a duplicate filter.
-        let Ok((_, wan)) = resolve_interfaces(&[], &["auto".to_owned(), "auto".to_owned()]) else {
-            return;
-        };
-        assert_eq!(wan.len(), 1, "{wan:?}");
+    fn an_explicit_interface_list_is_passed_through_in_order() {
+        let (_, wan) = resolve_interfaces(
+            &[],
+            &WanInterface::Named(vec!["eth0".to_owned(), "wg0".to_owned()]),
+        )
+        .expect("resolves");
+        assert_eq!(wan, ["eth0", "wg0"]);
     }
 }

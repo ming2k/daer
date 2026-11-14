@@ -1,16 +1,17 @@
 # Scripts
 
-Executable helpers that are not part of the Rust workspace. A task that fits the
-workspace belongs in [`cargo xtask`](../crates/xtask/src/main.rs); the files here are
-the cases that need a privileged shell, a standalone Python interpreter, or direct
-access to a host service.
+Executable helpers that are not part of the Rust workspace. Rust tests are selected with
+`cargo nextest` (see [`docs/dev/testing.md`](../docs/dev/testing.md)); these scripts are the
+cases that need a privileged shell, a standalone Python interpreter, or direct access to a
+host service. xtask owns code generation, packaging and the unprivileged preflight, not test
+selection.
 
 ## Layout
 
 | Path | Runs as | Entry point | Answers |
 | :--- | :--- | :--- | :--- |
-| `verify/kernel-check.sh` | root (`sudo`) | `cargo xtask kernel-check` | Does the eBPF object load, verify, attach, and pass the in-kernel datapath cases? |
-| `verify/e2e-check.sh` | root (`sudo`) | `cargo xtask e2e-check` | Does a real redirected flow reach the daemon and come back? |
+| `verify/kernel-check.sh` | root (`sudo`) | direct | Does the eBPF object load, verify, attach TCX and the pname cgroup hooks, and pass the in-kernel datapath cases? |
+| `verify/e2e-check.sh` | root (`sudo`) | direct | Does a real redirected flow reach the daemon and come back? |
 | `rules/dat_to_rules.py` | user | `python3 scripts/rules/dat_to_rules.py` | Converts a legacy `geoip.dat` / `geosite.dat` into Canonical Rule Source (`.rules`). |
 | `ops/daer-install-netns.sh` | user, then root (re-execs `sudo`) | direct | Stages the local `daer` and `daer-drb` binaries, datapath object, and systemd unit with `cargo xtask install`, copies the staged tree into `/usr`, installs a site config, and restarts `daer`. |
 | `ops/daer-delivery-check.sh` | root (`sudo`); `--preflight` as user | direct | Runs the private-ingress diagnostic and restores the host's prior network state. `--preflight` checks the kernel, tools, artifacts, and config without root. |
@@ -21,16 +22,16 @@ The two `verify/` scripts are deliberately separate: they have different depende
 closures and different failure meanings (ADR-0007, ADR-0025). Both re-exec themselves
 under `sudo`; run them as your normal user so `cargo` stays on `PATH`.
 
-`cargo xtask e2e-check` runs `verify/e2e-check.sh` and is deterministic: it builds test
-binaries and drives the userspace relay through nftables, but it does **not** exercise the
-real TCX hooks. The real-daemon delivery and `SIGKILL` gate is
+`scripts/verify/e2e-check.sh` is deterministic: it builds the root `e2e` test binary and
+drives the userspace relay through nftables, but it does **not** exercise the real TCX hooks. The real-daemon delivery and `SIGKILL` gate is
 `ops/daer-delivery-check.sh`; it needs a site config, a real node and a clean disposable host.
 The host preparation and release checklist live in
 [`docs/dev/test-environment.md`](../docs/dev/test-environment.md) and
 [`docs/dev/production-readiness.md`](../docs/dev/production-readiness.md).
 
 `DAER_REQUIRE=<key,...>` turns a named **skip** into a failure. The keys belong to the
-script that emits them; see `docs/how-to/deployment.md` for the full list.
+script that emits them; the current list and the key-consistency audit are defined in
+[`docs/dev/testing.md`](../docs/dev/testing.md) (ADR-0052).
 
 | Variable | Script | Meaning |
 | :--- | :--- | :--- |

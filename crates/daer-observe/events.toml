@@ -1078,7 +1078,7 @@ message = "diagnostic ring dropped events"
 fields = ["dropped", "capacity"]
 counter = "observe.ring_dropped"
 rate = "observe.ring_dropped"
-remediation = "Increase `global.diagnostics.event-buffer` or reduce debug volume; the event stream is incomplete."
+remediation = "Reduce debug volume; the diagnostic ring has a fixed capacity, so the event stream is incomplete."
 
 [[events]]
 name = "IncidentCaptureFailed"

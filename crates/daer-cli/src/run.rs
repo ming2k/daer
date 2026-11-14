@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use daer_config::WanInterface;
 use daer_control::daemon::{Daemon, resolve_interfaces};
 use daer_control::datapath;
 use daer_control::datapath::{DEVICE, PEER};
@@ -99,7 +100,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // The bootstrap subscriber was installed before `load_resolved`, so subscription and
     // provider warnings are visible. This applies the configuration's level; a malformed
     // directive is a startup error, not a silent fallback to `info`.
-    super::set_log_filter(&loaded.global.log_level).map_err(anyhow::Error::msg)?;
+    super::set_log_filter(&loaded.log_level).map_err(anyhow::Error::msg)?;
     for warning in &resolved.warnings {
         daer_observe::warn!(daer_observe::EventCode::DaemonConfigWarning,%warning, "configuration warning");
     }
@@ -127,9 +128,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // exit and stay down; with it on, a missing route is fatal immediately, which is what a
     // container with a static route wants.
     let (lan, wan) = wait_for_interfaces(
-        &loaded.global.lan_interface,
-        &loaded.global.wan_interface,
-        !loaded.global.disable_waiting_network,
+        &loaded.lan_interface,
+        &loaded.wan_interface,
+        !loaded.disable_waiting_network,
     )
     .await?;
     daer_observe::info!(
@@ -153,14 +154,14 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     //
     // Every socket consumer has to agree or the proxy captures its own traffic and loops:
     // the generation's dialers, the transparent listeners (including their replies), the
-    // DNS upstreams, reload-time subscription and rule-provider fetches, and the
+    // DNS upstreams, reload-time subscription and rule-set fetches, and the
     // datapath's `PARAM.socket_mark`. `--no-datapath` deliberately gets `None`: nothing
     // is redirected, so there is no capture loop to evade; the listener still needs
     // `CAP_NET_ADMIN` for `IP_TRANSPARENT`.
     let so_mark = if options.no_datapath {
         None
     } else {
-        Some(loaded.global.so_mark.unwrap_or(DEFAULT_SOCKET_MARK))
+        Some(DEFAULT_SOCKET_MARK)
     };
     let socket_config = match so_mark {
         Some(mark) => SocketConfig::default().with_mark(mark),
@@ -243,8 +244,8 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
 
     // The observer only exists once the datapath is attached, so the generation that will
     // serve has to be rebuilt with it. This is not cosmetic: without the observer the router
-    // matches on addresses and the sniffed name only, so every `mac(...)`, `dscp(...)`, and
-    // `pname(...)` rule is compiled, accepted, and inert.
+    // matches on addresses and the sniffed name only, so `mac(...)`, `dscp(...)`, and
+    // `pname(...)` rules cannot match even though the cgroup hooks are attached.
     let options_router = match ebpf.as_ref() {
         Some(attached) => {
             let with_observer = base_options
@@ -415,11 +416,8 @@ fn write_state(
     });
 
     let result = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all("/run/daer")?;
-        let path = std::path::Path::new(crate::status::STATE_PATH);
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
-        std::fs::rename(&temporary, path)
+        let path = Path::new(crate::status::STATE_PATH);
+        crate::private_fs::write_atomic(path, &serde_json::to_vec_pretty(&value)?)
     })();
     if let Err(error) = result {
         daer_observe::debug!(
@@ -558,10 +556,10 @@ async fn start_dns(
     );
     let snooper = std::sync::Arc::new(daer_dns::DnsSnooper::default());
 
-    // Fake-IP without a resolver is inert: nothing allocates a synthetic address, so the pool
-    // would never be consulted. Treating it as a request for the server is what makes the
-    // feature usable without a second configuration key.
-    let wants_server = config.dns.bind.is_some() || config.dns.fake_ip.enabled;
+    // The listener is the operator's explicit decision. Fake-IP is a mode of that listener,
+    // not a second way to start one: validation rejects Fake-IP without `dns.bind`, so the
+    // daemon never binds port 53 as a side effect of enabling an answer mode.
+    let wants_server = config.dns.bind.is_some();
     let transports = crate::dns::transports(config, socket_config)?;
     let resolver = std::sync::Arc::new(
         daer_dns::Resolver::with_state(
@@ -576,8 +574,8 @@ async fn start_dns(
     if !wants_server {
         daer_observe::info!(
             daer_observe::EventCode::DaemonDnsNotStarted,
-            "dns server not started: `dns.bind` is unset and fake-ip is disabled, so this \
-             daemon is not the box's resolver (set `dns.bind` to serve, or enable `[dns.fake-ip]`)"
+            "dns server not started: `dns.bind` is unset, so this daemon is not the box's \
+             resolver (set `dns.bind` to serve; Fake-IP requires it too)"
         );
         return Ok((None, Some(fake_ip), snooper));
     }
@@ -884,7 +882,7 @@ fn resolve_object_path_in(
     path.to_path_buf()
 }
 
-/// The mark used when `global.so-mark` is absent.
+/// The internal socket mark every privileged run applies to daer's own sockets.
 ///
 /// One definition in `daer-common`: `0x6461_6572` is the ASCII bytes `daer`.
 pub use daer_common::consts::DEFAULT_SOCKET_MARK;
@@ -1059,7 +1057,7 @@ async fn serve_until_signal(inputs: ServeInputs<'_>) -> anyhow::Result<()> {
                 }
                 if let Some(reloaded_pool) = reloaded {
                     provider_pool = reloaded_pool;
-                    // SIGHUP may have changed `[[rule-provider]]`, so the cadence is rebuilt
+                    // SIGHUP may have changed `[[rule-set]]`, so the cadence is rebuilt
                     // from the configuration that was just reloaded. Keeping the startup
                     // ticker would leave a changed `interval` silently ignored for the
                     // daemon's lifetime.
@@ -1174,7 +1172,7 @@ async fn refresh_due_providers(
         .config
         .parent()
         .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
-    let mark = router_options.so_mark.unwrap_or(config.global.so_mark);
+    let mark = router_options.so_mark;
     let socket_config = match mark {
         Some(mark) => SocketConfig::default().with_mark(mark),
         None => SocketConfig::default(),
@@ -1299,17 +1297,17 @@ fn publish_generation(daemon: &Daemon, ebpf: Option<&daer_control::datapath::Att
 /// # Errors
 ///
 /// Returns the resolution failure when waiting is disabled or the budget is exhausted, and always
-/// when `wan-interface` is empty — an empty list is a configuration error, not an environment
-/// one, so waiting cannot fix it.
+/// when `wan-interface` is an empty list — an empty list is a configuration error, not an
+/// environment one, so waiting cannot fix it.
 async fn wait_for_interfaces(
     lan: &[String],
-    wan: &[String],
+    wan: &WanInterface,
     wait: bool,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     if wan.is_empty() {
         return Err(anyhow::anyhow!(
-            "global.wan-interface is empty: daer cannot know which interface carries \
-             proxied traffic. Set it to a name or \"auto\""
+            "wan-interface is empty: daer cannot know which interface carries \
+             proxied traffic. Set it to \"auto\" or list the interface names"
         ));
     }
 
@@ -1319,13 +1317,25 @@ async fn wait_for_interfaces(
     let started = std::time::Instant::now();
     loop {
         match resolve_interfaces(lan, wan) {
-            Ok((lan, wan)) if !wan.is_empty() => return Ok((lan, wan)),
+            Ok((lan, wan)) if !wan.is_empty() => {
+                if let Some(interface) = lan
+                    .iter()
+                    .find(|lan| lan.trim() != "lo" && wan.contains(lan))
+                {
+                    return Err(anyhow::anyhow!(
+                        "interface {interface:?} is both lan-interface and wan-interface; one \
+                         interface cannot carry both roles in this build"
+                    ));
+                }
+                return Ok((lan, wan));
+            }
             Ok((_, wan)) => {
                 // `auto` resolved to nothing: there is no default route yet.
                 if !wait || started.elapsed() >= BUDGET {
                     return Err(anyhow::anyhow!(
                         "no interface carries a default route (wan resolved to {wan:?}); set \
-                         global.wan-interface to a name, or wait for the network"
+                         wan-interface to \"auto\", list the interface names, or wait \
+                         for the network"
                     ));
                 }
                 daer_observe::info!(

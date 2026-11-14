@@ -5,8 +5,8 @@
 //! This is the single source of truth for configuration. Field names are
 //! kebab-case in TOML, values are typed (`Option` instead of sentinel strings,
 //! [`Bandwidth`] instead of a free-form string, [`TimeSpan`] instead of
-//! nanoseconds), and knobs that were declared twice are one struct: the
-//! health-check group is shared by `[global]` and every `[[group]]`.
+//! nanoseconds), and knobs that were declared twice are one struct: an election
+//! owns its probe, and every probe setting has exactly one definition.
 //!
 //! # Defaults
 //!
@@ -18,27 +18,27 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserializer;
-use serde::de::{DeserializeOwned, Error as _};
+use serde::de::{self, DeserializeOwned, Error as _, SeqAccess, Visitor};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ParseError;
-use crate::expr::{Function, Param, ParamValue, RoutingRule};
+use crate::expr::{DnsRule, Function, MatchExpr, Param, ParamValue};
 use crate::scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration};
 
-/// The configuration schema version written as `schema = 2`.
+/// The configuration schema version written as `schema = 5`.
 ///
-/// Version 2 is the clean break that separates resources (`node`/`group`) from
-/// elections: a group is a candidate set, an election is the routing target that
-/// selects one node from it, and the old `group.policy`/`group.health-check`
-/// surface no longer exists.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Version 5 removes the `[global]` wrapper: host and daemon settings live at the
+/// top level, TLS defaults live in `[tls]`, and an election owns its probe without a
+/// global defaults table. Version 4 made domain acquisition an explicit routing
+/// policy (`[routing.sniff]`, explicit `[dns].bind` for Fake-IP).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Default UDP endpoints for the server-liveness probe.
 pub const DEFAULT_UDP_CHECK_DNS: &str = "1.1.1.1:53,8.8.8.8:53,2001:4860:4860::8888:53";
 
 /// A configuration value that may be written either as a bare name or as a
-/// function expression (`fallback: direct` vs `provider: name(...)`).
+/// function expression (for example a DNS upstream name or a probe policy call).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionOrString {
     Name(String),
@@ -86,13 +86,13 @@ impl fmt::Display for FunctionOrString {
     }
 }
 
-/// Parses a standalone routing rule expression.
+/// Parses a standalone routing match expression.
 ///
 /// # Errors
 ///
-/// Returns a positioned [`ParseError`] when the expression is not a rule.
-pub fn parse_rule_expr(src: &str) -> Result<RoutingRule, ParseError> {
-    crate::expr::parse_rule(src)
+/// Returns a positioned [`ParseError`] when the expression is not a match.
+pub fn parse_match_expr(src: &str) -> Result<MatchExpr, ParseError> {
+    crate::expr::parse_match_expr(src)
 }
 
 /// Parses a standalone value expression (`min`, `fixed(0)`, `min(10%)`).
@@ -104,19 +104,15 @@ pub fn parse_value_expr(src: &str) -> Result<FunctionOrString, ParseError> {
     Ok(crate::expr::parse_value(src)?.into())
 }
 
-/// `routing.rules` / `dns.request.rules` style lists: an array of expressions.
-mod rule_list {
+/// `dns.request.rules` / `dns.response.rules`: an array of DNS rule expressions.
+mod dns_rule_list {
     use serde::de::Error as _;
     use serde::ser::SerializeSeq as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    use super::RoutingRule;
-    use super::parse_rule_expr;
+    use super::DnsRule;
 
-    pub fn serialize<S: Serializer>(
-        rules: &[RoutingRule],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(rules: &[DnsRule], serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(rules.len()))?;
         for rule in rules {
             seq.serialize_element(&rule.to_string())?;
@@ -124,11 +120,11 @@ mod rule_list {
         seq.end()
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<RoutingRule>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<DnsRule>, D::Error> {
         Vec::<String>::deserialize(d)?
             .iter()
             .map(|text| {
-                parse_rule_expr(text)
+                crate::expr::parse_dns_rule_expr(text)
                     .map_err(|error| D::Error::custom(super::fragment_error(text, &error)))
             })
             .collect()
@@ -146,27 +142,6 @@ pub fn parse_filter_expr(text: &str) -> Result<Vec<Function>, String> {
 }
 
 pub use crate::expr::{render_fragment_error as fragment_error, render_functions};
-
-/// A single expression that is either a bare name or a function call.
-mod function_value {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::{FunctionOrString, parse_value_expr};
-
-    pub fn serialize<S: Serializer>(
-        value: &FunctionOrString,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.to_string())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<FunctionOrString, D::Error> {
-        let text = String::deserialize(d)?;
-        parse_value_expr(&text)
-            .map_err(|error| D::Error::custom(super::fragment_error(&text, &error)))
-    }
-}
 
 /// `Option<FunctionOrString>`, as used by the DNS routings.
 mod function_option {
@@ -252,11 +227,13 @@ pub enum ProbeMode {
     Url,
 }
 
-/// Probe defaults, shared by `[global.probe]` and every election that overrides them.
+/// The measurement an election asks its health scheduler to perform.
 ///
 /// Measurement is not a property of a group: a group is only a candidate set. An
-/// election owns the probe it needs; the global table supplies defaults so a file
-/// does not repeat the same URL for every election.
+/// election owns the probe it needs; the defaults below are constants, not a
+/// second configuration table. `tolerance` is deliberately absent: it shifts the
+/// moving-average switch threshold, which is a selection policy parameter, not a
+/// property of the probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
@@ -275,9 +252,6 @@ pub struct ProbeSettings {
     pub interval: TimeSpan,
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub timeout: TimeSpan,
-    /// Shifts the switch threshold of moving averages.
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub tolerance: TimeSpan,
 }
 
 impl Default for ProbeSettings {
@@ -292,7 +266,6 @@ impl Default for ProbeSettings {
                 .collect(),
             interval: TimeSpan::from_secs(30),
             timeout: TimeSpan::from_secs(5),
-            tolerance: TimeSpan::ZERO,
         }
     }
 }
@@ -355,7 +328,8 @@ pub struct Election {
     /// The selection rule.
     #[serde(rename = "type")]
     pub kind: ElectionKind,
-    /// Probe overrides. `None` inherits `[global.probe]`.
+    /// The probe this election asks the health scheduler to run. Absent fields use
+    /// [`ProbeSettings::default`]; there is no global defaults table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ProbeMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,22 +348,24 @@ pub struct Election {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub timeout: Option<TimeSpan>,
+    /// The moving-average switch threshold. Selection policy, not probe state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub tolerance: Option<TimeSpan>,
 }
 
 impl Election {
-    /// Resolves this election's effective probe settings.
+    /// Resolves this election's effective probe settings from the built-in defaults.
     #[must_use]
-    pub fn resolved_probe(&self, defaults: &ProbeSettings) -> ProbeSettings {
+    pub fn resolved_probe(&self) -> ProbeSettings {
+        let defaults = ProbeSettings::default();
         let mode = self.mode.unwrap_or(defaults.mode);
         ProbeSettings {
             mode,
             // A server probe never requests a URL. The mode is the authority; a URL
-            // inherited from the global defaults must not silently make it a URL probe.
+            // set without switching the mode must not silently make it a URL probe.
             url: if mode == ProbeMode::Url {
-                self.url.clone().or_else(|| defaults.url.clone())
+                self.url.clone()
             } else {
                 None
             },
@@ -403,8 +379,13 @@ impl Election {
                 .unwrap_or_else(|| defaults.udp_dns.clone()),
             interval: self.interval.unwrap_or(defaults.interval),
             timeout: self.timeout.unwrap_or(defaults.timeout),
-            tolerance: self.tolerance.unwrap_or(defaults.tolerance),
         }
+    }
+
+    /// The moving-average switch threshold, or zero when unset.
+    #[must_use]
+    pub fn effective_tolerance(&self) -> TimeSpan {
+        self.tolerance.unwrap_or_default()
     }
 
     /// The input kind, as a diagnostic string.
@@ -449,50 +430,113 @@ impl Default for Tls {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
-pub struct Global {
-    /// Socket mark for daer-originated traffic.
-    ///
-    /// Omitted, a privileged run picks [`daer_common::consts::DEFAULT_SOCKET_MARK`] and an
-    /// unprivileged one marks nothing; the datapath and the redirect rule have to agree with
-    /// whichever it is, so the daemon decides once and reports the value it used.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub so_mark: Option<u32>,
-    /// `tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.
-    pub log_level: String,
-    pub lan_interface: Vec<String>,
-    pub wan_interface: Vec<String>,
-    pub allow_insecure: bool,
-    pub disable_waiting_network: bool,
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub sniffing_timeout: TimeSpan,
-    pub auto_sniff_punt: bool,
-    pub tls: Tls,
-    pub probe: ProbeSettings,
+/// Which interfaces carry proxied egress traffic.
+///
+/// This is deliberately an enum, not a `Vec<String>` with an `"auto"` sentinel: `auto`
+/// and an explicit interface list are two different answers to one question. Allowing
+/// `["auto", "wg0"]` made the configuration say both at once and let an order-dependent
+/// duplicate interface through to the datapath.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WanInterface {
+    /// Follow the interface carrying the default route.
+    #[default]
+    Auto,
+    /// One or more explicitly named interfaces.
+    Named(Vec<String>),
 }
 
-impl Default for Global {
-    fn default() -> Self {
-        Self {
-            so_mark: None,
-            log_level: "info".to_owned(),
-            lan_interface: Vec::new(),
-            // `["auto"]`, not `[]`. The daemon refuses an empty list ("daer cannot know which
-            // interface carries proxied traffic"), so an empty default made the *defaults* —
-            // and therefore an otherwise empty configuration file — unrunnable, while the
-            // reference documentation and `daer.example.toml` both promised `["auto"]`.
-            // A default that `run` rejects is a trap; the honest default is the one the
-            // example and the docs already named.
-            wan_interface: vec!["auto".to_owned()],
-            allow_insecure: false,
-            disable_waiting_network: false,
-            sniffing_timeout: TimeSpan::from_millis(30),
-            auto_sniff_punt: true,
-            tls: Tls::default(),
-            probe: ProbeSettings::default(),
+impl WanInterface {
+    /// True when the configuration asks for default-route detection.
+    #[must_use]
+    pub const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// The explicit interface names, or an empty slice for [`Self::Auto`].
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Auto => &[],
+            Self::Named(names) => names,
         }
+    }
+
+    /// True when this is an explicit empty list, which cannot be resolved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Named(names) if names.is_empty())
+    }
+}
+
+impl Serialize for WanInterface {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Named(names) => names.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WanInterface {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WanVisitor;
+
+        impl<'de> Visitor<'de> for WanVisitor {
+            type Value = WanInterface;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "`\"auto\"` or a list of interface names such as `[\"eth0\", \"wg0\"]`",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value == "auto" {
+                    Ok(WanInterface::Auto)
+                } else {
+                    Err(E::custom(format!(
+                        "a bare string must be \"auto\"; write interface names as a list, e.g. \
+                         [\"{value}\"]"
+                    )))
+                }
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut names = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                while let Some(name) = sequence.next_element::<String>()? {
+                    if name.trim() == "auto" {
+                        return Err(de::Error::custom(
+                            "\"auto\" must be written as the bare string \"auto\", not as a \
+                             list element; do not mix automatic detection with explicit \
+                             interface names",
+                        ));
+                    }
+                    names.push(name);
+                }
+                Ok(WanInterface::Named(names))
+            }
+        }
+
+        deserializer.deserialize_any(WanVisitor)
     }
 }
 
@@ -561,7 +605,9 @@ impl<'de> Deserialize<'de> for Subscription {
     }
 }
 
-/// One `[[rule-provider]]` entry.
+/// One `[[rule-set]]` entry. Internally this is still the rule provider spec:
+/// the routing layer resolves it into a provider pool. The TOML key is
+/// `rule-set`; `rule-provider` remains accepted as a compatibility alias.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -730,13 +776,13 @@ impl Node {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum NodeEndpoint {
-    Direct(DirectNode),
     #[serde(alias = "socks")]
     Socks5(Socks5Node),
     Http(HttpNode),
     #[serde(alias = "ss")]
     Shadowsocks(ShadowsocksNode),
     Trojan(TrojanNode),
+    #[serde(rename = "anytls", alias = "any-tls")]
     AnyTls(AnyTlsNode),
     Hysteria2(Hysteria2Node),
     Vless(VlessNode),
@@ -749,7 +795,6 @@ pub enum NodeEndpoint {
 }
 
 pub type StructuredNode = NodeEndpoint;
-pub type DirectEndpoint = DirectNode;
 pub type Socks5Endpoint = Socks5Node;
 pub type HttpEndpoint = HttpNode;
 pub type ShadowsocksEndpoint = ShadowsocksNode;
@@ -763,7 +808,6 @@ impl NodeEndpoint {
     /// Validates the semantic constraints of the structured node.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Direct(_) => Ok(()),
             Self::Socks5(node) => {
                 if node.server.trim().is_empty() {
                     return Err("socks5: 'server' must not be empty".to_owned());
@@ -821,11 +865,11 @@ impl NodeEndpoint {
                 }
                 // A certificate cannot be verified against an address: the TLS client would
                 // present the IP as SNI, and no CA signs an IP for a proxy node.
-                if node.sni.is_none() && node.server.parse::<std::net::IpAddr>().is_ok() {
+                if node.tls.sni.is_none() && node.server.parse::<std::net::IpAddr>().is_ok() {
                     return Err(format!(
                         "trojan: the server {:?} is an address, so an explicit `sni` is \
-                         required (write `sni = \"hostname\"` or `?sni=…` in a link); a \
-                         certificate cannot be verified against an address",
+                         required (write `[node.tls] sni = \"hostname\"` or `?sni=…` in a \
+                         link); a certificate cannot be verified against an address",
                         node.server
                     ));
                 }
@@ -861,28 +905,21 @@ impl NodeEndpoint {
                 if node.password.is_empty() {
                     return Err("hysteria2: 'password' must not be empty".to_owned());
                 }
-                if node.ports.hops() {
+                if node.port_hopping.is_enabled() {
                     // The reference's floor: a hop schedule shorter than 5 s would
                     // exhaust the server's port table faster than it can release it.
-                    let low = if node.ports.hop_min_ms > 0 {
-                        node.ports.hop_min_ms
-                    } else {
-                        node.ports.hop_ms
-                    };
-                    let high = if node.ports.hop_max_ms > 0 {
-                        node.ports.hop_max_ms
-                    } else {
-                        node.ports.hop_ms
-                    };
+                    let low = node.port_hopping.low_ms();
+                    let high = node.port_hopping.high_ms();
                     if low != 0 && high != 0 && low > high {
                         return Err(format!(
-                            "hysteria2: hop-min-interval ({low}ms) must not exceed \
-                             hop-max-interval ({high}ms)"
+                            "hysteria2.port-hopping: min-interval ({low}ms) must not exceed \
+                             max-interval ({high}ms)"
                         ));
                     }
                     if low < 5_000 {
                         return Err(format!(
-                            "hysteria2: the hop interval must be at least 5s, got {low}ms"
+                            "hysteria2.port-hopping: the interval must be at least 5s, got \
+                             {low}ms"
                         ));
                     }
                 }
@@ -918,17 +955,17 @@ impl NodeEndpoint {
                         }
                     }
                 }
-                if matches!(node.congestion, Hysteria2Congestion::Brutal)
-                    && node.up_mbps == 0
-                    && node.down_mbps == 0
+                if matches!(node.quic.congestion, Hysteria2Congestion::Brutal)
+                    && node.bandwidth.up_mbps == 0
+                    && node.bandwidth.down_mbps == 0
                 {
                     return Err(
                         "hysteria2: congestion = \"brutal\" pins the window to a configured \
-                         rate, so at least one of up-mbps/down-mbps must be set"
+                         rate, so at least one of [node.bandwidth] up-mbps/down-mbps must be set"
                             .to_owned(),
                     );
                 }
-                if let Some(pin) = &node.pin_sha256 {
+                if let Some(pin) = &node.tls.pin_sha256 {
                     let digits: String = pin
                         .chars()
                         .filter(|c| *c != ':' && *c != ' ' && *c != '-')
@@ -1011,7 +1048,6 @@ impl NodeEndpoint {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         match self {
-            Self::Direct(n) => n.name.as_deref(),
             Self::Socks5(n) => n.name.as_deref(),
             Self::Http(n) => n.name.as_deref(),
             Self::Shadowsocks(n) => n.name.as_deref(),
@@ -1034,7 +1070,6 @@ impl NodeEndpoint {
     #[must_use]
     pub fn default_name(&self) -> String {
         match self {
-            Self::Direct(_) => "direct".to_owned(),
             Self::Socks5(n) => format!("{}:{}", n.server, n.port),
             Self::Http(n) => format!("{}:{}", n.server, n.port),
             Self::Shadowsocks(n) => format!("{}:{}", n.server, n.port),
@@ -1056,7 +1091,6 @@ impl NodeEndpoint {
     #[must_use]
     pub fn to_link(&self) -> String {
         match self {
-            Self::Direct(n) => n.to_link(),
             Self::Socks5(n) => n.to_link(),
             Self::Http(n) => n.to_link(),
             Self::Shadowsocks(n) => n.to_link(),
@@ -1102,21 +1136,6 @@ impl NodeEndpoint {
             node: [&'a NodeEndpoint; 1],
         }
         toml::to_string_pretty(&Document { node: [self] }).map_err(|e| e.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct DirectNode {
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
-    pub name: Option<String>,
-}
-
-impl DirectNode {
-    #[must_use]
-    pub fn to_link(&self) -> String {
-        "direct://".to_owned()
     }
 }
 
@@ -1202,6 +1221,58 @@ impl ShadowsocksNode {
     }
 }
 
+/// TLS parameters of a protocol whose TLS leg is intrinsic.
+///
+/// Trojan and AnyTLS always speak TLS to the node, so these keys live in `[node.tls]`
+/// rather than `[node.security]` (which selects an optional security layer for
+/// VLESS/VMess). There is no `type` key: there is nothing to select.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct NodeTls {
+    /// SNI to present. Absent means the node's own hostname.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Accept any certificate. A deliberate, node-local assertion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+}
+
+impl NodeTls {
+    /// Whether this is the default (empty) TLS table, so output omits it.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// TLS parameters for Hysteria 2's intrinsic TLS leg.
+///
+/// Hysteria 2 adds a certificate digest pin on top of the ordinary TLS settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct Hysteria2Tls {
+    /// SNI to present. Absent means the node's own hostname.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Accept any certificate. A deliberate, node-local assertion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure: bool,
+    /// SHA-256 of the server's leaf certificate, hex. Compared after the chain check as a
+    /// second factor, not a replacement for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_sha256: Option<String>,
+}
+
+impl Hysteria2Tls {
+    /// Whether this is the default (empty) TLS table, so output omits it.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -1211,10 +1282,8 @@ pub struct TrojanNode {
     pub server: String,
     pub port: u16,
     pub password: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sni: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_insecure: bool,
+    #[serde(default, skip_serializing_if = "NodeTls::is_default")]
+    pub tls: NodeTls,
 }
 
 impl TrojanNode {
@@ -1222,12 +1291,12 @@ impl TrojanNode {
     pub fn to_link(&self) -> String {
         let server = format_host(&self.server);
         let mut query = Vec::new();
-        if let Some(sni) = &self.sni
+        if let Some(sni) = &self.tls.sni
             && !sni.is_empty()
         {
             query.push(format!("sni={}", percent_encode(sni)));
         }
-        if self.allow_insecure {
+        if self.tls.allow_insecure {
             query.push("allowInsecure=1".to_owned());
         }
         let query_str = if query.is_empty() {
@@ -1251,10 +1320,8 @@ pub struct AnyTlsNode {
     pub server: String,
     pub port: u16,
     pub password: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sni: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_insecure: bool,
+    #[serde(default, skip_serializing_if = "NodeTls::is_default")]
+    pub tls: NodeTls,
     #[serde(
         default = "default_idle_sessions",
         skip_serializing_if = "is_default_idle_sessions"
@@ -1275,12 +1342,12 @@ impl AnyTlsNode {
     pub fn to_link(&self) -> String {
         let server = format_host(&self.server);
         let mut query = Vec::new();
-        if let Some(sni) = &self.sni
+        if let Some(sni) = &self.tls.sni
             && !sni.is_empty()
         {
             query.push(format!("sni={}", percent_encode(sni)));
         }
-        if self.allow_insecure {
+        if self.tls.allow_insecure {
             query.push("allowInsecure=1".to_owned());
         }
         if self.idle_sessions > 1 {
@@ -1305,32 +1372,42 @@ impl AnyTlsNode {
 /// (`443`, `443,8443`, `20000-30000`, `all`). The set is kept normalised — sorted,
 /// merged, no overlaps — because the hop layer samples uniformly from it and a
 /// duplicated range would bias the rotation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+/// A set of server ports, written in the reference's port-union syntax.
+///
+/// `ports = "443"`, `ports = "443,8443"`, `ports = "20000-30000"`, or `ports = "all"`.
+/// Port hopping is a separate behavior and lives in [`PortHopping`], so the port set stays
+/// a pure address value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSet {
     /// `low-high` ranges, inclusive, sorted and non-overlapping.
     pub ranges: Vec<(u16, u16)>,
-    /// Rotate the source port on this interval. `0` disables hopping.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub hop_ms: u64,
-    /// Lower bound of the randomised interval, when it differs from `hop_ms`.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub hop_min_ms: u64,
-    /// Upper bound of the randomised interval.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub hop_max_ms: u64,
+}
+
+impl Serialize for PortSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_link_port())
+    }
+}
+
+impl<'de> Deserialize<'de> for PortSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(de::Error::custom)
+    }
 }
 
 impl PortSet {
-    /// A single port and no hopping.
+    /// A single port.
     #[must_use]
     pub fn single(port: u16) -> Self {
         Self {
             ranges: vec![(port, port)],
-            hop_ms: 0,
-            hop_min_ms: 0,
-            hop_max_ms: 0,
         }
     }
 
@@ -1353,9 +1430,6 @@ impl PortSet {
         if text == "all" || text == "*" {
             return Ok(Self {
                 ranges: vec![(0, 65535)],
-                hop_ms: 0,
-                hop_min_ms: 0,
-                hop_max_ms: 0,
             });
         }
         let mut ranges = Vec::new();
@@ -1401,12 +1475,7 @@ impl PortSet {
                 _ => merged.push((low, high)),
             }
         }
-        Ok(Self {
-            ranges: merged,
-            hop_ms: 0,
-            hop_min_ms: 0,
-            hop_max_ms: 0,
-        })
+        Ok(Self { ranges: merged })
     }
 
     /// Every port in the set, for the hop layer.
@@ -1419,12 +1488,6 @@ impl PortSet {
             }
         }
         ports
-    }
-
-    /// Whether hopping is configured.
-    #[must_use]
-    pub const fn hops(&self) -> bool {
-        self.hop_ms > 0 || self.hop_min_ms > 0 || self.hop_max_ms > 0
     }
 
     /// The port written as a reference link does.
@@ -1441,6 +1504,63 @@ impl PortSet {
             })
             .collect::<Vec<_>>()
             .join(",")
+    }
+}
+
+/// Hysteria 2's source-port hopping schedule.
+///
+/// Hopping changes the client's five-tuple without re-dialling the QUIC connection. The
+/// reference refuses a schedule shorter than 5 seconds, so the validator does too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct PortHopping {
+    /// Fixed interval between hops. Zero means hopping is disabled.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub interval: TimeSpan,
+    /// Lower bound of a randomised interval, when it differs from `interval`.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub min_interval: TimeSpan,
+    /// Upper bound of a randomised interval.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub max_interval: TimeSpan,
+}
+
+impl PortHopping {
+    /// Whether any hopping key is configured.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.interval.as_nanos() > 0
+            || self.min_interval.as_nanos() > 0
+            || self.max_interval.as_nanos() > 0
+    }
+
+    /// Whether this is the default (all zero), so output omits the table.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.is_enabled()
+    }
+
+    /// The effective lower bound in milliseconds.
+    #[must_use]
+    pub fn low_ms(&self) -> u64 {
+        let value = if self.min_interval.as_nanos() > 0 {
+            self.min_interval
+        } else {
+            self.interval
+        };
+        u64::try_from(value.as_nanos() / 1_000_000).unwrap_or(0)
+    }
+
+    /// The effective upper bound in milliseconds.
+    #[must_use]
+    pub fn high_ms(&self) -> u64 {
+        let value = if self.max_interval.as_nanos() > 0 {
+            self.max_interval
+        } else {
+            self.interval
+        };
+        u64::try_from(value.as_nanos() / 1_000_000).unwrap_or(0)
     }
 }
 
@@ -1463,12 +1583,14 @@ pub struct Hysteria2Quic {
     pub init_conn_receive_window: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub max_conn_receive_window: u64,
-    /// Connection idle timeout in milliseconds. `0` keeps netune's default.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub max_idle_timeout_ms: u64,
-    /// Keep-alive period in milliseconds. `0` keeps daer's 10 s default.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub keep_alive_period_ms: u64,
+    /// Connection idle timeout. Zero keeps netune's default.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub max_idle_timeout: TimeSpan,
+    /// Keep-alive period. Zero keeps daer's 10 s default.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub keep_alive_period: TimeSpan,
+    /// Congestion controller. `brutal` needs `[node.bandwidth]`.
+    pub congestion: Hysteria2Congestion,
     /// Disable netune's DPLPMTUD probing and keep datagrams at the QUIC
     /// 1200-byte floor, matching the reference's `disablePathMTUDiscovery`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1492,6 +1614,19 @@ pub enum Hysteria2Congestion {
     NewReno,
     /// The reference's throughput-pinning controller; needs `up-mbps`/`down-mbps`.
     Brutal,
+}
+
+impl Hysteria2Congestion {
+    /// The canonical link spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bbr => "bbr",
+            Self::Cubic => "cubic",
+            Self::NewReno => "new-reno",
+            Self::Brutal => "brutal",
+        }
+    }
 }
 
 /// Hysteria 2's obfuscation layer (ADR-0029).
@@ -1574,6 +1709,27 @@ struct ObfsGecko {
     max_packet_size: u16,
 }
 
+/// Hysteria 2's bandwidth hints, in megabits per second.
+///
+/// `brutal` pins its send window to `up-mbps`; the loss-based controllers ignore both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct Hysteria2Bandwidth {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub up_mbps: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub down_mbps: u64,
+}
+
+impl Hysteria2Bandwidth {
+    /// Whether this is the default (zero) table, so output omits it.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.up_mbps == 0 && self.down_mbps == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -1581,28 +1737,20 @@ pub struct Hysteria2Node {
     #[serde(skip_serializing_if = "Option::is_none", alias = "tag")]
     pub name: Option<String>,
     pub server: String,
-    /// One port, a list, or a range (ADR-0029).
+    /// One port, a list, or a range (ADR-0029), e.g. `"443,20000-20010"`.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub ports: PortSet,
     pub password: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sni: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_insecure: bool,
-    /// Certificate digest pin: the SHA-256 of the server's leaf certificate, hex.
-    /// Compared after the handshake, so it is a second factor rather than a
-    /// replacement for the chain.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pin_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub up_mbps: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub down_mbps: u64,
+    #[serde(default, skip_serializing_if = "Hysteria2Tls::is_default")]
+    pub tls: Hysteria2Tls,
+    #[serde(default, skip_serializing_if = "Hysteria2Bandwidth::is_default")]
+    pub bandwidth: Hysteria2Bandwidth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obfs: Option<Hysteria2Obfs>,
-    #[serde(default, skip_serializing_if = "is_default_congestion")]
-    pub congestion: Hysteria2Congestion,
     #[serde(default, skip_serializing_if = "Hysteria2Quic::is_default")]
     pub quic: Hysteria2Quic,
+    #[serde(default, skip_serializing_if = "PortHopping::is_default")]
+    pub port_hopping: PortHopping,
 }
 
 impl Hysteria2Quic {
@@ -1611,10 +1759,6 @@ impl Hysteria2Quic {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
-}
-
-const fn is_default_congestion(congestion: &Hysteria2Congestion) -> bool {
-    matches!(congestion, Hysteria2Congestion::Bbr)
 }
 
 const fn is_zero_u64(v: &u64) -> bool {
@@ -1701,7 +1845,7 @@ pub struct TlsSecurity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn: Vec<String>,
     /// netune TLS preset name for this node's ClientHello. Absent uses
-    /// `global.tls.profile`.
+    /// `tls.profile`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
@@ -1959,37 +2103,49 @@ impl Hysteria2Node {
     pub fn to_link(&self) -> String {
         let server = format_host(&self.server);
         let mut query = Vec::new();
-        if let Some(sni) = &self.sni
+        if let Some(sni) = &self.tls.sni
             && !sni.is_empty()
         {
             query.push(format!("sni={}", percent_encode(sni)));
         }
-        if self.allow_insecure {
+        if self.tls.allow_insecure {
             query.push("insecure=1".to_owned());
         }
-        if let Some(pin) = &self.pin_sha256
+        if let Some(pin) = &self.tls.pin_sha256
             && !pin.is_empty()
         {
             query.push(format!("pinSHA256={}", percent_encode(pin)));
         }
-        if self.up_mbps > 0 {
-            query.push(format!("upmbps={}", self.up_mbps));
+        if self.bandwidth.up_mbps > 0 {
+            query.push(format!("upmbps={}", self.bandwidth.up_mbps));
         }
-        if self.down_mbps > 0 {
-            query.push(format!("downmbps={}", self.down_mbps));
+        if self.bandwidth.down_mbps > 0 {
+            query.push(format!("downmbps={}", self.bandwidth.down_mbps));
+        }
+        if self.quic.congestion != Hysteria2Congestion::Bbr {
+            query.push(format!("congestion={}", self.quic.congestion.as_str()));
         }
         if let Some(obfs) = &self.obfs {
             query.push(format!("obfs={}", percent_encode(obfs.kind())));
             query.push(format!("obfs-password={}", percent_encode(obfs.password())));
         }
-        if self.ports.hop_ms > 0 {
-            query.push(format!("hop-interval={}", self.ports.hop_ms));
+        if self.port_hopping.interval.as_nanos() > 0 {
+            query.push(format!(
+                "hop-interval={}",
+                self.port_hopping.interval.as_nanos() / 1_000_000
+            ));
         }
-        if self.ports.hop_min_ms > 0 {
-            query.push(format!("hop-min-interval={}", self.ports.hop_min_ms));
+        if self.port_hopping.min_interval.as_nanos() > 0 {
+            query.push(format!(
+                "hop-min-interval={}",
+                self.port_hopping.min_interval.as_nanos() / 1_000_000
+            ));
         }
-        if self.ports.hop_max_ms > 0 {
-            query.push(format!("hop-max-interval={}", self.ports.hop_max_ms));
+        if self.port_hopping.max_interval.as_nanos() > 0 {
+            query.push(format!(
+                "hop-max-interval={}",
+                self.port_hopping.max_interval.as_nanos() / 1_000_000
+            ));
         }
         let query_str = if query.is_empty() {
             String::new()
@@ -2982,8 +3138,12 @@ impl StructuredNode {
     /// cipher that is not implemented, an empty server, or a `vless` node with no REALITY.
     fn from_link_unchecked(link: &str) -> Result<Self, String> {
         let link = link.trim();
-        if link.is_empty() || link == "direct" || link == "direct://" {
-            return Ok(Self::Direct(DirectNode { name: None }));
+        if link.is_empty() || link == "direct" || link.starts_with("direct://") {
+            return Err(
+                "`direct` is a routing verdict, not a node: use `action = \"direct\"` in a \
+                 [[routing.rule]] or as `fallback`"
+                    .to_owned(),
+            );
         }
 
         if link.contains("->") {
@@ -3005,7 +3165,6 @@ impl StructuredNode {
         };
 
         match scheme.to_ascii_lowercase().as_str() {
-            "direct" => Ok(Self::Direct(DirectNode { name })),
             "socks" | "socks5" | "socks5h" => {
                 let (auth, authority) = match before_fragment.rsplit_once('@') {
                     Some((auth, hostport)) => (Some(auth), hostport),
@@ -3117,8 +3276,10 @@ impl StructuredNode {
                     server,
                     port,
                     password: password.to_owned(),
-                    sni,
-                    allow_insecure,
+                    tls: NodeTls {
+                        sni,
+                        allow_insecure,
+                    },
                 }))
             }
             "anytls" => {
@@ -3159,8 +3320,10 @@ impl StructuredNode {
                     server,
                     port,
                     password: percent_decode(password),
-                    sni,
-                    allow_insecure,
+                    tls: NodeTls {
+                        sni,
+                        allow_insecure,
+                    },
                     idle_sessions,
                 }))
             }
@@ -3176,7 +3339,7 @@ impl StructuredNode {
                 // what the reference's port hopping needs. Splitting on the *last* colon
                 // keeps an IPv6 literal intact.
                 let (server, port_text) = split_host_ports(hostport)?;
-                let mut ports = PortSet::parse(&port_text)?;
+                let ports = PortSet::parse(&port_text)?;
 
                 let mut sni = None;
                 let mut allow_insecure = false;
@@ -3188,6 +3351,7 @@ impl StructuredNode {
                 let mut congestion = Hysteria2Congestion::Bbr;
                 let mut gecko_min = 0u16;
                 let mut gecko_max = 0u16;
+                let mut port_hopping = PortHopping::default();
 
                 for pair in query.split('&').filter(|p| !p.is_empty()) {
                     let (k, v) = match pair.split_once('=') {
@@ -3209,13 +3373,22 @@ impl StructuredNode {
                             obfs_password = Some(percent_decode(v));
                         }
                         "hop-interval" | "hop_interval" => {
-                            ports.hop_ms = parse_interval_ms(v).unwrap_or(0);
+                            port_hopping.interval = TimeSpan::from_millis(
+                                i64::try_from(parse_interval_ms(v).unwrap_or(0))
+                                    .unwrap_or(i64::MAX),
+                            );
                         }
                         "hop-min-interval" | "hop_min_interval" => {
-                            ports.hop_min_ms = parse_interval_ms(v).unwrap_or(0);
+                            port_hopping.min_interval = TimeSpan::from_millis(
+                                i64::try_from(parse_interval_ms(v).unwrap_or(0))
+                                    .unwrap_or(i64::MAX),
+                            );
                         }
                         "hop-max-interval" | "hop_max_interval" => {
-                            ports.hop_max_ms = parse_interval_ms(v).unwrap_or(0);
+                            port_hopping.max_interval = TimeSpan::from_millis(
+                                i64::try_from(parse_interval_ms(v).unwrap_or(0))
+                                    .unwrap_or(i64::MAX),
+                            );
                         }
                         "congestion" if !v.is_empty() => {
                             congestion = match percent_decode(v).to_ascii_lowercase().as_str() {
@@ -3274,14 +3447,18 @@ impl StructuredNode {
                     server,
                     ports,
                     password: percent_decode(password),
-                    sni,
-                    allow_insecure,
-                    pin_sha256,
-                    up_mbps,
-                    down_mbps,
+                    tls: Hysteria2Tls {
+                        sni,
+                        allow_insecure,
+                        pin_sha256,
+                    },
+                    bandwidth: Hysteria2Bandwidth { up_mbps, down_mbps },
                     obfs,
-                    congestion,
-                    quic: Hysteria2Quic::default(),
+                    quic: Hysteria2Quic {
+                        congestion,
+                        ..Hysteria2Quic::default()
+                    },
+                    port_hopping,
                 }))
             }
             "vless" => {
@@ -3320,7 +3497,7 @@ impl<'de> Deserialize<'de> for Node {
                 }
                 if !table.contains_key("type") {
                     return Err(D::Error::custom(
-                        "missing 'type' in [[node]] table (expected e.g. type = \"vless\", \"anytls\", \"shadowsocks\", \"trojan\", \"socks5\", \"http\", \"direct\")",
+                        "missing 'type' in [[node]] table (expected e.g. type = \"vless\", \"anytls\", \"shadowsocks\", \"trojan\", \"socks5\", \"http\")",
                     ));
                 }
 
@@ -3445,9 +3622,9 @@ pub struct Group {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct DnsRouting {
-    #[serde(with = "rule_list")]
+    #[serde(with = "dns_rule_list")]
     #[cfg_attr(feature = "schema", schemars(with = "Vec<String>"))]
-    pub rules: Vec<RoutingRule>,
+    pub rules: Vec<DnsRule>,
     #[serde(
         with = "function_option",
         skip_serializing_if = "Option::is_none",
@@ -3527,25 +3704,200 @@ impl Default for Dns {
     }
 }
 
+/// The kind of egress a routing action names.
+///
+/// `Direct` and `Block` are built-in policies. `Election` is a dynamic egress: the
+/// election selects one node, and that node's dialer is the concrete outbound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum OutboundKind {
+    Direct,
+    Block,
+    Election,
+}
+
+/// One built-in routing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum BuiltinOutbound {
+    Direct,
+    Block,
+}
+
+/// A routing action: the egress a rule sends a matching flow to.
+///
+/// Built-ins are bare strings; an election is a table. The table is what keeps the
+/// two namespaces apart: `action = "direct"` can only mean the built-in policy, and
+/// `action = { election = "direct" }` would be a different (and reserved-name)
+/// resource. There is no action string that silently means an election.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(untagged)]
+pub enum OutboundAction {
+    Builtin(BuiltinOutbound),
+    Election(ElectionAction),
+}
+
+impl<'de> Deserialize<'de> for OutboundAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        match value {
+            toml::Value::String(name) => match name.as_str() {
+                "direct" => Ok(Self::Builtin(BuiltinOutbound::Direct)),
+                "block" => Ok(Self::Builtin(BuiltinOutbound::Block)),
+                other => Err(de::Error::custom(format!(
+                    "routing action {other:?} is not a built-in; write `action = {{ election = \
+                     \"{other}\" }}` for an election"
+                ))),
+            },
+            toml::Value::Table(table) => {
+                let election = ElectionAction::deserialize(toml::Value::Table(table))
+                    .map_err(de::Error::custom)?;
+                if election.election.trim().is_empty() {
+                    return Err(de::Error::custom(
+                        "an election action needs a non-empty election name",
+                    ));
+                }
+                Ok(Self::Election(election))
+            }
+            other => Err(de::Error::custom(format!(
+                "a routing action is `\"direct\"`, `\"block\"`, or `{{ election = \"name\" }}`; \
+                 got {other:?}"
+            ))),
+        }
+    }
+}
+
+impl Default for OutboundAction {
+    fn default() -> Self {
+        Self::Builtin(BuiltinOutbound::Direct)
+    }
+}
+
+impl OutboundAction {
+    /// The kind of egress this action names.
+    #[must_use]
+    pub const fn kind(&self) -> OutboundKind {
+        match self {
+            Self::Builtin(BuiltinOutbound::Direct) => OutboundKind::Direct,
+            Self::Builtin(BuiltinOutbound::Block) => OutboundKind::Block,
+            Self::Election(_) => OutboundKind::Election,
+        }
+    }
+
+    /// The built-in name or the election name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Builtin(BuiltinOutbound::Direct) => daer_common::consts::outbound_name::DIRECT,
+            Self::Builtin(BuiltinOutbound::Block) => daer_common::consts::outbound_name::BLOCK,
+            Self::Election(election) => &election.election,
+        }
+    }
+
+    /// The election name, when this is a dynamic egress.
+    #[must_use]
+    pub fn election_name(&self) -> Option<&str> {
+        match self {
+            Self::Election(election) => Some(&election.election),
+            Self::Builtin(_) => None,
+        }
+    }
+
+    /// True for `direct` and `block`.
+    #[must_use]
+    pub const fn is_builtin(&self) -> bool {
+        matches!(self, Self::Builtin(_))
+    }
+}
+
+impl fmt::Display for OutboundAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin(builtin) => f.write_str(match builtin {
+                BuiltinOutbound::Direct => "direct",
+                BuiltinOutbound::Block => "block",
+            }),
+            Self::Election(election) => write!(f, "election {:?}", election.election),
+        }
+    }
+}
+
+/// The `{ election = "name" }` action table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ElectionAction {
+    pub election: String,
+}
+
+/// One ordered routing rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RoutingRule {
+    /// Stable identity for diagnostics, logs and tests. Must be unique.
+    pub name: String,
+    /// Predicate conjunction. The action is a separate field, never part of it.
+    #[serde(rename = "match")]
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub match_expr: MatchExpr,
+    /// The egress this rule selects.
+    pub action: OutboundAction,
+}
+
+impl fmt::Display for RoutingRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -> {}", self.match_expr, self.action)
+    }
+}
+
+/// Payload-based domain recovery for routing.
+///
+/// This table deliberately configures only the fallback mechanism, not DNS. DNS is a
+/// service and lives in [`crate::model::Dns`]; `sniff` is what routing may do when that
+/// service (or Fake-IP) cannot provide a unique name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct SniffConfig {
+    /// Whether routing may inspect the first bytes of a flow for a domain.
+    ///
+    /// `None` is only valid when the configuration has no `domain(...)` rule. When a
+    /// domain rule exists the operator must choose: `true` allows a bounded payload
+    /// inspection, `false` routes by the facts already known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The total TCP wait budget. Only valid with `enabled = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub timeout: Option<TimeSpan>,
+}
+
+impl SniffConfig {
+    /// True when neither answer nor budget is present.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.timeout.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct Routing {
-    #[serde(with = "rule_list")]
-    #[cfg_attr(feature = "schema", schemars(with = "Vec<String>"))]
-    pub rules: Vec<RoutingRule>,
-    #[serde(with = "function_value")]
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub fallback: FunctionOrString,
-}
-
-impl Default for Routing {
-    fn default() -> Self {
-        Self {
-            rules: Vec::new(),
-            fallback: FunctionOrString::Name("direct".to_owned()),
-        }
-    }
+    /// Ordered rules; the first matching rule wins.
+    #[serde(rename = "rule", default, skip_serializing_if = "Vec::is_empty")]
+    pub rule: Vec<RoutingRule>,
+    pub fallback: OutboundAction,
+    /// What routing may do when DNS/Fake-IP cannot name the flow.
+    #[serde(default, skip_serializing_if = "SniffConfig::is_default")]
+    pub sniff: SniffConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3557,7 +3909,19 @@ pub struct Config {
     /// Globs, relative to the directory of the file that names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
-    pub global: Global,
+    /// `tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.
+    pub log_level: String,
+    /// Ingress interfaces receiving client traffic.
+    pub lan_interface: Vec<String>,
+    /// Egress interfaces: `"auto"` or an explicit list.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(with = "crate::schema::mirror::WanInterface")
+    )]
+    pub wan_interface: WanInterface,
+    pub disable_waiting_network: bool,
+    /// Defaults for every outbound TLS leg, with per-node overrides.
+    pub tls: Tls,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(
         feature = "schema",
@@ -3576,7 +3940,8 @@ pub struct Config {
     pub election: Vec<Election>,
     #[serde(
         default,
-        rename = "rule-provider",
+        rename = "rule-set",
+        alias = "rule-provider",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub rule_provider: Vec<RuleProvider>,
@@ -3589,7 +3954,14 @@ impl Default for Config {
         Self {
             schema: SCHEMA_VERSION,
             include: Vec::new(),
-            global: Global::default(),
+            log_level: "info".to_owned(),
+            lan_interface: Vec::new(),
+            // `Auto`, not `Named(Vec::new())`. The daemon refuses an empty interface set
+            // ("daer cannot know which interface carries proxied traffic"), so the default
+            // has to be a value `run` can resolve.
+            wan_interface: WanInterface::Auto,
+            disable_waiting_network: false,
+            tls: Tls::default(),
             subscription: Vec::new(),
             node: Vec::new(),
             group: Vec::new(),
@@ -3602,536 +3974,4 @@ impl Default for Config {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(toml: &str) -> Config {
-        toml::from_str(toml).expect("parses")
-    }
-
-    #[test]
-    fn defaults_apply_and_unknown_keys_are_rejected() {
-        let parsed = config("");
-        assert_eq!(parsed.schema, SCHEMA_VERSION);
-        assert_eq!(
-            parsed.routing.fallback,
-            FunctionOrString::Name("direct".into())
-        );
-
-        let error = toml::from_str::<Config>("[global]\ntproxy-port = 1\n")
-            .expect_err("unknown key must fail");
-        assert!(
-            error.to_string().contains("tproxy-port"),
-            "unexpected error: {error}"
-        );
-    }
-
-    /// The defaults must be a configuration `daer run` accepts.
-    ///
-    /// `daer run` refuses an empty `wan-interface` ("daer cannot know which interface carries
-    /// proxied traffic"), so while the default was `[]` the documented smallest valid file —
-    /// and the reference documentation's own default column, and `daer.example.toml`, which
-    /// both said `["auto"]` — produced a daemon that exited immediately. The falsifier is one
-    /// command: `printf 'schema = 2\n' > c.toml && daer run -c c.toml --no-datapath` used to
-    /// fail with that message; the default is now the value the documentation promised.
-    #[test]
-    fn the_defaults_are_a_configuration_the_daemon_can_run() {
-        let parsed = config("");
-        assert_eq!(
-            parsed.global.wan_interface,
-            vec!["auto".to_owned()],
-            "an empty configuration must name a WAN interface the daemon can resolve"
-        );
-        // And the default survives semantic validation, which is what `run` performs first.
-        let mut validated = parsed;
-        crate::validate::normalize(&mut validated).expect("the defaults must validate");
-        assert_eq!(validated.global.wan_interface, vec!["auto".to_owned()]);
-    }
-
-    #[test]
-    fn rules_are_parsed_from_expressions() {
-        let parsed = config(
-            "[routing]\nrules = [\"domain(a.com) && port(443) -> proxy\"]\nfallback = \"direct\"\n",
-        );
-        let rule = &parsed.routing.rules[0];
-        assert_eq!(rule.and_functions.len(), 2);
-        assert_eq!(rule.outbound.name, "proxy");
-
-        let error = toml::from_str::<Config>("[routing]\nrules = [\"domain(a) direct\"]\n")
-            .expect_err("missing arrow must fail");
-        assert!(error.to_string().contains("invalid expression"), "{error}");
-    }
-
-    #[test]
-    fn durations_require_units() {
-        let parsed = config("[global.probe]\ninterval = \"45s\"\ntolerance = \"-1s\"\n");
-        assert_eq!(parsed.global.probe.interval, TimeSpan::from_secs(45));
-        assert!(parsed.global.probe.tolerance.is_negative());
-
-        let error = toml::from_str::<Config>("[global.probe]\ninterval = \"45\"\n")
-            .expect_err("a unitless duration must fail");
-        assert!(error.to_string().contains("invalid duration"), "{error}");
-    }
-
-    #[test]
-    fn subscriptions_accept_both_shapes_and_nodes_require_structured_tables() {
-        let plain = config("subscription = [\"https://a/sub\"]\n");
-        assert_eq!(plain.subscription[0].name, None);
-        assert!(!plain.subscription[0].persist);
-
-        let tables = config(
-            "[[subscription]]\nname = \"b\"\nurl = \"https://b/sub\"\npersist = true\n\
-             [[node]]\nname = \"n1\"\ntype = \"direct\"\n",
-        );
-        assert_eq!(tables.subscription[0].name.as_deref(), Some("b"));
-        assert!(tables.subscription[0].persist);
-        assert_eq!(tables.node[0].name.as_deref(), Some("n1"));
-
-        // Backwards compatibility alias for `tag`
-        let legacy = config(
-            "[[subscription]]\ntag = \"b_leg\"\nurl = \"https://b/sub\"\n\
-             [[node]]\ntag = \"n_leg\"\ntype = \"direct\"\n",
-        );
-        assert_eq!(legacy.subscription[0].name.as_deref(), Some("b_leg"));
-        assert_eq!(legacy.node[0].name.as_deref(), Some("n_leg"));
-
-        // Legacy bare URL strings in node are rejected with clear explanation
-        let err = toml::from_str::<Config>("node = [\"ss://x\"]\n")
-            .expect_err("bare url array must fail");
-        assert!(
-            err.to_string()
-                .contains("bare URL strings in 'node' have been retired"),
-            "{err}"
-        );
-
-        // Legacy `url = "..."` in [[node]] is rejected with clear explanation
-        let err = toml::from_str::<Config>("[[node]]\ntag = \"n1\"\nurl = \"ss://x\"\n")
-            .expect_err("url in node must fail");
-        assert!(
-            err.to_string()
-                .contains("the 'url' field in [[node]] has been retired"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn structured_node_from_link_converts_real_world_links() {
-        // Real-world VLESS REALITY link from user's subscription (note: omits fp=, should default to chrome).
-        let vless_link = "vless://df4af3d0-030e-4062-baa6-eb9dd45298ef@fkus1keria.itknowledgeblog.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com&pbk=9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E&sid=672f&type=tcp&udp=1&tfo=1#US%20VIP%2001";
-        let structured = StructuredNode::from_link(vless_link).expect("converts vless link");
-        match structured {
-            StructuredNode::Vless(vless) => {
-                assert_eq!(vless.name.as_deref(), Some("US VIP 01"));
-                assert_eq!(vless.server, "fkus1keria.itknowledgeblog.com");
-                assert_eq!(vless.port, 443);
-                assert_eq!(vless.uuid, "df4af3d0-030e-4062-baa6-eb9dd45298ef");
-                assert_eq!(vless.flow, Flow::Vision);
-                let SecurityConfig::Reality(reality) = &vless.security else {
-                    panic!(
-                        "expected a REALITY security layer, got {:?}",
-                        vless.security
-                    );
-                };
-                assert_eq!(reality.sni, "portal.citygrainla.com");
-                assert_eq!(
-                    reality.public_key,
-                    "9IKqS8KEelO5cwsRvHXcz2-15-npnsx6k38qcf-GS0E"
-                );
-                assert_eq!(reality.short_id.as_deref(), Some("672f"));
-                // The transport layer is its own axis now (ADR-0028): `type=tcp` in the
-                // link is `TransportConfig::Tcp`, not a field on the REALITY layer.
-                assert_eq!(vless.transport, TransportConfig::Tcp);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        // Real-world Shadowsocks link with base64 userinfo
-        let ss_link =
-            "ss://YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080?udp=0#Website%3A%20user.totorofree.com";
-        let structured = StructuredNode::from_link(ss_link).expect("converts ss link");
-        match structured {
-            StructuredNode::Shadowsocks(ss) => {
-                assert_eq!(ss.name.as_deref(), Some("Website: user.totorofree.com"));
-                assert_eq!(ss.server, "127.0.0.1");
-                assert_eq!(ss.port, 1080);
-                // The fixture spelled the cipher `aes-128-grm` — a typo the test asserted
-                // as if correct. `from_link` now validates, so it has to be a real cipher;
-                // the assertion follows the link's base64 rather than the old typo.
-                assert_eq!(ss.method, "aes-128-gcm");
-                assert_eq!(ss.password, "none");
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        // SOCKS5 and Trojan
-        let socks_link = "socks5://user:pass@127.0.0.1:1080#my-socks";
-        let structured = StructuredNode::from_link(socks_link).expect("converts socks link");
-        assert_eq!(structured.name(), Some("my-socks"));
-
-        let trojan_link = "trojan://password@node.example.com:443?sni=sni.example.com#my-trojan";
-        let structured = StructuredNode::from_link(trojan_link).expect("converts trojan link");
-        assert_eq!(structured.name(), Some("my-trojan"));
-
-        let anytls_link = "anytls://secret-pass@anytls.example.com:443?sni=sni.example.com&allowInsecure=1&idle_sessions=3#my-anytls";
-        let structured = StructuredNode::from_link(anytls_link).expect("converts anytls link");
-        match structured {
-            StructuredNode::AnyTls(anytls) => {
-                assert_eq!(anytls.name.as_deref(), Some("my-anytls"));
-                assert_eq!(anytls.server, "anytls.example.com");
-                assert_eq!(anytls.port, 443);
-                assert_eq!(anytls.password, "secret-pass");
-                assert_eq!(anytls.sni.as_deref(), Some("sni.example.com"));
-                assert!(anytls.allow_insecure);
-                assert_eq!(anytls.idle_sessions, 3);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        let hy2_link = "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com&insecure=1&upmbps=50&downmbps=100&obfs=salamander&obfs-password=cry_me_a_r1ver#my-hy2";
-        let structured = StructuredNode::from_link(hy2_link).expect("converts hysteria2 link");
-        match structured {
-            StructuredNode::Hysteria2(hy2) => {
-                assert_eq!(hy2.name.as_deref(), Some("my-hy2"));
-                assert_eq!(hy2.server, "hy2.example.com");
-                assert_eq!(hy2.ports.ranges, vec![(443, 443)]);
-                assert_eq!(hy2.password, "secret-hy2");
-                assert_eq!(hy2.sni.as_deref(), Some("sni.example.com"));
-                assert!(hy2.allow_insecure);
-                assert_eq!(hy2.up_mbps, 50);
-                assert_eq!(hy2.down_mbps, 100);
-                // `obfs=salamander` with no password is refused at link-parse time, so the
-                // fixture carries one and the layer survives with its key.
-                assert_eq!(
-                    hy2.obfs,
-                    Some(Hysteria2Obfs::Salamander {
-                        password: "cry_me_a_r1ver".to_owned()
-                    })
-                );
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn filters_accept_a_string_or_a_table() {
-        let parsed = config(
-            "[[group]]\nname = \"g\"\n\
-             filters = [\"subtag(a) && !name(keyword: 'x')\", { match = \"name(n1)\", annotate = { mark = \"1\" } }]\n",
-        );
-        assert_eq!(parsed.group[0].filters.len(), 2);
-        assert_eq!(parsed.group[0].filters[0].functions.len(), 2);
-        assert_eq!(parsed.group[0].filters[1].annotate[0].key, "mark");
-    }
-
-    #[test]
-    fn structured_nodes_parse_validate_and_generate_canonical_links() {
-        let toml_str = r#"
-[[node]]
-tag = "hk-vless"
-type = "vless"
-server = "198.51.100.1"
-port = 443
-uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
-flow = "xtls-rprx-vision"
-[node.security]
-type = "reality"
-sni = "example.com"
-public-key = "f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"
-short-id = "ab01cd02"
-
-[[node]]
-tag = "us-ss"
-type = "shadowsocks"
-server = "198.51.100.2"
-port = 8388
-method = "chacha20-ietf-poly1305"
-password = "secret-password"
-
-[[node]]
-tag = "jp-trojan"
-type = "trojan"
-server = "198.51.100.3"
-port = 443
-password = "my-password"
-sni = "trojan.example.com"
-allow-insecure = true
-
-[[node]]
-tag = "local-socks5"
-type = "socks5"
-server = "127.0.0.1"
-port = 1080
-username = "admin"
-password = "123"
-
-[[node]]
-tag = "local-http"
-type = "http"
-server = "127.0.0.1"
-port = 8080
-
-[[node]]
-tag = "direct-node"
-type = "direct"
-"#;
-        let parsed = config(toml_str);
-        assert_eq!(parsed.node.len(), 6);
-
-        // hk-vless
-        let n0 = &parsed.node[0];
-        assert_eq!(n0.name.as_deref(), Some("hk-vless"));
-        assert!(matches!(n0.endpoint, NodeEndpoint::Vless(_)));
-        let link0 = n0.to_link();
-        assert!(
-            link0.starts_with("vless://b831381d-6324-4d53-ad4f-8cda48b30811@198.51.100.1:443?"),
-            "link: {}",
-            link0
-        );
-        assert!(link0.contains("security=reality"));
-        assert!(link0.contains("sni=example.com"));
-        assert!(link0.contains("pbk=f26c_e2kFv8-39rQz10M_xU8vI3f9Qk2lW0mNoPqRsT"));
-        assert!(link0.contains("sid=ab01cd02"));
-        assert!(link0.contains("flow=xtls-rprx-vision"));
-
-        // us-ss
-        let n1 = &parsed.node[1];
-        assert_eq!(n1.name.as_deref(), Some("us-ss"));
-        assert!(matches!(n1.endpoint, NodeEndpoint::Shadowsocks(_)));
-        let link1 = n1.to_link();
-        assert!(link1.starts_with("ss://"));
-        assert!(link1.contains("@198.51.100.2:8388"));
-
-        // jp-trojan
-        let n2 = &parsed.node[2];
-        assert_eq!(n2.name.as_deref(), Some("jp-trojan"));
-        assert!(matches!(n2.endpoint, NodeEndpoint::Trojan(_)));
-        assert_eq!(
-            n2.to_link(),
-            "trojan://my-password@198.51.100.3:443?sni=trojan.example.com&allowInsecure=1"
-        );
-
-        // local-socks5
-        let n3 = &parsed.node[3];
-        assert_eq!(n3.name.as_deref(), Some("local-socks5"));
-        assert!(matches!(n3.endpoint, NodeEndpoint::Socks5(_)));
-        assert_eq!(n3.to_link(), "socks5://admin:123@127.0.0.1:1080");
-
-        // local-http
-        let n4 = &parsed.node[4];
-        assert_eq!(n4.name.as_deref(), Some("local-http"));
-        assert!(matches!(n4.endpoint, NodeEndpoint::Http(_)));
-        assert_eq!(n4.to_link(), "http://127.0.0.1:8080");
-
-        // direct-node
-        let n5 = &parsed.node[5];
-        assert_eq!(n5.name.as_deref(), Some("direct-node"));
-        assert!(matches!(n5.endpoint, NodeEndpoint::Direct(_)));
-        assert_eq!(n5.to_link(), "direct://");
-
-        // Serialization roundtrip preserves structured representation
-        let rendered = toml::to_string(&parsed).expect("serializes");
-        let reparsed = config(&rendered);
-        assert_eq!(parsed, reparsed);
-    }
-
-    #[test]
-    fn a_converted_node_reloads_as_the_configuration_it_came_from() {
-        // The falsifier for `daer node convert`: its output is only useful if pasting it
-        // into a configuration *loads*. Two defects made that impossible, and neither was
-        // visible in the printed text — both surfaced as a TOML error from a file the tool
-        // had just written:
-        //
-        // 1. a nested table was rendered as `[reality]` instead of `[node.reality]`;
-        // 2. `Node` carries `tag` and so does its flattened endpoint, so the block held
-        //    `tag` twice and TOML rejected it as a duplicate key.
-        //
-        // The test asserts the round trip through the *real* loader, not through
-        // `toml::from_str`: the loader is what `config validate` and `daer run` use.
-        let links = [
-            "vless://3141d7ca-f74d-46ad-bda6-a5b32a9ae991@212.50.249.175:443?security=reality&encryption=none&pbk=Ka8Bf3HpMgsAeQVmlFAIXrzlEpBsXck-QQn4RA6z_EE&headerType=none&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=cdn.softbank.jp&sid=8e3af867d5ffc09f#bwg-jp",
-            "ss://YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080#Website",
-            "trojan://my-password@198.51.100.3:443?sni=trojan.example.com#tj",
-            "socks5://admin:123@127.0.0.1:1080#local",
-            "http://127.0.0.1:8080#local-http",
-            "direct://#direct-node",
-            "anytls://secret@anytls.example.com:443?sni=sni.example.com#anytls-node",
-            "hysteria2://secret-hy2@hy2.example.com:443?sni=sni.example.com#my-hy2",
-        ];
-        for link in links {
-            let endpoint = NodeEndpoint::from_link(link).expect("link converts");
-            let rendered = endpoint.to_toml_node().expect("renders");
-            // A nested table is legal TOML *and* wrong here: the node's sub-table is
-            // `[node.reality]`, and a bare `[reality]` is a key the schema does not have.
-            assert!(
-                !rendered.lines().any(|line| line.starts_with("[reality]")),
-                "the sub-table must be scoped to the node:\n{rendered}"
-            );
-            let document = format!("schema = 2\n\n{rendered}");
-            let parsed: Config = toml::from_str(&document)
-                .unwrap_or_else(|error| panic!("{link}\n{rendered}\n{error}"));
-            assert_eq!(
-                parsed.node.len(),
-                1,
-                "one block must be one node:\n{rendered}"
-            );
-            // The loader keeps the tag on the `Node`, not on the endpoint, so the
-            // comparison is on the two things the block carries: the tag and the protocol
-            // fields. Comparing endpoints directly would fail on `tag: Some/None` while
-            // every other field matched, which is a difference in where the loader stores
-            // the value, not in what was written.
-            assert_eq!(
-                parsed.node[0].name.as_deref(),
-                endpoint.name(),
-                "\n{rendered}"
-            );
-            let mut expected = endpoint.clone();
-            match &mut expected {
-                NodeEndpoint::Direct(n) => n.name = None,
-                NodeEndpoint::Socks5(n) => n.name = None,
-                NodeEndpoint::Http(n) => n.name = None,
-                NodeEndpoint::Shadowsocks(n) => n.name = None,
-                NodeEndpoint::Trojan(n) => n.name = None,
-                NodeEndpoint::AnyTls(n) => n.name = None,
-                NodeEndpoint::Hysteria2(n) => n.name = None,
-                NodeEndpoint::Vless(n) => n.name = None,
-                NodeEndpoint::Vmess(n) => n.name = None,
-                NodeEndpoint::Unsupported { .. } => {}
-            }
-            assert_eq!(parsed.node[0].endpoint, expected, "\n{rendered}");
-        }
-    }
-
-    #[test]
-    fn structured_node_negative_controls() {
-        // A chain is not "a link with an arrow": it is a routing topology this build does not
-        // implement, and truncating it to the first hop would silently proxy somewhere the
-        // operator did not write.
-        let err = StructuredNode::from_link("socks5://127.0.0.1:1080 -> socks5://127.0.0.1:1081")
-            .expect_err("chained link must fail");
-        assert!(err.contains("chained links"), "{err}");
-
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"socks5\"\nserver = \"1.1.1.1\"\nport = 1080\nunknown_field = 1\n",
-        )
-        .expect_err("unknown field must fail");
-        assert!(err.to_string().contains("unknown_field"), "{err}");
-
-        // Unknown field inside a layer table fails. `deny_unknown_fields` on an internally
-        // tagged enum is not something serde provides, so `SecurityConfig::deserialize`
-        // reads the table itself; this is the test that keeps that hand-written check
-        // honest.
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.security]\ntype = \"reality\"\nsni = \"s\"\npublic-key = \"k\"\nextra = \"bad\"\n",
-        )
-        .expect_err("unknown field in the security layer must fail");
-        assert!(err.to_string().contains("extra"), "{err}");
-
-        // The retired `[node.reality]` table is gone (ADR-0028 moved it under
-        // `[node.security]`), and the error is a plain unknown-field error naming the key.
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.reality]\nsni = \"s\"\npublic-key = \"k\"\n",
-        )
-        .expect_err("the retired [node.reality] table must fail");
-        assert!(err.to_string().contains("reality"), "{err}");
-
-        // Having 'url' fails with retirement explanation
-        let err = toml::from_str::<Config>("[[node]]\nurl = \"socks5://1.1.1.1:1080\"\n")
-            .expect_err("url field must fail");
-        assert!(
-            err.to_string()
-                .contains("the 'url' field in [[node]] has been retired"),
-            "{err}"
-        );
-
-        // Missing type fails
-        let err = toml::from_str::<Config>("[[node]]\ntag = \"lonely\"\n")
-            .expect_err("missing type must fail");
-        assert!(
-            err.to_string().contains("missing 'type' in [[node]] table"),
-            "{err}"
-        );
-
-        // Port 0 fails
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"socks5\"\nserver = \"1.1.1.1\"\nport = 0\n",
-        )
-        .expect_err("port 0 must fail");
-        assert!(err.to_string().contains("port"), "{err}");
-
-        // Empty server fails
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"socks5\"\nserver = \"   \"\nport = 1080\n",
-        )
-        .expect_err("empty server must fail");
-        assert!(err.to_string().contains("server"), "{err}");
-
-        // A VLESS node needs no security layer at all now (ADR-0028), but it does need a
-        // UUID: the id is what authenticates the session, and a malformed one produces a
-        // generic node rejection with nothing to attribute it to.
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"u\"\n",
-        )
-        .expect_err("a malformed vless uuid must fail");
-        assert!(err.to_string().contains("UUID"), "{err}");
-
-        // A malformed REALITY public key is refused only at dial time today, but the
-        // missing `sni` is a load-time error because REALITY impersonates a named site.
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\n[node.security]\ntype = \"reality\"\npublic-key = \"k\"\n",
-        )
-        .expect_err("reality without sni must fail");
-        assert!(err.to_string().contains("sni"), "{err}");
-
-        // Vision needs a record layer it can splice. The reference rejects this on both
-        // ends; accepting it would produce a session that authenticates and deadlocks.
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"vless\"\nserver = \"1.1.1.1\"\nport = 443\nuuid = \"b831381d-6324-4d53-ad4f-8cda48b30811\"\nflow = \"xtls-rprx-vision\"\n",
-        )
-        .expect_err("vision without a security layer must fail");
-        assert!(err.to_string().contains("security layer"), "{err}");
-
-        // Shadowsocks with legacy cipher fails with clear explanation
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"aes-128-cfb\"\npassword = \"p\"\n",
-        )
-        .expect_err("legacy cipher must fail");
-        assert!(err.to_string().contains("insecure legacy cipher"), "{err}");
-
-        // Shadowsocks 2022 with valid 16-byte base64 key succeeds
-        let valid_2022 = toml::from_str::<Config>(
-            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"3L69X4PF2eSL/JSLkoWnXg==\"\n",
-        );
-        assert!(valid_2022.is_ok(), "{valid_2022:?}");
-
-        // Shadowsocks 2022 with wrong key length fails
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"bm90MTZieXRlcw==\"\n",
-        )
-        .expect_err("wrong key length must fail");
-        assert!(err.to_string().contains("requires a 16-byte"), "{err}");
-
-        // Shadowsocks 2022 with invalid base64 fails
-        let err = toml::from_str::<Config>(
-            "[[node]]\ntag = \"ss22\"\ntype = \"shadowsocks\"\nserver = \"1.1.1.1\"\nport = 8388\nmethod = \"2022-blake3-aes-128-gcm\"\npassword = \"not-valid-base64!\"\n",
-        )
-        .expect_err("invalid base64 must fail");
-        assert!(err.to_string().contains("valid base64"), "{err}");
-    }
-
-    #[test]
-    fn every_field_round_trips_through_the_serializer() {
-        let original = config(
-            "schema = 2\n[global]\nso-mark = 7\n\
-             [global.tls]\nprofile = \"chrome\"\n[global.probe]\ninterval = \"10s\"\n\
-             [[subscription]]\nname = \"s\"\nurl = \"https://s\"\n\
-             [[node]]\nname = \"n\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
-             [[group]]\nname = \"g\"\n\
-             [[election]]\nname = \"e\"\ngroup = \"g\"\ntype = \"random\"\n\
-             [routing]\nrules = [\"pname(NetworkManager) -> direct\"]\nfallback = \"e\"\n\
-             [dns]\nupstream = [\"udp://1.1.1.1:53\"]\n[dns.fixed-domain-ttl]\n\"example.com\" = 60\n",
-        );
-        let rendered = toml::to_string(&original).expect("serializes");
-        let reparsed = config(&rendered);
-        assert_eq!(original, reparsed, "rendered:\n{rendered}");
-    }
-}
+mod tests;

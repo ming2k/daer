@@ -86,7 +86,7 @@ pub fn install_panic_hook() {
 /// this on stderr and continue.
 pub fn capture(trigger: &str, detail: serde_json::Value) -> Result<PathBuf, String> {
     let root = incident_root()?;
-    std::fs::create_dir_all(&root)
+    crate::private_fs::ensure_dir(&root)
         .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
     let id = format!(
         "{}-{}",
@@ -96,7 +96,7 @@ pub fn capture(trigger: &str, detail: serde_json::Value) -> Result<PathBuf, Stri
         std::process::id()
     );
     let directory = root.join(id);
-    std::fs::create_dir_all(&directory)
+    crate::private_fs::ensure_dir(&directory)
         .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
 
     let manifest = serde_json::json!({
@@ -121,33 +121,33 @@ pub fn capture(trigger: &str, detail: serde_json::Value) -> Result<PathBuf, Stri
             "secrets_removed": true,
         },
     });
-    std::fs::write(
-        directory.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)
+    crate::private_fs::write_private(
+        &directory.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest)
             .map_err(|error| format!("cannot encode manifest: {error}"))?,
     )
     .map_err(|error| format!("cannot write manifest: {error}"))?;
 
     if let Ok(snapshot) = std::fs::read(crate::status::STATE_PATH) {
-        let _ = std::fs::write(directory.join("snapshot.json"), snapshot);
+        let _ = crate::private_fs::write_private(&directory.join("snapshot.json"), &snapshot);
     }
     if let Err(error) = copy_tail(
         Path::new(EVENT_LOG_PATH),
         &directory.join("events.jsonl"),
         MAX_EVENT_TAIL,
     ) {
-        std::fs::write(
-            directory.join("events.jsonl"),
-            format!("event stream unavailable: {error}\n"),
+        crate::private_fs::write_private(
+            &directory.join("events.jsonl"),
+            format!("event stream unavailable: {error}\n").as_bytes(),
         )
         .map_err(|write| format!("cannot write events placeholder: {write}"))?;
     }
-    std::fs::write(
-        directory.join("README.txt"),
-        "daer incident bundle.\n\
-         Contains the panic/signal manifest, the last status snapshot and the tail of the JSON\n\
-         event stream. It contains no configuration file, proxy link or credential. A full\n\
-         per-flow record is produced by the event stream; the `flow_id` fields join it.\n",
+    crate::private_fs::write_private(
+        &directory.join("README.txt"),
+        b"daer incident bundle.\n\
+          Contains the panic/signal manifest, the last status snapshot and the tail of the JSON\n\
+          event stream. It contains no configuration file, proxy link or credential. A full\n\
+          per-flow record is produced by the event stream; the `flow_id` fields join it.\n",
     )
     .map_err(|error| format!("cannot write README: {error}"))?;
     Ok(directory)
@@ -160,7 +160,7 @@ fn incident_root() -> Result<PathBuf, String> {
     // There is no tmpfs fallback: an incident that is copied later by a post-stop helper is
     // not self-contained (ADR-0042). The systemd unit's `StateDirectory=daer` creates this
     // tree; a foreground run must be able to write it.
-    std::fs::create_dir_all(INCIDENT_ROOT)
+    crate::private_fs::ensure_dir(Path::new(INCIDENT_ROOT))
         .map_err(|error| format!("cannot create {INCIDENT_ROOT}: {error}"))?;
     Ok(PathBuf::from(INCIDENT_ROOT))
 }
@@ -174,7 +174,7 @@ fn copy_tail(source: &Path, destination: &Path, max_bytes: u64) -> std::io::Resu
     }
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
-    std::fs::write(destination, buffer)
+    crate::private_fs::write_private(destination, &buffer)
 }
 
 #[cfg(test)]

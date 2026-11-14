@@ -48,10 +48,10 @@ Two questions follow, and they are different:
 2. **What if the translation cannot be faithful?** `domain(...)` is matched in the
    kernel through `domain_routing_map`, a bitmap keyed by **destination IP** that
    the datapath expects the control plane to populate from DNS answers.
-   `pname(...)` is matched against `cookie_pid_map`, which only a control plane that
-   tracks sockets can fill. Neither exists in `daer` today. A translator that
-   ignored that difference would silently send traffic somewhere the configuration
-   does not say.
+   `pname(...)` is matched against `cookie_pid_map`, which the cgroup v2 hooks populate;
+   the kernel table still defers this predicate to the userspace path in this build. A
+   translator that ignored the remaining difference would silently send traffic somewhere
+   the configuration does not say.
 
 ## Decision
 
@@ -81,7 +81,7 @@ whenever a construct cannot be represented exactly:
 | --- | --- | --- | --- |
 | `dip`/`sip`, `port`, `sport`, `l4proto`, `ipversion`, `mac`, `dscp` | `routing_map` + per-entry LPM tries | written by this ADR | encodable |
 | `domain(...)` | `domain_routing_map`: IP-keyed bitmap derived from **DNS answers** | no DNS-derived bitmap | **not encodable** |
-| `pname(...)` | `cookie_pid_map` populated from socket tracking | not tracked | **not encodable** |
+| `pname(...)` | `cookie_pid_map` populated from socket tracking | populated by the attached cgroup v2 hooks; kernel encoding still deferred | **deferred to userspace** |
 | more than `MAX_MATCH_SET_LEN` sets | array bound | — | **not encodable** |
 
 ### 3. When it is not equivalent, the kernel defers — it does not guess

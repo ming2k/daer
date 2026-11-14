@@ -44,7 +44,7 @@
 // Connection tracking: the TCP/UDP state machines the fast path depends on.
 #include "src/conn.h"
 
-// The ingress hooks (LAN and WAN), including the dual-role hook.
+// The ingress hooks (LAN and WAN).
 #include "src/ingress.h"
 
 // The egress hooks (LAN and WAN) and the daer0/daer0peer reply path.
@@ -52,10 +52,6 @@
 
 // The cgroup hooks: socket cookie to process name.
 #include "src/cgroup.h"
-
-// The sockmap TCP offload path. Its `#include "include/tcp_offload.h"` resolves
-// against `ebpf/kern/include/`, which the build symlinks next to the sources.
-#include "src/offload.h"
 
 // The kernel requires a licence section and refuses GPL-only helpers without it.
 char __license[] SEC("license") = "Dual BSD/GPL";

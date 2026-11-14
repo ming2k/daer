@@ -20,7 +20,7 @@
 - **Mechanisms Over Exhortations**: Rely on Rust compiler typestates, private encapsulation, and automated tests to guarantee invariants. Never rely on natural-language comments alone.
 - **Falsifiable Verification ([INV-VERIFY-01])**: Every test asserting datapath correctness must name its falsifier and carry negative controls (ADR-0007). A test that cannot fail is a liability.
 - **Zero Unwired Keys**: Every accepted configuration key must be consumed by the daemon or rejected by schema validation (ADR-0006). Enforced by native Rust test `daer-config::tests::config_keys`.
-- **Atomic Verification**: Always verify code changes with `cargo xtask ci` (`cargo fmt`, `clippy`, `cargo test`) before declaring tasks complete.
+- **Atomic Verification**: Always verify code changes with `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --bins`, `cargo nextest run --workspace` and `cargo test --workspace --doc` before declaring tasks complete. External tests live in the root `tests/` harness; see `docs/dev/testing.md`.
 
 ## 4. On-Demand Standards Routing
 Do not guess repository rules or rely on unverified assumptions. Consult authoritative specifications as needed:
@@ -29,6 +29,7 @@ Do not guess repository rules or rely on unverified assumptions. Consult authori
   - Workspace Architecture & Boundaries: `docs/dev/standards/architecture.md`
   - Invariant & Constraint Policy: `docs/dev/standards/invariants.md`
   - Project Invariant Registry: `docs/dev/invariants.md`
+  - Test Architecture & Layered Runner: `docs/dev/testing.md`
   - Testing & Verification Policy: `docs/adr/0007-verification.md`
   - Markdown & Hyperlink Style: `docs/dev/standards/style.md`
   - Architectural Decision Records: `docs/dev/standards/adr.md`

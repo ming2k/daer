@@ -94,3 +94,7 @@ Three lessons, each of which becomes a rule below:
 - `docs/how-to/deployment.md` keeps the `nonzero insn_off` entry in its failure table: it
   is now a *build* failure that `tests/object.rs` catches, and the entry tells a reader
   arriving from an old binary what they were looking at.
+
+> Note (2026-11-14): the inherited TCP-offload/sockmap section names discussed above are
+> historical. That path was removed because no Rust control plane attached it; see the
+> amendment to [ADR-0024](0024-datapath-source-layout.md).

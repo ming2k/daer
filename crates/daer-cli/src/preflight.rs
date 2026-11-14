@@ -124,12 +124,7 @@ pub fn plan(
             }
         })?;
 
-    let socket_mark = Some(
-        config
-            .global
-            .so_mark
-            .unwrap_or(crate::run::DEFAULT_SOCKET_MARK),
-    );
+    let socket_mark = Some(crate::run::DEFAULT_SOCKET_MARK);
     let (object, object_error) = match object {
         Some(path) => match validate_object(path) {
             Ok(report) => (Some(report), None),

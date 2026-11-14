@@ -37,7 +37,7 @@ use netune_quic::{QuicSocketConfig, QuicUdpSocket, QuicUdpSocketFactory};
 
 use crate::error::ProxyProtocolError;
 use crate::hysteria2::obfs::{Obfs, ObfsSocket};
-use crate::hysteria2::port_set::PortSet;
+use daer_config::PortHopping;
 
 /// The reference's floor for a hop interval (`udphop`): a shorter schedule exhausts the
 /// server's port table faster than it releases entries.
@@ -51,25 +51,27 @@ pub struct HopSchedule {
 }
 
 impl HopSchedule {
-    /// Builds a schedule from a node's port set.
+    /// Builds a schedule from a node's port-hopping table.
     ///
     /// # Errors
     ///
     /// Returns a message when the bounds are reversed or below [`MIN_HOP_INTERVAL`]. Both are
     /// load-time facts, and a 1-second schedule looks like a working node whose connections
     /// the server drops.
-    pub fn from_ports(ports: &PortSet) -> Result<Option<Self>, String> {
-        if !ports.hops() {
+    pub fn from_hopping(hopping: &PortHopping) -> Result<Option<Self>, String> {
+        if !hopping.is_enabled() {
             return Ok(None);
         }
-        let single = Duration::from_millis(ports.hop_ms.max(1));
-        let min = if ports.hop_min_ms > 0 {
-            Duration::from_millis(ports.hop_min_ms)
+        let millis =
+            |value: daer_config::TimeSpan| u64::try_from(value.as_nanos() / 1_000_000).unwrap_or(0);
+        let single = Duration::from_millis(millis(hopping.interval).max(1));
+        let min = if hopping.min_interval.as_nanos() > 0 {
+            Duration::from_millis(millis(hopping.min_interval))
         } else {
             single
         };
-        let max = if ports.hop_max_ms > 0 {
-            Duration::from_millis(ports.hop_max_ms)
+        let max = if hopping.max_interval.as_nanos() > 0 {
+            Duration::from_millis(millis(hopping.max_interval))
         } else {
             single
         };
@@ -385,13 +387,18 @@ mod tests {
 
     #[test]
     fn a_schedule_shorter_than_the_reference_floor_is_refused() {
-        let mut ports = PortSet::single(443);
-        ports.hop_ms = 1_000;
-        let error = HopSchedule::from_ports(&ports).expect_err("1s is under the floor");
+        let hopping = PortHopping {
+            interval: daer_config::TimeSpan::from_secs(1),
+            ..PortHopping::default()
+        };
+        let error = HopSchedule::from_hopping(&hopping).expect_err("1s is under the floor");
         assert!(error.contains("5s"), "{error}");
 
-        ports.hop_ms = 30_000;
-        let schedule = HopSchedule::from_ports(&ports)
+        let hopping = PortHopping {
+            interval: daer_config::TimeSpan::from_secs(30),
+            ..PortHopping::default()
+        };
+        let schedule = HopSchedule::from_hopping(&hopping)
             .expect("30s is fine")
             .expect("hopping is configured");
         assert_eq!(schedule.min, Duration::from_secs(30));
@@ -400,16 +407,17 @@ mod tests {
 
     #[test]
     fn no_hop_key_means_no_hopping() {
-        let ports = PortSet::single(443);
-        assert_eq!(HopSchedule::from_ports(&ports), Ok(None));
+        assert_eq!(HopSchedule::from_hopping(&PortHopping::default()), Ok(None));
     }
 
     #[test]
     fn reversed_bounds_are_refused_by_name() {
-        let mut ports = PortSet::single(443);
-        ports.hop_min_ms = 60_000;
-        ports.hop_max_ms = 30_000;
-        let error = HopSchedule::from_ports(&ports).expect_err("min > max");
+        let hopping = PortHopping {
+            min_interval: daer_config::TimeSpan::from_secs(60),
+            max_interval: daer_config::TimeSpan::from_secs(30),
+            ..PortHopping::default()
+        };
+        let error = HopSchedule::from_hopping(&hopping).expect_err("min > max");
         assert!(error.contains("hop-min-interval"), "{error}");
     }
 

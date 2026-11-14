@@ -8,32 +8,27 @@
 # Unknown keys are errors, not warnings: a typo must fail loudly.
 
 # Schema version. daer refuses a version it does not understand.
-schema = 2
+schema = 5
 
 # Extra files, relative to this one. Tables merge key by key, arrays are
 # concatenated, and a key set twice is an error.
 #include = ["conf.d/*.toml"]
 
-[global]
-# Socket mark for daer-originated traffic. Omit to let daer pick an internal
-# mark that prevents UDP self-capture.
-#so-mark = 0
+# The socket mark that keeps daer's own traffic out of its datapath is internal;
+# it is not a configuration key.
 # tracing filter directive: "info", "debug", or "daer=debug,netune=trace".
 log-level = "info"
 
 # Interfaces to proxy. "auto" detects the default route's interface.
 #lan-interface = ["docker0"]
-wan-interface = ["auto"]
+# `"auto"` follows the default route; for multiple uplinks write a list such as
+# ["eth0", "wg0"]. The two forms are mutually exclusive.
+wan-interface = "auto"
 
-# How long to wait for a sniffable byte sequence before falling back to IP.
-sniffing-timeout = "30ms"
-auto-sniff-punt = true
-
-allow-insecure = false
 disable-waiting-network = false
 
 
-[global.tls]
+[tls]
 # TLS fingerprint preset owned by netune: "netune-default", "chrome-current",
 # "firefox-current", "safari-current", "codex-reqwest", "codex-network-proxy".
 # Unknown names fail
@@ -43,21 +38,6 @@ disable-waiting-network = false
 fragment = false
 fragment-length = "50-100"
 fragment-interval = "10-20"
-
-# Probe defaults; each [[election]] may override any of these.
-[global.probe]
-# "server" checks the node's own server port; "url" asks a URL *through* the
-# node and measures the end-to-end path. A latency election should use "url".
-mode = "server"
-# Required when mode = "url"; ignored when mode = "server".
-#url = "https://www.gstatic.com/generate_204"
-method = "HEAD"
-# Bare IPs mean port 53; a name is reported and skipped, never silently resolved.
-udp-dns = ["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]
-interval = "30s"
-timeout = "5s"
-# Shifts the switching threshold of moving averages; may be negative.
-tolerance = "0s"
 
 # Subscriptions are merged into the node pool. Either write bare URLs
 # (`subscription = ["https://…"]`) or these tables, not both.
@@ -132,23 +112,53 @@ tolerance = "0s"
 #type = "tls"
 #sni = "node.example.com"
 #
-# Structured Hysteria 2 (ADR-0029). `ports` accepts one port, a list or a range;
-# `hop-interval` rotates the source port, which is what defeats a per-flow
-# throttle, and needs at least 5s:
+# Structured Hysteria 2 (ADR-0029). `ports` accepts one port, a list or a range.
+# The TLS leg has its own table; `[node.port-hopping]` rotates the source port,
+# which is what defeats a per-flow throttle, and needs at least 5s:
 #[[node]]
 #name = "hy2"
 #type = "hysteria2"
 #server = "198.51.100.6"
 #ports = "443,20000-20010"
 #password = "secret"
+#[node.tls]
 #sni = "hy2.example.com"
+#allow-insecure = false
+#pin-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+#[node.bandwidth]
 #up-mbps = 100
 #down-mbps = 200
+#[node.quic]
 #congestion = "brutal"
-#hop-interval = "30s"
+#max-idle-timeout = "30s"
+#keep-alive-period = "10s"
+#[node.port-hopping]
+#interval = "30s"
 #[node.obfs]
 #type = "salamander"
 #password = "cry_me_a_r1ver"
+#
+# Structured Trojan (TLS is intrinsic, so its parameters live in `[node.tls]`):
+#[[node]]
+#name = "trojan"
+#type = "trojan"
+#server = "198.51.100.7"
+#port = 443
+#password = "secret"
+#[node.tls]
+#sni = "trojan.example.com"
+#allow-insecure = false
+#
+# Structured AnyTLS:
+#[[node]]
+#name = "anytls"
+#type = "anytls"
+#server = "198.51.100.8"
+#port = 443
+#password = "secret"
+#idle-sessions = 1
+#[node.tls]
+#sni = "anytls.example.com"
 #
 # Structured Shadowsocks example:
 #[[node]]
@@ -194,9 +204,19 @@ group = "proxy-pool"
 # "random", "min", "min-avg10", "min-moving-avg"; a manual election uses
 # `node = "name"` instead of `group`.
 type = "min-moving-avg"
-# A URL probe measures the path through the node, not just its server port.
+# Shifts the switching threshold of the moving average; selection policy,
+# not a probe setting. May be negative.
+#tolerance = "0s"
+# The probe belongs to the election. Omitted fields use the built-in defaults:
+# mode = "server", method = "HEAD", interval = "30s", timeout = "5s", and the
+# UDP DNS endpoints used for datagram-capable nodes. A latency election should
+# use "url" so it measures the path through the node, not just its server port.
 #mode = "url"
 #url = "https://www.gstatic.com/generate_204"
+#method = "HEAD"
+#interval = "30s"
+#timeout = "5s"
+#udp-dns = ["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]
 
 [dns]
 # "4", "6", or 0 for no preference.
@@ -217,7 +237,8 @@ optimistic-cache-ttl = 60
 optimistic-stale-reply-ttl = 30
 max-cache-size = 65536
 
-# Synthetic DNS answers. Disabled by default. `inet6` is optional: when set, AAAA queries
+# Synthetic DNS answers. Disabled by default. Enabling it requires an explicit `[dns].bind`
+# above; it never starts the listener by itself. `inet6` is optional: when set, AAAA queries
 # receive synthetic addresses too; when unset, AAAA is answered empty so a dual-stack client
 # falls back to the synthetic A record.
 #[dns.fake-ip]
@@ -240,7 +261,7 @@ fallback = "googledns"
 rules = []
 fallback = "accept"
 
-# Rule Providers (ADR-0014, ADR-0019). A provider is a compiled `.drb` set or a plain-text rule file,
+# Rule Sets (ADR-0014, ADR-0019). A rule set is a compiled `.drb` set or a plain-text rule file,
 # local or remote. This is how `geoip:` / `geosite:` are expressed now: the `.dat` format is
 # retired: unpack an existing .dat with scripts/rules/dat_to_rules.py and compile with daer-drb.
 #
@@ -252,50 +273,78 @@ fallback = "accept"
 #
 # Dedicated rules distribution repository: https://github.com/daeuniverse/drb-sets
 # These URLs resolve once that repository has published its first build. Until then (or with
-# no network at all) `daer check` names every provider it could not load and the cache path it
+# no network at all) `daer check` names every rule set it could not load and the cache path it
 # looked in, rather than starting with an empty rule — that is the intended behaviour, not a
 # failure of the example. Point `path` at a local `.drb` to work offline.
 #
 # For a locally managed set, place the file under /var/lib/daer/rules and declare:
-#   [[rule-provider]]
-#   name = "company"
-#   type = "file"
-#   path = "/var/lib/daer/rules/company.drb"
-#   format = "drb"
-[[rule-provider]]
-name = "private"
-type = "http"
-url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
-format = "drb"
-interval = "24h"
-
-[[rule-provider]]
-name = "cn"
-type = "http"
-url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
-format = "drb"
-interval = "24h"
-
-[[rule-provider]]
-name = "cn-ip"
-type = "http"
-url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
-format = "drb"
-interval = "24h"
+#
+# [[rule-set]]
+# name = "company"
+# type = "file"
+# path = "/var/lib/daer/rules/company.drb"
+# format = "drb"
+#
+# For the published rule sets, use:
+#
+# [[rule-set]]
+# name = "cn"
+# type = "http"
+# url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
+# format = "drb"
+# interval = "24h"
+#
+# This example keeps those declarations commented so it validates on a clean,
+# offline machine. Uncomment them and replace the inline `domain(...)`/`dip(...)`
+# rules below with `rule-set(...)` when the artifacts are available.
 
 [routing]
-# Rules are evaluated top to bottom; the first match wins.
-rules = [
-    # Network managers should reach the network directly, otherwise binding to
-    # the WAN interface produces a false-negative connectivity check.
-    "pname(NetworkManager) -> direct",
-    # Keep broadcast and multicast traffic away from the proxy.
-    "dip(224.0.0.0/3, 'ff00::/8') -> direct",
-    "provider(private) -> direct",
-    # HTTP/3 usually costs more CPU and memory than it is worth.
-    "l4proto(udp) && dport(443) -> block",
-    # Domestic destinations: domains and addresses from the same provider tags.
-    "provider(cn, cn-ip) -> direct",
-]
-# Where everything else goes.
-fallback = "proxy"
+# Rules are evaluated top to bottom; the first match wins. Each rule has a
+# stable name, a match expression, and a typed action.
+fallback = { election = "proxy" }
+
+[routing.sniff]
+# A domain(...) rule needs a name. DNS/Fake-IP is always consulted first; this
+# table only decides whether routing may inspect the first bytes when they did
+# not produce a unique name. `enabled = false` routes by the remaining facts.
+enabled = true
+timeout = "30ms"
+
+[[routing.rule]]
+name = "lan"
+# RFC1918 destinations are local and should not enter the proxy.
+match = "dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)"
+action = "direct"
+
+# pname matches the local process that opened a host-originated flow. It
+# requires the cgroup v2 hooks the daemon attaches at startup; a LAN client's
+# flow has no local process name.
+#[[routing.rule]]
+#name = "network-manager"
+#match = "pname(NetworkManager)"
+#action = "direct"
+
+[[routing.rule]]
+name = "multicast"
+# Keep broadcast and multicast traffic away from the proxy.
+match = "dip(224.0.0.0/3, 'ff00::/8')"
+action = "direct"
+
+[[routing.rule]]
+name = "private"
+# RFC1918 / loopback / link-local stay local.
+match = "dip(10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16)"
+action = "direct"
+
+[[routing.rule]]
+name = "quic-block"
+# HTTP/3 usually costs more CPU and memory than it is worth.
+match = "l4proto(udp) && dport(443)"
+action = "block"
+
+[[routing.rule]]
+name = "cn-direct"
+# Domestic destinations: replace this with rule-set(cn, cn-ip) after declaring
+# the compiled sets above.
+match = "domain(example.cn)"
+action = "direct"

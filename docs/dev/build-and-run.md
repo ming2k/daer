@@ -17,6 +17,7 @@ systemd unit, which this page deliberately does not repeat.
 | Linux 6.6+ | TCX (`BPF_TCX_INGRESS`/`BPF_TCX_EGRESS`), `bpf_loop`, and the cgroup hooks the datapath uses |
 | `clang` | compiles `ebpf/kern` — there is no prebuilt object in the repository |
 | `bpftool` | dumps the per-kernel `vmlinux.h` the datapath includes |
+| cgroup v2 | the six `pname` hooks attach to the unified hierarchy at daemon startup |
 | `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON` + `CAP_SYS_ADMIN` | only for the privileged gates in §4; building and the unprivileged gates need nothing. The first three load/attach the datapath; `CAP_SYS_ADMIN` creates and enters the private ingress namespace (ADR-0038) |
 
 ---
@@ -33,7 +34,7 @@ cargo xtask ebpf                       # target/ebpf/datapath.bpf.o  (needs clan
 `daer` is the single public binary: `run`, `check`, `route`, `probe`, `status`, `elect`,
 `schema`, `version` (ADR-0015/ADR-0041/ADR-0047, `[INV-CLI-01]`). `daer-drb` is the
 rule-artifact producer and is
-*not* linked into the daemon — `crates/daer-cli/tests/surface.rs` asserts that closure stays
+*not* linked into the daemon — `tests/integration/cli_surface.rs` asserts that closure stays
 empty (ADR-0031).
 
 For a failure that needs a real backtrace, build the forensic profile:
@@ -50,8 +51,8 @@ use it only to explain a failure, never as the artifact you deploy.
 per-kernel and is not vendored:
 
 ```bash
-mkdir -p ebpf/headers
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
+mkdir -p ebpf/kern/headers
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/kern/headers/vmlinux.h
 cargo xtask ebpf
 ```
 
@@ -101,47 +102,42 @@ and `... route` are the topology checks; the mount is private to the daemon, so 
 
 ## 4. Verifying
 
-The unprivileged gate, and the one to run before pushing:
+The per-layer commands, and the ones to run before pushing:
 
 ```bash
-cargo xtask ci
+# L1: unit tests in library and binary targets
+cargo nextest run --workspace -E 'kind(lib) + kind(bin)'
+# L1: doctests (nextest does not run them)
+cargo test --workspace --doc
+
+# L2: the root integration harness
+cargo build -p daer-cli -p daer-drb --bins
+cargo nextest run --workspace -E 'binary(integration)'
+
+# L3: the root e2e harness (most tests skip without privilege)
+cargo nextest run --workspace -E 'binary(e2e)'
 ```
 
-It runs the ABI drift check, the diagnostic event catalog check
-(`cargo xtask events --check`), the incident-record check (`cargo xtask incident --check`),
-`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` and `daer check --object`
-over the object this tree just built. It needs no capability, and `.github/workflows/ci.yml`
-runs the same steps.
+The checks that do not run Rust tests are the ABI drift check, the diagnostic event catalog
+check (`cargo xtask events --check`), the incident-record check
+(`cargo xtask incident --check`), `cargo fmt --check`, `clippy -D warnings`, and the
+unprivileged preflight (`cargo xtask preflight`). `.github/workflows/ci.yml` runs the same
+steps, with tests selected by nextest filtersets.
 
-The two privileged gates answer different questions over different dependency closures, so
-neither substitutes for the other:
+[Test Architecture](testing.md) defines what belongs in each layer, the unit-test placement
+rules, the skip policy, and the `DAER_REQUIRE` key contract. The two privileged gates answer
+different questions over different dependency closures, so neither substitutes for the other:
 
 ```bash
-cargo xtask kernel-check    # does the eBPF object load and behave?
-cargo xtask e2e-check       # does a redirected flow reach the daemon and come back?
+scripts/verify/kernel-check.sh   # does the eBPF object load and behave?
+scripts/verify/e2e-check.sh      # does a redirected flow reach the daemon and come back?
 ```
 
 Both re-exec themselves under `sudo` and both report `skip` with a reason when a fixture is
 missing. A skip is a fact on a laptop and a hole in CI, so `DAER_REQUIRE=<key,...>` turns a named
-skip into a failure; the keys are in `docs/how-to/deployment.md`. The full script layout,
-including the host-level `ops/` helpers, is documented in
+skip into a failure; the keys are in [Test Architecture](testing.md#5-skips-ignored-tests-and-daer_require).
+The full script layout, including the host-level `ops/` helpers, is documented in
 [`scripts/README.md`](../../scripts/README.md).
-
-The real-host delivery gate and the clean-host preparation checklist are engineering-process
-documents: [Production Readiness](production-readiness.md) and
-[Test Environment Requirements](test-environment.md). They are deliberately not part of the
-public operator how-to surface because they require a disposable host, a site config and a real
-node.
-
-TC attachment is TCX-only (ADR-0042). Every hook is an fd-owned `bpf_link`; there is no
-`clsact` qdisc, no classic `cls_bpf` fallback and no `DAER_TC_ATTACH` switch. The
-real-daemon gate is `sudo scripts/ops/daer-delivery-check.sh --config <config>`: it must show
-`example.com http=200`, then kill the daemon with `SIGKILL` and prove that no TCX link,
-qdisc, veth, namespace or `daer0` sysctl remains and that direct traffic recovers. Run it
-with `--preflight` first (no root): that checks the Linux 6.6+ kernel, tools, release
-artifacts and config and prints the exact sudo command. Attachment alone is not delivery.
-
----
 
 ## 5. Diagnosing a flow
 

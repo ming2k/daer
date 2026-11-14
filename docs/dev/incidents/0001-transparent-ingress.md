@@ -8,8 +8,8 @@ signal:
   - event: datapath.policy_deferred
   - counter: bpf_stats.listener_assign_failed
 regression:
-  - crates/daer-control/tests/transparent.rs::a_redirected_flow_is_proxied_by_the_daemon
-  - crates/daer-control/tests/netns_lifecycle.rs
+  - tests/e2e/control_transparent.rs::a_redirected_flow_is_proxied_by_the_daemon
+  - tests/e2e/control_netns_lifecycle.rs
 events_added: [datapath.event, datapath.stats, flow.dial_failed]
 adr: [ADR-0038]
 ---
@@ -166,7 +166,7 @@ flow closed ... to_upstream=1921 to_client=6509
 ```
 
 The real-kernel lifecycle falsifier is
-[`crates/daer-control/tests/netns_lifecycle.rs`](../../../crates/daer-control/tests/netns_lifecycle.rs).
+[`tests/e2e/control_netns_lifecycle.rs`](../../../tests/e2e/control_netns_lifecycle.rs).
 It owns `daer0ns` and the pair, so it is gated on `DAER_NETNS_TEST=1` and runs in the
 privileged e2e script. It asserts:
 

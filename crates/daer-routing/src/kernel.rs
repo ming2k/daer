@@ -28,7 +28,7 @@
 //! | Construct | Kernel mechanism | Why it is absent here |
 //! | --- | --- | --- |
 //! | `domain(...)` | `domain_routing_map`, a bitmap keyed by **destination IP** | the bitmap is derived from DNS answers, which daer does not feed the kernel yet |
-//! | `pname(...)` | `cookie_pid_map`, keyed by socket cookie | daer does not populate that map |
+//! | `pname(...)` | `cookie_pid_map`, keyed by socket cookie | populated by the cgroup v2 hooks, but the kernel encoding is deferred to userspace |
 //! | > `MAX_MATCH_SET_LEN` sets | `routing_map` is a fixed `ARRAY` | the bound is the object's |
 //!
 //! The first two are not limitations of the encoding; they are tables the *control plane* has
@@ -37,7 +37,7 @@
 
 use std::net::IpAddr;
 
-use daer_common::{MacAddr, PortRange, consts::outbound_name};
+use daer_common::{MacAddr, PortRange};
 use daer_ebpf::abi::{
     LpmKey, MAX_MATCH_SET_LEN, MatchSet as KernelMatchSet, match_type, outbound as kernel_outbound,
 };
@@ -81,7 +81,7 @@ pub enum DeferReason {
     /// A `domain(...)` predicate exists: it needs `domain_routing_map`, which is IP-keyed and
     /// derived from DNS answers daer does not yet maintain.
     Domain { rule: usize },
-    /// A `pname(...)` predicate exists: it needs `cookie_pid_map`, which daer does not populate.
+    /// A `pname(...)` predicate exists; the userspace evaluator owns this fact.
     ProcessName { rule: usize },
     /// The program lowers to more sets than one slot can hold.
     TooManySets { sets: usize, bound: usize },
@@ -101,8 +101,8 @@ impl std::fmt::Display for DeferReason {
             ),
             Self::ProcessName { rule } => write!(
                 f,
-                "rule {rule} uses pname(...) and cookie_pid_map is not populated by this build, \
-                 so the kernel cannot evaluate it"
+                "rule {rule} uses pname(...); process names are populated for the userspace \
+                 path, while the kernel table defers this predicate to the control plane"
             ),
             Self::TooManySets { sets, bound } => write!(
                 f,
@@ -205,7 +205,7 @@ impl OutboundIds {
     ///
     /// `direct` and `block` are the datapath's own constants and consume no id.
     fn id_for(&mut self, outbound: &Outbound) -> Option<u8> {
-        if let Some(id) = Self::reserved(&outbound.name) {
+        if let Some(id) = Self::reserved(outbound.kind) {
             return Some(id);
         }
         let name = &*outbound.name;
@@ -221,15 +221,12 @@ impl OutboundIds {
         u8::try_from(id).ok()
     }
 
-    /// The datapath's own id for a reserved outbound name, or `None` for a group.
-    fn reserved(name: &str) -> Option<u8> {
-        // The names come from `daer_common::consts::outbound_name`, not from literals here: this
-        // is the mapping between a userspace name and a kernel constant, and a typo on either
-        // side would silently route `direct` flows into the group-id window.
-        match name {
-            outbound_name::DIRECT => Some(kernel_outbound::DIRECT),
-            outbound_name::BLOCK => Some(kernel_outbound::BLOCK),
-            _ => None,
+    /// The datapath's own id for a built-in outbound kind, or `None` for an election.
+    fn reserved(kind: daer_config::OutboundKind) -> Option<u8> {
+        match kind {
+            daer_config::OutboundKind::Direct => Some(kernel_outbound::DIRECT),
+            daer_config::OutboundKind::Block => Some(kernel_outbound::BLOCK),
+            daer_config::OutboundKind::Election => None,
         }
     }
 

@@ -8,8 +8,7 @@
 //! declarations are the ones in `ebpf/kern/datapath.bpf.c`; the doc blocks below quote them
 //! so a reader can compare without opening a second file.
 
-/// Key of the connection-tracking maps (`fast_sock`, `tcp_offload_pause`,
-/// `conn_state_map`, ...).
+/// Key of the connection-tracking maps (`conn_state_map`, ...).
 ///
 /// ```c
 /// struct tuples_key {
@@ -379,7 +378,7 @@ pub struct RoutingResult {
     pub outbound: u8,
     /// `TASK_COMM_LEN` bytes, NUL-padded.
     pub pname: [u8; TASK_COMM_LEN],
-    /// The pid that opened the flow, or `0` when the cgroup hooks are not attached.
+    /// The pid that opened the flow, or `0` when the process was not observed for it.
     pub pid: u32,
     /// The packet's DSCP.
     pub dscp: u8,

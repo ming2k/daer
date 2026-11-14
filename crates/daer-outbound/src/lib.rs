@@ -43,7 +43,7 @@ pub use property::{Property, Protocol, Security};
 
 /// The ClientHello fragmentation plan, re-exported because [`DialerOptions`] carries one.
 ///
-/// `decide` turns `[global.tls]` into a `Fragment` before it builds dialer options, and it
+/// `decide` turns `[tls]` into a `Fragment` before it builds dialer options, and it
 /// must be able to name the type it is constructing. Nothing else from
 /// `daer-proxy-protocols` is re-exported here: a protocol type reachable through the
 /// governance crate would announce a boundary this crate does not own (ADR-0017).

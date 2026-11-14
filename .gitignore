@@ -17,6 +17,12 @@ __pycache__/
 daer-kernel-check/
 *.log
 
+# Site-specific daer configurations (may contain credentials or node links).
+# Keep the tracked reference example; everything else with this root-level
+# `daer.<site>.toml` shape is operator data and must not be committed.
+/daer.*.toml
+!/daer.example.toml
+
 # Editor and environment
 *~
 *.swp

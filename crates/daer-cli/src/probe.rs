@@ -146,7 +146,6 @@ struct NodeReport {
     /// `Some` once the endpoint was read; a `direct` node has none.
     endpoint: Option<String>,
     /// A direct node needs no remote probe, so it is reported as ok without one.
-    direct: bool,
     /// The timings collected so far, in phase order.
     trace: Vec<String>,
     outcome: Result<(), Failure>,
@@ -205,6 +204,24 @@ fn one_source_at_a_time(options: &ProbeNodeOptions) -> anyhow::Result<()> {
     )
 }
 
+/// The label of a `direct` / `direct://…` diagnostic request.
+///
+/// `direct` is a routing verdict, not a configuration node. The probe still accepts the
+/// conventional link spelling because "is the local path healthy?" is a useful question, but
+/// it never reaches `NodeEndpoint` and never enters the node pool.
+fn direct_link_label(value: &str) -> Option<String> {
+    if value == outbound_name::DIRECT {
+        return Some(outbound_name::DIRECT.to_owned());
+    }
+    let rest = value.strip_prefix("direct://")?;
+    let label = rest
+        .split_once('#')
+        .map(|(_, fragment)| fragment)
+        .filter(|fragment| !fragment.is_empty())
+        .unwrap_or(outbound_name::DIRECT);
+    Some(label.to_owned())
+}
+
 pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
     one_source_at_a_time(&options)?;
 
@@ -258,15 +275,14 @@ pub async fn probe_node(options: ProbeNodeOptions) -> anyhow::Result<()> {
             );
         }
         Ok(())
-    } else if options.node == outbound_name::DIRECT {
-        // `direct` is a built-in outbound name, not a node in the file, and it has no remote
-        // server to probe. Reported as ok rather than as "node not found", which would be a
-        // true statement about the file and a misleading one about the request.
+    } else if let Some(label) = direct_link_label(&options.node) {
+        // `direct` is a built-in outbound verdict, not a node in the file, and it has no
+        // remote server to probe. Reported as ok rather than as "node not found", which
+        // would be a true statement about the file and a misleading one about the request.
         let report = NodeReport {
-            label: outbound_name::DIRECT.to_owned(),
+            label,
             protocol: "direct".to_owned(),
             endpoint: None,
-            direct: true,
             trace: vec![
                 "  endpoint        : local direct interface".to_owned(),
                 "  verdict         : ok (direct outbound requires no remote server probe)"
@@ -354,7 +370,6 @@ fn describe(failure: &Failure) -> &str {
 /// The `[protocol]` label a report prints.
 fn protocol_name(node: &daer_config::Node) -> &str {
     match &node.endpoint {
-        NodeEndpoint::Direct(_) => "direct",
         NodeEndpoint::Socks5(_) => "socks5",
         NodeEndpoint::Http(_) => "http",
         NodeEndpoint::Shadowsocks(_) => "shadowsocks",
@@ -379,20 +394,9 @@ async fn probe_one(
         label: node.label(),
         protocol,
         endpoint: None,
-        direct: matches!(node.endpoint, NodeEndpoint::Direct(_)) && node.detour.is_none(),
         trace: Vec::new(),
         outcome: Ok(()),
     };
-
-    if report.direct {
-        report
-            .trace
-            .push("  endpoint        : local direct interface".to_owned());
-        report.trace.push(
-            "  verdict         : ok (direct outbound requires no remote server probe)".to_owned(),
-        );
-        return report;
-    }
 
     let (server, port) = match &node.endpoint {
         NodeEndpoint::Socks5(e) => (e.server.as_str(), e.port),
@@ -409,7 +413,6 @@ async fn probe_one(
             )));
             return report;
         }
-        NodeEndpoint::Direct(_) => ("", 0),
     };
     report.endpoint = (!server.is_empty()).then(|| format!("{server}:{port}"));
 

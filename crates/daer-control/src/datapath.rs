@@ -495,6 +495,11 @@ fn link_line(interface: &str) -> Result<String, DatapathError> {
 
 /// Loads the object, attaches every program, and returns the handle.
 ///
+/// The six cgroup v2 hooks are attached before the TC hooks: they populate the
+/// `cookie_pid_map` that makes `pname(...)` a real predicate, not an accepted but inert
+/// configuration key. Their links are fd-owned by the same `Ebpf` object as the TCX links,
+/// so dropping the handle detaches both.
+///
 /// The handle must be kept alive for the lifetime of the daemon: dropping it detaches the
 /// programs and removes the policy routing, and the box silently stops proxying.
 ///
@@ -524,6 +529,14 @@ pub fn attach(
     // datapath that attaches cleanly but proxies nothing.
     daer_ebpf::set_device_ifindex(&mut ebpf, param.device_ifindex)
         .map_err(DatapathError::Object)?;
+
+    // pname is a first-class routing predicate. The cgroup hooks are what populate
+    // `cookie_pid_map`; attaching them here, before any flow can be served, is what
+    // makes "accepted by the parser" and "actually matches" the same statement. A
+    // host without cgroup v2 fails at startup rather than running with an inert
+    // `pname(...)` rule.
+    let cgroup_path = loader::cgroup_v2_path().map_err(DatapathError::Object)?;
+    loader::attach_cgroup_hooks(&mut ebpf, &cgroup_path).map_err(DatapathError::Object)?;
 
     // Resolved before anything is attached: a device with no parser must stop the run
     // rather than leave half the interfaces hooked and the rest silently direct.

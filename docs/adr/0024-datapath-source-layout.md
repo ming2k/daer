@@ -50,20 +50,21 @@ preference about directory names.
    | `packet.h` | *no maps* | pure functions over `(data, data_end)` |
    | `conn.h` | `conn_state_map`, `redirect_track` | shared by the tc hooks |
    | `policy.h` | `routing_map`, `routing_meta_map`, `active_routing_epoch_map`, `lpm_array_map`, `unused_lpm_type`, `domain_routing_map`, `routing_handoff_map`, `outbound_connectivity_map` | shared by the tc hooks |
-   | `redirect.h` | `listen_socket_map`, `daer_ifindex_map`, `fast_sock` | shared by the tc hooks |
+   | `redirect.h` | `listen_socket_map`, `daer_ifindex_map` | shared by the tc hooks |
    | `event.h` | `event_ringbuf`, `alive_block_rate_map`, `bpf_stats_map` | callable from anywhere |
    | `types.h` | *no maps* | the ABI structs every module uses |
    | `maps.h` | *declares all of the above* | — |
 
    `packet.h` and `types.h` own no maps because they are pure: they take bytes and return
    a parsed key. Keeping them map-free is what lets them be unit-reasoned about and reused
-   by the cgroup and sockmap hooks without dragging policy state along.
+   by the cgroup hooks without dragging policy state along.
 
 2. **The attach domains are separate files, because the kernel attaches them separately.**
-   `tc.c` (14 `classifier/` programs), `cgroup.c` (6 `cgroup/` programs),
-   `offload.c` (`sk_skb/stream_verdict`, `fentry/`, `kprobe/`). These are not a
-   classification by taste: `daer-ebpf/src/loader.rs` attaches them through different
-   `aya` APIs, and a bug in one cannot be reached from the others.
+   The 10 `classifier/` programs live in `ingress.h`/`egress.h`; the six `cgroup/`
+   programs live in `cgroup.h`. These are not a classification by taste: `daer-ebpf/src/
+   loader.rs` attaches them through different `aya` APIs, and a bug in one cannot be
+   reached from the others. `offload.c` and its sockmap path were removed (amendment
+   below): no Rust control plane ever registered `fast_sock` entries.
 
 3. **One translation unit still produces the object, and it is `datapath.bpf.c`.**
    `datapath.bpf.c` includes the headers and compiles to a single `datapath.bpf.o`. The files
@@ -124,3 +125,23 @@ preference about directory names.
   replaced by a stack local is a question only the verifier answers. Removing them is a
   separate change with its own falsifier; doing it here would couple a mechanical
   reorganisation to an unverifiable behavioural risk.
+
+## Amendment (2026-11-14): inherited TCP offload and combined-role variants removed
+
+The `offload.h` module, `include/tcp_offload.h`, the three sockmap programs
+(`tcp_offload_redirect`, `tcp_offload_sent_account`, `tcp_offload_sent_account_kprobe`)
+and the maps `fast_sock`, `tcp_offload_pause` and `tcp_offload_sent` were removed. The
+module described a Go control plane and a Go session that do not exist in this Rust
+project; no loader path attached the programs or populated the maps. Keeping it made the
+object look larger and more capable than it was, and made the production-readiness claim
+"unwired programs remain" true for code with no owner.
+
+The six cgroup programs remain and are now a supported part of the datapath: the loader
+attaches them to the cgroup v2 root at startup, and a host without a unified hierarchy
+fails the datapath gate instead of accepting an inert `pname(...)` rule. The attach is
+fd-owned and dies with the `Ebpf` object, like the TCX links.
+
+The four combined-role classifiers (`lan_wan_egress_*`, `wan_lan_ingress_*`) were also
+removed. The supported topology is one role per interface; validation rejects an interface
+that appears in both `lan-interface` and `wan-interface`. A single-interface dual-role mode,
+if ever needed, must return as an explicit attach plan with its own test.

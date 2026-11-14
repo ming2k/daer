@@ -6,7 +6,7 @@
 //! and the `OutboundLogicalOr` / `OutboundLogicalAnd` markers that encode AND/OR
 //! structure inside the flat match-set array.
 
-use daer_config::Function;
+use daer_config::OutboundKind;
 
 use crate::error::RoutingError;
 
@@ -49,17 +49,77 @@ pub use daer_common::consts::is_builtin_outbound;
 /// `malloc`/`free` pair per connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outbound {
+    /// What kind of egress this is. `Direct` and `Block` are built-in policies;
+    /// `Election` is a dynamic egress whose selected node is the concrete dialer.
+    pub kind: OutboundKind,
     pub name: std::sync::Arc<str>,
+    /// Reserved datapath modifier. Configuration actions set it to zero.
     pub mark: u32,
+    /// Reserved datapath marker. Configuration actions set it to false.
     pub must: bool,
 }
 
+impl std::fmt::Display for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            OutboundKind::Direct => f.write_str("direct"),
+            OutboundKind::Block => f.write_str("block"),
+            OutboundKind::Election => write!(f, "election {:?}", self.name),
+        }
+    }
+}
+
 impl Outbound {
-    pub fn new(name: impl Into<std::sync::Arc<str>>) -> Self {
+    #[must_use]
+    pub fn direct() -> Self {
         Self {
+            kind: OutboundKind::Direct,
+            name: std::sync::Arc::from(daer_common::consts::outbound_name::DIRECT),
+            mark: 0,
+            must: false,
+        }
+    }
+
+    #[must_use]
+    pub fn block() -> Self {
+        Self {
+            kind: OutboundKind::Block,
+            name: std::sync::Arc::from(daer_common::consts::outbound_name::BLOCK),
+            mark: 0,
+            must: false,
+        }
+    }
+
+    #[must_use]
+    pub fn election(name: impl Into<std::sync::Arc<str>>) -> Self {
+        Self {
+            kind: OutboundKind::Election,
             name: name.into(),
             mark: 0,
             must: false,
+        }
+    }
+
+    /// Builds the outbound a configured action names.
+    ///
+    /// # Errors
+    ///
+    /// An election name must not be empty; the loader has already reserved the
+    /// built-in names, so a non-empty election is the only dynamic case.
+    pub fn from_action(action: &daer_config::OutboundAction) -> Result<Self, RoutingError> {
+        match action {
+            daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Direct) => {
+                Ok(Self::direct())
+            }
+            daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block) => {
+                Ok(Self::block())
+            }
+            daer_config::OutboundAction::Election(election) => {
+                if election.election.trim().is_empty() {
+                    return Err(RoutingError::new("election action names no election"));
+                }
+                Ok(Self::election(election.election.as_str()))
+            }
         }
     }
 }
@@ -127,94 +187,40 @@ impl MatchTarget {
     }
 }
 
-/// Parses `direct`, `proxy(mark: 0x10)`, `my_group(must)` and friends.
-pub fn parse_outbound(raw: &Function) -> Result<Outbound, RoutingError> {
-    let mut outbound = Outbound {
-        name: std::sync::Arc::from(raw.name.as_str()),
-        mark: 0,
-        must: false,
-    };
-
-    for param in &raw.params {
-        match param.key.as_str() {
-            "mark" => {
-                let value = param.as_literal().unwrap_or_default();
-                let parsed = daer_config::parse_integer(value)
-                    .and_then(|number| u32::try_from(number).ok())
-                    .ok_or_else(|| {
-                        RoutingError::new(format!("failed to parse mark: {value} is not a uint32"))
-                    })?;
-                outbound.mark = parsed;
-            }
-            "" => {
-                let value = param.as_literal().unwrap_or_default();
-                if value == "must" {
-                    outbound.must = true;
-                } else {
-                    return Err(RoutingError::new(format!(
-                        "unknown outbound param: {value}"
-                    )));
-                }
-            }
-            key => {
-                return Err(RoutingError::new(format!(
-                    "unknown outbound param key: {key}"
-                )));
-            }
-        }
-    }
-
-    Ok(outbound)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daer_config::Param;
+    use daer_config::{BuiltinOutbound, ElectionAction, OutboundAction};
 
-    fn outbound_from(outbound: &str) -> Outbound {
-        let rule =
-            daer_config::parse_rule_expr(&format!("domain(a.com) -> {outbound}")).expect("parses");
-        parse_outbound(&rule.outbound).expect("parses outbound")
+    #[test]
+    fn builtins_are_distinct_outbounds() {
+        let direct = Outbound::from_action(&OutboundAction::Builtin(BuiltinOutbound::Direct))
+            .expect("direct");
+        assert_eq!(direct.kind, OutboundKind::Direct);
+        assert_eq!(&*direct.name, daer_common::consts::outbound_name::DIRECT);
+
+        let block =
+            Outbound::from_action(&OutboundAction::Builtin(BuiltinOutbound::Block)).expect("block");
+        assert_eq!(block.kind, OutboundKind::Block);
+        assert_eq!(&*block.name, daer_common::consts::outbound_name::BLOCK);
     }
 
     #[test]
-    fn parses_plain_outbound() {
-        let outbound = outbound_from("direct");
-        assert_eq!(&*outbound.name, "direct");
-        assert_eq!(outbound.mark, 0);
-        assert!(!outbound.must);
+    fn an_election_is_a_dynamic_outbound() {
+        let outbound = Outbound::from_action(&OutboundAction::Election(ElectionAction {
+            election: "proxy".to_owned(),
+        }))
+        .expect("election");
+        assert_eq!(outbound.kind, OutboundKind::Election);
+        assert_eq!(&*outbound.name, "proxy");
     }
 
     #[test]
-    fn parses_mark_and_must() {
-        assert_eq!(outbound_from("proxy(mark: 0x10)").mark, 16);
-        assert_eq!(outbound_from("proxy(mark: 16)").mark, 16);
-        assert!(outbound_from("direct(must)").must);
-    }
-
-    #[test]
-    fn rejects_unknown_params() {
-        let rule = daer_config::parse_rule_expr("domain(a.com) -> proxy(nope: 1)").expect("parses");
-        let error = parse_outbound(&rule.outbound).expect_err("must fail");
-        assert_eq!(error.message, "unknown outbound param key: nope");
-
-        let rule = daer_config::parse_rule_expr("domain(a.com) -> proxy(oops)").expect("parses");
-        let error = parse_outbound(&rule.outbound).expect_err("must fail");
-        assert_eq!(error.message, "unknown outbound param: oops");
-    }
-
-    #[test]
-    fn rejects_mark_out_of_range() {
-        let rule = daer_config::parse_rule_expr("domain(a.com) -> proxy(mark: 0x100000000)")
-            .expect("parses");
-        assert!(parse_outbound(&rule.outbound).is_err());
-    }
-
-    #[test]
-    fn parses_outbound_with_annotation_free_params() {
-        let function = Function::with_params("group", vec![Param::bare("must")]);
-        let outbound = parse_outbound(&function).expect("parses");
-        assert!(outbound.must);
+    fn an_empty_election_name_is_rejected() {
+        let error = Outbound::from_action(&OutboundAction::Election(ElectionAction {
+            election: "  ".to_owned(),
+        }))
+        .expect_err("empty election");
+        assert!(error.message.contains("no election"), "{error}");
     }
 }

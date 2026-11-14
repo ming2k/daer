@@ -403,35 +403,6 @@ int tproxy_wan_egress_l3(struct __sk_buff *skb)
 	return do_tproxy_wan_egress(skb, 0, NULL);
 }
 
-static __always_inline int
-do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
-{
-	__u32 scratch_key = 0;
-	struct parsed_packet *pkt =
-		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
-
-	if (!pkt)
-		return DAER_TC_DROP;
-
-	int ret = do_tproxy_lan_egress(skb, link_h_len, pkt);
-
-	if (ret != DAER_TC_CONTINUE)
-		return ret;
-	return do_tproxy_wan_egress(skb, link_h_len, pkt);
-}
-
-SEC("classifier/lan_wan_egress_l2")
-int tproxy_lan_wan_egress_l2(struct __sk_buff *skb)
-{
-	return do_tproxy_lan_wan_egress(skb, 14);
-}
-
-SEC("classifier/lan_wan_egress_l3")
-int tproxy_lan_wan_egress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_lan_wan_egress(skb, 0);
-}
-
 SEC("classifier/daer0peer_ingress")
 int tproxy_daer0peer_ingress(struct __sk_buff *skb)
 {

@@ -3,20 +3,23 @@
 //! The rule expression AST.
 //!
 //! Deliberately small: a [`Function`] is a name, an optional negation and its
-//! parameters; a [`RoutingRule`] joins a conjunction of functions to an outbound.
-//! There is no document-level node type, because a document is TOML.
+//! parameters; a [`MatchExpr`] is a conjunction of functions. The action is not
+//! part of the expression: it is a typed outbound on the rule table.
 
 use std::fmt;
+
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::lexer::{Lexer, TokenKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    /// Empty for positional params, e.g. the `cn` in `provider(cn)`.
+    /// Empty for positional params, e.g. the `cn` in `rule-set(cn)`.
     /// has a key while the `cn` in `domain(cn)` does not.
     pub key: String,
     pub value: ParamValue,
-    /// Trailing `[...]` annotation, e.g. `-> direct [# comment]`.
+    /// Optional trailing annotation parameters.
     pub annotation: Vec<Param>,
 }
 
@@ -208,22 +211,67 @@ impl fmt::Display for Function {
     }
 }
 
+/// A conjunction of predicates: `pname(curl) && !dip(10.0.0.0/8)`.
+///
+/// The action is not here. It is a typed [`crate::model::OutboundAction`] on the
+/// routing rule table, so an election name can never be confused with a predicate
+/// or a built-in verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoutingRule {
+pub struct MatchExpr {
     pub and_functions: Vec<Function>,
-    pub outbound: Function,
 }
 
-impl fmt::Display for RoutingRule {
+impl MatchExpr {
+    #[must_use]
+    pub fn new(and_functions: Vec<Function>) -> Self {
+        Self { and_functions }
+    }
+}
+
+impl fmt::Display for MatchExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, function) in self.and_functions.iter().enumerate() {
-            if index != 0 {
-                f.write_str(" && ")?;
-            }
-            write!(f, "{function}")?;
-        }
-        f.write_str(" -> ")?;
-        self.outbound.write(f, true)
+        f.write_str(&super::render_functions(&self.and_functions))
+    }
+}
+
+impl Serialize for MatchExpr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// A DNS rule: a predicate conjunction and the upstream it selects.
+///
+/// DNS policy is a different surface from flow routing: its action is an upstream
+/// name or `reject`, not a node/election outbound. It keeps the compact
+/// `match -> upstream` spelling because it has no outbound namespace to type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRule {
+    pub and_functions: Vec<Function>,
+    pub upstream: Function,
+}
+
+impl fmt::Display for DnsRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} -> {}",
+            super::render_functions(&self.and_functions),
+            self.upstream
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchExpr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        super::parse_match_expr(&text).map_err(D::Error::custom)
     }
 }
 
@@ -269,29 +317,26 @@ fn write_quoted(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::parse_rule;
+    use crate::expr::parse_match_expr;
 
     #[test]
-    fn renders_rules_back_into_parseable_text() {
-        let rule = RoutingRule {
-            and_functions: vec![Function::with_params(
-                "domain",
-                vec![Param::bare("example.com")],
-            )],
-            outbound: Function::new("direct"),
-        };
-        assert_eq!(rule.to_string(), "domain(example.com) -> direct");
+    fn renders_a_match_back_into_parseable_text() {
+        let expr = MatchExpr::new(vec![Function::with_params(
+            "domain",
+            vec![Param::bare("example.com")],
+        )]);
+        assert_eq!(expr.to_string(), "domain(example.com)");
     }
 
     #[test]
     fn parses_bare_domain_as_positional_param_like_the_go_walker() {
-        let rule = parse_rule("domain(auth.example.com) -> direct").unwrap();
-        assert_eq!(rule.and_functions[0].params[0].key, "");
+        let expr = parse_match_expr("domain(auth.example.com)").unwrap();
+        assert_eq!(expr.and_functions[0].params[0].key, "");
         assert_eq!(
-            rule.and_functions[0].params[0].value,
+            expr.and_functions[0].params[0].value,
             ParamValue::Literal("auth.example.com".to_owned())
         );
-        assert_eq!(rule.to_string(), "domain(auth.example.com) -> direct");
+        assert_eq!(expr.to_string(), "domain(auth.example.com)");
     }
 
     #[test]

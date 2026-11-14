@@ -64,14 +64,11 @@ pub fn generationality(name: &str) -> Option<Generationality> {
         | COOKIE_PID
         | DEVICE_IFINDEX
         | EVENT_RINGBUF
-        | FAST_SOCK
         | LISTEN_SOCKET
         | PARSE_CTX_SCRATCH
         | PKT_SCRATCH
         | REDIRECT_TRACK
         | ROUTE_CTX_SCRATCH
-        | TCP_OFFLOAD_PAUSE
-        | TCP_OFFLOAD_SENT
         | WAN_EGRESS_ROUTE_SCRATCH => Shared,
 
         _ => return None,

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """
 Unpacks legacy V2Ray/v2fly/Loyalsoldier geoip.dat and geosite.dat Protobuf files
-into Canonical Rule Source (.rules) format for compilation with daer-drb (ADR-0031).
+into Canonical Rule Source (CRS v3, .rules) format for compilation with daer-drb (ADR-0045).
 
 Pure Python standard-library implementation: requires no external dependencies (zero pip packages).
 """
@@ -155,7 +155,7 @@ def parse_geosite_entry(
                 skipped_count += 1
                 continue
 
-            # In CRS v2 (ADR-0031, ADR-0033, ADR-0036):
+            # In CRS v3 (ADR-0031, ADR-0033, ADR-0036, ADR-0045):
             # 2: RootDomain -> bare suffix: <domain>
             # 3: Full -> exact match: =<domain>
             # 0: Plain, 1: Regex -> not supported as routing predicates
@@ -329,7 +329,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(content)
-        count = len(lines) - 2  # minus header and empty line
+        count = len(lines) - 4  # minus frontmatter delimiters, name line, and blank line
         sys.stderr.write(f"wrote {args.output} ({count} directives)\n")
 
 

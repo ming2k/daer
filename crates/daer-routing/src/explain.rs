@@ -232,11 +232,13 @@ pub fn explain(sets: &[MatchSet], facts: &MatchFacts<'_>) -> Trace {
         let fired = all_held && !internal && decided_by.is_none();
         if fired {
             decided_by = Some(rule);
-            outbound = Some(Outbound {
-                name: std::sync::Arc::from(target.unwrap_or_default()),
-                mark: set.target.mark(),
-                must: set.target.must() || forced_must,
-            });
+            let mut selected = set
+                .target
+                .outbound()
+                .cloned()
+                .expect("a non-internal match set terminates at an outbound");
+            selected.must |= set.target.must() || forced_must;
+            outbound = Some(selected);
         }
 
         rules.push(RuleTrace {
@@ -274,7 +276,7 @@ fn describe_rule(set: &MatchSet, facts: &MatchFacts<'_>) -> String {
         MatchValue::IpSet(index) => format!("dip({})", join_prefixes(index.prefixes())),
         MatchValue::SourceIpSet(index) => format!("sip({})", join_prefixes(index.prefixes())),
         MatchValue::Mac(macs) => format!("mac({})", join(macs)),
-        MatchValue::Port(range) => format!("port({range})"),
+        MatchValue::Port(range) => format!("dport({range})"),
         MatchValue::SourcePort(range) => format!("sport({range})"),
         MatchValue::L4Proto(mask) => format!("l4proto({})", describe_l4(*mask, facts)),
         MatchValue::IpVersion(mask) => format!("ipversion({})", describe_ip_version(*mask)),
@@ -355,12 +357,25 @@ mod tests {
     use daer_common::MacAddr;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// Lowers rules the way the configuration does, without an alias rewrite, so the
-    /// predicate text in the report matches the fixture.
-    fn sets(rules: &[&str]) -> Vec<MatchSet> {
+    fn action(name: &str) -> daer_config::OutboundAction {
+        match name {
+            "direct" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Direct),
+            "block" => daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block),
+            election => daer_config::OutboundAction::Election(daer_config::ElectionAction {
+                election: election.to_owned(),
+            }),
+        }
+    }
+
+    /// Lowers rules the way the configuration does. `(name, match, action)`.
+    fn sets(rules: &[(&str, &str, &str)]) -> Vec<MatchSet> {
         let parsed: Vec<_> = rules
             .iter()
-            .map(|rule| daer_config::parse_rule_expr(rule).expect("parses"))
+            .map(|(name, expr, action_name)| daer_config::RoutingRule {
+                name: (*name).to_owned(),
+                match_expr: daer_config::parse_match_expr(expr).expect("parses"),
+                action: action(action_name),
+            })
             .collect();
         let mut sink = RecordingSink::default();
         {
@@ -388,7 +403,10 @@ mod tests {
     fn the_report_agrees_with_the_data_path() {
         // The only property that matters: a diagnostic that disagrees with the engine
         // is worse than no diagnostic.
-        let sets = sets(&["port(443) -> block", "port(80) -> direct"]);
+        let sets = sets(&[
+            ("block443", "dport(443)", "block"),
+            ("direct80", "dport(80)", "direct"),
+        ]);
         for port in [80u16, 443, 8080] {
             let probe = facts(port);
             let trace = explain(&sets, &probe);
@@ -408,7 +426,10 @@ mod tests {
 
     #[test]
     fn a_skipped_rule_names_the_predicate_that_blocked_it() {
-        let sets = sets(&["port(443) -> block", "port(80) -> direct"]);
+        let sets = sets(&[
+            ("block443", "dport(443)", "block"),
+            ("direct80", "dport(80)", "direct"),
+        ]);
         let trace = explain(&sets, &facts(80));
 
         assert_eq!(trace.decided_by, Some(1));
@@ -417,10 +438,10 @@ mod tests {
         assert!(!skipped.fired);
         assert!(!skipped.shadowed);
         let blocking = skipped.blocking().expect("a blocking predicate");
-        assert_eq!(blocking.predicate, "port(443)");
+        assert_eq!(blocking.predicate, "dport(443)");
         assert!(!blocking.matched);
         assert!(
-            skipped.reason().contains("port(443)"),
+            skipped.reason().contains("dport(443)"),
             "{}",
             skipped.reason()
         );
@@ -428,8 +449,8 @@ mod tests {
 
     #[test]
     fn negation_is_reported_per_predicate_not_per_rule() {
-        // `!port(443) && port(80)` — the negation belongs to the first predicate only.
-        let sets = sets(&["!port(443) && port(80) -> direct"]);
+        // `!dport(443) && dport(80)` — the negation belongs to the first predicate only.
+        let sets = sets(&[("not443-80", "!dport(443) && dport(80)", "direct")]);
         let trace = explain(&sets, &facts(80));
 
         let rule = &trace.rules[0];
@@ -449,9 +470,9 @@ mod tests {
 
     #[test]
     fn several_values_of_one_predicate_are_one_predicate() {
-        // `port(80, 8080)` lowers to two match sets joined by LogicalOr; the rule has
+        // `dport(80, 8080)` lowers to two match sets joined by LogicalOr; the rule has
         // one predicate, not two, and reporting them separately would misrepresent it.
-        let sets = sets(&["port(80, 8080) -> direct"]);
+        let sets = sets(&[("ports", "dport(80, 8080)", "direct")]);
         assert!(sets.len() > 1, "the fixture must lower to several sets");
 
         let trace = explain(&sets, &facts(8080));
@@ -468,7 +489,7 @@ mod tests {
 
     #[test]
     fn two_predicates_in_one_rule_are_two_predicates() {
-        let sets = sets(&["port(80) && l4proto(tcp) -> direct"]);
+        let sets = sets(&[("http", "dport(80) && l4proto(tcp)", "direct")]);
         let trace = explain(&sets, &facts(80));
         let rule = &trace.rules[0];
         assert_eq!(rule.predicates.len(), 2, "{:?}", rule.predicates);
@@ -478,7 +499,10 @@ mod tests {
 
     #[test]
     fn a_later_matching_rule_is_reported_as_shadowed() {
-        let sets = sets(&["port(443) -> block", "l4proto(tcp) -> direct"]);
+        let sets = sets(&[
+            ("block443", "dport(443)", "block"),
+            ("tcp", "l4proto(tcp)", "direct"),
+        ]);
         let trace = explain(&sets, &facts(443));
 
         assert_eq!(trace.decided_by, Some(0));
@@ -494,7 +518,7 @@ mod tests {
 
     #[test]
     fn nothing_matching_leaves_the_decision_to_the_caller() {
-        let sets = sets(&["port(443) -> block"]);
+        let sets = sets(&[("block443", "dport(443)", "block")]);
         let trace = explain(&sets, &facts(80));
         assert_eq!(trace.decided_by, None);
         assert!(trace.outbound.is_none());
@@ -504,13 +528,16 @@ mod tests {
 
     #[test]
     fn the_display_is_readable_and_names_every_rule() {
-        let sets = sets(&["port(443) -> block", "port(80) -> direct"]);
+        let sets = sets(&[
+            ("block443", "dport(443)", "block"),
+            ("direct80", "dport(80)", "direct"),
+        ]);
         let rendered = explain(&sets, &facts(80)).to_string();
         assert!(rendered.contains("rule 0 [skipped]"), "{rendered}");
         assert!(rendered.contains("rule 1 [fired]"), "{rendered}");
-        assert!(rendered.contains("x port(443)"), "{rendered}");
+        assert!(rendered.contains("x dport(443)"), "{rendered}");
         assert!(
-            rendered.contains("-> port(443) did not match"),
+            rendered.contains("-> dport(443) did not match"),
             "{rendered}"
         );
     }

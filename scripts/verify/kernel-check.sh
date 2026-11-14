@@ -140,37 +140,23 @@ if [[ ! -f "$object" ]]; then
 fi
 ok "$object ($(stat -c %s "$object") bytes)"
 
-section "3. building the test binaries (as $builder, so cargo is findable)"
-if ! as_builder env -u SUDO_USER cargo test -p daer-ebpf --test kernel --no-run \
+section "3. building the workspace E2E test binary (as $builder, so cargo is findable)"
+# Every kernel case lives in `tests/e2e/main.rs`. One link step replaces the two per-crate
+# test binaries the script used to build; the exact test names are selected by `run_one`.
+if ! as_builder env -u SUDO_USER cargo test -p daer-tests --test e2e --no-run \
         >"$logs/build.log" 2>&1; then
-    bad "the kernel test binary did not build; see $logs/build.log"
+    bad "the e2e test binary did not build; see $logs/build.log"
     sed -n '$p' "$logs/build.log" | sed 's/^/       /'
-fi
-# Keep the glob out of `ls`: a long-lived target directory can hold enough incremental
-# objects that `ls` exits with E2BIG before selecting the newest executable.
-binary="$(find target/debug/deps -maxdepth 1 -type f -name 'kernel-*' -perm -u+x \
-    -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
-if [[ -z "$binary" ]]; then
-    bad "no kernel test binary under target/debug/deps"
     binary=""
 else
-    ok "binary: $binary"
-fi
-
-# The in-kernel datapath cases (ADR-0022) live in their own test target. Building it here
-# is what makes section 9 possible; a binary that was never built would turn the section
-# into a silent skip, which is the failure mode ADR-0007 exists to prevent.
-if ! as_builder env -u SUDO_USER cargo test -p daer-ebpf --test datapath --no-run \
-        >"$logs/build-datapath.log" 2>&1; then
-    bad "the datapath test binary did not build; see $logs/build-datapath.log"
-    binary_datapath=""
-else
-    binary_datapath="$(find target/debug/deps -maxdepth 1 -type f -name 'datapath-*' -perm -u+x \
+    # Keep the glob out of `ls`: a long-lived target directory can hold enough incremental
+    # objects that `ls` exits with E2BIG before selecting the newest executable.
+    binary="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
         -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
-    if [[ -z "$binary_datapath" ]]; then
-        bad "no datapath test binary under target/debug/deps"
+    if [[ -z "$binary" ]]; then
+        bad "no e2e test binary under target/debug"
     else
-        ok "binary: $binary_datapath"
+        ok "binary: $binary"
     fi
 fi
 
@@ -209,10 +195,14 @@ run_one() {
 }
 
 section "4. loading the object (this runs the verifier)"
-run_one the_object_loads_and_verifies "$logs/load.log" "the object loaded and passed the verifier"
+run_one ebpf_kernel::the_object_loads_and_verifies "$logs/load.log" "the object loaded and passed the verifier"
 
 section "5. attaching a TCX link to a real interface"
-run_one a_tcx_program_attaches_to_loopback "$logs/attach.log" "a TCX program attached to lo"
+run_one ebpf_kernel::a_tcx_program_attaches_to_loopback "$logs/attach.log" "a TCX program attached to lo"
+
+section "5a. attaching the pname cgroup hooks"
+run_one ebpf_kernel::cgroup_hooks_attach_to_the_unified_hierarchy "$logs/cgroup.log" \
+    "the six pname cgroup hooks attached to cgroup v2"
 
 section "6. the device pair and PARAM"
 created_pair=0
@@ -240,14 +230,14 @@ fi
 
 section "7. the in-kernel datapath cases (BPF_PROG_TEST_RUN)"
 # Every case is a pktgen/setup/check triple in `ebpf/kern/tests/bpf_test.c`, compiled into
-# `target/ebpf/datapath_test.bpf.o` and driven by `crates/daer-ebpf/tests/datapath.rs`. This is
+# `target/ebpf/datapath_test.bpf.o` and driven by `tests/e2e/ebpf_datapath.rs`. This is
 # the only part of the suite that executes the datapath's own logic in the kernel.
-if [[ -z "$binary_datapath" ]]; then
-    skip "7" "no datapath test binary (run \`cargo xtask ebpf --tests\`)"
+if [[ -z "$binary" ]]; then
+    skip "7" "no e2e test binary (the build failed above)"
 elif [[ ! -f target/ebpf/datapath_test.bpf.o ]]; then
     skip "7" "target/ebpf/datapath_test.bpf.o is missing (run \`cargo xtask ebpf --tests\`)"
 else
-    run_one every_datapath_case_passes "$logs/datapath.log" \
+    run_one ebpf_datapath::every_datapath_case_passes "$logs/datapath.log" \
         "every in-kernel datapath case passed"
 fi
 

@@ -60,9 +60,9 @@ pub struct Accepted {
 impl Accepted {
     /// The address facts of this flow, without the stream.
     ///
-    /// The routing decision only ever looks at addresses (plus the sniffed name),
-    /// so a datagram flow can reach the same decision machinery without pretending
-    /// to own a `TcpStream`. Keeping this as a method rather than a free function
+    /// The relay only supplies addresses; domain acquisition belongs to the control
+    /// plane, so a datagram flow can reach the same decision machinery without
+    /// pretending to own a `TcpStream`. Keeping this as a method rather than a free function
     /// means a future fact — a mark, an interface index — is added in one place and
     /// both transports inherit it.
     #[must_use]

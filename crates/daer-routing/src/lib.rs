@@ -51,12 +51,11 @@ pub use matcher::{
     matches_value,
 };
 pub use optimizer::{
-    AliasOptimizer, DeduplicateParamsOptimizer, MergeAndSortOptimizer, RulesOptimizer,
-    apply_optimizers,
+    DeduplicateParamsOptimizer, RulesOptimizer, SortFunctionsOptimizer, apply_optimizers,
 };
 pub use outbound::{
     BUILTIN_OUTBOUNDS, CONTROL_PLANE_ROUTING, LOGICAL_AND, LOGICAL_OR, MUST_RULES, MatchTarget,
-    Outbound, is_builtin_outbound, parse_outbound,
+    Outbound, is_builtin_outbound,
 };
 pub use program::NormalizedProgram;
 pub use values::{IpVersionMask, L4ProtoMask, ProcessName, TASK_COMM_LEN};

@@ -15,7 +15,7 @@ pub struct DialerOptions {
     /// `SO_MARK`, applied before `connect(2)`.
     pub so_mark: Option<u32>,
     pub timeout: Duration,
-    /// `[global.tls] profile`: a netune preset name, used by every outbound that rides netune's
+    /// `[tls] profile`: a netune preset name, used by every outbound that rides netune's
     /// TLS stack (`trojan`, and any future TLS-based connector).
     ///
     /// Carried here rather than read per connector because the profile is a property of the
@@ -26,7 +26,7 @@ pub struct DialerOptions {
     /// **load-time** error (`DialerOptions::with_tls_profile`), because a silently different
     /// ClientHello defeats the point of configuring one.
     pub tls_profile: Option<&'static str>,
-    /// `[global.tls] fragment`: slice a handshake daer owns. Only a REALITY session qualifies,
+    /// `[tls] fragment`: slice a handshake daer owns. Only a REALITY session qualifies,
     /// because a `trojan://` node's ClientHello is written by netune inside its own connector.
     pub fragment: Option<Fragment>,
     /// The stream to the node's own server. `None`-free by construction: the default is the
@@ -82,7 +82,7 @@ impl DialerOptions {
         let Some(preset) = Preset::by_name(name) else {
             let known: Vec<&str> = Preset::all().iter().map(|preset| preset.name()).collect();
             return Err(ProxyProtocolError::UnsupportedLink(format!(
-                "global.tls.profile = {name:?} is not a netune TLS preset; the registered names \
+                "tls.profile = {name:?} is not a netune TLS preset; the registered names \
                  are {known:?}"
             )));
         };

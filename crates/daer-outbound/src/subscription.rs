@@ -27,6 +27,8 @@
 //!   every error path reports the subscription's *tag*, never its URL.
 
 use std::fmt;
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -539,6 +541,17 @@ impl Cache {
                 self.directory.display()
             ))
         })?;
+        // The persisted nodes carry the operator's credentials. A foreground
+        // `daer check` does not run under the unit's `UMask=0077`, so the cache
+        // must set its own mode rather than inherit the caller's umask.
+        std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                SubscriptionError::Cache(format!(
+                    "cannot make {} private: {error}",
+                    self.directory.display()
+                ))
+            },
+        )?;
         let path = self.path();
         // A temp file in the same directory, then a rename: a crash mid-write must
         // not leave a truncated cache that the next start believes.
@@ -548,9 +561,25 @@ impl Cache {
             text.push_str(link);
             text.push('\n');
         }
-        std::fs::write(&temporary, text).map_err(|error| {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true).mode(0o600);
+        let mut file = options.open(&temporary).map_err(|error| {
+            SubscriptionError::Cache(format!("cannot open {}: {error}", temporary.display()))
+        })?;
+        file.write_all(text.as_bytes()).map_err(|error| {
             SubscriptionError::Cache(format!("cannot write {}: {error}", temporary.display()))
         })?;
+        file.sync_all().map_err(|error| {
+            SubscriptionError::Cache(format!("cannot sync {}: {error}", temporary.display()))
+        })?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                SubscriptionError::Cache(format!(
+                    "cannot make {} private: {error}",
+                    temporary.display()
+                ))
+            },
+        )?;
         std::fs::rename(&temporary, &path).map_err(|error| {
             SubscriptionError::Cache(format!("cannot rename into {}: {error}", path.display()))
         })?;
@@ -851,6 +880,18 @@ mod tests {
         let links = vec!["ss://a@1.2.3.4:8388#one".to_owned()];
         cache.write(&links).expect("writes");
         assert_eq!(cache.read().expect("read"), Some(links));
+        let directory_mode = std::fs::metadata(&directory)
+            .expect("cache directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(cache.path())
+            .expect("cache file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700, "cache directory must be private");
+        assert_eq!(file_mode, 0o600, "cache file must be private");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

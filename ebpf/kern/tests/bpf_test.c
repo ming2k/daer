@@ -905,46 +905,6 @@ int testcheck_wan_egress_udp_expired_state_recreates_handoff(
 	return DAER_TC_PASS;
 }
 
-SEC("classifier/pktgen/lan_wan_egress_combined_udp_redirect")
-int testpktgen_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
-{
-	return set_ipv4_udp_fastpath_with_dscp(
-		skb, IPV4(192,168,30,1), IPV4(10,30,0,1), 43001, 8443, 0);
-}
-
-SEC("classifier/setup/lan_wan_egress_combined_udp_redirect")
-int testsetup_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
-{
-	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
-	return do_tproxy_lan_wan_egress(skb, ETH_HLEN);
-}
-
-SEC("classifier/check/lan_wan_egress_combined_udp_redirect")
-int testcheck_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
-{
-	return check_redirect_with_listener_l4proto(skb, IPPROTO_UDP);
-}
-
-SEC("classifier/pktgen/lan_wan_egress_combined_tcp_redirect")
-int testpktgen_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
-{
-	return set_ipv4_tcp(skb, IPV4(192,168,31,1), IPV4(10,31,0,1), 43101,
-			    8443);
-}
-
-SEC("classifier/setup/lan_wan_egress_combined_tcp_redirect")
-int testsetup_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
-{
-	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
-	return do_tproxy_lan_wan_egress(skb, ETH_HLEN);
-}
-
-SEC("classifier/check/lan_wan_egress_combined_tcp_redirect")
-int testcheck_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
-{
-	return check_redirect_with_listener_l4proto(skb, IPPROTO_TCP);
-}
-
 SEC("classifier/pktgen/tcp_active_idle_state_retained")
 int testpktgen_tcp_active_idle_state_retained(struct __sk_buff *skb)
 {

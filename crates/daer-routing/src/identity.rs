@@ -12,7 +12,7 @@
 //! only ever compared within one implementation, so this difference does not
 //! affect reload decisions.
 
-use daer_config::{Function, FunctionOrString, Param, ParamValue, RoutingRule};
+use daer_config::{Function, OutboundAction, OutboundKind, Param, ParamValue, RoutingRule};
 use sha2::{Digest, Sha256};
 
 use crate::error::RoutingError;
@@ -141,56 +141,54 @@ impl CanonicalHasher {
         self.write_strings_presence(rules.len());
         for rule in rules {
             self.write_byte(1);
-            self.write_functions(&rule.and_functions);
-            self.write_function_value(&rule.outbound);
+            self.write_string(&rule.name);
+            self.write_functions(&rule.match_expr.and_functions);
+            self.write_action(&rule.action);
         }
     }
 
-    fn write_fallback(&mut self, fallback: &FunctionOrString) {
-        match fallback {
-            FunctionOrString::Name(name) => {
-                self.write_byte(1);
-                self.write_string(name);
-            }
-            FunctionOrString::Functions(functions) => {
-                self.write_byte(3);
-                self.write_functions(functions);
-            }
+    fn write_action(&mut self, action: &OutboundAction) {
+        self.write_byte(match action.kind() {
+            OutboundKind::Direct => 1,
+            OutboundKind::Block => 2,
+            OutboundKind::Election => 3,
+        });
+        if let Some(name) = action.election_name() {
+            self.write_string(name);
         }
+    }
+
+    fn write_fallback(&mut self, fallback: &OutboundAction) {
+        self.write_action(fallback);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizer::AliasOptimizer;
+    use daer_config::BuiltinOutbound;
 
-    /// Fixtures are written as config used to read: a `routing { … }` wrapper
-    /// around one rule per line. Only the lines matter.
-    fn rules(src: &str) -> Vec<RoutingRule> {
-        let body = src.trim();
-        let body = body.strip_prefix("routing {").unwrap_or(body);
-        let body = body.strip_suffix('}').unwrap_or(body);
-        body.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| daer_config::parse_rule_expr(line).expect("parses"))
-            .collect()
+    fn rule(name: &str, expr: &str) -> RoutingRule {
+        RoutingRule {
+            name: name.to_owned(),
+            match_expr: daer_config::parse_match_expr(expr).expect("parses"),
+            action: OutboundAction::Builtin(BuiltinOutbound::Direct),
+        }
     }
 
-    fn program(src: &str) -> NormalizedProgram {
+    fn program(name: &str, expr: &str) -> NormalizedProgram {
         NormalizedProgram::new(
-            &rules(src),
-            FunctionOrString::Name("direct".to_owned()),
-            &[&AliasOptimizer],
+            &[rule(name, expr)],
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
+            &[],
         )
         .expect("normalizes")
     }
 
     #[test]
     fn identical_policies_hash_identically() {
-        let left = program("routing { dport(443) && domain(a.com) -> direct }");
-        let right = program("routing { dport(443) && domain(a.com) -> direct }");
+        let left = program("a", "dport(443) && domain(a.com)");
+        let right = program("a", "dport(443) && domain(a.com)");
         assert_eq!(
             hash_normalized_program(&left).unwrap(),
             hash_normalized_program(&right).unwrap()
@@ -198,9 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn rule_names_are_part_of_the_identity() {
+        let left = program("a", "dport(443)");
+        let right = program("b", "dport(443)");
+        assert_ne!(
+            hash_normalized_program(&left).unwrap(),
+            hash_normalized_program(&right).unwrap()
+        );
+    }
+
+    #[test]
     fn different_policies_hash_differently() {
-        let left = program("routing { dport(443) -> direct }");
-        let right = program("routing { dport(80) -> direct }");
+        let left = program("a", "dport(443)");
+        let right = program("a", "dport(80)");
         assert_ne!(
             hash_normalized_program(&left).unwrap(),
             hash_normalized_program(&right).unwrap()
@@ -209,12 +217,15 @@ mod tests {
 
     #[test]
     fn fallback_is_part_of_the_identity() {
-        let rules = rules("routing { dport(443) -> direct }");
-        let with_direct =
-            NormalizedProgram::new(&rules, FunctionOrString::Name("direct".to_owned()), &[])
-                .unwrap();
+        let rules = [rule("a", "dport(443)")];
+        let with_direct = NormalizedProgram::new(
+            &rules,
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
+            &[],
+        )
+        .unwrap();
         let with_block =
-            NormalizedProgram::new(&rules, FunctionOrString::Name("block".to_owned()), &[])
+            NormalizedProgram::new(&rules, OutboundAction::Builtin(BuiltinOutbound::Block), &[])
                 .unwrap();
         assert_ne!(
             hash_normalized_program(&with_direct).unwrap(),
@@ -224,7 +235,7 @@ mod tests {
 
     #[test]
     fn epoch_is_separate_from_the_hash() {
-        let program = program("routing { dport(443) -> direct }");
+        let program = program("a", "dport(443)");
         let first = PolicyIdentity::new(PolicyEpoch(1), &program).unwrap();
         let second = PolicyIdentity::new(PolicyEpoch(2), &program).unwrap();
         assert_eq!(first.hash(), second.hash());

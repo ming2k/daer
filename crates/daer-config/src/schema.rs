@@ -69,6 +69,28 @@ pub mod mirror {
         },
     }
 
+    /// `wan-interface = "auto"` or `["eth0", "wg0"]`.
+    ///
+    /// The model derives this shape by hand so it can reject `["auto"]` with an error that
+    /// names the replacement. The schema still has to say "one keyword or a list".
+    #[derive(Debug, Serialize, JsonSchema)]
+    #[serde(untagged)]
+    #[schemars(untagged)]
+    pub enum WanInterface {
+        /// Follow the interface carrying the default route.
+        Auto(AutoKeyword),
+        /// One or more explicitly named interfaces.
+        Named(Vec<String>),
+    }
+
+    /// The only bare string `wan-interface` accepts.
+    #[derive(Debug, Serialize, JsonSchema)]
+    pub enum AutoKeyword {
+        /// Follow the interface carrying the default route.
+        #[serde(rename = "auto")]
+        Auto,
+    }
+
     /// `[[node]] name/type/...`.
     pub type Node = crate::model::Node;
 
@@ -114,6 +136,7 @@ struct _SchemaUsesEveryMirror {
     node: mirror::Node,
     filter: mirror::Filter,
     method: mirror::HttpMethod,
+    wan_interface: mirror::WanInterface,
 }
 
 /// Compile-time assertion that [`Config`] is what the schema is derived from.
@@ -137,11 +160,16 @@ mod tests {
         for key in [
             "schema",
             "include",
-            "global",
+            "log-level",
+            "lan-interface",
+            "wan-interface",
+            "disable-waiting-network",
+            "tls",
             "subscription",
             "node",
             "group",
-            "rule-provider",
+            "election",
+            "rule-set",
             "routing",
             "dns",
         ] {
@@ -162,21 +190,44 @@ mod tests {
             serde_json::Value::Bool(false),
             "{schema:#}"
         );
-        let global = &schema["$defs"]["Global"];
+        let election = &schema["$defs"]["Election"];
         assert_eq!(
-            global["additionalProperties"],
+            election["additionalProperties"],
             serde_json::Value::Bool(false),
-            "Global must reject unknown keys: {global:#}"
+            "Election must reject unknown keys: {election:#}"
+        );
+    }
+
+    #[test]
+    fn routing_sniff_has_an_explicit_shape() {
+        let schema = schema();
+        let sniff = &schema["$defs"]["SniffConfig"];
+        assert_eq!(
+            sniff["additionalProperties"],
+            serde_json::Value::Bool(false),
+            "routing.sniff must reject unknown keys: {sniff:#}"
+        );
+        assert!(
+            sniff["properties"]["enabled"]
+                .to_string()
+                .contains("boolean"),
+            "enabled must be a boolean: {sniff:#}"
+        );
+        assert!(
+            sniff["properties"]["timeout"]
+                .to_string()
+                .contains("string"),
+            "timeout must be a duration string: {sniff:#}"
         );
     }
 
     #[test]
     fn expressions_are_described_as_strings() {
         let schema = schema();
-        let rendered = schema["$defs"]["Routing"]["properties"]["rules"].to_string();
+        let rendered = schema["$defs"]["RoutingRule"]["properties"]["match"].to_string();
         assert!(
             rendered.contains("\"string\""),
-            "rules must be described as strings: {rendered}"
+            "a rule's match must be described as a string: {rendered}"
         );
     }
 

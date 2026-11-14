@@ -102,8 +102,6 @@ pub struct Generation {
     nodes: usize,
     /// The shortest probe interval any election asks for; `0` disables probing.
     health_interval: daer_config::TimeSpan,
-    /// The global probe defaults this generation was built from.
-    probe: daer_config::ProbeSettings,
     build_time: Duration,
     built_at: Instant,
     /// Non-fatal warnings from compilation, for the reload report and snapshot.
@@ -135,7 +133,6 @@ impl Generation {
             router: Arc::new(router),
             policy_hash,
             health_interval: shortest_probe_interval(config),
-            probe: config.global.probe.clone(),
             build_time: started.elapsed(),
             built_at: Instant::now(),
             warnings,
@@ -152,12 +149,6 @@ impl Generation {
     #[must_use]
     pub const fn health_interval(&self) -> daer_config::TimeSpan {
         self.health_interval
-    }
-
-    /// The global probe defaults this generation was built from.
-    #[must_use]
-    pub fn probe(&self) -> daer_config::ProbeSettings {
-        self.probe.clone()
     }
 
     /// The number of elections in this generation.
@@ -458,7 +449,7 @@ fn shortest_probe_interval(config: &Config) -> daer_config::TimeSpan {
         if election.kind == daer_config::ElectionKind::Manual {
             continue;
         }
-        let interval = election.resolved_probe(&config.global.probe).interval;
+        let interval = election.resolved_probe().interval;
         if interval.as_nanos() <= 0 {
             continue;
         }
@@ -485,8 +476,8 @@ mod tests {
         RouterOptions::default()
     }
 
-    const DIRECT: &str = "[routing]\nrules = [\"dport(80) -> direct\"]\nfallback = \"direct\"\n";
-    const CHANGED: &str = "[routing]\nrules = [\"dport(443) -> direct\"]\nfallback = \"direct\"\n";
+    const DIRECT: &str = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"http\"\nmatch = \"dport(80)\"\naction = \"direct\"\n";
+    const CHANGED: &str = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"https\"\nmatch = \"dport(443)\"\naction = \"direct\"\n";
 
     #[test]
     fn the_first_generation_is_published_and_described() {
@@ -503,7 +494,7 @@ mod tests {
         // A warning that only reaches the log is not reviewable after the fact. The report
         // is what a snapshot and an incident bundle carry, so it must not drop the sink.
         let generations = Generations::new(&config(DIRECT), &options()).expect("builds");
-        let warned = "[routing]\nrules = [\"pname(this_process_name_is_too_long) -> direct\"]\nfallback = \"direct\"\n";
+        let warned = "[routing]\nfallback = \"direct\"\n[[routing.rule]]\nname = \"long\"\nmatch = \"pname(this_process_name_is_too_long)\"\naction = \"direct\"\n";
         let report = generations
             .reload(&config(warned), &options())
             .expect("reloads");
@@ -551,8 +542,14 @@ mod tests {
         let generations = Generations::new(&config(DIRECT), &options()).expect("builds");
         let before = generations.current();
 
-        // A fallback that names an outbound nobody declared.
-        let broken = config("[routing]\nrules = []\nfallback = \"nope\"\n");
+        // A fallback that names an outbound nobody declared. Built programmatically:
+        // the configuration validator catches this first, and the generation builder
+        // must catch it too for callers that construct a `Config` directly.
+        let mut broken = config(DIRECT);
+        broken.routing.fallback =
+            daer_config::OutboundAction::Election(daer_config::ElectionAction {
+                election: "nope".to_owned(),
+            });
         let error = generations
             .reload(&broken, &options())
             .expect_err("must be rejected");

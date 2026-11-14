@@ -7,8 +7,6 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Proxy protocol implementations (Shadowsocks, Trojan, REALITY, Hysteria 2, AnyTLS) for daer"
-autotests = false
-
 # The package is `md-5`; the crate it exposes is `md5`, which is what the
 # Shadowsocks/VMess code imports. cargo-machete cannot see through the rename.
 [package.metadata.cargo-machete]
@@ -46,61 +44,10 @@ thiserror.workspace = true
 blake2.workspace = true
 sha3.workspace = true
 
-# `tests/shadowsocks_server.rs` is a shared helper, not a test target. Declaring the test
-# targets explicitly is what keeps cargo from compiling it as a binary of its own.
-[[test]]
-name = "architecture"
-
-[[test]]
-name = "shadowsocks_interop"
-
-[[test]]
-name = "trojan_interop"
-
-[[test]]
-name = "anytls_interop"
-
-[[test]]
-name = "hysteria2_interop"
-
-[[test]]
-name = "reality_live"
-
-[[test]]
-name = "reality_interop"
-
-[[test]]
-name = "client_hello_probe"
-
-[[test]]
-name = "reality_tag_audit"
-
-[[test]]
-name = "vision_lab"
-
-# A TLS stream through the tunnel: the case that broke while every plaintext test passed.
-[[test]]
-name = "vision_tls_inside"
-
-# Every layer combination ADR-0028 made expressible, against a local `xray` inbound.
-[[test]]
-name = "layer_matrix"
-
-[[test]]
-name = "ws_upgrade"
-
-[[test]]
-name = "hysteria2_live"
-
-[[test]]
-name = "vmess_live"
-
 [lints]
 workspace = true
 
 [dev-dependencies]
-# A real TLS server for the Trojan interop test: a certificate has to come from somewhere, and
-# a hard-coded one would expire.
+# In-crate TLS tests generate a certificate and stand up a rustls server.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }

@@ -1,6 +1,12 @@
 # Configuration Reference
 
-`daer` uses strictly-typed TOML with `schema = 2`. Unknown keys are rejected with descriptive errors.
+For a task-oriented guide that assembles these tables into a modular `/etc/daer` tree, see the
+[Configuration Guide](../how-to/configuration/index.md).
+
+`daer` uses strictly-typed TOML with `schema = 5`. Unknown keys are rejected with descriptive
+errors, and an older schema is rejected rather than silently upgraded. Schema 4 moved domain
+acquisition into `[routing.sniff]` and made `[dns].bind` the only DNS listener switch; schema 5
+removed the `[global]` wrapper and made probe settings election-owned.
 
 The default configuration file path is `/etc/daer/config.toml`.
 
@@ -9,36 +15,45 @@ The default configuration file path is `/etc/daer/config.toml`.
 ## 1. Top-Level Schema
 
 ```toml
-schema = 2
+schema = 5
 ```
 
-- `schema` (integer, required): Schema version. Must be `2`.
+- `schema` (integer, required): Schema version. Must be `5`.
 
 ---
 
-## 2. `[global]` Table
+## 2. Top-Level Host and Daemon Settings
 
-Controls global transparent proxy, networking, and daemon behaviors.
+These keys apply to the whole process and sit at the top level, before the first table header.
+There is no `[global]` wrapper: the top level *is* the process scope.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `wan-interface` | list of string | `["auto"]` | Egress interfaces toward the internet. `"auto"` resolves to the interface carrying the default route; an empty list is a configuration error. |
-| `lan-interface` | list of string | `[]` | Ingress interfaces receiving client traffic. |
-| `so-mark` | integer (hex/dec) | `0x64616572` when omitted | Socket mark applied before outbound `connect(2)` to evade loop redirection. Omitted, a privileged run picks `0x64616572` and an unprivileged one marks nothing. |
+| `wan-interface` | string or list of string | `"auto"` | Egress interfaces toward the internet. `"auto"` resolves to the interface carrying the default route; an explicit list such as `["eth0", "wg0"]` names them. The two forms are mutually exclusive, and an empty list is a configuration error. |
+| `lan-interface` | list of string | `[]` | Ingress interfaces receiving client traffic. An interface cannot also appear in `wan-interface`; one role per interface is a hard invariant. |
 | `log-level` | string | `"info"` | `tracing` filter directive: `"info"`, `"debug"`, or `"daer=debug,netune=trace"`. An unparseable directive fails `daer check` and startup; it never silently falls back to `info`. |
 | `disable-waiting-network` | boolean | `false` | When true, fails immediately if the default route is missing rather than waiting up to 2 minutes. |
-| `sniffing-timeout` | duration | `"30ms"` | How long to wait for a sniffable byte sequence before routing by IP. |
-| `auto-sniff-punt` | boolean | `true` | When false, a name is only used after the flow reaches userspace, never as a reason to hold it up. |
-| `allow-insecure` | boolean | `false` | Accept an invalid node certificate. |
+
+The `SO_MARK` that keeps daer's own sockets out of its datapath is an internal
+constant (`0x64616572`, ASCII `daer`). It is not configurable: a value of `0` means
+"no mark" to the kernel and would defeat the loop evasion. A privileged run applies
+it; `--no-datapath` and unprivileged diagnostics do not mark.
 
 > [!NOTE]
 > Transparent listeners bind ephemerally (`port = 0`) inside the isolated `daer0ns` network namespace; traffic assignment is performed directly by the eBPF datapath via `bpf_sk_assign` into the sockmap (ADR-0043). Therefore, `tproxy-port` and `tproxy-port-protect` do not exist.
 
-There is no `dial-mode` key: `daer` sniffs whenever a rule can use a domain and there is no
-separate knob to turn that off. The name was documented and rejected by `deny_unknown_fields`,
-so it was removed from this table rather than left as a trap.
+There is no `dial-mode` key and no global sniff knob. Domain acquisition is a routing policy:
+`[routing.sniff]` answers whether payload inspection is allowed when DNS/Fake-IP cannot name a
+flow, and `[dns]` owns the DNS service itself. A rule that needs a name does not silently enable
+payload inspection; the loader rejects a `domain(...)` rule with no explicit answer.
 
-### `[global.tls]` Sub-Table
+There is also no process-wide `allow-insecure`: certificate verification belongs to one node's
+TLS leg. Setting it globally would let a single self-signed or expired node weaken every other
+node. Use the node-level key described under the protocol that owns the TLS leg.
+
+### `[tls]` Table
+
+Defaults for every outbound TLS leg. A node's own TLS table may override individual parameters.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -46,20 +61,6 @@ so it was removed from this table rather than left as a trap.
 | `fragment` | boolean | `false` | Split the ClientHello across TCP segments to defeat naive SNI filtering. |
 | `fragment-length` | string | `"50-100"` | Byte range for `fragment`. |
 | `fragment-interval` | string | `"10-20"` | Millisecond range for the delay between fragments. |
-
-### `[global.probe]` Sub-Table
-
-Probe defaults for every election. An `[[election]]` may override any field.
-
-| Key | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `mode` | string | `"server"` | `"server"` probes the node's own server port (cheap liveness); `"url"` requests a URL **through** the node and measures the end-to-end path. |
-| `url` | string | unset | Required when `mode = "url"`; ignored (and rejected) when `mode = "server"`. |
-| `method` | string | `"HEAD"` | HTTP method for a URL probe: `HEAD` or `GET`. |
-| `udp-dns` | list of string | `["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]` | Hosts probed over UDP DNS for server-mode liveness. A bare IP uses port 53; a name is reported and skipped rather than resolved silently. |
-| `interval` | duration | `"30s"` | Probe interval; `0s` disables probing. A latency election must be enabled. |
-| `timeout` | duration | `"5s"` | Per-probe deadline. |
-| `tolerance` | duration | `"0s"` | Shifts the switching threshold of moving averages; may be negative. |
 
 ---
 
@@ -73,8 +74,8 @@ Common fields for all structured nodes:
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `name` | string | Optional unique identifier for the node (`tag` is accepted as an alias). A `detour` references this value. |
-| `type` | string | Node protocol: `"vless"`, `"shadowsocks"` (or `"ss"`), `"trojan"`, `"socks5"` (or `"socks"`), `"http"`, `"direct"`. |
+| `name` | string | Optional unique identifier for the node (`tag` is accepted as an alias). A `detour` references this value. Built-in policy names (`direct`, `block`, `must_rules`, `<OR>`, `<AND>`) are reserved and rejected. |
+| `type` | string | Node protocol: `"vless"`, `"vmess"`, `"shadowsocks"` (or `"ss"`), `"trojan"`, `"anytls"`, `"hysteria2"`, `"socks5"` (or `"socks"`), `"http"`. `direct` is not a node type. |
 | `detour` | string | Optional node name. The named node opens this node's stream to its own server; the outer protocol still carries the final target (ADR-0044). |
 
 #### Detour chains
@@ -109,7 +110,7 @@ Capabilities are not silently degraded:
   datagram-under-proxy seam); it can be the inner hop;
 - a detoured SOCKS5 node carries TCP only, because a SOCKS5 UDP associate would send datagrams
   directly to the proxy server and bypass the chain;
-- a `direct` node cannot be the outer hop (it has no server leg); it can be the inner hop;
+- `direct` is a routing verdict, not an inner hop; omit `detour` when the server leg is direct;
 - VLESS/VMess/AnyTLS datagrams ride their stream and are therefore carried by the chain.
 
 #### `type = "vless"`
@@ -161,6 +162,41 @@ public-key = "1qA2ff-bTrVm4R-UAkRa6GGI5Dd_OrNDAELO1pxXVjI"
 short-id = "d9268b533cd4d860"
 ```
 
+#### `type = "vmess"`
+
+VMess is AEAD-only (ADR-0030): a non-zero `alterId` selects the retired handshake and is not
+expressible. The security and transport layers are the same shapes VLESS uses.
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `server` | string | Remote server hostname or IP address. |
+| `port` | integer | Port number (1-65535). |
+| `uuid` | string | Client UUID. |
+| `cipher` | string | `"auto"`, `"aes-128-gcm"`, or `"chacha20-poly1305"`. |
+| `authenticated-length` | boolean | Authenticate each chunk's length. Default `false`. |
+| `no-termination-signal` | boolean | Omit the terminating shutdown signal. Default `false`. |
+| `[node.security]` | table | `none`, `tls`, or `reality`. REALITY is rejected for VMess. |
+| `[node.transport]` | table | `tcp` (default) or `ws`. |
+
+```toml
+[[node]]
+name = "vmess-01"
+type = "vmess"
+server = "203.0.113.15"
+port = 443
+uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+cipher = "auto"
+
+[node.security]
+type = "tls"
+sni = "cdn.example.com"
+
+[node.transport]
+type = "ws"
+path = "/vm"
+host = "cdn.example.com"
+```
+
 #### `type = "shadowsocks"` / `"ss"`
 
 | Key | Type | Description |
@@ -172,13 +208,81 @@ short-id = "d9268b533cd4d860"
 
 #### `type = "trojan"`
 
+Trojan always speaks TLS to the node, so its TLS parameters live in `[node.tls]`, not in
+`[node.security]` (that table selects an optional layer for VLESS/VMess).
+
 | Key | Type | Description |
 | :--- | :--- | :--- |
 | `server` | string | Remote server hostname or IP address. |
 | `port` | integer | Port number (1-65535). |
 | `password` | string | Authentication password. |
-| `sni` | string | SNI presented in TLS handshake. Optional (defaults to server hostname). |
-| `allow-insecure` | boolean | Disables certificate verification. Optional (default `false`). |
+| `[node.tls]` | table | `sni` (defaults to the server hostname) and `allow-insecure` (default `false`). |
+
+```toml
+[[node]]
+name = "trojan-01"
+type = "trojan"
+server = "203.0.113.11"
+port = 443
+password = "secret"
+
+[node.tls]
+sni = "example.com"
+allow-insecure = false
+```
+
+#### `type = "anytls"` / `"any-tls"`
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `server` | string | Remote server hostname or IP address. |
+| `port` | integer | Port number (1-65535). |
+| `password` | string | Authentication password. |
+| `idle-sessions` | integer | Pooled idle sessions. Default `1`. |
+| `[node.tls]` | table | `sni` and `allow-insecure`. |
+
+#### `type = "hysteria2"`
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `server` | string | Remote server hostname or IP address. |
+| `ports` | string | One port, a list, or a range: `"443"`, `"443,20000-20010"`, `"all"`. |
+| `password` | string | Authentication password. |
+| `[node.tls]` | table | `sni`, `allow-insecure`, `pin-sha256`. |
+| `[node.bandwidth]` | table | `up-mbps`, `down-mbps`. Required by `brutal`. |
+| `[node.quic]` | table | QUIC windows, `max-idle-timeout`, `keep-alive-period`, `congestion`, PMTU/GSO switches. |
+| `[node.port-hopping]` | table | `interval`, `min-interval`, `max-interval`; the floor is 5s. |
+| `[node.obfs]` | table | `type = "salamander"` or `"gecko"` plus its password. |
+
+```toml
+[[node]]
+name = "hy2-01"
+type = "hysteria2"
+server = "203.0.113.13"
+ports = "443,20000-20010"
+password = "secret"
+
+[node.tls]
+sni = "hy2.example.com"
+allow-insecure = false
+pin-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[node.bandwidth]
+up-mbps = 100
+down-mbps = 200
+
+[node.quic]
+congestion = "brutal"
+max-idle-timeout = "30s"
+keep-alive-period = "10s"
+
+[node.port-hopping]
+interval = "30s"
+
+[node.obfs]
+type = "salamander"
+password = "cry_me_a_r1ver"
+```
 
 #### `type = "socks5"` / `"socks"`
 
@@ -198,9 +302,22 @@ short-id = "d9268b533cd4d860"
 | `username` | string | Optional authentication username. |
 | `password` | string | Optional authentication password. |
 
-#### `type = "direct"`
+#### `direct` is not a node
 
-Direct outbound connection without proxying.
+`direct` is a built-in routing verdict, not a `[[node]]` type:
+
+```toml
+[routing]
+fallback = "direct"
+[[routing.rule]]
+name = "cn"
+match = "rule-set(cn)"
+action = "direct"
+```
+
+Use `direct` as a rule's `action` or as the fallback. A `[[node]] type = "direct"`
+is rejected by name, and a `direct://` link is rejected by `Node::from_link`. The probe still
+accepts `daer probe node direct` as a local-path diagnostic, but it never enters the node pool.
 
 ---
 
@@ -253,13 +370,17 @@ An election is the **routing target** and the rule that elects one node from its
 | `group` | string | — | Candidate pool. Exactly one of `group`/`node` is required. |
 | `node` | string | — | A singleton candidate set. Exactly one of `group`/`node` is required. |
 | `type` | string | Required | `"manual"` (node input only), `"random"`, `"min"`, `"min-avg10"`, `"min-moving-avg"`. |
-| `mode` | string | inherited | `"server"` or `"url"`; overrides `[global.probe]`. |
-| `url` | string | inherited | URL for `mode = "url"`. |
-| `method` | string | inherited | `HEAD` or `GET`. |
-| `udp-dns` | list of string | inherited | UDP endpoints for server-mode liveness. |
-| `interval` | duration | inherited | Probe cadence. |
-| `timeout` | duration | inherited | Probe deadline. |
-| `tolerance` | duration | inherited | Moving-average switch threshold. |
+| `mode` | string | `"server"` | `"server"` probes the node's own server port (cheap liveness); `"url"` requests a URL **through** the node and measures the end-to-end path. |
+| `url` | string | unset | Required when `mode = "url"`; rejected when `mode = "server"`. |
+| `method` | string | `"HEAD"` | HTTP method for a URL probe: `HEAD` or `GET`. |
+| `udp-dns` | list of string | `["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]` | Hosts probed over UDP DNS for server-mode liveness. A bare IP uses port 53; a name is reported and skipped rather than resolved silently. |
+| `interval` | duration | `"30s"` | Probe cadence; `0s` disables probing. A latency election must keep probing enabled. |
+| `timeout` | duration | `"5s"` | Per-probe deadline. |
+| `tolerance` | duration | `"0s"` | Moving-average switch threshold; only valid for `type = "min-moving-avg"`. May be negative. |
+
+A **manual** election is never scheduled for probing, so it rejects all probe keys; use
+`daer probe node` for on-demand measurement. Probe settings belong to the election that
+consumes them; there is no global probe-default table.
 
 ```toml
 [[group]]
@@ -281,14 +402,14 @@ URL through it; `server` mode only proves the server port is reachable.
 
 ---
 
-## 6. `[[rule-provider]]` Tables (ADR-0014)
+## 6. `[[rule-set]]` Tables (ADR-0014)
 
 Declares pre-compiled DRB (`.drb`) or human-readable text rule sets from local files or remote HTTP subscriptions.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `name` | string | Required | Unique identifier for referencing in routing rules via `provider(name)` (`tag` is accepted as an alias). |
-| `type` | string | `"file"` | Provider type: `"file"` or `"http"`. |
+| `name` | string | Required | Unique identifier for referencing in routing rules via `rule-set(name)` (`tag` is accepted as the name field's alias). |
+| `type` | string | `"file"` | Source type: `"file"` or `"http"`. |
 | `url` | string | Optional | Remote download URL (required when `type = "http"`). |
 | `path` | string | Optional | Local file path (required when `type = "file"`). Relative paths resolve against the configuration directory; system-wide local sets belong under `/var/lib/daer/rules/`. |
 | `format` | string | `"drb"` | Artifact format: `"drb"` (binary zero-copy) or `"text"` (plain text). |
@@ -298,12 +419,66 @@ Declares pre-compiled DRB (`.drb`) or human-readable text rule sets from local f
 
 ## 7. `[routing]` Table
 
-Defines flow matching rules and default verdicts.
+Defines an ordered list of routing rules and the fallback action.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `rules` | list of string | `[]` | Ordered routing rule expressions evaluated top-to-bottom. The right-hand side of `->` is `direct`, `block`, or an election name. |
-| `fallback` | string | `"direct"` | Verdict (`direct`/`block`) or election name if no rule matches. |
+| `rule` | array of tables | `[]` | Ordered `[[routing.rule]]` entries; the first match wins. |
+| `fallback` | action | `"direct"` | `"direct"`, `"block"`, or `{ election = "name" }` when no rule matches. |
+
+Each `[[routing.rule]]` has exactly:
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `name` | string | Required, unique stable identity used by diagnostics and tests. |
+| `match` | string | Predicate conjunction; no `->` and no action. |
+| `action` | action | `"direct"`, `"block"`, or `{ election = "name" }`. |
+
+```toml
+[routing]
+fallback = { election = "proxy" }
+
+[[routing.rule]]
+name = "ads"
+match = "rule-set(ads)"
+action = "block"
+
+[[routing.rule]]
+name = "ai"
+match = "rule-set(openai, anthropic)"
+action = { election = "proxy" }
+```
+
+### Rule Actions
+
+`action` and `fallback` use the same type:
+
+| Value | Meaning |
+| :--- | :--- |
+| `"direct"` | Built-in local path. |
+| `"block"` | Built-in drop verdict. |
+| `{ election = "name" }` | Dynamic outbound: the election selects one node, and that node's dialer is the egress. |
+
+A bare action string is only `direct` or `block`. An election is never a bare string; the table
+keeps the built-in and election namespaces apart. A group is a candidate pool, never an action.
+`direct`, `block`, `must_rules`, `<OR>` and `<AND>` are reserved as node/group/election names.
+
+### Rule Names
+
+`name` is required and unique. It is the identity used by `daer route --why`, logs and tests.
+Rule order is array order; there is no priority field. An empty match or duplicate name is a load
+error.
+
+### Rule Grammar
+
+```text
+match     := predicate ('&&' predicate)*
+predicate := '!'? name '(' value (',' value)* ')'
+```
+
+`&&` is AND, a comma inside one predicate is OR, and `!` negates. There is no `||` and no
+parenthesis; cross-predicate OR is multiple rules with the same action. The normal form maps to
+one kernel match path per conjunction (ADR-0049).
 
 ### Rule Predicates
 
@@ -311,12 +486,46 @@ Defines flow matching rules and default verdicts.
 - `sip(cidr)` — Match source IP.
 - `dport(port_range)` — Match destination port.
 - `sport(port_range)` — Match source port.
-- `domain(pattern)` — Match the sniffed domain (ADR-0036): a bare name (`example.com`) is a suffix matching the domain and all subdomains; `.example.com` matches subdomains only; `=example.com` matches the exact name only. `keyword:` and `regex:` are removed (ADR-0033); expand them into concrete patterns.
-- `provider(name)` / `rule-set(name)` — Match IP intervals or domains from a declared `[[rule-provider]]`.
-- `dip(provider:name)` / `ip(provider:name)` — Match only IP intervals from a declared rule provider.
-- `domain(provider:name)` — Match only domains from a declared rule provider.
+- `domain(pattern)` — Match the acquired domain (ADR-0036): a bare name (`example.com`) is a suffix matching the domain and all subdomains; `.example.com` matches subdomains only; `=example.com` matches the exact name only. `keyword:` and `regex:` are removed (ADR-0033); expand them into concrete patterns.
+- `rule-set(name)` — Match IP intervals or domains from a declared `[[rule-set]]`.
+- `ip-set(name)` — Match only IP intervals from a declared rule set.
+- `domain-set(name)` — Match only domains from a declared rule set.
 - `l4proto(tcp|udp)` — Match Layer 4 transport protocol.
-- `pname(process_name)` — Match client process name.
+- `pname(process_name)` — Match the local process that opened a host-originated flow. The
+  daemon attaches the six cgroup v2 hooks that populate `cookie_pid_map`; a LAN client flow
+  has no local process name and therefore does not match a positive `pname(...)`.
+- `mac(address)` / `dscp(value)` — Match datapath-observed facts.
+- `ipversion(4|6)` — Match the destination address family.
+
+`&&` is AND, commas inside one predicate are OR, and `!` negates. Cross-predicate OR is
+multiple rules with the same action. There is no `||` and no parenthesis; see ADR-0049.
+
+`domain`, `pname`, `mac` and `dscp` need userspace facts. `daer route` has no live flow, so
+those predicates report “not matched” in a diagnostic. On the data path, `mac`, `dscp` and
+`pname` fire when the kernel handoff supplies the value; `pname` requires cgroup v2 and is
+observed for locally-originated host traffic.
+
+### `[routing.sniff]` Sub-Table
+
+Payload-based domain recovery is a fallback, not a DNS setting. DNS/Fake-IP is always consulted
+first; this table only answers what routing may do when it did not produce a unique name.
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | boolean | unset | Required whenever a `domain(...)` rule exists (including a domain set from a rule provider). `true` allows a bounded inspection of the first bytes; `false` routes by the remaining facts. |
+| `timeout` | duration | unset | Required with `enabled = true`, forbidden with `enabled = false`. The total TCP wait budget; UDP parses only the first datagram and never waits. |
+
+The fixed source order is:
+
+```text
+Fake-IP
+  > a unique DNS-snooper candidate
+  > sniff (only when enabled)
+  > address
+```
+
+A `domain(...)` rule with no `[routing.sniff] enabled` is a load error. A `timeout` without
+`enabled = true` is also a load error: there is exactly one way to disable payload inspection.
 
 ---
 
@@ -326,8 +535,8 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `bind` | string | unset (no server) | Listen address for DNS queries. Unset *and* Fake-IP disabled means `daer` is not the box's resolver and starts no server. |
-| `upstream` | list of string | `[]` | Upstream resolvers as `tag:protocol://address:port`. The protocol is required: `udp`, `tcp`, `tls` (DoT), `https` (DoH), or a `+` chain tried in order. A hostname instead of an address is rejected (there is no bootstrap resolver yet). |
+| `bind` | string | unset (no server) | The only switch that starts the DNS listener. Unset means `daer` is not the box's resolver and starts no server. |
+| `upstream` | list of string | `[]` | Upstream resolvers as `tag:protocol://address:port`. Required when `bind` is set. The protocol is required: `udp`, `tcp`, `tls` (DoT), `https` (DoH), or a `+` chain tried in order. A hostname instead of an address is rejected (there is no bootstrap resolver yet). |
 | `ipversion-prefer` | integer | `0` | `4`, `6`, or `0` for no preference. |
 | `optimistic-cache` | boolean | `true` | Serve stale entries while refreshing. |
 | `optimistic-cache-ttl` | integer | `60` | Seconds an optimistic entry is served. |
@@ -342,7 +551,7 @@ Configures the built-in DNS server, caching, and upstream transports.
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Enabling it also starts the DNS server. |
+| `enabled` | boolean | `false` | Allocate synthetic addresses and serve them to clients. Requires an explicit `[dns].bind`; it never starts the listener by itself. |
 | `inet` | string | `"198.18.0.0/15"` | The IPv4 pool prefix. |
 | `inet6` | string | unset | Optional IPv6 pool prefix. When set, `AAAA` queries receive synthetic addresses too; when unset, `AAAA` is answered with an empty NOERROR so clients fall back to the synthetic `A`. |
 | `pool-size` | integer | `65535` | Number of synthetic addresses per address family. |
@@ -353,8 +562,8 @@ Configures the built-in DNS server, caching, and upstream transports.
 ## 9. What is not here
 
 The retired Protobuf `geoip:` / `geosite:` databases are gone (ADR-0014/ADR-0015): domestic and
-regional routing is expressed as a `[[rule-provider]]` holding a compiled `.drb` set plus
-`provider(name)` in a rule. Legacy `.dat` files can be unpacked once with `scripts/rules/dat_to_rules.py`
+regional routing is expressed as a `[[rule-set]]` holding a compiled `.drb` set plus
+`rule-set(name)` in a rule. Legacy `.dat` files can be unpacked once with `scripts/rules/dat_to_rules.py`
 and compiled via `daer-drb compile`.
 
 An outbound chain is expressed as a node's `detour` (ADR-0044). A URI chain string
@@ -378,9 +587,10 @@ the reference cannot carry is a load-time error that names the layer:
 | `transport = grpc`/`httpupgrade`/`xhttp`/`kcp`/`quic` | the framing is not implemented, and silently treating it as `tcp` sends nonsense |
 | a `vmess` link with a non-zero `aid` | that selects the legacy handshake; only VMess AEAD is spoken (ADR-0030) |
 
-`hysteria2` (ADR-0029) exposes `ports`, `obfs` (`salamander`, `gecko`), `congestion`
-(`bbr`, `cubic`, `new-reno`, `brutal`), `hop-interval`/`hop-min-interval`/`hop-max-interval`,
-`pin-sha256` and a `[node.quic]` table. `brutal` needs `up-mbps` or `down-mbps`; a hop
+`hysteria2` (ADR-0029) keeps its layers separate: `[node.tls]` for the intrinsic TLS leg,
+`[node.bandwidth]` for `up-mbps`/`down-mbps`, `[node.quic]` for windows, timeouts, congestion
+(`bbr`, `cubic`, `new-reno`, `brutal`) and PMTU/GSO switches, `[node.port-hopping]` for the hop
+schedule, and `[node.obfs]` for `salamander`/`gecko`. `brutal` needs a bandwidth hint; a hop
 interval shorter than 5 s is refused; and `[node.quic].max-stream-receive-window` /
 `max-conn-receive-window` are refused rather than ignored, because netune's flow control has no
 growing window — set the `init-*-receive-window` keys instead. netune probes the path with

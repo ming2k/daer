@@ -31,7 +31,7 @@ cargo xtask ebpf
 Verify that the eBPF object passes the kernel verifier before running:
 
 ```bash
-cargo xtask kernel-check
+scripts/verify/kernel-check.sh
 ```
 
 ---
@@ -41,12 +41,11 @@ cargo xtask kernel-check
 Create a simple configuration file at `/etc/daer/config.toml` (or locally as `config.toml`):
 
 ```toml
-schema = 2
+schema = 5
 
-[global]
-wan-interface = ["auto"]
+wan-interface = ["eth1"]      # Replace with your upstream interface; "auto" is fine only
+                              # when it resolves a different interface than lan-interface
 lan-interface = ["eth0"]       # Replace with your client-facing LAN interface
-so-mark = 0x64616572               # Required to avoid proxy self-capture
 
 [[node]]
 name = "edge-proxy"
@@ -65,11 +64,22 @@ group = "proxy-pool"
 type = "min-moving-avg"
 
 [routing]
-rules = [
-    "provider(private) -> direct",
-    "provider(cn) -> direct"
-]
-fallback = "proxy"
+fallback = { election = "proxy" }
+
+[routing.sniff]
+# The sets below may carry domains; DNS/Fake-IP is consulted first.
+enabled = true
+timeout = "30ms"
+
+[[routing.rule]]
+name = "rule-1"
+match = "rule-set(private)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-2"
+match = "rule-set(cn)"
+action = "direct"
 ```
 
 Validate your configuration syntax before starting:
@@ -101,5 +111,6 @@ INFO datapath attached: redirected flows will be proxied port=12345 namespace=da
 
 ## Next Steps
 
+- To grow the single file into a maintainable tree, read the [Configuration Guide](../how-to/configuration/index.md).
 - For full production setup with `nftables` redirect rules and systemd service auto-start, consult the [Production Deployment Guide](../how-to/deployment.md).
 - To inspect routing decisions without running the proxy, read [Diagnose Flows & Rules](../how-to/diagnostics.md).

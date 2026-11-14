@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::model::{
-    Config, ElectionKind, FunctionOrString, ProbeMode, ProviderType, SCHEMA_VERSION,
+    Config, ElectionKind, FunctionOrString, ProbeMode, ProviderType, SCHEMA_VERSION, WanInterface,
 };
 
 /// A semantic error, attributed to the field that caused it.
@@ -105,9 +105,10 @@ pub fn normalize(config: &mut Config) -> Result<Vec<String>, ConfigError> {
         ));
     }
 
-    check_global(config)?;
+    check_host(config)?;
     check_groups(config)?;
     check_elections(config)?;
+    check_routing(config)?;
     check_dns(config)?;
     check_endpoints(config)?;
     check_nodes(config)?;
@@ -115,48 +116,7 @@ pub fn normalize(config: &mut Config) -> Result<Vec<String>, ConfigError> {
     Ok(warnings)
 }
 
-fn check_global(config: &mut Config) -> Result<(), ConfigError> {
-    let probe = &config.global.probe;
-    let method = &probe.method;
-    if !is_valid_http_method(method) {
-        return Err(ConfigError::new(
-            "global.probe.method",
-            format!("unknown HTTP method {method:?}; this build issues GET or HEAD"),
-        ));
-    }
-
-    if probe.interval.is_negative() {
-        return Err(ConfigError::new(
-            "global.probe.interval",
-            format!("must not be negative (got \"{}\")", probe.interval),
-        ));
-    }
-    if probe.timeout.as_nanos() <= 0 {
-        return Err(ConfigError::new(
-            "global.probe.timeout",
-            format!("must be a positive duration (got \"{}\")", probe.timeout),
-        ));
-    }
-    if let Some(url) = &probe.url
-        && !is_valid_probe_url(url)
-    {
-        return Err(ConfigError::new(
-            "global.probe.url",
-            format!("{url:?} is not an http(s) URL"),
-        ));
-    }
-    if probe.mode == ProbeMode::Server && probe.url.is_some() {
-        return Err(ConfigError::new(
-            "global.probe.url",
-            "a server-mode probe does not request a URL; set mode = \"url\" or remove the URL",
-        ));
-    }
-    if probe.mode == ProbeMode::Url && probe.url.is_none() {
-        return Err(ConfigError::new(
-            "global.probe.url",
-            "a url-mode probe requires a URL",
-        ));
-    }
+fn check_host(config: &Config) -> Result<(), ConfigError> {
     // An empty `wan-interface` is unrunnable, and `daer check` has to say so.
     //
     // The daemon's own guard (`run::wait_for_interfaces`) refused it with "daer cannot know which
@@ -164,43 +124,67 @@ fn check_global(config: &mut Config) -> Result<(), ConfigError> {
     // this configuration run" — reported a file as `ok` that `daer run` then exited on. This is
     // the same divergence as a builtin-named group, caught one layer later: validation has to be
     // the place a configuration is judged, or every caller grows its own idea of validity.
-    if config.global.wan_interface.is_empty() {
-        return Err(ConfigError::new(
-            "global.wan-interface",
-            "must name at least one interface (use [\"auto\"] to follow the default route)",
-        ));
+    match &config.wan_interface {
+        WanInterface::Auto => {}
+        WanInterface::Named(names) => {
+            if names.is_empty() {
+                return Err(ConfigError::new(
+                    "wan-interface",
+                    "must name at least one interface (use \"auto\" to follow the default route)",
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for name in names {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(ConfigError::new(
+                        "wan-interface",
+                        format!("names an empty interface ({name:?}); remove it or use \"auto\""),
+                    ));
+                }
+                if !seen.insert(trimmed) {
+                    return Err(ConfigError::new(
+                        "wan-interface",
+                        format!("names interface {trimmed:?} more than once"),
+                    ));
+                }
+            }
+        }
     }
-    if let Some(blank) = config
-        .global
-        .wan_interface
-        .iter()
-        .find(|entry| entry.trim().is_empty())
+
+    // One interface cannot be both the client ingress and the egress side: the
+    // datapath has one role per hook, and the old combined-role classifiers were
+    // removed. An explicit overlap is rejected here; `wan-interface = "auto"` is
+    // checked again after the default route is resolved.
+    if let WanInterface::Named(wan) = &config.wan_interface
+        && let Some(interface) = config.lan_interface.iter().find(|lan| {
+            // Loopback is the test/diagnostic interface and has no real
+            // LAN/WAN role; the transparent-path fixtures use it for both.
+            lan.trim() != "lo" && wan.iter().any(|wan| wan.trim() == lan.trim())
+        })
     {
         return Err(ConfigError::new(
-            "global.wan-interface",
-            format!("names an empty interface ({blank:?}); remove it or use \"auto\""),
+            "lan-interface",
+            format!(
+                "interface {interface:?} is both lan-interface and wan-interface; one interface \
+                 cannot carry both roles in this build"
+            ),
         ));
     }
     for (name, range) in [
-        (
-            "global.tls.fragment-length",
-            &config.global.tls.fragment_length,
-        ),
-        (
-            "global.tls.fragment-interval",
-            &config.global.tls.fragment_interval,
-        ),
+        ("tls.fragment-length", &config.tls.fragment_length),
+        ("tls.fragment-interval", &config.tls.fragment_interval),
     ] {
-        if config.global.tls.fragment && !is_range_spec(range) {
+        if config.tls.fragment && !is_range_spec(range) {
             return Err(ConfigError::new(
                 name,
                 format!("{range:?} is not a `low-high` range"),
             ));
         }
     }
-    if config.global.log_level.trim().is_empty() {
+    if config.log_level.trim().is_empty() {
         return Err(ConfigError::new(
-            "global.log-level",
+            "log-level",
             "must be a tracing filter directive",
         ));
     }
@@ -328,7 +312,37 @@ fn check_elections(config: &Config) -> Result<(), ConfigError> {
             }
         }
 
-        let probe = election.resolved_probe(&config.global.probe);
+        // A manual election is never scheduled for probing: the scheduler skips it, and
+        // `daer probe node` is the on-demand path for a pinned node. Accepting probe
+        // settings here would create keys that cannot take effect (ADR-0006).
+        let has_probe_settings = election.mode.is_some()
+            || election.url.is_some()
+            || election.method.is_some()
+            || election.udp_dns.is_some()
+            || election.interval.is_some()
+            || election.timeout.is_some();
+        if election.kind == ElectionKind::Manual && has_probe_settings {
+            return Err(ConfigError::new(
+                "election.probe",
+                format!(
+                    "election {:?} is manual and is never probed; remove the probe settings or \
+                     use `daer probe node` for on-demand measurement",
+                    election.name
+                ),
+            ));
+        }
+        if election.tolerance.is_some() && election.kind != ElectionKind::MinMovingAvg {
+            return Err(ConfigError::new(
+                "election.tolerance",
+                format!(
+                    "election {:?} sets `tolerance`, which only changes the switch threshold of \
+                     type = \"min-moving-avg\"",
+                    election.name
+                ),
+            ));
+        }
+
+        let probe = election.resolved_probe();
         if !is_valid_http_method(&probe.method) {
             return Err(ConfigError::new(
                 "election.method",
@@ -401,8 +415,151 @@ fn check_elections(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Rule identity and action targets.
+///
+/// A rule's name is what `daer route --why`, logs and tests use; a duplicate is
+/// ambiguity. An action is typed, so an election must be declared and a group is
+/// never a valid target.
+fn check_routing(config: &Config) -> Result<(), ConfigError> {
+    let mut names = BTreeSet::new();
+    let has_explicit_domain_rule = config.routing.rule.iter().any(|rule| {
+        rule.match_expr
+            .and_functions
+            .iter()
+            .any(|function| function.name == "domain")
+    });
+
+    check_sniff_shape(config, has_explicit_domain_rule)?;
+
+    for (index, rule) in config.routing.rule.iter().enumerate() {
+        let name = rule.name.trim();
+        if name.is_empty() {
+            return Err(ConfigError::new(
+                "routing.rule.name",
+                format!("rule {index} has an empty name; every rule needs an identity"),
+            ));
+        }
+        if !names.insert(name) {
+            return Err(ConfigError::new(
+                "routing.rule.name",
+                format!("duplicate routing rule name {name:?}"),
+            ));
+        }
+
+        if rule.match_expr.and_functions.is_empty() {
+            return Err(ConfigError::new(
+                "routing.rule.match",
+                format!("rule {name:?} has an empty match expression"),
+            ));
+        }
+
+        check_action_target(config, &rule.action, "routing.rule.action")?;
+    }
+
+    check_action_target(config, &config.routing.fallback, "routing.fallback")
+}
+
+/// Validates the shape of `[routing.sniff]`.
+///
+/// The rule-dependent half (a domain rule requires an explicit answer) also runs here for
+/// explicit `domain(...)` rules, and again in `daer-control::domain::DomainPlan` after rule
+/// providers are lowered. The second pass is what catches a domain set contributed by a
+/// provider, which the raw configuration cannot see.
+fn check_sniff_shape(config: &Config, has_explicit_domain_rule: bool) -> Result<(), ConfigError> {
+    let sniff = &config.routing.sniff;
+
+    if has_explicit_domain_rule && sniff.enabled.is_none() {
+        return Err(ConfigError::new(
+            "routing.sniff.enabled",
+            "a domain(...) rule requires an explicit answer: set enabled = true to allow \
+             bounded payload inspection, or enabled = false to route by the facts already known",
+        ));
+    }
+    if has_explicit_domain_rule && sniff.enabled == Some(false) && config.dns.bind.is_none() {
+        return Err(ConfigError::new(
+            "routing.sniff.enabled",
+            "domain(...) rules have no name source: set enabled = true or configure [dns].bind",
+        ));
+    }
+
+    match (sniff.enabled, sniff.timeout) {
+        (Some(true), None) => Err(ConfigError::new(
+            "routing.sniff.timeout",
+            "enabled = true requires a positive timeout (for example \"30ms\")",
+        )),
+        (Some(true), Some(timeout)) if timeout.as_nanos() <= 0 => Err(ConfigError::new(
+            "routing.sniff.timeout",
+            format!("must be a positive duration (got \"{timeout}\")"),
+        )),
+        (Some(false), Some(_)) => Err(ConfigError::new(
+            "routing.sniff.timeout",
+            "enabled = false does not inspect payload; remove timeout",
+        )),
+        (None, Some(_)) => Err(ConfigError::new(
+            "routing.sniff.timeout",
+            "timeout has no effect without enabled = true",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Checks that an action is a built-in or a declared election.
+///
+/// This is the one target check shared by configuration validation, generation
+/// construction, and `daer check`/`daer route`. A group is a candidate pool, never
+/// a routing target.
+pub fn check_action_target(
+    config: &Config,
+    action: &crate::model::OutboundAction,
+    field: &'static str,
+) -> Result<(), ConfigError> {
+    let Some(election) = action.election_name() else {
+        return Ok(());
+    };
+    if config
+        .election
+        .iter()
+        .any(|declared| declared.name == election)
+    {
+        return Ok(());
+    }
+    if config.group.iter().any(|group| group.name == election) {
+        return Err(ConfigError::new(
+            field,
+            format!(
+                "{election:?} is a group (a candidate pool), not a routing action; add \
+                 [[election]] name = \"{election}\" group = \"{election}\""
+            ),
+        ));
+    }
+    Err(ConfigError::new(
+        field,
+        format!("election {election:?} is not declared; add [[election]] name = \"{election}\""),
+    ))
+}
+
 fn check_dns(config: &mut Config) -> Result<(), ConfigError> {
     let dns = &mut config.dns;
+
+    // Fake-IP is an answer mode of the DNS server, not a routing mode. Without a listener
+    // there is no channel to hand a synthetic address to a client and no reverse mapping to
+    // read later, so enabling it alone used to start an implicit `0.0.0.0:53` listener.
+    // That side effect is gone: the listener is the operator's explicit decision.
+    if dns.fake_ip.enabled && dns.bind.is_none() {
+        return Err(ConfigError::new(
+            "dns.fake-ip.enabled",
+            "Fake-IP requires an explicit [dns].bind; a synthetic address is only useful when \
+             daer answers the client's queries",
+        ));
+    }
+    if dns.bind.is_some() && dns.upstream.is_empty() {
+        return Err(ConfigError::new(
+            "dns.upstream",
+            "[dns].bind starts the resolver but no upstream is declared; add at least one \
+             upstream or remove bind",
+        ));
+    }
+
     if !matches!(dns.ipversion_prefer, 0 | 4 | 6) {
         return Err(ConfigError::new(
             "dns.ipversion-prefer",
@@ -483,6 +640,21 @@ fn check_endpoints(config: &Config) -> Result<(), ConfigError> {
 /// stops at "the reference is syntactically usable". [`validate_chain_graph`] is the second,
 /// stricter pass, run after the node pool is complete (and again by the router, which is the
 /// generation's single source of truth).
+/// Built-in policy names are routing verdicts, not node labels.
+///
+/// A node named `direct` or `block` would make `daer probe node direct`, `daer elect`, and the
+/// rule compiler disagree about what the name means. The datapath already reserves the ids, so
+/// the configuration must not create a second owner.
+fn check_reserved_node_name(name: &str) -> Result<(), ConfigError> {
+    if daer_common::consts::is_builtin_outbound(name) {
+        return Err(ConfigError::new(
+            "node.name",
+            format!("{name:?} is a built-in routing policy, not a node name; choose another name"),
+        ));
+    }
+    Ok(())
+}
+
 fn check_nodes(config: &Config) -> Result<(), ConfigError> {
     let mut names = BTreeSet::new();
     for node in &config.node {
@@ -491,13 +663,14 @@ fn check_nodes(config: &Config) -> Result<(), ConfigError> {
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty());
-        if let Some(name) = name
-            && !names.insert(name.to_owned())
-        {
-            return Err(ConfigError::new(
-                "node.name",
-                format!("duplicate node name {name:?}; a detour must name exactly one node"),
-            ));
+        if let Some(name) = name {
+            check_reserved_node_name(name)?;
+            if !names.insert(name.to_owned()) {
+                return Err(ConfigError::new(
+                    "node.name",
+                    format!("duplicate node name {name:?}; a detour must name exactly one node"),
+                ));
+            }
         }
         if let Some(detour) = &node.detour {
             let detour = detour.trim();
@@ -511,13 +684,6 @@ fn check_nodes(config: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError::new(
                     "node.detour",
                     format!("node {detour:?} cannot detour through itself"),
-                ));
-            }
-            if matches!(node.endpoint, crate::model::NodeEndpoint::Direct(_)) {
-                return Err(ConfigError::new(
-                    "node.detour",
-                    "a direct node has no server leg to replace; remove detour and route to \
-                     the inner node's group instead",
                 ));
             }
         }
@@ -546,6 +712,7 @@ pub fn validate_chain_graph(config: &Config) -> Result<(), ConfigError> {
         else {
             continue;
         };
+        check_reserved_node_name(name)?;
         if names.insert(name, index).is_some() {
             return Err(ConfigError::new(
                 "node.name",
@@ -558,13 +725,6 @@ pub fn validate_chain_graph(config: &Config) -> Result<(), ConfigError> {
         let Some(detour) = node.detour.as_deref().map(str::trim) else {
             continue;
         };
-        if matches!(node.endpoint, crate::model::NodeEndpoint::Direct(_)) {
-            return Err(ConfigError::new(
-                "node.detour",
-                "a direct node has no server leg to replace; remove detour and route to the \
-                 inner node's group instead",
-            ));
-        }
         if !names.contains_key(detour) {
             return Err(ConfigError::new(
                 "node.detour",
@@ -636,27 +796,27 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
         let name = provider.name.trim();
         if name.is_empty() {
             return Err(ConfigError::new(
-                "rule-provider.name",
-                "rule provider name must not be empty",
+                "rule-set.name",
+                "rule set name must not be empty",
             ));
         }
         if !names.insert(name) {
             return Err(ConfigError::new(
-                "rule-provider.name",
-                format!("duplicate rule provider name {:?}", provider.name),
+                "rule-set.name",
+                format!("duplicate rule set name {:?}", provider.name),
             ));
         }
         match provider.provider_type {
             ProviderType::File => {
                 let Some(path) = &provider.path else {
                     return Err(ConfigError::new(
-                        "rule-provider.path",
+                        "rule-set.path",
                         format!("file provider {:?} must specify 'path'", provider.name),
                     ));
                 };
                 if path.trim().is_empty() {
                     return Err(ConfigError::new(
-                        "rule-provider.path",
+                        "rule-set.path",
                         format!("empty path for file provider {:?}", provider.name),
                     ));
                 }
@@ -664,13 +824,13 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
             ProviderType::Http => {
                 let Some(url) = &provider.url else {
                     return Err(ConfigError::new(
-                        "rule-provider.url",
+                        "rule-set.url",
                         format!("http provider {:?} must specify 'url'", provider.name),
                     ));
                 };
                 if url.trim().is_empty() {
                     return Err(ConfigError::new(
-                        "rule-provider.url",
+                        "rule-set.url",
                         format!("empty URL for http provider {:?}", provider.name),
                     ));
                 }
@@ -683,7 +843,7 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
             // watching a daemon that silently ignores the declaration.
             if provider.provider_type == ProviderType::File {
                 return Err(ConfigError::new(
-                    "rule-provider.interval",
+                    "rule-set.interval",
                     format!(
                         "file provider {:?} must not set 'interval': a file has no background \
                          checks, so remove the key or declare an http provider",
@@ -693,9 +853,9 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
             }
             if interval.as_nanos() <= 0 {
                 return Err(ConfigError::new(
-                    "rule-provider.interval",
+                    "rule-set.interval",
                     format!(
-                        "interval must be positive (got \"{}\") for rule provider {:?}",
+                        "interval must be positive (got \"{}\") for rule set {:?}",
                         interval, provider.name
                     ),
                 ));
@@ -706,234 +866,4 @@ fn check_rule_providers(config: &Config) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn valid() -> Config {
-        Config::default()
-    }
-
-    #[test]
-    fn rejects_an_unknown_schema() {
-        let mut config = valid();
-        config.schema = 99;
-        let error = normalize(&mut config).expect_err("must fail");
-        assert_eq!(error.field, "schema");
-    }
-
-    #[test]
-    fn an_unknown_http_method_is_rejected() {
-        let mut config = valid();
-        config.global.probe.method = "BREW".to_owned();
-        let error = normalize(&mut config).expect_err("must fail");
-        assert_eq!(error.field, "global.probe.method");
-    }
-
-    #[test]
-    fn an_election_url_mode_requires_a_url() {
-        let mut config = valid();
-        config.election = vec![crate::model::Election {
-            name: "proxy".to_owned(),
-            group: None,
-            node: Some("n".to_owned()),
-            kind: crate::model::ElectionKind::Min,
-            mode: Some(crate::model::ProbeMode::Url),
-            url: None,
-            method: None,
-            udp_dns: None,
-            interval: Some(crate::TimeSpan::from_secs(30)),
-            timeout: Some(crate::TimeSpan::from_secs(5)),
-            tolerance: None,
-        }];
-        let error = normalize(&mut config).expect_err("url mode needs a URL");
-        assert_eq!(error.field, "election.url");
-    }
-
-    #[test]
-    fn a_server_mode_election_cannot_carry_a_url() {
-        let mut config = valid();
-        config.global.probe.url = None;
-        config.election = vec![crate::model::Election {
-            name: "proxy".to_owned(),
-            group: None,
-            node: Some("n".to_owned()),
-            kind: crate::model::ElectionKind::Min,
-            mode: Some(crate::model::ProbeMode::Server),
-            url: Some("https://example.com/".to_owned()),
-            method: None,
-            udp_dns: None,
-            interval: Some(crate::TimeSpan::from_secs(30)),
-            timeout: Some(crate::TimeSpan::from_secs(5)),
-            tolerance: None,
-        }];
-        let error = normalize(&mut config).expect_err("server mode cannot carry a URL");
-        assert_eq!(error.field, "election.url");
-    }
-
-    #[test]
-    fn a_latency_election_cannot_disable_probing() {
-        let mut config = valid();
-        config.election = vec![crate::model::Election {
-            name: "proxy".to_owned(),
-            group: None,
-            node: Some("n".to_owned()),
-            kind: crate::model::ElectionKind::Min,
-            mode: None,
-            url: None,
-            method: None,
-            udp_dns: None,
-            interval: Some(crate::TimeSpan::ZERO),
-            timeout: None,
-            tolerance: None,
-        }];
-        let error = normalize(&mut config).expect_err("a latency election needs probes");
-        assert_eq!(error.field, "election.interval");
-    }
-
-    #[test]
-    fn dns_fallbacks_are_defaulted() {
-        let mut config = valid();
-        assert!(config.dns.request.fallback.is_none());
-        normalize(&mut config).expect("valid");
-        assert_eq!(
-            config.dns.request.fallback,
-            Some(FunctionOrString::Name("asis".to_owned()))
-        );
-        assert_eq!(
-            config.dns.response.fallback,
-            Some(FunctionOrString::Name("accept".to_owned()))
-        );
-    }
-
-    #[test]
-    fn duplicate_and_empty_group_names_are_rejected() {
-        let mut config = valid();
-        config.group = vec![
-            crate::model::Group {
-                name: "a".to_owned(),
-                filters: Vec::new(),
-            },
-            crate::model::Group {
-                name: "a".to_owned(),
-                filters: Vec::new(),
-            },
-        ];
-        assert!(normalize(&mut config).is_err());
-    }
-
-    /// A group may not shadow a builtin outbound.
-    ///
-    /// The falsifier is the observed divergence: `[[group]] name = "direct"` with one node
-    /// pointing at a dead SOCKS port loaded fine, `daer route` reported that node as the
-    /// selected outbound, and the daemon dialled the flow *directly* and returned the origin's
-    /// bytes. Either the name is the builtin everywhere or it is an error everywhere; the
-    /// configuration is not allowed to mean two things.
-    /// An empty `wan-interface` is rejected here, not only by the daemon.
-    ///
-    /// The falsifier is one command pair: `printf 'schema = 2\n[global]\nwan-interface = []\n'`
-    /// used to be `check` → `ok` and `run` → exit 1, so the gate that promises "will this
-    /// configuration run" disagreed with the process that runs it. The default is `["auto"]`,
-    /// which is why a plain `schema = 2` file still passes.
-    #[test]
-    fn an_empty_wan_interface_fails_validation_even_though_the_default_is_not_empty() {
-        let mut config = valid();
-        config.global.wan_interface = Vec::new();
-        let error = normalize(&mut config).expect_err("the daemon cannot honour this");
-        assert_eq!(error.field, "global.wan-interface");
-
-        // The control: the defaults pass, so the check is about the empty list and not about
-        // `wan-interface` being present at all.
-        let mut config = valid();
-        normalize(&mut config).expect("the default [\"auto\"] must still validate");
-
-        // And a blank entry, which `run` would otherwise try to resolve as an interface name.
-        let mut config = valid();
-        config.global.wan_interface = vec!["  ".to_owned()];
-        let error = normalize(&mut config).expect_err("a blank interface name is not a name");
-        assert_eq!(error.field, "global.wan-interface");
-    }
-
-    #[test]
-    fn a_group_may_not_shadow_a_builtin_outbound() {
-        for name in ["direct", "block", "must_rules", "<OR>", "<AND>"] {
-            let mut config = valid();
-            config.group = vec![crate::model::Group {
-                name: name.to_owned(),
-                filters: Vec::new(),
-            }];
-            let error = normalize(&mut config)
-                .expect_err("a group named after a builtin outbound must be rejected");
-            assert_eq!(error.field, "group.name", "{name}: {error}");
-            assert!(
-                error.message.contains("built-in"),
-                "{name}: the message must say why: {error}"
-            );
-
-            // The control: the same group under a name that is not reserved loads.
-            let mut config = valid();
-            config.group = vec![crate::model::Group {
-                name: format!("proxy-{name}"),
-                filters: Vec::new(),
-            }];
-            normalize(&mut config).expect("a non-reserved name is fine");
-        }
-    }
-
-    fn node(name: &str, detour: Option<&str>) -> crate::model::Node {
-        let mut node = crate::model::Node::from_link(&format!("socks5://127.0.0.1:1080#{name}"))
-            .expect("node parses");
-        node.detour = detour.map(str::to_owned);
-        node
-    }
-
-    #[test]
-    fn a_detour_chain_is_a_valid_dag() {
-        let mut config = valid();
-        config.node = vec![node("outer", Some("inner")), node("inner", None)];
-        normalize(&mut config).expect("parses");
-        validate_chain_graph(&config).expect("a two-node chain is acyclic");
-    }
-
-    #[test]
-    fn an_unknown_detour_target_is_rejected_after_resolution() {
-        let mut config = valid();
-        config.node = vec![node("outer", Some("missing"))];
-        // The first pass cannot decide existence: a subscription may add the target later.
-        normalize(&mut config).expect("syntactically usable");
-        let error = validate_chain_graph(&config).expect_err("no such node");
-        assert_eq!(error.field, "node.detour");
-        assert!(error.message.contains("missing"), "{error}");
-    }
-
-    #[test]
-    fn a_detour_cycle_is_rejected_with_the_path() {
-        let mut config = valid();
-        config.node = vec![node("a", Some("b")), node("b", Some("a"))];
-        normalize(&mut config).expect("syntactically usable");
-        let error = validate_chain_graph(&config).expect_err("cycle");
-        assert_eq!(error.field, "node.detour");
-        assert!(error.message.contains("cycle"), "{error}");
-        assert!(error.message.contains("a"), "{error}");
-        assert!(error.message.contains("b"), "{error}");
-    }
-
-    #[test]
-    fn a_node_cannot_detour_through_itself() {
-        let mut config = valid();
-        config.node = vec![node("a", Some("a"))];
-        let error = normalize(&mut config).expect_err("self detour");
-        assert_eq!(error.field, "node.detour");
-        assert!(error.message.contains("itself"), "{error}");
-    }
-
-    #[test]
-    fn duplicate_node_names_are_rejected_because_detour_needs_one_target() {
-        let mut config = valid();
-        config.node = vec![node("same", None), node("same", None)];
-        let error = normalize(&mut config).expect_err("ambiguous target");
-        assert_eq!(error.field, "node.name");
-        // The control: a chain with distinct names is accepted.
-        config.node = vec![node("a", Some("b")), node("b", None)];
-        normalize(&mut config).expect("distinct names are fine");
-    }
-}
+mod tests;

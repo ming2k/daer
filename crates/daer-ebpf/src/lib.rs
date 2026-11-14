@@ -10,8 +10,8 @@
 //! # The loader loads, it does not repair
 //!
 //! The object this crate is handed is the object this repository built. Its section
-//! names are already what `aya` parses (`classifier/<name>`, `sk_skb/stream_verdict`),
-//! so [`loader::load`] overrides the runtime parameter global and nothing else. There
+//! names are already what `aya` parses (`classifier/<name>`, `cgroup/<hook>`), so
+//! [`loader::load`] overrides the runtime parameter global and nothing else. There
 //! is deliberately no ELF or BTF rewriting step: a previous one renamed sections in
 //! the ELF header without renaming them in `.BTF.ext`, which dropped every program's
 //! `func_info` and made the kernel reject the load with
@@ -45,8 +45,8 @@ pub use listeners::Listeners;
 
 #[cfg(feature = "loader")]
 pub use loader::{
-    LoadError, ObjectReport, attach_tc, inspect_bytes, inspect_object, load, load_path,
-    require_tcx, set_device_ifindex,
+    LoadError, ObjectReport, attach_cgroup_hooks, attach_tc, cgroup_v2_path, inspect_bytes,
+    inspect_object, load, load_path, require_tcx, set_device_ifindex,
 };
 #[cfg(feature = "loader")]
 pub use publish::{AyaWriter, publish_listeners, publish_lpm, publish_outbound_connectivity};

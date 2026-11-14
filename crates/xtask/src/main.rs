@@ -9,6 +9,7 @@
 //!     ebpf    - Compiles the eBPF C datapath into target/ebpf/datapath.bpf.o
 //!     schema  - Prints or writes (--write) the published JSON schema
 //!     events  - Generates the diagnostic event catalog (ADR-0040)
+//!     test    - Runs one test layer, audits the test architecture, or lists its inventory
 //!     ci      - Runs the entire CI suite locally (fmt, clippy, tests)
 
 mod abi;
@@ -18,11 +19,7 @@ mod incident;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-
-/// Where the privileged verification scripts live. Keeping them in a subdirectory
-/// means `scripts/` can grow more categories without changing the command path.
-const VERIFY_SCRIPTS: &str = "scripts/verify";
+use std::process::Command;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -257,18 +254,6 @@ fn build_test_object(
     println!("built {}", out_file.display());
 }
 
-fn run_command(cmd: &str, args: &[&str]) -> ExitStatus {
-    println!("> {cmd} {}", args.join(" "));
-    let status = Command::new(cmd)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to execute {cmd}: {e}"));
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    status
-}
-
 fn generate_schema(write: bool) {
     let root = workspace_root();
     let output = Command::new("cargo")
@@ -291,63 +276,6 @@ fn generate_schema(write: bool) {
     }
 }
 
-fn run_ci() {
-    println!("=== Running CI Suite ===");
-    let jobs = format!("-j{}", ci_jobs());
-
-    // The kernel ABI is generated (ADR-0021). Checking it first means a drifted
-    // declaration fails before the compile that would hide it, and the message names the
-    // file and the command that fixes it.
-    println!("> cargo xtask abi --check");
-    let root = workspace_root();
-    if let Err(error) = abi::run(&root, true) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
-
-    // The diagnostic catalog is generated too (ADR-0040). It is checked before the compile
-    // for the same reason as the ABI: a raw `tracing` macro or a call-site severity that
-    // disagrees with the catalog is a contract failure, not a style warning.
-    println!("> cargo xtask events --check");
-    if let Err(error) = events::run(&root, true) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
-
-    println!("> cargo xtask incident --check");
-    if let Err(error) = incident::run(&root) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
-
-    run_command("cargo", &["fmt", "--all", "--", "--check"]);
-    run_command(
-        "cargo",
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--locked",
-            &jobs,
-            "--",
-            "-D",
-            "warnings",
-        ],
-    );
-    run_command("cargo", &["test", "--workspace", "--locked", &jobs]);
-
-    // The unprivileged preflight (ADR-0029): the object the repository just built has to be
-    // one `daer check` accepts, which is the same gate a packaging script runs against an
-    // installed artifact. It needs no capability, so it belongs in this suite.
-    println!("> cargo xtask preflight");
-    if let Err(error) = run_preflight(&root) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
-
-    println!("\n✅ All checks and tests passed cleanly!");
-}
-
 /// Runs `daer check --object` over the built object and the example configuration.
 ///
 /// This is the unprivileged gate from ADR-0029, exercised the way a packaging script would:
@@ -367,11 +295,8 @@ fn run_preflight(root: &Path) -> Result<(), String> {
     if let Some(parent) = config.parent() {
         fs::create_dir_all(parent).expect("failed to create the preflight directory");
     }
-    fs::write(
-        &config,
-        "schema = 2\n\n[global]\nwan-interface = [\"auto\"]\n",
-    )
-    .map_err(|error| format!("failed to write {}: {error}", config.display()))?;
+    fs::write(&config, "schema = 5\n\nwan-interface = \"auto\"\n")
+        .map_err(|error| format!("failed to write {}: {error}", config.display()))?;
 
     let status = Command::new("cargo")
         .current_dir(root)
@@ -393,32 +318,6 @@ fn run_preflight(root: &Path) -> Result<(), String> {
         return Err("the unprivileged preflight rejected the built object".to_owned());
     }
     Ok(())
-}
-
-/// How many codegen units to run in parallel during CI.
-///
-/// Cargo's default is one job per core, and this workspace has 23 test targets that each link
-/// the entire dependency graph. On a 16-core box that is 23 concurrent `rust-lld` processes,
-/// and the wall-clock cost is dominated by their *contention* rather than their work: measured
-/// on the dev machine, an uncontended no-op `cargo test --no-run --workspace` takes 169 ms
-/// while the same command after touching one library took 666 s, every one of those seconds
-/// inside the linker.
-///
-/// Half the cores is the point where the linkers stop competing for the same page cache and
-/// the same disk queue while still using the machine. `DAER_CI_JOBS` overrides it for a
-/// machine where that trade is different — a CI runner with a fast NVMe wants more, a laptop
-/// on a battery wants fewer.
-fn ci_jobs() -> usize {
-    if let Some(jobs) = std::env::var("DAER_CI_JOBS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|jobs| *jobs > 0)
-    {
-        return jobs;
-    }
-    std::thread::available_parallelism()
-        .map(|cores| (cores.get() / 2).max(1))
-        .unwrap_or(1)
 }
 
 fn run_install(args: &[String]) {
@@ -516,6 +415,20 @@ fn install_layout(root: &Path, prefix: &str, destdir: &Path) -> Result<Vec<PathB
             .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
     }
 
+    // Pre-TCX releases installed a separate cleanup binary and a differently named
+    // object. They are not part of the current set; remove them from a live `/usr`
+    // or a reused staging tree so an upgrade cannot leave an orphan helper behind.
+    for legacy in [bin_dir.join("daer-cleanup"), lib_dir.join("datapath.o")] {
+        if let Err(error) = fs::remove_file(&legacy)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "cannot remove legacy {}: {error}",
+                legacy.display()
+            ));
+        }
+    }
+
     let mut installed = Vec::with_capacity(binaries.len() + 2);
     for name in binaries {
         // `daer-drb` is the rule-artifact producer operators need to compile `.rules`
@@ -600,27 +513,6 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one of the privileged verification scripts under `scripts/verify/`.
-///
-/// The two scripts answer different questions and have different dependency closures, so
-/// neither is a superset of the other: `kernel-check.sh` asks whether the eBPF object loads
-/// and behaves, and `e2e-check.sh` asks whether a real redirected flow reaches the daemon
-/// and comes back. Running the wrong one for a change is how a gate silently stops covering
-/// what it claims, so both are named explicitly rather than folded into one entry point.
-fn run_privileged_script(name: &str, args: Vec<String>) {
-    let root = workspace_root();
-    let script = root.join(VERIFY_SCRIPTS).join(name);
-    if !script.is_file() {
-        eprintln!("error: {VERIFY_SCRIPTS}/{name} not found");
-        std::process::exit(1);
-    }
-    let status = Command::new(&script)
-        .args(&args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run {}: {e}", script.display()));
-    std::process::exit(status.code().unwrap_or(1));
-}
-
 fn main() {
     let mut args = env::args().skip(1);
     let subcommand = args.next();
@@ -664,10 +556,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some("ci") => run_ci(),
         Some("install") => run_install(&args.collect::<Vec<_>>()),
-        Some("kernel-check") => run_privileged_script("kernel-check.sh", args.collect()),
-        Some("e2e-check") => run_privileged_script("e2e-check.sh", args.collect()),
         Some("help") | None => {
             println!("daer workspace task runner (cargo-xtask)\n");
             println!("Usage:");
@@ -683,12 +572,9 @@ fn main() {
             println!(
                 "    cargo xtask preflight          Validate the built object and example config (no capability)"
             );
-            println!("    cargo xtask ci                 Run full CI suite (fmt, clippy, test)");
             println!(
                 "    cargo xtask install            Install binaries, datapath, and unit (--prefix/--destdir)"
             );
-            println!("    cargo xtask kernel-check       Run privileged kernel datapath tests");
-            println!("    cargo xtask e2e-check          Run privileged end-to-end ingress tests");
         }
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
@@ -703,28 +589,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-
-    #[test]
-    fn the_verification_scripts_exist_where_xtask_runs_them() {
-        let root = workspace_root();
-        for name in ["kernel-check.sh", "e2e-check.sh"] {
-            let path = root.join(VERIFY_SCRIPTS).join(name);
-            assert!(path.is_file(), "{} is missing", path.display());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = fs::metadata(&path)
-                    .expect("script metadata")
-                    .permissions()
-                    .mode();
-                assert!(
-                    mode & 0o111 != 0,
-                    "{} is not executable (mode {mode:o})",
-                    path.display()
-                );
-            }
-        }
-    }
 
     #[test]
     fn the_installed_unit_follows_the_requested_prefix() {
@@ -767,6 +631,7 @@ mod tests {
         fs::write(
             root.join("install/daer.service"),
             "[Service]\n\
+             UMask=0077\n\
              ExecStart=/usr/bin/daer run --object /usr/lib/daer/datapath.bpf.o\n",
         )
         .expect("write fake unit");
@@ -821,7 +686,27 @@ mod tests {
             .expect("read staged unit");
         assert!(!unit.contains("ExecStopPost"), "{unit}");
         assert!(!unit.contains("daer-cleanup"), "{unit}");
+        assert!(unit.contains("UMask=0077"), "{unit}");
 
+        fs::remove_dir_all(&root).expect("remove fake workspace");
+    }
+
+    #[test]
+    fn a_reused_staging_tree_does_not_keep_pre_tcx_artifacts() {
+        let root = temporary_root();
+        let destdir = root.join("stage");
+        let legacy_bin = destdir.join("usr/bin/daer-cleanup");
+        let legacy_object = destdir.join("usr/lib/daer/datapath.o");
+        fs::create_dir_all(legacy_bin.parent().expect("bin parent")).expect("create bin dir");
+        fs::create_dir_all(legacy_object.parent().expect("object parent"))
+            .expect("create object dir");
+        fs::write(&legacy_bin, b"old cleanup").expect("write legacy cleanup");
+        fs::write(&legacy_object, b"old object").expect("write legacy object");
+
+        install_layout(&root, "/usr", &destdir).expect("install layout");
+
+        assert!(!legacy_bin.exists(), "legacy cleanup must be removed");
+        assert!(!legacy_object.exists(), "legacy object must be removed");
         fs::remove_dir_all(&root).expect("remove fake workspace");
     }
 

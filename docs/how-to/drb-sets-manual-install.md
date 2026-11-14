@@ -108,7 +108,7 @@ sudo install -m 0644 dist/*.drb /var/lib/daer/rules/
 ```
 
 That is safe: `daer` does not scan the directory, so unused files have no effect. Only a
-file named by a `[[rule-provider]]` entry is loaded. Keeping the full set locally makes a
+file named by a `[[rule-set]]` entry is loaded. Keeping the full set locally makes a
 later routing change a configuration edit rather than a redeployment.
 
 Do not install `dist/rules.tar.gz` or `manifest.json` into `/var/lib/daer/rules`; they
@@ -118,25 +118,23 @@ are release metadata, not provider inputs.
 
 ## 5. Configure File Providers
 
-Add one `[[rule-provider]]` per artifact you want to route with. File providers have no
+Add one `[[rule-set]]` per artifact you want to route with. File providers have no
 background refresh, so an `interval` key is rejected; update the file and reload the
 daemon instead.
 
-The following configuration keeps the existing `[global]`, `[[node]]`, `[[group]]`, and
+The following configuration keeps the existing host keys, `[[node]]`, `[[group]]`, and
 `[[election]]`
 blocks and adds a domestic bypass pipeline. Replace the node values with your own.
 
 ```toml
-schema = 2
+schema = 5
 
-[global]
-wan-interface = ["auto"]
-so-mark = 0x0dae
+wan-interface = "auto"
 log-level = "info"
 # Set this only on a gateway that receives client traffic:
 # lan-interface = ["eth0"]
 
-[global.tls]
+[tls]
 profile = "chrome-current"
 
 [[node]]
@@ -162,65 +160,112 @@ group = "proxy-pool"
 type = "min-moving-avg"
 
 # Domestic domains: direct.
-[[rule-provider]]
-tag = "cn-sites"
+[[rule-set]]
+name = "cn-sites"
 type = "file"
 path = "/var/lib/daer/rules/geosite-cn.drb"
 format = "drb"
 
 # Domestic IP intervals: direct, and eligible for the kernel fast path.
-[[rule-provider]]
-tag = "cn-ips"
+[[rule-set]]
+name = "cn-ips"
 type = "file"
 path = "/var/lib/daer/rules/geoip-cn.drb"
 format = "drb"
 
 # Optional: ad and tracker domains are blocked before the domestic rules.
-[[rule-provider]]
-tag = "ads"
+[[rule-set]]
+name = "ads"
 type = "file"
 path = "/var/lib/daer/rules/geosite-category-ads-all.drb"
 format = "drb"
 
 [routing]
+fallback = { election = "proxy" }
+
+[routing.sniff]
+# The `cn-sites` and `ads` sets carry domains; DNS/Fake-IP is consulted first,
+# then this bounded payload fallback.
+enabled = true
+timeout = "30ms"
+
 # First match wins. Keep pure-IP rules ahead of domain rules so the kernel can
 # terminate them without a userspace round trip.
-rules = [
     # Optional: remove this line if you do not want ad blocking.
-    "provider(ads) -> block",
+[[routing.rule]]
+name = "rule-1"
+match = "rule-set(ads)"
+action = "block"
 
     # DNS stays direct, so resolving the node hostname never recurses through
     # the proxy.
-    "dport(53) -> direct",
+[[routing.rule]]
+name = "rule-2"
+match = "dport(53)"
+action = "direct"
 
     # Local, link-local, and private destinations are not internet traffic.
-    "dip(10.0.0.0/8) -> direct",
-    "dip(100.64.0.0/10) -> direct",
-    "dip(127.0.0.0/8) -> direct",
-    "dip(169.254.0.0/16) -> direct",
-    "dip(172.16.0.0/12) -> direct",
-    "dip(192.168.0.0/16) -> direct",
+[[routing.rule]]
+name = "rule-3"
+match = "dip(10.0.0.0/8)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-4"
+match = "dip(100.64.0.0/10)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-5"
+match = "dip(127.0.0.0/8)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-6"
+match = "dip(169.254.0.0/16)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-7"
+match = "dip(172.16.0.0/12)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-8"
+match = "dip(192.168.0.0/16)"
+action = "direct"
 
     # IPv6 is direct in this configuration; the datapath's IPv6 UDP path is
     # not part of the routing decision here.
-    "ipversion(6) -> direct",
+[[routing.rule]]
+name = "rule-9"
+match = "ipversion(6)"
+action = "direct"
 
     # Broadcast and multicast never belong to a TCP/UDP proxy.
-    "dip(224.0.0.0/3, 'ff00::/8') -> direct",
+[[routing.rule]]
+name = "rule-10"
+match = "dip(224.0.0.0/3, 'ff00::/8')"
+action = "direct"
 
     # Domestic destinations bypass the proxy.
-    "provider(cn-ips) -> direct",
-    "provider(cn-sites) -> direct",
-]
-fallback = "proxy"
+[[routing.rule]]
+name = "rule-11"
+match = "rule-set(cn-ips)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-12"
+match = "rule-set(cn-sites)"
+action = "direct"
 ```
 
 Notes:
 
-- `provider(cn-ips)` is a pure-IP set. `provider(cn-sites)` is a domain set; flows that
-  need it are evaluated in userspace after sniffing, which is expected. Keep the IP
-  predicate first.
-- The six `dip(...)` lines can be replaced by one `provider(private-ips) -> direct` if
+- `rule-set(cn-ips)` is a pure-IP set. `rule-set(cn-sites)` is a domain set; flows that
+  need it are evaluated in userspace after domain acquisition (DNS/Fake-IP, or the
+  explicit `[routing.sniff]` fallback). Keep the IP predicate first.
+- The six `dip(...)` rules can be replaced by one `match = "rule-set(private-ips)"` rule if
   you install `geoip-private.drb` and declare that provider. The inline form has no extra
   file dependency, so it is a reasonable default.
 - `geosite-cn` and `geoip-cn` are different artifacts. Declaring only one leaves either
@@ -296,8 +341,8 @@ back to its `/var/cache/daer/rules/<tag>.drb` cache when one exists.
 | :--- | :--- |
 | `daer check` says a file provider cannot read its path | The path is wrong, or the file was not installed. Remember that a relative `path` resolves against `/etc/daer/`, not the current shell directory; prefer absolute paths. |
 | `daer check` rejects `interval` on a file provider | File providers have no background refresh. Remove `interval`, update the file, and reload. |
-| `daer route --why` never matches `provider(cn-sites)` | The flow has no sniffed domain (for example, plain IP or an unsniffable protocol), or the artifact is not the expected set. Test the artifact directly with `daer-drb test dist/geosite-cn.drb baidu.com`. |
-| `provider(cn-ips)` misses an address | IP geodata is coarse and changes over time; rebuild the artifact from current upstream data. |
+| `daer route --why` never matches `rule-set(cn-sites)` | The flow has no acquired domain (for example, plain IP or an unsniffable protocol), or the artifact is not the expected set. Test the artifact directly with `daer-drb test dist/geosite-cn.drb baidu.com`. |
+| `rule-set(cn-ips)` misses an address | IP geodata is coarse and changes over time; rebuild the artifact from current upstream data. |
 | The service starts but traffic is unchanged | Check `journalctl -u daer -b` for `datapath attached` and the provider counts. A reload that fails validation does not swap the running generation. |
 | An HTTP provider reports 404 | The release asset does not exist. Use the local file form from this guide, or verify the exact artifact name in the `drb-sets` release. |
 

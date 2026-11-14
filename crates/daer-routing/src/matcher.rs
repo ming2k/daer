@@ -211,8 +211,14 @@ pub fn matches_value(value: &MatchValue, facts: &MatchFacts<'_>) -> bool {
 /// selects it: cloning one is an atomic increment, not an allocation, which is what
 /// keeps the decision path free of heap traffic.
 #[must_use]
-pub fn intern_outbound(name: &str, mark: u32, must: bool) -> Outbound {
+pub fn intern_outbound(
+    kind: daer_config::OutboundKind,
+    name: &str,
+    mark: u32,
+    must: bool,
+) -> Outbound {
     Outbound {
+        kind,
         name: Arc::from(name),
         mark,
         must,
@@ -237,8 +243,21 @@ mod tests {
             // Two predicates in the first rule, so the lowered program has more
             // match sets than rules — the whole point of the assertion below.
             let rules = vec![
-                daer_config::parse_rule_expr("port(80) && l4proto(tcp) -> direct").expect("parses"),
-                daer_config::parse_rule_expr("port(443) -> block").expect("parses"),
+                daer_config::RoutingRule {
+                    name: "http".to_owned(),
+                    match_expr: daer_config::parse_match_expr("dport(80) && l4proto(tcp)")
+                        .expect("parses"),
+                    action: daer_config::OutboundAction::Builtin(
+                        daer_config::BuiltinOutbound::Direct,
+                    ),
+                },
+                daer_config::RoutingRule {
+                    name: "https".to_owned(),
+                    match_expr: daer_config::parse_match_expr("dport(443)").expect("parses"),
+                    action: daer_config::OutboundAction::Builtin(
+                        daer_config::BuiltinOutbound::Block,
+                    ),
+                },
             ];
             builder.apply(&rules).expect("lowers");
         }
@@ -290,7 +309,12 @@ mod tests {
     }
 
     fn outbound(name: &str) -> MatchTarget {
-        MatchTarget::Outbound(intern_outbound(name, 0, false))
+        let kind = match name {
+            daer_common::consts::outbound_name::DIRECT => daer_config::OutboundKind::Direct,
+            daer_common::consts::outbound_name::BLOCK => daer_config::OutboundKind::Block,
+            _ => daer_config::OutboundKind::Election,
+        };
+        MatchTarget::Outbound(intern_outbound(kind, name, 0, false))
     }
 
     #[test]
@@ -324,7 +348,7 @@ mod tests {
 
     #[test]
     fn and_requires_every_function() {
-        // port(443) && domain(suffix:example.com) -> direct
+        // dport(443) && domain(suffix:example.com) -> direct
         let sets = [
             set(
                 MatchValue::Port(PortRange::single(443)),
@@ -349,7 +373,7 @@ mod tests {
 
     #[test]
     fn or_within_one_function() {
-        // port(80, 443) lowers to two sets: the first is LogicalOr.
+        // dport(80, 443) lowers to two sets: the first is LogicalOr.
         let sets = [
             set(
                 MatchValue::Port(PortRange::single(80)),
@@ -405,10 +429,30 @@ mod tests {
         {
             let mut builder = crate::builder::RulesBuilder::new(&mut sink);
             let rules = vec![
-                daer_config::parse_rule_expr("port(1) && l4proto(tcp) && dscp(0) -> block")
+                daer_config::RoutingRule {
+                    name: "one".to_owned(),
+                    match_expr: daer_config::parse_match_expr(
+                        "dport(1) && l4proto(tcp) && dscp(0)",
+                    )
                     .expect("parses"),
-                daer_config::parse_rule_expr("port(2, 3) -> direct").expect("parses"),
-                daer_config::parse_rule_expr("port(4) -> proxy").expect("parses"),
+                    action: daer_config::OutboundAction::Builtin(
+                        daer_config::BuiltinOutbound::Block,
+                    ),
+                },
+                daer_config::RoutingRule {
+                    name: "two-three".to_owned(),
+                    match_expr: daer_config::parse_match_expr("dport(2, 3)").expect("parses"),
+                    action: daer_config::OutboundAction::Builtin(
+                        daer_config::BuiltinOutbound::Direct,
+                    ),
+                },
+                daer_config::RoutingRule {
+                    name: "four".to_owned(),
+                    match_expr: daer_config::parse_match_expr("dport(4)").expect("parses"),
+                    action: daer_config::OutboundAction::Election(daer_config::ElectionAction {
+                        election: "proxy".to_owned(),
+                    }),
+                },
             ];
             builder.apply(&rules).expect("lowers");
         }

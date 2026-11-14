@@ -76,8 +76,8 @@ impl ProxyDialer {
                     &n.server,
                     n.port,
                     &n.password,
-                    n.sni.as_deref(),
-                    n.allow_insecure,
+                    n.tls.sni.as_deref(),
+                    n.tls.allow_insecure,
                     options,
                 )?;
                 Ok(Self::Trojan(connector))
@@ -87,8 +87,8 @@ impl ProxyDialer {
                     &n.server,
                     n.port,
                     &n.password,
-                    n.sni.as_deref(),
-                    n.allow_insecure,
+                    n.tls.sni.as_deref(),
+                    n.tls.allow_insecure,
                     n.idle_sessions,
                     options,
                 )?;
@@ -100,14 +100,15 @@ impl ProxyDialer {
                         server: &n.server,
                         ports: &n.ports,
                         password: &n.password,
-                        sni: n.sni.as_deref(),
-                        allow_insecure: n.allow_insecure,
-                        pin_sha256: n.pin_sha256.as_deref(),
-                        up_mbps: n.up_mbps,
-                        down_mbps: n.down_mbps,
+                        sni: n.tls.sni.as_deref(),
+                        allow_insecure: n.tls.allow_insecure,
+                        pin_sha256: n.tls.pin_sha256.as_deref(),
+                        up_mbps: n.bandwidth.up_mbps,
+                        down_mbps: n.bandwidth.down_mbps,
                         obfs: n.obfs.as_ref(),
-                        congestion: n.congestion,
+                        congestion: n.quic.congestion,
                         quic: &n.quic,
+                        hopping: &n.port_hopping,
                     },
                     options,
                 )?;
@@ -150,9 +151,6 @@ impl ProxyDialer {
                 )?;
                 Ok(Self::Vmess(connector))
             }
-            NodeEndpoint::Direct(_) => Err(ProxyProtocolError::UnsupportedLink(
-                "a direct node has no proxy protocol".to_owned(),
-            )),
             NodeEndpoint::Socks5(_) | NodeEndpoint::Http(_) => {
                 Err(ProxyProtocolError::UnsupportedLink(
                     "a socks5/http node is a netune connector, not a proxy protocol".to_owned(),

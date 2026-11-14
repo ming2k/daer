@@ -9,7 +9,7 @@ test reference. A record without a signal or a falsifier is rejected.
 
 | ID | Title | Status | Affected | Signal | Regression |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [INC-0001](0001-transparent-ingress.md) | Transparent ingress `NO_SOCKET`: five layers, one observable failure | resolved | 0.0.11 | `datapath.policy_deferred`, `bpf_stats.listener_assign_failed` | `tests/transparent.rs`, `tests/netns_lifecycle.rs` |
+| [INC-0001](0001-transparent-ingress.md) | Transparent ingress `NO_SOCKET`: five layers, one observable failure | resolved | 0.0.11 | `datapath.policy_deferred`, `bpf_stats.listener_assign_failed` | `tests/e2e/control_transparent.rs`, `tests/e2e/control_netns_lifecycle.rs` |
 
 ## Record template
 
@@ -24,7 +24,7 @@ signal:
   - event: flow.dial_failed
   - counter: bpf_stats.listener_assign_failed
 regression:
-  - crates/daer-control/tests/transparent.rs::the_test_that_fails_if_this_returns
+  - tests/e2e/control_transparent.rs::the_test_that_fails_if_this_returns
 events_added: [flow.dial_failed]
 adr: [ADR-NNNN]
 ---

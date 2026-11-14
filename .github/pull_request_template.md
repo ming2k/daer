@@ -4,7 +4,7 @@
 
 ## Verification
 
-- [ ] `cargo xtask ci` passes locally.
+- [ ] `cargo nextest run --workspace` and `cargo test --workspace --doc` pass locally.
 - [ ] A falsifier/negative control proves the change (ADR-0007). Test names:
       <!-- e.g. `daer-relay::serve::tests::...` -->
 - [ ] If this touches a data path, the test fails when the fix is removed.

@@ -9,3 +9,6 @@ license.workspace = true
 # `abi.toml` is deserialised with the same stack the rest of the workspace uses.
 serde.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true

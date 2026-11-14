@@ -7,9 +7,9 @@
 //! * `#` and `/*` are valid *continuation* characters of an identifier, so
 //!   `value#note` is a single identifier and `a/*x*/b` is one identifier too.
 //!   Comments only start at a token boundary.
-//! * `->` is only recognised when it starts a token, so `f(a)->direct` parses
-//!   while `a->b` lexes as `ID("a-")` and then fails: the arrow is never a
-//!   subtraction.
+//! * `->` is only recognised when it starts a token, so `qname(a)->reject`
+//!   parses while `a->b` lexes as `ID("a-")` and then fails: the arrow is
+//!   never a subtraction.
 
 use std::fmt;
 

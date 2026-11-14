@@ -101,7 +101,7 @@ These seams are exactly right and `daer` depends on them:
   reach private addresses, so `strict_public()` must never be used on the data
   path.
 - `SocketConfig::mark` runs before `connect(2)` (`socket.rs:39`) — this is what
-  `global.so-mark` needs, applied before the SYN rather than after the handshake.
+  internal socket mark needs, applied before the SYN rather than after the handshake.
 - `Client::request(target, head, Option<Bytes>)` (`client.rs:115`) is what the DoH
   upstream and the subscription fetcher use; `TlsConnector` is what the DoT upstream
   uses.

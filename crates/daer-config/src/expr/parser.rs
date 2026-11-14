@@ -2,7 +2,7 @@
 
 //! Recursive-descent parser for the rule expression language.
 
-use super::ast::{Function, Param, ParamValue, RoutingRule};
+use super::ast::{DnsRule, Function, MatchExpr, Param, ParamValue};
 use super::lexer::{Lexer, Token, TokenKind};
 use crate::error::ParseError;
 
@@ -22,11 +22,45 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses one routing rule (`predicate && … -> outbound`).
-    pub fn parse_rule(&mut self) -> Result<RoutingRule, ParseError> {
-        let rule = self.parse_routing_rule()?;
-        self.expect_end("after the routing rule")?;
-        Ok(rule)
+    /// Parses one routing match (`predicate && …`). The action is a typed field,
+    /// not part of the expression.
+    pub fn parse_match(&mut self) -> Result<MatchExpr, ParseError> {
+        let and_functions = self.parse_function_expression()?;
+        self.expect_end("after the match expression")?;
+        Ok(MatchExpr::new(and_functions))
+    }
+
+    /// Parses one DNS rule (`predicate && … -> upstream`).
+    pub fn parse_dns_rule(&mut self) -> Result<DnsRule, ParseError> {
+        let and_functions = self.parse_function_expression()?;
+        self.expect(TokenKind::Arrow, "'->' in the DNS rule")?;
+        let upstream = match self.peek() {
+            Some(token)
+                if token.kind == TokenKind::Id
+                    && self.peek_at(1).map(|next| next.kind) == Some(TokenKind::LParen) =>
+            {
+                self.parse_function()?
+            }
+            Some(token) if token.kind.is_literal() => {
+                self.pos += 1;
+                Function::new(token.literal_value())
+            }
+            Some(token) => {
+                return Err(self.error_at(
+                    token,
+                    format!(
+                        "expected an upstream name or function, found {}",
+                        token.kind.describe()
+                    ),
+                ));
+            }
+            None => return Err(self.error_eof("expected an upstream after '->'")),
+        };
+        self.expect_end("after the DNS rule")?;
+        Ok(DnsRule {
+            and_functions,
+            upstream,
+        })
     }
 
     /// Parses a standalone value expression: `min`, `fixed(0)`, `min(10%)`.
@@ -169,74 +203,38 @@ impl<'a> Parser<'a> {
             params,
         })
     }
-
-    fn parse_routing_rule(&mut self) -> Result<RoutingRule, ParseError> {
-        let and_functions = self.parse_function_expression()?;
-        self.expect(TokenKind::Arrow, "'->' in the routing rule")?;
-
-        let outbound = match self.peek() {
-            Some(token) if token.kind == TokenKind::Bang => self.parse_function()?,
-            Some(token)
-                if token.kind == TokenKind::Id
-                    && self.peek_at(1).map(|next| next.kind) == Some(TokenKind::LParen) =>
-            {
-                self.parse_function()?
-            }
-            Some(token) if token.kind.is_literal() => {
-                self.pos += 1;
-                Function::new(token.literal_value())
-            }
-            Some(token) => {
-                return Err(self.error_at(
-                    token,
-                    format!(
-                        "expected an outbound name or function, found {}",
-                        token.kind.describe()
-                    ),
-                ));
-            }
-            None => return Err(self.error_eof("expected an outbound after '->'")),
-        };
-
-        Ok(RoutingRule {
-            and_functions,
-            outbound,
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rule(src: &str) -> RoutingRule {
+    fn matches(src: &str) -> MatchExpr {
         Parser::new(src)
-            .and_then(|mut parser| parser.parse_rule())
+            .and_then(|mut parser| parser.parse_match())
             .expect("parses")
     }
 
     fn error(src: &str) -> ParseError {
         Parser::new(src)
-            .and_then(|mut parser| parser.parse_rule())
+            .and_then(|mut parser| parser.parse_match())
             .expect_err("must fail")
     }
 
     #[test]
-    fn parses_routing_rules_with_negation_and_lists() {
-        let parsed = rule("pname(curl) && !dip(1.1.1.1, 'ff00::/8') -> direct");
+    fn parses_matches_with_negation_and_lists() {
+        let parsed = matches("pname(curl) && !dip(1.1.1.1, 'ff00::/8')");
         assert_eq!(parsed.and_functions.len(), 2);
         assert_eq!(parsed.and_functions[0].name, "pname");
         assert!(parsed.and_functions[1].negated);
         assert_eq!(parsed.and_functions[1].params.len(), 2);
-        assert_eq!(parsed.outbound.name, "direct");
     }
 
     #[test]
-    fn parses_keyed_parameters_and_outbound_calls() {
-        let parsed = rule("domain(provider:cn) -> proxy(mark: 0x10)");
+    fn parses_keyed_parameters() {
+        let parsed = matches("domain(provider:cn)");
         assert_eq!(parsed.and_functions[0].params[0].key, "provider");
-        assert_eq!(parsed.outbound.params[0].key, "mark");
-        assert_eq!(parsed.outbound.params[0].value.to_string(), "0x10");
+        assert_eq!(parsed.and_functions[0].params[0].value.to_string(), "cn");
     }
 
     #[test]
@@ -257,20 +255,20 @@ mod tests {
 
     #[test]
     fn rejects_trailing_input() {
-        let err = error("domain(a) -> direct, domain(b) -> direct");
+        let err = error("domain(a), domain(b)");
         assert!(err.message.contains("unexpected"), "{}", err.message);
     }
 
     #[test]
-    fn reports_a_missing_arrow() {
-        let err = error("domain(a.com) direct");
-        assert!(err.message.contains("'->'"), "{}", err.message);
+    fn an_arrow_is_not_part_of_a_match() {
+        let err = error("domain(a.com) -> direct");
+        assert!(err.message.contains("unexpected"), "{}", err.message);
         assert_eq!(err.line, 1);
     }
 
     #[test]
     fn reports_unexpected_characters() {
-        let err = error("domain(a) -> >");
+        let err = error("domain(a) >");
         assert!(err.message.contains("'>'"), "{}", err.message);
     }
 }

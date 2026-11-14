@@ -416,12 +416,12 @@ mod tests {
             std::env::remove_var("DAER_ADMIN_GROUP");
         }
         let config = daer_config::toml_config::load_str(
-            "schema = 2\n\
-             [[node]]\nname = \"n1\"\ntype = \"direct\"\n\
-             [[node]]\nname = \"n2\"\ntype = \"direct\"\n\
+            "schema = 5\n\
+             [[node]]\nname = \"n1\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
+             [[node]]\nname = \"n2\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\n\
              [[group]]\nname = \"pool\"\n\
              [[election]]\nname = \"proxy\"\ngroup = \"pool\"\ntype = \"random\"\n\
-             [routing]\nrules = []\nfallback = \"proxy\"\n",
+             [routing]\nfallback = { election = \"proxy\" }\n",
         )
         .expect("config loads");
         let overrides = Arc::new(daer_control::ElectionOverrides::load(Some(state.clone())));

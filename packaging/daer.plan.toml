@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.0.13"
+version = "0.1.0"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"
@@ -67,10 +67,9 @@ cargo build --release --locked
 # do with the object it claims to validate. This mirrors `cargo xtask preflight`, which writes
 # the same minimal file for the same reason.
 cat > packaging-check.toml << 'EOF'
-schema = 2
+schema = 5
 
-[global]
-wan-interface = ["auto"]
+wan-interface = "auto"
 EOF
 ./target/release/daer check --config packaging-check.toml --object target/ebpf/datapath.bpf.o'''
 
@@ -93,10 +92,9 @@ cat << 'EOF' > ${STAGING_DIR}/etc/daer/config.toml
 # daer transparent proxy configuration
 # See /etc/daer/example.toml for reference documentation.
 
-schema = 2
+schema = 5
 
-[global]
-wan-interface = ["auto"]
+wan-interface = "auto"
 EOF
 chmod 0640 ${STAGING_DIR}/etc/daer/config.toml
 
@@ -120,6 +118,12 @@ backup = ["/etc/daer/config.toml"]
 
 [output.hooks]
 post_install = '''
+# A pre-TCX installation may have installed these manually; a package cannot own
+# or remove files it did not create. Remove them explicitly during upgrade.
+rm -f /usr/bin/daer-cleanup /usr/lib/daer/datapath.o 2>/dev/null || true
+# Existing artifacts from an older build may predate the explicit 0600/0700
+# modes. Tighten them on upgrade; do not touch operator-managed rule sets.
+chmod -R go-rwx /run/daer /var/lib/daer/incidents /etc/daer/persist.d 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 echo ":: Configure daer in /etc/daer/config.toml"
 echo ":: Put local .drb/.rules files in /var/lib/daer/rules"
@@ -127,6 +131,11 @@ echo ":: Runtime election control is root-only by default; see the deployment gu
 echo ":: Verify configuration with: daer check -c /etc/daer/config.toml"
 echo ":: Ensure permissions are restricted: chmod 0640 /etc/daer/config.toml"
 echo ":: Enable service with: systemctl enable --now daer.service"'''
-post_upgrade = "systemctl daemon-reload 2>/dev/null || true"
+post_upgrade = '''
+rm -f /usr/bin/daer-cleanup /usr/lib/daer/datapath.o 2>/dev/null || true
+chmod -R go-rwx /run/daer /var/lib/daer/incidents /etc/daer/persist.d 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true'''
 pre_remove = "systemctl disable --now daer.service 2>/dev/null || true"
-post_remove = "systemctl daemon-reload 2>/dev/null || true"
+post_remove = '''
+rm -f /usr/bin/daer-cleanup /usr/lib/daer/datapath.o 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true'''

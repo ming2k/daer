@@ -13,6 +13,10 @@ the transparent-capture boundary; the implementation is spread across `daer-ebpf
 **Egress** is the side where daer opens its own outbound connection after the control plane has
 chosen a node or `direct`. That path belongs to netune.
 
+The built-in DNS resolver is neither ingress nor egress: it is the name plane that supplies
+domain facts before a flow is decided. [Packet Flow and the DNS Name Plane](packet-flow-and-dns.md)
+traces both directions end to end and shows where that state is written and read.
+
 ---
 
 ## 1. The Two-Plane Model
@@ -53,7 +57,7 @@ chosen a node or `direct`. That path belongs to netune.
    - Traffic matched to a `direct` rule bypasses userspace entirely and continues routing natively in Linux.
    - Traffic requiring proxying is redirected to `daer0` and directly assigned to userspace listeners via `bpf_sk_assign` in `daer0ns` (ADR-0038, ADR-0043).
 2. **Userspace Data Path (`daer-relay`) and Decision Plane (`daer-control`)**:
-   `daer-relay` dynamically binds ephemeral listeners (`port = 0`) inside `daer0ns`, recovers original destination IPs via `getsockopt(SO_ORIGINAL_DST)`, sniffs early domain names from TLS ClientHello or HTTP headers, and relays payload streams via zero-copy `splice(2)`. It decides nothing: `daer-control` resolves each flow to an election (a routing target) and elects one node from that election's resource input (a group or a single node), then hands back the other leg (ADR-0018, ADR-0046).
+   `daer-relay` dynamically binds ephemeral listeners (`port = 0`) inside `daer0ns`, recovers original destination IPs via `getsockopt(SO_ORIGINAL_DST)`, and relays payload streams via zero-copy `splice(2)`. It decides nothing and does not inspect application payloads: `daer-control` acquires the domain (Fake-IP, DNS snooper, or explicit sniff fallback), resolves each flow to an election (a routing target), elects one node from that election's resource input, then hands back the other leg (ADR-0018, ADR-0050, ADR-0051, ADR-0046).
 3. **Private ingress namespace (`daer0ns`, ADR-0038)**:
    `daer0peer`, the transparent listeners, table 2023 and the peer sysctls live in a private network namespace. The host keeps `daer0`, forwarding and the redirect hooks. A redirected packet crosses the namespace boundary before `bpf_sk_assign`; without that context the transport stack can return `NO_SOCKET` even when the helper succeeded. Listener replies use the peer's return route and are marked so the host treats them as daer's own egress.
 4. **Concurrency is part of the data path**:

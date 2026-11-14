@@ -3,6 +3,10 @@
   "title": "Config",
   "type": "object",
   "properties": {
+    "disable-waiting-network": {
+      "type": "boolean",
+      "default": false
+    },
     "dns": {
       "$ref": "#/$defs/Dns",
       "default": {
@@ -32,38 +36,6 @@
         "$ref": "#/$defs/Election"
       }
     },
-    "global": {
-      "$ref": "#/$defs/Global",
-      "default": {
-        "allow-insecure": false,
-        "auto-sniff-punt": true,
-        "disable-waiting-network": false,
-        "lan-interface": [],
-        "log-level": "info",
-        "probe": {
-          "interval": "30s",
-          "method": "HEAD",
-          "mode": "server",
-          "timeout": "5s",
-          "tolerance": "0s",
-          "udp-dns": [
-            "1.1.1.1:53",
-            "8.8.8.8:53",
-            "2001:4860:4860::8888:53"
-          ],
-          "url": null
-        },
-        "sniffing-timeout": "30ms",
-        "tls": {
-          "fragment": false,
-          "fragment-interval": "10-20",
-          "fragment-length": "50-100"
-        },
-        "wan-interface": [
-          "auto"
-        ]
-      }
-    },
     "group": {
       "type": "array",
       "items": {
@@ -77,6 +49,19 @@
         "type": "string"
       }
     },
+    "lan-interface": {
+      "description": "Ingress interfaces receiving client traffic.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "log-level": {
+      "description": "`tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.",
+      "type": "string",
+      "default": "info"
+    },
     "node": {
       "type": "array",
       "items": {
@@ -86,11 +71,10 @@
     "routing": {
       "$ref": "#/$defs/Routing",
       "default": {
-        "fallback": "direct",
-        "rules": []
+        "fallback": "direct"
       }
     },
-    "rule-provider": {
+    "rule-set": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/RuleProvider"
@@ -100,7 +84,7 @@
       "description": "Schema version. Bumped when a change cannot be expressed as a default.",
       "type": "integer",
       "format": "uint32",
-      "default": 2,
+      "default": 5,
       "minimum": 0
     },
     "subscription": {
@@ -108,10 +92,42 @@
       "items": {
         "$ref": "#/$defs/Subscription"
       }
+    },
+    "tls": {
+      "description": "Defaults for every outbound TLS leg, with per-node overrides.",
+      "$ref": "#/$defs/Tls",
+      "default": {
+        "fragment": false,
+        "fragment-interval": "10-20",
+        "fragment-length": "50-100"
+      }
+    },
+    "wan-interface": {
+      "description": "Egress interfaces: `\"auto\"` or an explicit list.",
+      "$ref": "#/$defs/WanInterface",
+      "default": "auto"
     }
   },
   "additionalProperties": false,
   "$defs": {
+    "AutoKeyword": {
+      "description": "The only bare string `wan-interface` accepts.",
+      "oneOf": [
+        {
+          "description": "Follow the interface carrying the default route.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "BuiltinOutbound": {
+      "description": "One built-in routing policy.",
+      "type": "string",
+      "enum": [
+        "direct",
+        "block"
+      ]
+    },
     "Dns": {
       "type": "object",
       "properties": {
@@ -233,7 +249,7 @@
           ]
         },
         "mode": {
-          "description": "Probe overrides. `None` inherits `[global.probe]`.",
+          "description": "The probe this election asks the health scheduler to run. Absent fields use\n[`ProbeSettings::default`]; there is no global defaults table.",
           "anyOf": [
             {
               "$ref": "#/$defs/ProbeMode"
@@ -260,6 +276,7 @@
           ]
         },
         "tolerance": {
+          "description": "The moving-average switch threshold. Selection policy, not probe state.",
           "type": [
             "string",
             "null"
@@ -289,6 +306,19 @@
       "required": [
         "name",
         "type"
+      ]
+    },
+    "ElectionAction": {
+      "description": "The `{ election = \"name\" }` action table.",
+      "type": "object",
+      "properties": {
+        "election": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "election"
       ]
     },
     "ElectionKind": {
@@ -402,82 +432,6 @@
         }
       ]
     },
-    "Global": {
-      "type": "object",
-      "properties": {
-        "allow-insecure": {
-          "type": "boolean",
-          "default": false
-        },
-        "auto-sniff-punt": {
-          "type": "boolean",
-          "default": true
-        },
-        "disable-waiting-network": {
-          "type": "boolean",
-          "default": false
-        },
-        "lan-interface": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "log-level": {
-          "description": "`tracing` filter directive, e.g. `info`, `debug`, or `daer=debug,netune=trace`.",
-          "type": "string",
-          "default": "info"
-        },
-        "probe": {
-          "$ref": "#/$defs/ProbeSettings",
-          "default": {
-            "interval": "30s",
-            "method": "HEAD",
-            "mode": "server",
-            "timeout": "5s",
-            "tolerance": "0s",
-            "udp-dns": [
-              "1.1.1.1:53",
-              "8.8.8.8:53",
-              "2001:4860:4860::8888:53"
-            ],
-            "url": null
-          }
-        },
-        "sniffing-timeout": {
-          "type": "string",
-          "default": "30ms"
-        },
-        "so-mark": {
-          "description": "Socket mark for daer-originated traffic.\n\nOmitted, a privileged run picks [`daer_common::consts::DEFAULT_SOCKET_MARK`] and an\nunprivileged one marks nothing; the datapath and the redirect rule have to agree with\nwhichever it is, so the daemon decides once and reports the value it used.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "tls": {
-          "$ref": "#/$defs/Tls",
-          "default": {
-            "fragment": false,
-            "fragment-interval": "10-20",
-            "fragment-length": "50-100"
-          }
-        },
-        "wan-interface": {
-          "type": "array",
-          "default": [
-            "auto"
-          ],
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
     "Group": {
       "type": "object",
       "properties": {
@@ -512,6 +466,23 @@
           "const": "GET"
         }
       ]
+    },
+    "Hysteria2Bandwidth": {
+      "description": "Hysteria 2's bandwidth hints, in megabits per second.\n\n`brutal` pins its send window to `up-mbps`; the loss-based controllers ignore both.",
+      "type": "object",
+      "properties": {
+        "down-mbps": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "up-mbps": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "Hysteria2Congestion": {
       "description": "Hysteria 2's congestion controller (ADR-0029).",
@@ -598,6 +569,11 @@
       "description": "Hysteria 2's QUIC tuning (ADR-0029).\n\nEvery field maps onto a `netune_quic::QuicProfile`/`QuicTransportParameters` knob, so a\nvalue here either changes the connection or is not in the model. The defaults are netune's\n(30 s idle timeout, 10 MB connection window); they are daer's own, not the reference's,\nbecause a daer deployment shares one daemon across many nodes and a buffer sized for one\nnode's 500 Mbit link would be wrong everywhere else.",
       "type": "object",
       "properties": {
+        "congestion": {
+          "description": "Congestion controller. `brutal` needs `[node.bandwidth]`.",
+          "$ref": "#/$defs/Hysteria2Congestion",
+          "default": "bbr"
+        },
         "disable-path-mtu-discovery": {
           "description": "Disable netune's DPLPMTUD probing and keep datagrams at the QUIC\n1200-byte floor, matching the reference's `disablePathMTUDiscovery`.",
           "type": "boolean"
@@ -616,27 +592,50 @@
           "format": "uint64",
           "minimum": 0
         },
-        "keep-alive-period-ms": {
-          "description": "Keep-alive period in milliseconds. `0` keeps daer's 10 s default.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
+        "keep-alive-period": {
+          "description": "Keep-alive period. Zero keeps daer's 10 s default.",
+          "type": "string",
+          "default": "0s"
         },
         "max-conn-receive-window": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
-        "max-idle-timeout-ms": {
-          "description": "Connection idle timeout in milliseconds. `0` keeps netune's default.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
+        "max-idle-timeout": {
+          "description": "Connection idle timeout. Zero keeps netune's default.",
+          "type": "string",
+          "default": "0s"
         },
         "max-stream-receive-window": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Hysteria2Tls": {
+      "description": "TLS parameters for Hysteria 2's intrinsic TLS leg.\n\nHysteria 2 adds a certificate digest pin on top of the ordinary TLS settings.",
+      "type": "object",
+      "properties": {
+        "allow-insecure": {
+          "description": "Accept any certificate. A deliberate, node-local assertion.",
+          "type": "boolean"
+        },
+        "pin-sha256": {
+          "description": "SHA-256 of the server's leaf certificate, hex. Compared after the chain check as a\nsecond factor, not a replacement for it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sni": {
+          "description": "SNI to present. Absent means the node's own hostname.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -660,24 +659,6 @@
         }
       },
       "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "type": "string",
-              "const": "direct"
-            }
-          },
-          "required": [
-            "type"
-          ]
-        },
         {
           "type": "object",
           "properties": {
@@ -800,9 +781,6 @@
         {
           "type": "object",
           "properties": {
-            "allow-insecure": {
-              "type": "boolean"
-            },
             "name": {
               "type": [
                 "string",
@@ -821,11 +799,8 @@
             "server": {
               "type": "string"
             },
-            "sni": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "tls": {
+              "$ref": "#/$defs/NodeTls"
             },
             "type": {
               "type": "string",
@@ -842,9 +817,6 @@
         {
           "type": "object",
           "properties": {
-            "allow-insecure": {
-              "type": "boolean"
-            },
             "idle-sessions": {
               "type": "integer",
               "format": "uint",
@@ -868,15 +840,12 @@
             "server": {
               "type": "string"
             },
-            "sni": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "tls": {
+              "$ref": "#/$defs/NodeTls"
             },
             "type": {
               "type": "string",
-              "const": "any-tls"
+              "const": "anytls"
             }
           },
           "required": [
@@ -889,16 +858,8 @@
         {
           "type": "object",
           "properties": {
-            "allow-insecure": {
-              "type": "boolean"
-            },
-            "congestion": {
-              "$ref": "#/$defs/Hysteria2Congestion"
-            },
-            "down-mbps": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
+            "bandwidth": {
+              "$ref": "#/$defs/Hysteria2Bandwidth"
             },
             "name": {
               "type": [
@@ -919,16 +880,12 @@
             "password": {
               "type": "string"
             },
-            "pin-sha256": {
-              "description": "Certificate digest pin: the SHA-256 of the server's leaf certificate, hex.\nCompared after the handshake, so it is a second factor rather than a\nreplacement for the chain.",
-              "type": [
-                "string",
-                "null"
-              ]
+            "port-hopping": {
+              "$ref": "#/$defs/PortHopping"
             },
             "ports": {
-              "description": "One port, a list, or a range (ADR-0029).",
-              "$ref": "#/$defs/PortSet"
+              "description": "One port, a list, or a range (ADR-0029), e.g. `\"443,20000-20010\"`.",
+              "type": "string"
             },
             "quic": {
               "$ref": "#/$defs/Hysteria2Quic"
@@ -936,20 +893,12 @@
             "server": {
               "type": "string"
             },
-            "sni": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "tls": {
+              "$ref": "#/$defs/Hysteria2Tls"
             },
             "type": {
               "type": "string",
               "const": "hysteria2"
-            },
-            "up-mbps": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
             }
           },
           "required": [
@@ -1056,56 +1005,56 @@
       ],
       "unevaluatedProperties": false
     },
-    "PortSet": {
-      "description": "Ports a Hysteria 2 node may be reached on, and the hop schedule (ADR-0029).\n\nA reference `hysteria2://` link names either one port or a set\n(`443`, `443,8443`, `20000-30000`, `all`). The set is kept normalised — sorted,\nmerged, no overlaps — because the hop layer samples uniformly from it and a\nduplicated range would bias the rotation.",
+    "NodeTls": {
+      "description": "TLS parameters of a protocol whose TLS leg is intrinsic.\n\nTrojan and AnyTLS always speak TLS to the node, so these keys live in `[node.tls]`\nrather than `[node.security]` (which selects an optional security layer for\nVLESS/VMess). There is no `type` key: there is nothing to select.",
       "type": "object",
       "properties": {
-        "hop-max-ms": {
-          "description": "Upper bound of the randomised interval.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
+        "allow-insecure": {
+          "description": "Accept any certificate. A deliberate, node-local assertion.",
+          "type": "boolean"
         },
-        "hop-min-ms": {
-          "description": "Lower bound of the randomised interval, when it differs from `hop_ms`.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "hop-ms": {
-          "description": "Rotate the source port on this interval. `0` disables hopping.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "ranges": {
-          "description": "`low-high` ranges, inclusive, sorted and non-overlapping.",
-          "type": "array",
-          "items": {
-            "type": "array",
-            "maxItems": 2,
-            "minItems": 2,
-            "prefixItems": [
-              {
-                "type": "integer",
-                "format": "uint16",
-                "maximum": 65535,
-                "minimum": 0
-              },
-              {
-                "type": "integer",
-                "format": "uint16",
-                "maximum": 65535,
-                "minimum": 0
-              }
-            ]
-          }
+        "sni": {
+          "description": "SNI to present. Absent means the node's own hostname.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "ranges"
+      "additionalProperties": false
+    },
+    "OutboundAction": {
+      "description": "A routing action: the egress a rule sends a matching flow to.\n\nBuilt-ins are bare strings; an election is a table. The table is what keeps the\ntwo namespaces apart: `action = \"direct\"` can only mean the built-in policy, and\n`action = { election = \"direct\" }` would be a different (and reserved-name)\nresource. There is no action string that silently means an election.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BuiltinOutbound"
+        },
+        {
+          "$ref": "#/$defs/ElectionAction"
+        }
       ]
+    },
+    "PortHopping": {
+      "description": "Hysteria 2's source-port hopping schedule.\n\nHopping changes the client's five-tuple without re-dialling the QUIC connection. The\nreference refuses a schedule shorter than 5 seconds, so the validator does too.",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "description": "Fixed interval between hops. Zero means hopping is disabled.",
+          "type": "string",
+          "default": "0s"
+        },
+        "max-interval": {
+          "description": "Upper bound of a randomised interval.",
+          "type": "string",
+          "default": "0s"
+        },
+        "min-interval": {
+          "description": "Lower bound of a randomised interval, when it differs from `interval`.",
+          "type": "string",
+          "default": "0s"
+        }
+      },
+      "additionalProperties": false
     },
     "ProbeMode": {
       "description": "What a probe measures.",
@@ -1121,54 +1070,6 @@
           "const": "url"
         }
       ]
-    },
-    "ProbeSettings": {
-      "description": "Probe defaults, shared by `[global.probe]` and every election that overrides them.\n\nMeasurement is not a property of a group: a group is only a candidate set. An\nelection owns the probe it needs; the global table supplies defaults so a file\ndoes not repeat the same URL for every election.",
-      "type": "object",
-      "properties": {
-        "interval": {
-          "type": "string",
-          "default": "30s"
-        },
-        "method": {
-          "$ref": "#/$defs/HttpMethod",
-          "default": "HEAD"
-        },
-        "mode": {
-          "$ref": "#/$defs/ProbeMode",
-          "default": "server"
-        },
-        "timeout": {
-          "type": "string",
-          "default": "5s"
-        },
-        "tolerance": {
-          "description": "Shifts the switch threshold of moving averages.",
-          "type": "string",
-          "default": "0s"
-        },
-        "udp-dns": {
-          "description": "DNS endpoints used by the server-liveness probe for datagram-carrying nodes.",
-          "type": "array",
-          "default": [
-            "1.1.1.1:53",
-            "8.8.8.8:53",
-            "2001:4860:4860::8888:53"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "url": {
-          "description": "The URL requested when `mode = \"url\"`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "additionalProperties": false
     },
     "ProviderFormat": {
       "type": "string",
@@ -1188,21 +1089,49 @@
       "type": "object",
       "properties": {
         "fallback": {
-          "type": "string",
+          "$ref": "#/$defs/OutboundAction",
           "default": "direct"
         },
-        "rules": {
+        "rule": {
+          "description": "Ordered rules; the first matching rule wins.",
           "type": "array",
-          "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/RoutingRule"
           }
+        },
+        "sniff": {
+          "description": "What routing may do when DNS/Fake-IP cannot name the flow.",
+          "$ref": "#/$defs/SniffConfig"
         }
       },
       "additionalProperties": false
     },
+    "RoutingRule": {
+      "description": "One ordered routing rule.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "The egress this rule selects.",
+          "$ref": "#/$defs/OutboundAction"
+        },
+        "match": {
+          "description": "Predicate conjunction. The action is a separate field, never part of it.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Stable identity for diagnostics, logs and tests. Must be unique.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "match",
+        "action"
+      ]
+    },
     "RuleProvider": {
-      "description": "One `[[rule-provider]]` entry.",
+      "description": "One `[[rule-set]]` entry. Internally this is still the rule provider spec:\nthe routing layer resolves it into a provider pool. The TOML key is\n`rule-set`; `rule-provider` remains accepted as a compatibility alias.",
       "type": "object",
       "properties": {
         "format": {
@@ -1271,7 +1200,7 @@
               }
             },
             "fingerprint": {
-              "description": "netune TLS preset name for this node's ClientHello. Absent uses\n`global.tls.profile`.",
+              "description": "netune TLS preset name for this node's ClientHello. Absent uses\n`tls.profile`.",
               "type": [
                 "string",
                 "null"
@@ -1332,6 +1261,27 @@
           ]
         }
       ]
+    },
+    "SniffConfig": {
+      "description": "Payload-based domain recovery for routing.\n\nThis table deliberately configures only the fallback mechanism, not DNS. DNS is a\nservice and lives in [`crate::model::Dns`]; `sniff` is what routing may do when that\nservice (or Fake-IP) cannot provide a unique name.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether routing may inspect the first bytes of a flow for a domain.\n\n`None` is only valid when the configuration has no `domain(...)` rule. When a\ndomain rule exists the operator must choose: `true` allows a bounded payload\ninspection, `false` routes by the facts already known.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "timeout": {
+          "description": "The total TCP wait budget. Only valid with `enabled = true`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "Subscription": {
       "description": "`subscription = [\"url\"]` or `[[subscription]] name/url/persist`.",
@@ -1467,6 +1417,22 @@
           "description": "AES-GCM when the CPU has AES-NI, ChaCha20-Poly1305 otherwise — the\nreference's `SecurityType_AUTO`.",
           "type": "string",
           "const": "auto"
+        }
+      ]
+    },
+    "WanInterface": {
+      "description": "`wan-interface = \"auto\"` or `[\"eth0\", \"wg0\"]`.\n\nThe model derives this shape by hand so it can reject `[\"auto\"]` with an error that\nnames the replacement. The schema still has to say \"one keyword or a list\".",
+      "anyOf": [
+        {
+          "description": "Follow the interface carrying the default route.",
+          "$ref": "#/$defs/AutoKeyword"
+        },
+        {
+          "description": "One or more explicitly named interfaces.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       ]
     }

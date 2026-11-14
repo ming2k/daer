@@ -84,10 +84,11 @@ forwarded nothing (or the wrong thing).
    interface, silently.
 
 3. **A hook is attached to the interface whose role it implements.** `lan` devices get
-   `lan_ingress`/`lan_egress`; `wan` devices get `wan_ingress`/`wan_egress`. The dual-role
-   programs (`wan_lan_ingress`, `lan_wan_egress`) exist for a device that faces both, and this
-   build does not attach them: a single-homed box has no such device, and attaching one anyway
-   is how inbound internet traffic came to be proxied as if it were a client's.
+   `lan_ingress`/`lan_egress`; `wan` devices get `wan_ingress`/`wan_egress`. A device cannot
+   be both: the config/startup gate rejects an interface that appears in both lists. The
+   old dual-role programs (`wan_lan_ingress`, `lan_wan_egress`) were removed rather than
+   left unattached; supporting a single-interface dual-role topology would be a separate
+   feature with its own attach plan and falsifier.
 
 4. **The UDP listener is part of the same contract as TCP.** `Listeners` carries `tcp4`,
    `udp4`, `tcp6`, and `udp6` as one value with no `Option`, in `daer-ebpf` so the ABI keys
@@ -102,9 +103,11 @@ forwarded nothing (or the wrong thing).
    the honest answer for `--no-datapath`, for `daer route`, and for every test. A rule
    that needs a fact nobody observed must not match by accident.
 
-6. **`pid == 0` means the process name is unknown, not empty.** The cgroup hooks populate
-   `cookie_pid_map`; this build does not attach them, so the C leaves `pname` empty and `pid`
-   zero. Reporting the empty array as a name would let `pname()` match the empty string.
+6. **`pid == 0` means the process name is unknown, not empty.** The six cgroup v2 hooks
+   populate `cookie_pid_map`; the loader attaches them to the unified hierarchy at startup.
+   The C leaves `pname` empty and `pid` zero for sockets it did not observe (for example a
+   LAN client, which has no local process). Reporting the empty array as a name would let
+   `pname()` match the empty string.
 
 ## Consequences
 
@@ -220,8 +223,8 @@ TCX is not the default until the real-daemon delivery check
 `bpf_sk_assign` delivers the redirected flow on a Linux 6.6+ kernel. A successful attach is
 not that proof; an earlier TCX trial attached but left the assigned packet short of the
 listener's accept queue. The privileged kernel suite has the TCX attach test, but attachment
-alone is not delivery. Until the delivery check is green, `daer-cleanup` keeps its
-host-filter duty.
+alone is not delivery. At the time, until the delivery check was green, `daer-cleanup` kept
+its host-filter duty.
 
 ## Addendum — host-global forwarding settings are prerequisites
 

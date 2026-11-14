@@ -304,7 +304,7 @@ impl VmessConnector {
             })?;
         let local_port = established.local_port;
 
-        // `global.tls.fragment` slices a handshake daer writes. VMess over plain TLS rides
+        // `tls.fragment` slices a handshake daer writes. VMess over plain TLS rides
         // netune's rustls handshake, which daer cannot slice, and VMess has no REALITY layer at
         // all — so the setting cannot be honoured here. `DialerOptions::fragment` is documented
         // as applying only to a layer whose ClientHello daer owns, and the daemon reports which

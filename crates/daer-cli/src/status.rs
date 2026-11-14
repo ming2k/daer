@@ -299,7 +299,7 @@ fn join(value: Option<&serde_json::Value>) -> String {
 }
 
 fn probe_text(probe: Option<&serde_json::Value>) -> String {
-    let Some(probe) = probe else {
+    let Some(probe) = probe.filter(|value| !value.is_null()) else {
         return "-".to_owned();
     };
     let mode = probe
@@ -460,15 +460,15 @@ pub fn spawn_socket() -> Option<tokio::task::JoinHandle<()>> {
 
 fn write_bundle(directory: &Path, snapshot: &Snapshot) -> anyhow::Result<PathBuf> {
     let directory = directory.to_path_buf();
-    std::fs::create_dir_all(&directory)
+    crate::private_fs::ensure_dir(&directory)
         .with_context(|| format!("cannot create bundle directory {}", directory.display()))?;
     let state = serde_json::to_vec_pretty(&snapshot.value)?;
-    std::fs::write(directory.join("snapshot.json"), state)?;
+    crate::private_fs::write_private(&directory.join("snapshot.json"), &state)?;
 
     // The event stream is the machine-readable half of the same run. Copy it when it is
     // readable; a bundle without it still has the snapshot and an explicit manifest.
     if let Ok(events) = std::fs::read(events_path()) {
-        std::fs::write(directory.join("events.jsonl"), events)?;
+        crate::private_fs::write_private(&directory.join("events.jsonl"), &events)?;
     }
 
     let manifest = serde_json::json!({
@@ -487,17 +487,17 @@ fn write_bundle(directory: &Path, snapshot: &Snapshot) -> anyhow::Result<PathBuf
             "secrets_removed": true,
         },
     });
-    std::fs::write(
-        directory.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
+    crate::private_fs::write_private(
+        &directory.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest)?,
     )?;
-    std::fs::write(
-        directory.join("README.txt"),
-        "daer incident bundle (status snapshot).\n\
-         This bundle contains the versioned status snapshot and build identity. It does not\n\
-         contain configuration secrets, subscription links or proxy credentials.\n\
-         A full bundle (event ring, per-flow records) is written by the daemon's incident\n\
-         recorder; this file is the read-only client fallback.\n",
+    crate::private_fs::write_private(
+        &directory.join("README.txt"),
+        b"daer incident bundle (status snapshot).\n\
+          This bundle contains the versioned status snapshot and build identity. It does not\n\
+          contain configuration secrets, subscription links or proxy credentials.\n\
+          A full bundle (event ring, per-flow records) is written by the daemon's incident\n\
+          recorder; this file is the read-only client fallback.\n",
     )?;
     Ok(directory)
 }

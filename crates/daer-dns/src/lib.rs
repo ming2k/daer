@@ -72,7 +72,7 @@ pub mod transport;
 pub mod wire;
 
 pub use cache::{Cache, CacheConfig, Cached, Key, Skipped};
-pub use fake_ip::{DnsSnooper, FakeIpPool};
+pub use fake_ip::{DnsSnooper, FakeIpPool, SnoopLookup};
 pub use resolver::{
     ExchangeFuture, Resolution, Resolver, ResolverError, Stats, StatsSnapshot, Upstream,
     UpstreamError,

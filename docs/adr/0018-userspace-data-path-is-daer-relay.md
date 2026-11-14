@@ -9,9 +9,9 @@ supersedes: []
 
 # 0018. The userspace data path is a crate of its own, called daer-relay
 
-- Status: Accepted
+- Status: Accepted (Amended by ADR-0051)
 - Date: 2026-10-31
-- Related: [ADR-0002](0002-netune-boundary.md), [ADR-0017](0017-proxy-protocols-crate-boundary.md)
+- Related: [ADR-0002](0002-netune-boundary.md), [ADR-0017](0017-proxy-protocols-crate-boundary.md), [ADR-0051](0051-datagram-relay-is-transport-only.md)
 
 ---
 

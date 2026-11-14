@@ -1,3 +1,20 @@
+[package]
+name = "daer-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Workspace-level integration and end-to-end test harness for daer"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
 [workspace]
 resolver = "3"
 members = [
@@ -15,17 +32,17 @@ members = [
     "crates/daer-rule-ast",
     "crates/daer-sniff",
     "crates/daer-drb",
+    "crates/daer-test-support",
     "crates/xtask",
 ]
 
 [workspace.package]
-version = "0.0.13"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
 authors = ["daer contributors"]
 repository = "https://github.com/ming2k/daer"
-description = "An eBPF transparent proxy for Linux, with a Rust userspace"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -49,6 +66,7 @@ daer-relay = { path = "crates/daer-relay" }
 daer-routing = { path = "crates/daer-routing" }
 daer-rule-ast = { path = "crates/daer-rule-ast" }
 daer-sniff = { path = "crates/daer-sniff" }
+daer-test-support = { path = "crates/daer-test-support" }
 
 aes = "0.8"
 blake2 = "0.10"
@@ -82,7 +100,6 @@ netune-trace = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
 netune-ws = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
 netune-quic = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
 netune-http3 = { git = "https://github.com/ming2k/netune.git", tag = "v0.0.28" }
-aho-corasick = "1.1"
 regex = "1.11"
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -102,6 +119,43 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+aya.workspace = true
+aya-obj = "0.3"
+blake2.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+daer-common.workspace = true
+daer-config = { workspace = true, features = ["schema"] }
+daer-control.workspace = true
+daer-dns.workspace = true
+daer-ebpf.workspace = true
+daer-observe.workspace = true
+daer-outbound.workspace = true
+daer-proxy-protocols.workspace = true
+daer-relay.workspace = true
+daer-routing.workspace = true
+daer-rule-ast.workspace = true
+daer-sniff.workspace = true
+daer-test-support.workspace = true
+hkdf.workspace = true
+libc.workspace = true
+md-5.workspace = true
+ipnet.workspace = true
+netune.workspace = true
+netune-trace.workspace = true
+netune-ws.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 [profile.release]
 lto = "thin"

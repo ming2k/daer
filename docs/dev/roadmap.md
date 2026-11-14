@@ -9,7 +9,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 | Area | State |
 | --- | --- |
-| Protocol: REALITY (tag, TLS 1.3 client, certificate check, `X25519MLKEM768`) | ✅ verified end to end against a local reference `xray` inbound, in CI (`tests/reality_interop.rs`) |
+| Protocol: REALITY (tag, TLS 1.3 client, certificate check, `X25519MLKEM768`) | ✅ verified end to end against a local reference `xray` inbound, in CI (`tests/e2e/protocols_reality_interop.rs`) |
 | Protocol: XTLS Vision (`flow=xtls-rprx-vision`) | ✅ verified end to end (uplink and downlink) against a local reference `xray` inbound, in CI |
 | Configuration (TOML schema, expression language, loader, validation) | ✅ |
 | Configuration tooling (JSON Schema + drift check; `fmt`/`example` removed by ADR-0015) | ✅ |
@@ -28,12 +28,12 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Outbound: **vmess AEAD** | ✅ per [ADR-0030](../adr/0030-vmess-aead-only.md): the reference's aliasing-hasher KDF (six vectors taken from `aead.KDF` itself), `AuthID`, the sealed header, the three size modes, both ciphers and both data planes. `tests/vmess_live.rs` takes a round trip through a real `xray` VMess inbound for `auto`/`aes-128-gcm`/`chacha20-poly1305`, with `AuthenticatedLength` on and off, and over `ws`. The legacy handshake is not expressible: a non-zero `aid` is a load error |
 | Outbound: **hysteria2, complete** | ✅ per [ADR-0029](../adr/0029-hysteria2-socket-stack.md): Salamander and Gecko on the datagram path (the `obfs` key used to be parsed and never applied — the defect the ADR exists for), per-flow session ids, fragmentation/reassembly, `Hysteria-UDP`/`Hysteria-CC-RX` honoured, Brutal congestion control, and source-port hopping through netune's `QuicUdpSocket` seam. `tests/hysteria2_live.rs` starts the reference server itself — including one configured **with** Salamander, so the obfuscation is proven on the wire, not in a struct |
 | Outbound: `tuic` | ⬜ the one family left: not implemented, listed and reported as unselectable |
-| Outbound: `[global.tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
-| Outbound: `[global.tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
+| Outbound: `[tls] fragment` (ClientHello slicing) | ✅ honoured on the REALITY path, whose handshake daer owns; a `trojan://` node's hello is written inside netune's connector, where the setting cannot mean the same thing |
+| Outbound: `[tls] profile` | ✅ applied per `Target`; an unknown name is a load-time error |
 | Health checks: an election's `mode`/`url`/`method` and `udp-dns` are what probes use; `url` mode measures through the node | ✅ |
 | Outbound: Vision (`xtls-rprx-vision`) | ✅ framing both ways, and the peer's `Direct` is honoured with a raw read (see below). The uplink never claims `Direct` — it sends `End` — because a splice on our side is not implemented; that costs throughput on a TLS stream and nothing else |
 | Outbound: Vision, **inner TLS** | ✅ a TLS stream through the tunnel works (`curl https://…`, three runs, against a local reference node with a local TLS origin). This was broken until the peer's `Direct` was implemented: the node stops encrypting and a client that keeps decrypting reads ciphertext as plaintext (`the record was altered`). Plaintext (HTTP) inside the tunnel always worked, which is exactly why the gap survived — the e2e probe tier was a plaintext GET, so `daer probe node` reported "fully operational" for a node that could not carry a single HTTPS request |
-| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire. **Interop is now a CI fixture**: `tests/reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with two negative controls (a wrong `pbk`, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
+| Outbound: REALITY | ✅ owned by `daer-outbound` per [ADR-0010](../adr/0010-reality-client-ownership.md): a minimal TLS 1.3 client (`reality/tls13`), reachable only from a `security=reality` link. Key schedule verified against RFC 8448 vectors; record layer tested for tamper detection; the tag in `legacy_session_id` is asserted on the wire; the ClientHello offers `X25519MLKEM768` and classic `X25519` over the same secret for old and new servers. **Interop is now a CI fixture**: `tests/e2e/protocols_reality_interop.rs` starts a local reference `xray` inbound and takes a session through REALITY + Vision in both directions, with four negative controls (wrong `pbk`, wrong `sid`, wrong UUID after REALITY, and a server that speaks no REALITY). It skips with a reason when no `xray` binary is present, so it never becomes a dependency on someone else's uptime |
 | Datagrams: netune transport + SOCKS5 UDP associate (netune side) | ✅ |
 | Datagrams: transparent UDP ingress (`IP_ORIGDSTADDR`) + relay | ✅ `TransparentDatagramListener`, per-peer sessions, bounded table, idle reaping; wired into `Daemon::serve` |
 | Datapath: IPv6 TCP and UDP | ✅ separate tcp6/udp6 listener slots, family-aware `assign_listener`, IPv6 extension-header parsing, and independent IPv6 Fake-IP allocation (`dns.fake-ip.inet6`) |
@@ -51,9 +51,9 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | Sniffing: connection-side loop, `dial-mode = domain` wired into routing | ✅ |
 | Sniffing: QUIC Initial decryption | ⬜ |
 | UDP: relay wired and driven | ✅ `Daemon::serve` runs the datagram service, one session per peer, replies routed back to the right peer, counters readable |
-| UDP: IPv6 proven through `tproxy` | ✅ `tests/transparent_udp6.rs` builds a real client/origin two-namespace topology, requires the negative control to fail without the daemon, and checks the origin's nonce plus the relay counters; CI makes its skip fatal as `3-udp6` |
-| UDP: IPv4 proven through `tproxy` | ⬜ needs the same **second network namespace** (`TPROXY` matches on the ingress interface). The single-namespace fixture cannot work: the origin and the transparent reply socket must own the same `(address, port)`. The IPv4 test is ignored with that reason rather than passing vacuously |
-| Daemon runtime: spawned tasks are scheduled | ✅ `daer run` uses a multi-threaded runtime. A current-thread runtime starved the spawned datagram forward — session opened, reply never sent — which took a debugging pass to attribute to the runtime rather than the relay (`crates/daer-cli/tests/runtime.rs`) |
+| UDP: IPv6 proven through `tproxy` | ✅ `tests/e2e/control_transparent_udp6.rs` builds a real client/origin two-namespace topology, requires the negative control to fail without the daemon, and checks the origin's nonce plus the relay counters; CI makes its skip fatal as `3-udp6` |
+| UDP: IPv4 proven through `tproxy` | ✅ `tests/e2e/control_transparent_udp4.rs` builds the same two-namespace client/origin topology as the IPv6 test, with a negative control, the origin's nonce, and relay counters; CI makes its skip fatal as `3-udp4` |
+| Daemon runtime: spawned tasks are scheduled | ✅ `daer run` uses a multi-threaded runtime. A current-thread runtime starved the spawned datagram forward — session opened, reply never sent — which took a debugging pass to attribute to the runtime rather than the relay (`tests/integration/cli_runtime.rs`) |
 | Configuration: every accepted key has a consumer | ✅ enforced by `daer-config::tests::config_keys` |
 | Control plane: transparent accept, relay, accept loop with metrics | ✅ |
 | Control plane: routing verdict + outbound dialing per flow | ✅ |
@@ -65,7 +65,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 **`daer run` now proxies traffic.** The wiring that was missing —
 `crates/daer-control/src/daemon.rs`, `datapath.rs`, and `crates/daer-cli/src/run.rs` — loads
 the object, creates and attaches `daer0`/`daer0peer`, binds the transparent port, and serves.
-`tests/transparent.rs` proves it with `nftables tproxy` into a real origin, and
+`tests/e2e/control_transparent.rs` proves it with `nftables tproxy` into a real origin, and
 [`docs/how-to/deployment.md`](../how-to/deployment.md) is the operator's side. What remains is map *writes* per reload (the
 publish sequence of ADR-0004 exists and is tested against a `MapWriter` trait; the `tc`
 side of a live policy swap is not wired).
@@ -102,7 +102,7 @@ The largest piece. Order matters: this is what makes the binary useful.
    deferral, never empty and never partial: an empty table makes `route()` return
    `-EPERM`, which every caller turns into `DAER_TC_DROP`, so "no policy" was never a
    safe state. **Exit:** the encoded table agrees with `first_hit` on a generated flow
-   corpus, which `crates/daer-routing/tests/kernel_policy.rs` asserts.
+   corpus, which `tests/integration/routing_kernel_policy.rs` asserts.
 3. **Routing decision** ✅ — the flow's tuple becomes `MatchFacts`, the compiled
    program yields a verdict, and `block` / `direct` / election are applied per flow.
    Facts the ingress cannot know (sniffed domain, process name, DSCP, source MAC)
@@ -131,7 +131,7 @@ The largest piece. Order matters: this is what makes the binary useful.
    generation, so a reload now reaches the kernel table as well as the decisions. What that
    path lacked until recently was a test that could fail at all — the *first* `SIGHUP` used to
    panic the daemon (`reload` called `block_on` from inside the runtime), which no unit test
-   saw because none of them signalled a running process. `crates/daer-cli/tests/reload.rs`
+   saw because none of them signalled a running process. `tests/e2e/cli_reload.rs`
    now starts the real binary, sends `SIGHUP`, and asserts the process is alive **and** that
    generation 2 was published; `scripts/verify/kernel-check.sh` section 8 runs it where the
    transparent port can bind. **Exit:** 1000 reloads under a long-lived connection with zero
@@ -187,27 +187,26 @@ implemented and verified against live public resolvers.
 **Exit:** a client using the box as its resolver gets answers, the cache is
 observable, and a request whose rule names a specific upstream is routed there.
 
-## 4. Sniffing (`daer-sniff`) 🟡
+## 4. Domain acquisition (`daer-sniff`) 🟢
 
 Done: prefix inspection that returns a decision (`NeedMore` / `Domain` / `None` /
 `Malformed`) rather than transforming a stream. TLS ClientHello SNI is reassembled across
 records, and the parser is bounds-checked and budget-limited so a hostile length field
 cannot make the caller buffer without limit. HTTP is covered through `Host`, including a
 `host:port` split, case-insensitive header names, and absolute-form request targets.
+QUIC Initial support decrypts the Initial packet and reads the SNI from its CRYPTO frame.
 
-Deliberately not done: **QUIC**. A QUIC Initial is encrypted; naming the host needs
-header-protection removal and TLS reassembly from CRYPTO frames. Half a parser would
-return wrong names, so a QUIC flow sniffs as `None` and is routed by IP until that work
-lands.
-
-Done as well: the connection-side loop. `sniff_stream` **peeks** (never consumes, so the
-origin receives every byte), bounded by a byte budget and by `sniffing-timeout`, and the
-result feeds `MatchFacts.domain` so `domain(...)` rules fire. A configuration with no
-domain rule spends no syscall and no wait on it, decided once per generation.
+Done as well: the policy and the connection-side loop. `daer-control::domain` owns
+`DomainPlan` and `DomainResolver`: Fake-IP first, a unique DNS-snooper candidate second,
+payload inspection only when `[routing.sniff] enabled = true`, and address last.
+`sniff_stream` **peeks** (never consumes, so the origin receives every byte), bounded by a
+byte budget and by the configured timeout. UDP parses only the first datagram and never
+waits. A configuration with no domain rule spends no syscall and no wait on it.
 
 **Exit criterion met:** `tests/sniff_route.rs` routes a flow by its ClientHello SNI when
 no IP rule matches, proves the origin received the bytes unchanged, and proves the
-fallback applies for a name the rules do not cover.
+fallback applies for a name the rules do not cover. `daer-control::domain` tests cover
+Fake-IP precedence, DNS ambiguity, and the explicit disabled mode.
 
 ## 5. Proxy protocols (`daer-outbound`) 🟡
 
@@ -291,7 +290,7 @@ was dead while the roadmap said "live-verified".
 The harness in `docs/how-to/vision-lab.md` existed and would have caught it. What did not
 exist was a *reason to run it*: `tests/reality_live.rs` is `#[ignore]` and needs a credentialed
 public node, so nothing in CI exercised the path, and a `✅` in this table recorded a manual
-result whose relevance nobody had to re-establish. `tests/reality_interop.rs` closes that:
+result whose relevance nobody had to re-establish. `tests/e2e/protocols_reality_interop.rs` closes that:
 it starts the reference server itself, so REALITY + Vision is a fixture that CI runs on every
 commit, and a skip is stated rather than silently absent.
 
@@ -356,4 +355,4 @@ is not needed and remains deliberately unused: the ring buffer is the structured
 | Datagram transport: netune API vs daer-side | **resolved** — netune owns the datagram socket (netune ADR-0008); the relay is daer's | [`netune-requests.md`](netune-requests.md) |
 | QUIC implementation for hysteria2/tuic | **resolved** — netune owns the QUIC/H3 client transport (netune ADR-0016); daer consumes `netune-quic`/`netune-http3` and keeps only product protocol layers (ADR-0035) | milestone 5 |
 | Matcher data structures | performance ceiling of the data path | milestone 6 |
-| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/transparent.rs`, `scripts/verify/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |
+| Kernel wiring and the transparent path need `CAP_NET_ADMIN`. Both now have tests that **skip with a reason** without it and run under `unshare -Urn` with it (`tests/e2e/control_transparent.rs`, `scripts/verify/kernel-check.sh`), so the gap is a skip instead of an unverified claim | whether a change to the data path works | ADR-0007 |

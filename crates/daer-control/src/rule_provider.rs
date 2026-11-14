@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Resolving `[[rule-provider]]` into the routing rule provider pool (ADR-0014).
+//! Resolving `[[rule-set]]` into the routing rule provider pool (ADR-0014).
 //!
 //! # Why this is a separate step
 //!
@@ -227,7 +227,7 @@ pub enum RefreshOutcome {
     Failed,
 }
 
-/// Resolves all `[[rule-provider]]` declarations in `config`.
+/// Resolves all `[[rule-set]]` declarations in `config`.
 pub async fn resolve_rule_providers(
     config: &Config,
     config_directory: &Path,
@@ -241,7 +241,7 @@ pub async fn resolve_rule_providers(
     .await
 }
 
-/// Resolves all `[[rule-provider]]` declarations with an explicit timeout and socket policy.
+/// Resolves all `[[rule-set]]` declarations with an explicit timeout and socket policy.
 pub async fn resolve_rule_providers_with(
     config: &Config,
     config_directory: &Path,

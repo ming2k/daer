@@ -120,47 +120,6 @@ struct {
 	__uint(max_entries, 1);
 } daer_ifindex_map SEC(".maps");
 
-/* fast_sock holds the two sockets of every user-space offloaded TCP relay
- * pair. The Go control plane registers each socket under its reversed
- * four-tuple (sip=remote, dip=local, sport=remote_port, dport=local_port),
- * pointing at the peer socket's fd. The sk_skb stream-verdict program
- * tcp_offload_redirect then splices received data between the pair in-kernel.
- * Sockets are automatically deleted from the map once closed.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_SOCKHASH);
-	__type(key, struct tuples_key);
-	__type(value, __u64);
-	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
-} fast_sock SEC(".maps");
-
-/* tcp_offload_pause is the backlog fuse: while a key is present, the
- * stream-verdict program passes received data through (SK_PASS) instead of
- * redirecting, so the userspace fallback forwards it while the kernel drains
- * skbs already queued on the peer's egress retry path. Unlike deleting the
- * fast_sock entry, a pause does not tear down the psock (which would drop
- * the queued skbs); the Go side removes the key once the backlog drains.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__type(key, struct tuples_key);
-	__type(value, __u8);
-	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
-} tcp_offload_pause SEC(".maps");
-
-/* tcp_offload_sent counts bytes that skb_send_sock delivered to a socket's
- * send path, keyed by the skb's reversed four-tuple (the same key space as
- * fast_sock and tcp_offload_pause). The Go session compares it against
- * tcp_info receive deltas to compute the egress retry-queue backlog that
- * drives the pause fuse.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-	__type(key, struct tuples_key);
-	__type(value, __u64);
-	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
-} tcp_offload_sent SEC(".maps");
-
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct tuples_key);

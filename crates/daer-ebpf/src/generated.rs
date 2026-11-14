@@ -12,9 +12,6 @@ pub mod map {
     pub const LISTEN_SOCKET: &str = "listen_socket_map";
     pub const REDIRECT_TRACK: &str = "redirect_track";
     pub const DEVICE_IFINDEX: &str = "daer_ifindex_map";
-    pub const FAST_SOCK: &str = "fast_sock";
-    pub const TCP_OFFLOAD_PAUSE: &str = "tcp_offload_pause";
-    pub const TCP_OFFLOAD_SENT: &str = "tcp_offload_sent";
     pub const ROUTING_HANDOFF: &str = "routing_handoff_map";
     pub const UNUSED_LPM_TYPE: &str = "unused_lpm_type";
     pub const LPM_ARRAY: &str = "lpm_array_map";
@@ -34,14 +31,11 @@ pub mod map {
     pub const CONNTRACK_ARGS: &str = "conntrack_args_map";
 
     /// Every map the object must contain.
-    pub const ALL: [&str; 24] = [
+    pub const ALL: [&str; 21] = [
         OUTBOUND_CONNECTIVITY,
         LISTEN_SOCKET,
         REDIRECT_TRACK,
         DEVICE_IFINDEX,
-        FAST_SOCK,
-        TCP_OFFLOAD_PAUSE,
-        TCP_OFFLOAD_SENT,
         ROUTING_HANDOFF,
         UNUSED_LPM_TYPE,
         LPM_ARRAY,
@@ -75,13 +69,10 @@ pub mod map {
     ];
 
     /// Every shared map: flow state that deliberately survives a reload.
-    pub const SHARED: [&str; 16] = [
+    pub const SHARED: [&str; 13] = [
         LISTEN_SOCKET,
         REDIRECT_TRACK,
         DEVICE_IFINDEX,
-        FAST_SOCK,
-        TCP_OFFLOAD_PAUSE,
-        TCP_OFFLOAD_SENT,
         COOKIE_PID,
         CONN_STATE,
         BPF_STATS,
@@ -103,76 +94,55 @@ pub mod program {
     pub const LAN_INGRESS_L3: &str = "tproxy_lan_ingress_l3";
     pub const LAN_EGRESS_L2: &str = "tproxy_lan_egress_l2";
     pub const LAN_EGRESS_L3: &str = "tproxy_lan_egress_l3";
-    pub const LAN_WAN_EGRESS_L2: &str = "tproxy_lan_wan_egress_l2";
-    pub const LAN_WAN_EGRESS_L3: &str = "tproxy_lan_wan_egress_l3";
     pub const WAN_INGRESS_L2: &str = "tproxy_wan_ingress_l2";
     pub const WAN_INGRESS_L3: &str = "tproxy_wan_ingress_l3";
     pub const WAN_EGRESS_L2: &str = "tproxy_wan_egress_l2";
     pub const WAN_EGRESS_L3: &str = "tproxy_wan_egress_l3";
-    pub const WAN_LAN_INGRESS_L2: &str = "tproxy_wan_lan_ingress_l2";
-    pub const WAN_LAN_INGRESS_L3: &str = "tproxy_wan_lan_ingress_l3";
     pub const WAN_CG_CONNECT4: &str = "tproxy_wan_cg_connect4";
     pub const WAN_CG_CONNECT6: &str = "tproxy_wan_cg_connect6";
     pub const WAN_CG_SENDMSG4: &str = "tproxy_wan_cg_sendmsg4";
     pub const WAN_CG_SENDMSG6: &str = "tproxy_wan_cg_sendmsg6";
     pub const WAN_CG_SOCK_CREATE: &str = "tproxy_wan_cg_sock_create";
     pub const WAN_CG_SOCK_RELEASE: &str = "tproxy_wan_cg_sock_release";
-    pub const TCP_OFFLOAD_REDIRECT: &str = "tcp_offload_redirect";
-    pub const TCP_OFFLOAD_SENT_ACCOUNT: &str = "tcp_offload_sent_account";
-    pub const TCP_OFFLOAD_SENT_ACCOUNT_KPROBE: &str = "tcp_offload_sent_account_kprobe";
 
     /// Every program the object must contain.
-    pub const ALL: [&str; 23] = [
+    pub const ALL: [&str; 16] = [
         DEVICE_INGRESS,
         PEER_INGRESS,
         LAN_INGRESS_L2,
         LAN_INGRESS_L3,
         LAN_EGRESS_L2,
         LAN_EGRESS_L3,
-        LAN_WAN_EGRESS_L2,
-        LAN_WAN_EGRESS_L3,
         WAN_INGRESS_L2,
         WAN_INGRESS_L3,
         WAN_EGRESS_L2,
         WAN_EGRESS_L3,
-        WAN_LAN_INGRESS_L2,
-        WAN_LAN_INGRESS_L3,
         WAN_CG_CONNECT4,
         WAN_CG_CONNECT6,
         WAN_CG_SENDMSG4,
         WAN_CG_SENDMSG6,
         WAN_CG_SOCK_CREATE,
         WAN_CG_SOCK_RELEASE,
-        TCP_OFFLOAD_REDIRECT,
-        TCP_OFFLOAD_SENT_ACCOUNT,
-        TCP_OFFLOAD_SENT_ACCOUNT_KPROBE,
     ];
 
     /// The section each program attaches through.
-    pub const SECTIONS: [(&str, &str); 23] = [
+    pub const SECTIONS: [(&str, &str); 16] = [
         (DEVICE_INGRESS, "classifier/daer0_ingress"),
         (PEER_INGRESS, "classifier/daer0peer_ingress"),
         (LAN_INGRESS_L2, "classifier/lan_ingress_l2"),
         (LAN_INGRESS_L3, "classifier/lan_ingress_l3"),
         (LAN_EGRESS_L2, "classifier/lan_egress_l2"),
         (LAN_EGRESS_L3, "classifier/lan_egress_l3"),
-        (LAN_WAN_EGRESS_L2, "classifier/lan_wan_egress_l2"),
-        (LAN_WAN_EGRESS_L3, "classifier/lan_wan_egress_l3"),
         (WAN_INGRESS_L2, "classifier/wan_ingress_l2"),
         (WAN_INGRESS_L3, "classifier/wan_ingress_l3"),
         (WAN_EGRESS_L2, "classifier/wan_egress_l2"),
         (WAN_EGRESS_L3, "classifier/wan_egress_l3"),
-        (WAN_LAN_INGRESS_L2, "classifier/wan_lan_ingress_l2"),
-        (WAN_LAN_INGRESS_L3, "classifier/wan_lan_ingress_l3"),
         (WAN_CG_CONNECT4, "cgroup/connect4"),
         (WAN_CG_CONNECT6, "cgroup/connect6"),
         (WAN_CG_SENDMSG4, "cgroup/sendmsg4"),
         (WAN_CG_SENDMSG6, "cgroup/sendmsg6"),
         (WAN_CG_SOCK_CREATE, "cgroup/sock_create"),
         (WAN_CG_SOCK_RELEASE, "cgroup/sock_release"),
-        (TCP_OFFLOAD_REDIRECT, "sk_skb/stream_verdict"),
-        (TCP_OFFLOAD_SENT_ACCOUNT, "fentry/skb_send_sock"),
-        (TCP_OFFLOAD_SENT_ACCOUNT_KPROBE, "kprobe/skb_send_sock"),
     ];
 }
 

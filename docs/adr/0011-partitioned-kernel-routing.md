@@ -9,10 +9,10 @@ supersedes: []
 
 # 0011. Partitioned kernel routing and DNS snooping for Real-IP datapaths
 
-- Status: Accepted
+- Status: Accepted (Amended by ADR-0050)
 - Date: 2026-01-08
 - Deciders: Ming Li
-- Related: [ADR-0005](0005-kernel-policy-encoding.md), [ADR-0004](0004-routing-epochs.md), [ADR-0012](0012-optional-fake-ip-ebpf.md)
+- Related: [ADR-0005](0005-kernel-policy-encoding.md), [ADR-0004](0004-routing-epochs.md), [ADR-0012](0012-optional-fake-ip-ebpf.md), [ADR-0050](0050-domain-acquisition-is-explicit.md)
 
 ---
 
@@ -21,7 +21,7 @@ supersedes: []
 [ADR-0005](0005-kernel-policy-encoding.md) ratified the foundational invariant `[INV-KERNEL-01]`:
 *The kernel policy table is written, and it is either provably equivalent to userspace or it defers.*
 
-To enforce this, `daer-routing::kernel::compile` implemented an **all-or-nothing deferral gate**: if *any* lowered `MatchSet` in the entire program contains a predicate requiring state the kernel lacks (specifically `domain(...)` without pre-computed IP maps, or `pname(...)`), `compile` returns `Policy::defer(reasons)`. This publishes a single fallback entry:
+To enforce this, `daer-routing::kernel::compile` implemented an **all-or-nothing deferral gate**: if *any* lowered `MatchSet` in the entire program contains a predicate the kernel cannot faithfully evaluate (specifically `domain(...)` without pre-computed IP maps, or `pname(...)` whose process-name facts are intentionally evaluated in userspace), `compile` returns `Policy::defer(reasons)`. This publishes a single fallback entry:
 
 ```text
 routing_map[slot*MAX + 0] = { type: Fallback, outbound: OUTBOUND_CONTROL_PLANE_ROUTING }

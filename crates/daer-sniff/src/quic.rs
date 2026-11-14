@@ -66,10 +66,23 @@ fn hkdf_expand_label(
     hkdf.expand(&info, out).map_err(|_| Malformed::BadLength)
 }
 
+/// A `NeedMore` whose declared size fits the sniff budget, or `Oversized`.
+///
+/// The caller buffers until it has `want` bytes. A length field from the network may claim
+/// more than [`crate::MAX_SNIFF_LEN`], and asking the caller to satisfy it would defeat the
+/// bound the rest of the sniffer enforces.
+fn need_more(want: usize) -> Sniffed {
+    if want > crate::MAX_SNIFF_LEN {
+        Sniffed::Malformed(Malformed::Oversized)
+    } else {
+        Sniffed::NeedMore { want: Some(want) }
+    }
+}
+
 /// Sniffs a QUIC Initial packet for a TLS ClientHello carrying an SNI.
 pub fn sniff_quic(buffer: &[u8]) -> Sniffed {
     if buffer.len() < 5 {
-        return Sniffed::NeedMore { want: Some(5) };
+        return need_more(5);
     }
 
     let first = buffer[0];
@@ -105,9 +118,7 @@ pub fn sniff_quic(buffer: &[u8]) -> Sniffed {
     let dcid_len = match buffer.get(offset) {
         Some(&len) => len as usize,
         None => {
-            return Sniffed::NeedMore {
-                want: Some(offset + 1),
-            };
+            return need_more(offset + 1);
         }
     };
     offset += 1;
@@ -115,9 +126,7 @@ pub fn sniff_quic(buffer: &[u8]) -> Sniffed {
     let dcid = match buffer.get(offset..offset + dcid_len) {
         Some(dcid) => dcid,
         None => {
-            return Sniffed::NeedMore {
-                want: Some(offset + dcid_len),
-            };
+            return need_more(offset + dcid_len);
         }
     };
     offset += dcid_len;
@@ -126,16 +135,12 @@ pub fn sniff_quic(buffer: &[u8]) -> Sniffed {
     let scid_len = match buffer.get(offset) {
         Some(&len) => len as usize,
         None => {
-            return Sniffed::NeedMore {
-                want: Some(offset + 1),
-            };
+            return need_more(offset + 1);
         }
     };
     offset += 1;
     if buffer.len() < offset + scid_len {
-        return Sniffed::NeedMore {
-            want: Some(offset + scid_len),
-        };
+        return need_more(offset + scid_len);
     }
     offset += scid_len;
 
@@ -143,38 +148,31 @@ pub fn sniff_quic(buffer: &[u8]) -> Sniffed {
     let (token_len, varint_len) = match read_varint(&buffer[offset..]) {
         Ok(res) => res,
         Err(_) => {
-            return Sniffed::NeedMore {
-                want: Some(offset + 1),
-            };
+            return need_more(offset + 1);
         }
     };
     offset += varint_len;
     let token_len = token_len as usize;
-    if buffer.len() < offset + token_len {
-        return Sniffed::NeedMore {
-            want: Some(offset + token_len),
-        };
+    let token_end = offset.saturating_add(token_len);
+    if buffer.len() < token_end {
+        return need_more(token_end);
     }
-    offset += token_len;
+    offset = token_end;
 
     // Length field (varint): describes the remaining bytes (Packet Number + Payload + AEAD Tag).
     let (packet_len, varint_len) = match read_varint(&buffer[offset..]) {
         Ok(res) => res,
         Err(_) => {
-            return Sniffed::NeedMore {
-                want: Some(offset + 1),
-            };
+            return need_more(offset + 1);
         }
     };
     offset += varint_len;
-    let packet_len = packet_len as usize;
+    let packet_len = usize::try_from(packet_len).unwrap_or(usize::MAX);
     let pn_offset = offset;
-    let total_expected = pn_offset + packet_len;
+    let total_expected = pn_offset.saturating_add(packet_len);
 
     if buffer.len() < total_expected {
-        return Sniffed::NeedMore {
-            want: Some(total_expected),
-        };
+        return need_more(total_expected);
     }
 
     let packet_data = &buffer[..total_expected];
@@ -406,6 +404,26 @@ mod tests {
         assert_eq!(to_hex(&key), "1f369613dd76d5467730efcbe3b1a22d");
         assert_eq!(to_hex(&iv), "fa044b2f42a3fd3b46fb255c");
         assert_eq!(to_hex(&hp), "9f50449e04a0e810283a1e9933adedd2");
+    }
+
+    #[test]
+    fn a_declared_length_beyond_the_sniff_budget_is_rejected_before_buffering() {
+        // Long header, QUIC v1 Initial, no DCID/SCID, then an 8-byte token-length varint
+        // claiming 2^62-1 bytes. `NeedMore` here would tell the caller to buffer unbounded.
+        let mut packet = vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+        packet.extend_from_slice(&[0xff; 8]);
+        assert_eq!(
+            sniff_quic(&packet),
+            Sniffed::Malformed(Malformed::Oversized)
+        );
+
+        // The packet-length varint has the same contract.
+        let mut packet = vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        packet.extend_from_slice(&[0xff; 8]);
+        assert_eq!(
+            sniff_quic(&packet),
+            Sniffed::Malformed(Malformed::Oversized)
+        );
     }
 
     #[test]

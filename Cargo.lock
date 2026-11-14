@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -555,6 +555,7 @@ dependencies = [
  "daer-observe",
  "daer-outbound",
  "daer-routing",
+ "daer-test-support",
  "libc",
  "netune",
  "serde",
@@ -565,11 +566,11 @@ dependencies = [
 
 [[package]]
 name = "daer-common"
-version = "0.0.13"
+version = "0.1.0"
 
 [[package]]
 name = "daer-config"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "daer-common",
  "glob",
@@ -581,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -603,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "daer-config",
@@ -618,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "daer-drb"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -628,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "aya",
  "aya-obj",
@@ -639,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "daer-observe"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "fastrand",
  "tracing",
@@ -647,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "daer-outbound"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "daer-common",
  "daer-config",
@@ -664,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -702,35 +703,31 @@ dependencies = [
 
 [[package]]
 name = "daer-relay"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "daer-observe",
- "daer-sniff",
  "libc",
  "netune",
  "netune-trace",
- "serde_json",
  "socket2",
  "tokio",
 ]
 
 [[package]]
 name = "daer-routing"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
- "aya-obj",
  "daer-common",
  "daer-config",
  "daer-ebpf",
  "daer-rule-ast",
  "ipnet",
- "serde_json",
  "sha2",
 ]
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -738,12 +735,57 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
  "hkdf",
  "sha2",
+]
+
+[[package]]
+name = "daer-test-support"
+version = "0.1.0"
+
+[[package]]
+name = "daer-tests"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aya",
+ "aya-obj",
+ "blake2",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "daer-common",
+ "daer-config",
+ "daer-control",
+ "daer-dns",
+ "daer-ebpf",
+ "daer-observe",
+ "daer-outbound",
+ "daer-proxy-protocols",
+ "daer-relay",
+ "daer-routing",
+ "daer-rule-ast",
+ "daer-sniff",
+ "daer-test-support",
+ "hkdf",
+ "ipnet",
+ "libc",
+ "md-5",
+ "netune",
+ "netune-trace",
+ "netune-ws",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -2404,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.13"
+version = "0.1.0"
 dependencies = [
  "serde",
  "toml",

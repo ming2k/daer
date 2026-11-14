@@ -5,10 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-11-14
 
 ### Breaking
 
+- **Configuration schema 5: the process scope is the top level, and probe belongs to the
+  election ([ADR-0053](docs/adr/0053-process-scope-and-election-owned-probe.md)).** `[global]`
+  is removed; `log-level`, `lan-interface`, `wan-interface` and `disable-waiting-network` are
+  top-level keys. `[global.tls]` becomes `[tls]`. `so-mark` is no longer a configuration key:
+  the internal loop-evasion mark is the fixed constant `0x64616572`. `[global.probe]` is
+  removed: each `[[election]]` resolves its probe from built-in defaults, `tolerance` is an
+  election policy key valid only for `min-moving-avg`, and a manual election rejects probe
+  settings because it is never scheduled for probing. Top-level scalar keys must appear before
+  the first table header.
+- **Configuration schema 4: domain acquisition is explicit and DNS-first.**
+  `[global].sniffing-timeout` and `auto-sniff-punt` are deleted. A `domain(...)` rule now
+  requires `[routing.sniff] enabled`; `enabled = true` allows a bounded first-packet
+  inspection and requires `timeout`, while `enabled = false` never inspects payload and
+  forbids `timeout`. DNS/Fake-IP always wins: Fake-IP, then a unique DNS-snooper candidate
+  for `(client, resolved)`, then the explicit sniff, then address. `[dns].bind` is the only
+  listener switch; `[dns.fake-ip] enabled = true` requires it and no longer starts port 53
+  implicitly. The DNS snooper stores a candidate set, so an ambiguous shared address is
+  reported rather than silently resolved to the last writer. See ADR-0050 and ADR-0051.
+- **Configuration schema 3: routing actions are outbounds and rules are named tables.**
+  `[routing].rules` is deleted. Each rule is a `[[routing.rule]]` table with a stable `name`,
+  a `match` expression, and a typed `action`:
+  `action = "direct"`, `action = "block"`, or `action = { election = "proxy" }`. The same
+  action type is used by `fallback`. `direct` and `block` are built-in outbounds, not nodes or
+  elections; election results are node outbounds. Built-in names are reserved for node labels.
+  The match language is a conjunction normal form with one canonical vocabulary
+  (`domain`, `dip`, `sip`, `dport`, `sport`, `l4proto`, `pname`, `mac`, `dscp`, `ipversion`,
+  `rule-set`, `ip-set`, `domain-set`); the `provider`, `ip` and `port` aliases are deleted.
+  See ADR-0049.
+- **`direct` is a routing verdict, not a node.** `[[node]] type = "direct"` and `direct://`
+  links are rejected. Use `action = "direct"` in a `[[routing.rule]]` or as `fallback`, and
+  remove a detour when the inner leg is direct. `daer probe node direct` remains a local-path
+  diagnostic, but it never enters the node pool. Built-in policy names (`direct`, `block`,
+  `must_rules`, `<OR>`, `<AND>`) are also reserved as node names, so a label cannot make the
+  probe and the compiler disagree about what a name means.
+- **Intrinsic-TLS protocols put TLS in `[node.tls]`.** Trojan, AnyTLS and Hysteria 2 no longer
+  accept flat `sni`, `allow-insecure` or `pin-sha256`; their TLS parameters are one table.
+  VLESS/VMess keep `[node.security]`, because there the security layer is selectable
+  (`none`/`tls`/`reality`).
+- **Hysteria 2's node shape is layered.** `ports` is the port-union string
+  (`"443,20000-20010"`), `[node.bandwidth]` holds `up-mbps`/`down-mbps`, `[node.quic]` holds
+  windows, durations and `congestion`, `[node.port-hopping]` holds the hop schedule, and
+  `[node.obfs]` stays a tagged table. The old flat `hop-interval`/`up-mbps`/`congestion` keys
+  are gone.
+- **The global `allow-insecure` switch is gone.** Certificate verification is a property of
+  one node's TLS leg, not of the daemon: a single self-signed or expired node must not turn
+  verification off for every other node. Use the node-level key instead — under
+  `[node.security]` for VLESS/VMess, and under `[node.tls]` for Trojan, AnyTLS and
+  Hysteria 2. Subscription links that carry `allowInsecure=1` already map to that node.
+- **`wan-interface` is `"auto"` or an explicit interface list, never a mix.** The old
+  `wan-interface = ["auto"]` spelling is rejected; write `wan-interface = "auto"` to follow
+  the default route, or `wan-interface = ["eth0", "wg0"]` to name egress interfaces. `auto`
+  is no longer a list element, so there is no order-dependent duplicate or ambiguous
+  "automatic selection plus a named interface" state. An empty explicit list remains an
+  error, and repeated names are rejected.
 - **Configuration schema 2 separates resources from elections
   ([ADR-0046](docs/adr/0046-resource-election-model.md)).** `[[group]]` is now a pure
   candidate pool; `[[election]]` is the routing target and the owner of the selection rule and
@@ -16,6 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   election input directly (`node = "…"`), and a single node no longer requires a dynamic group.
   `group.policy`, `group.health-check`, `[global.health-check]`, `tcp-url`, `tcp-method`,
   `fixed(n)`, and rules targeting groups are rejected. The clean break has no schema-1 shim.
+  Schema 3 keeps the model and replaces the string action with the typed
+  `action = { election = "…" }` spelling described above.
 - **Runtime elections are controlled by `daer elect <election> <node>` / `--reset`
   ([ADR-0047](docs/adr/0047-runtime-election-control.md)).** A separate
   `/run/daer/admin.sock` (`0600 root:root` by default; opt-in `0660` group delegation) is
@@ -40,6 +96,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The reference example now validates on a clean, offline machine.** Its rule-set
+  declarations are commented templates; the active routing rules use inline `dip(...)` and
+  `domain(...)` predicates. Uncomment the `[[rule-set]]` blocks and switch to `rule-set(...)`
+  when the compiled artifacts are available. This removes the previous 404-on-first-run
+  experience without weakening the rule-set documentation.
+- **Action-target validation has one implementation.** Configuration validation, generation
+  construction, and the CLI diagnostic path all call
+  `daer_config::validate::check_action_target`, so a group is rejected as an action in the same
+  way everywhere.
+- **The internal direct node dialer is gone.** `NodeDialer` no longer carries a `DirectTransport`
+  or accepts `direct`/`direct://` links. The built-in direct policy uses the control plane's
+  `DirectDialer`; `daer probe node direct` remains a diagnostic special case.
+- **Rule provider declarations are now `[[rule-set]]` tables.** The shorter key describes
+  what the entry is — a named, reusable set of IP and domain patterns — and keeps it distinct
+  from the predicate-and-action rules in `[routing].rules`. `rule-set(name)` is the preferred
+  routing predicate; `provider(name)` and the legacy `[[rule-provider]]` table remain accepted
+  as aliases. The internal resolver is still the rule provider pool.
 - **The datapath translation unit and object are named for the datapath, not one of its
   hooks.** `ebpf/kern/tproxy.c` is now `ebpf/kern/datapath.bpf.c`; the build produces
   `target/ebpf/datapath.bpf.o`, the test object is `datapath_test.bpf.o`, and packaged
@@ -47,9 +120,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convention and makes the object's target explicit. Program and map names such as
   `tproxy_lan_ingress_l2` are ABI and are unchanged. Operators using a custom `--object`
   path or a packaged unit must update the path (ADR-0024, naming amendment).
+- **Daemon artifacts are private by construction.** `state.json`, `events.jsonl`, incident
+  bundles and `persist.d` subscription caches are written with explicit `0600`/`0700`
+  modes, and the unit sets `UMask=0077`. Previously the modes depended on the caller's umask;
+  `persist.d` can contain node credentials.
+- **`pname(...)` is now backed by attached cgroup v2 hooks.** The loader attaches the six
+  `cgroup/` programs to the unified hierarchy at startup; a host without cgroup v2 fails the
+  datapath gate instead of accepting an inert process-name rule. `pname` describes the local
+  process that opened a host-originated flow, not a LAN client's process.
+- **The inherited TCP offload/sockmap path was removed.** It described a Go control plane
+  and a Go session that do not exist in this Rust project; no loader path attached it or
+  populated `fast_sock`/`tcp_offload_*`. The three programs and three maps are gone from the
+  object and ABI.
+- **The four combined-role classifiers were removed.** The supported topology is one role
+  per interface. `lan-interface ∩ wan-interface` is rejected at validation (and after
+  `wan-interface = "auto"` resolves at startup); a single-interface dual-role mode would be
+  a separate feature with its own attach plan.
+
+### Fixed
+
+- **A package upgrade removes the pre-TCX cleanup helper and object.** `post_install`,
+  `post_upgrade` and `post_remove` remove `/usr/bin/daer-cleanup` and
+  `/usr/lib/daer/datapath.o`; `cargo xtask install` removes the same legacy paths from a live
+  or reused staging tree. A package manager cannot remove a manually installed orphan it
+  does not own.
+
+- **REALITY offers both key shares and reports the current Xray client version.** The
+  ClientHello now carries `X25519MLKEM768` and classic `X25519` over the same ephemeral
+  secret, and the handshake accepts either group from the server. Current nodes still
+  authenticate the hybrid share; older nodes that only inspect classic X25519 no longer
+  forward the flow to the impersonated site. `VERSION` tracks Xray 26.11.9.
 
 ### Added
 
+- **IPv4 UDP has a real two-namespace `tproxy` gate.**
+  `crates/daer-control/tests/transparent_udp4.rs` builds the client/origin topology, asserts
+  the negative control, the
+  origin nonce and the relay counters, and is required as `3-udp4` in the privileged e2e job.
+  The old single-namespace test stays ignored because its fixture is invalid.
 - **Outbound detour chains ([ADR-0044](docs/adr/0044-outbound-detour-chain.md)).**
   `[[node]] detour = "<name>"` makes an outer proxy protocol run over another node's server
   leg while still carrying the flow's final target; `[[subscription]] detour` applies the
@@ -58,6 +166,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `daer route nodes` / `daer probe node` report it. Hysteria 2 cannot be the outer hop because
   its QUIC socket stack has no datagram-under-proxy seam; a detoured SOCKS5 node is TCP-only
   because a UDP associate would bypass the chain.
+
+### Tests
+
+- **The test suite is layered, and nextest selects each layer ([ADR-0052](docs/adr/0052-layered-test-architecture.md)).**
+  `cargo nextest run --workspace -E 'kind(lib) + kind(bin)'` runs unit tests,
+  `-E 'binary(integration)'` runs the root integration harness, and `-E 'binary(e2e)'` runs the
+  privileged harness. Doctests remain `cargo test --workspace --doc` because nextest does not
+  support them. CI runs the layers as separate jobs.
+- **External tests moved to one workspace harness.** The root package `daer-tests` owns
+  `tests/integration/main.rs` and `tests/e2e/main.rs`, each compiling many modules; `tests/common`
+  and the dev-only `daer-test-support` crate share scratch directories, nonces and binary
+  lookup. The number of test link steps drops from one per file to two.
+- **The test-architecture audit is an integration test.**
+  `tests/integration/test_architecture.rs` enforces ignore reasons, harness placement, the
+  dev-only test-support boundary, and the `DAER_REQUIRE` key set. It found that `3-netns` was
+  emitted but never required, so the private-ingress lifecycle could skip while the job stayed
+  green; it is now in `DAER_REQUIRE`.
+- **A QUIC Initial whose varint token or packet length exceeds `MAX_SNIFF_LEN` is malformed.**
+  `sniff_quic` used to return `NeedMore { want: <declared length> }`, asking a caller that
+  obeys the budget to buffer an unbounded amount. The new unit and integration tests pass
+  hostile lengths and a deterministic arbitrary-byte corpus through both entry points.
+- `tests/integration/rule_ast_canonical_contract.rs` asserts insertion-order-independent
+  canonicalisation and exact, contiguous, aligned decomposition over deterministic interval
+  corpora; `tests/integration/observe_catalog_contract.rs` validates the generated event
+  catalog's codes, severities, counters, rate groups, remediations and required fields.
+- **Unit-test modules that dominated their file moved to sibling files.** The test bodies of
+  `daer-cli/src/main.rs`, `daer-relay/src/{serve.rs,inbound/udp.rs,relay/datagram.rs}`,
+  `daer-dns/src/{resolver.rs,cache.rs}`, `daer-config/src/{model.rs,validate.rs}` and
+  `daer-control/src/decide.rs` now live under `src/<module>/tests.rs`; the production files
+  keep only `#[cfg(test)] mod tests;`.
 
 ## [0.0.13] - 2026-11-11
 

@@ -152,14 +152,19 @@ mod tests {
 
     #[test]
     fn dns_bind_sets_the_address_and_the_port_stays_53() {
-        let plan = Plan::resolve(&config("[dns]\nbind = \"127.0.0.1\"\n")).expect("resolves");
+        let plan = Plan::resolve(&config(
+            "[dns]\nbind = \"127.0.0.1\"\nupstream = [\"udp://1.1.1.1:53\"]\n",
+        ))
+        .expect("resolves");
         assert_eq!(plan.address.to_string(), "127.0.0.1:53");
     }
 
     #[test]
     fn a_bind_that_is_not_an_ip_is_rejected_with_the_field_name() {
-        let error =
-            Plan::resolve(&config("[dns]\nbind = \"not-an-ip\"\n")).expect_err("must reject");
+        let error = Plan::resolve(&config(
+            "[dns]\nbind = \"not-an-ip\"\nupstream = [\"udp://1.1.1.1:53\"]\n",
+        ))
+        .expect_err("must reject");
         assert!(error.contains("dns.bind"), "{error}");
         assert!(error.contains("not an IP"), "{error}");
     }
@@ -168,8 +173,10 @@ mod tests {
     fn a_port_in_dns_bind_is_rejected_not_guessed() {
         // `dns.bind` is an address, not a socket address: accepting `127.0.0.1:5353` would
         // silently ignore the port or bind something unexpected.
-        let error =
-            Plan::resolve(&config("[dns]\nbind = \"127.0.0.1:5353\"\n")).expect_err("must reject");
+        let error = Plan::resolve(&config(
+            "[dns]\nbind = \"127.0.0.1:5353\"\nupstream = [\"udp://1.1.1.1:53\"]\n",
+        ))
+        .expect_err("must reject");
         assert!(error.contains("dns.bind"), "{error}");
     }
 

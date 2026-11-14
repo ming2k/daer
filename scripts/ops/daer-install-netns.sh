@@ -102,6 +102,9 @@ cp -Rf --preserve=mode,timestamps "$staged/usr/." /usr/
 # deleted in ADR-0042; leaving it installed would make an old unit hook or operator command
 # look supported. `datapath.o` is the pre-rename object path.
 rm -f /usr/bin/daer-cleanup /usr/lib/daer/datapath.o
+# Artifacts written by an older build may predate the explicit 0600/0700 modes.
+# Only tighten daemon-owned state; do not recursively chmod operator rule sets.
+chmod -R go-rwx /run/daer /var/lib/daer/incidents /etc/daer/persist.d 2>/dev/null || true
 
 staged_config="$(mktemp)"
 trap 'rm -f "$staged_config"' EXIT

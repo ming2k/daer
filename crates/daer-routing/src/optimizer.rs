@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Rule optimizers, ported from `component/routing/optimizer.go`.
+//! Rule optimizers.
 //!
-//! They run before lowering and must stay semantically neutral: aliasing is
-//! spelling-only, merging relies on De Morgan's law holding for *positive*
-//! singleton rules, and deduplication removes identical parameters.
+//! Rules carry stable names, so an optimizer may normalize the inside of a rule
+//! but must never merge two rules: merging would delete one identity and make a
+//! log line name a rule the operator did not write.
 
 use std::collections::HashSet;
 
@@ -27,84 +27,28 @@ pub fn apply_optimizers(
     Ok(current)
 }
 
-/// Rewrites the documented aliases into their authoritative names.
+/// Sorts predicates and parameters so equivalent matches lower identically.
+///
+/// This does not reorder rules: array order is priority.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct AliasOptimizer;
+pub struct SortFunctionsOptimizer;
 
-impl RulesOptimizer for AliasOptimizer {
+impl RulesOptimizer for SortFunctionsOptimizer {
     fn optimize(&self, mut rules: Vec<RoutingRule>) -> Result<Vec<RoutingRule>, RoutingError> {
         for rule in &mut rules {
-            for function in &mut rule.and_functions {
-                match function.name.as_str() {
-                    "dport" => function.name = "port".to_owned(),
-                    "dip" => function.name = "ip".to_owned(),
-                    "rule-set" | "ruleset" => function.name = "provider".to_owned(),
-                    _ => {}
-                }
-                for param in &mut function.params {
-                    if param.key == "rule-set" || param.key == "ruleset" {
-                        param.key = "provider".to_owned();
-                    }
-                }
+            rule.match_expr
+                .and_functions
+                .sort_by(|a, b| a.name.cmp(&b.name));
+            for function in &mut rule.match_expr.and_functions {
+                sort_params(function);
             }
         }
         Ok(rules)
     }
 }
 
-/// Sorts functions and parameters so that equivalent rules lower identically,
-/// and merges adjacent single-function rules that share an outbound.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MergeAndSortOptimizer;
-
-impl RulesOptimizer for MergeAndSortOptimizer {
-    fn optimize(&self, mut rules: Vec<RoutingRule>) -> Result<Vec<RoutingRule>, RoutingError> {
-        if rules.is_empty() {
-            return Ok(rules);
-        }
-
-        for rule in &mut rules {
-            rule.and_functions.sort_by(|a, b| a.name.cmp(&b.name));
-        }
-
-        // Only positive singleton rules may merge: for negated rules De Morgan
-        // breaks the equivalence `!f(a) -> X OR !f(b) -> X != !f(a, b) -> X`.
-        let mut merged: Vec<RoutingRule> = Vec::with_capacity(rules.len());
-        let mut remaining = rules.into_iter();
-        let mut current = remaining.next().expect("non-empty");
-        for rule in remaining {
-            let mergeable = current.and_functions.len() == 1
-                && rule.and_functions.len() == 1
-                && !current.and_functions[0].negated
-                && !rule.and_functions[0].negated
-                && current.and_functions[0].name == rule.and_functions[0].name
-                && current.outbound.compact_omit_empty() == rule.outbound.compact_omit_empty();
-            if mergeable {
-                let params = rule
-                    .and_functions
-                    .into_iter()
-                    .next()
-                    .expect("one function")
-                    .params;
-                current.and_functions[0].params.extend(params);
-            } else {
-                merged.push(std::mem::replace(&mut current, rule));
-            }
-        }
-        merged.push(current);
-
-        for rule in &mut merged {
-            for function in &mut rule.and_functions {
-                sort_params(function);
-            }
-        }
-
-        Ok(merged)
-    }
-}
-
 fn sort_params(function: &mut Function) {
-    if function.name == "ip" || function.name == "sip" {
+    if function.name == "dip" || function.name == "sip" {
         function.params.sort_by(|a, b| {
             let a_value = a.as_literal().unwrap_or_default();
             let b_value = b.as_literal().unwrap_or_default();
@@ -130,7 +74,7 @@ pub struct DeduplicateParamsOptimizer;
 impl RulesOptimizer for DeduplicateParamsOptimizer {
     fn optimize(&self, mut rules: Vec<RoutingRule>) -> Result<Vec<RoutingRule>, RoutingError> {
         for rule in &mut rules {
-            for function in &mut rule.and_functions {
+            for function in &mut rule.match_expr.and_functions {
                 let mut seen = HashSet::new();
                 function.params.retain(|param| seen.insert(param.compact()));
             }
@@ -142,79 +86,63 @@ impl RulesOptimizer for DeduplicateParamsOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daer_config::{BuiltinOutbound, OutboundAction};
 
-    /// Fixtures are written as config used to read: a `routing { … }` wrapper
-    /// around one rule per line. Only the lines matter.
-    fn rules(src: &str) -> Vec<RoutingRule> {
-        let body = src.trim();
-        let body = body.strip_prefix("routing {").unwrap_or(body);
-        let body = body.strip_suffix('}').unwrap_or(body);
-        body.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| daer_config::parse_rule_expr(line).expect("parses"))
-            .collect()
+    fn rule(name: &str, expr: &str, action: OutboundAction) -> RoutingRule {
+        RoutingRule {
+            name: name.to_owned(),
+            match_expr: daer_config::parse_match_expr(expr).expect("parses"),
+            action,
+        }
+    }
+
+    fn direct() -> OutboundAction {
+        OutboundAction::Builtin(BuiltinOutbound::Direct)
     }
 
     #[test]
-    fn alias_rewrites_function_names() {
-        let rules = rules(
-            "routing {\n    dip(1.1.1.1) -> direct\n    dport(80) -> direct\n    rule-set(corp) -> direct\n}",
-        );
-        let rules = AliasOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules[0].and_functions[0].name, "ip");
-        assert_eq!(rules[1].and_functions[0].name, "port");
-        assert_eq!(rules[2].and_functions[0].name, "provider");
-    }
-
-    #[test]
-    fn merges_adjacent_positive_singleton_rules() {
-        let rules = rules(
-            "routing {\n    domain(a.com) -> direct\n    domain(b.com) -> direct\n    domain(c.com) -> block\n}",
-        );
-        let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].and_functions.len(), 1);
-        assert_eq!(rules[0].and_functions[0].params.len(), 2);
-        assert_eq!(&*rules[0].outbound.name, "direct");
-        assert_eq!(&*rules[1].outbound.name, "block");
-    }
-
-    #[test]
-    fn does_not_merge_negated_rules() {
-        let rules =
-            rules("routing {\n    !domain(a.com) -> direct\n    !domain(b.com) -> direct\n}");
-        let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules.len(), 2);
-    }
-
-    #[test]
-    fn does_not_merge_different_outbounds() {
-        let rules = rules(
-            "routing {\n    domain(a.com) -> direct\n    domain(b.com) -> direct(mark: 1)\n}",
-        );
-        let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules.len(), 2);
-    }
-
-    #[test]
-    fn sorts_functions_and_params() {
-        let rules = rules("routing { port(443) && domain(b.com, a.com) -> direct }");
-        let rules = MergeAndSortOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules[0].and_functions[0].name, "domain");
-        assert_eq!(rules[0].and_functions[1].name, "port");
-        let values: Vec<&str> = rules[0].and_functions[0]
+    fn sorts_predicates_and_params_without_reordering_rules() {
+        let rules = vec![
+            rule("b", "dport(443) && domain(b.com, a.com)", direct()),
+            rule("a", "domain(c.com)", direct()),
+        ];
+        let rules = SortFunctionsOptimizer.optimize(rules).unwrap();
+        assert_eq!(rules[0].name, "b");
+        assert_eq!(rules[0].match_expr.and_functions[0].name, "domain");
+        assert_eq!(rules[0].match_expr.and_functions[1].name, "dport");
+        let values: Vec<&str> = rules[0].match_expr.and_functions[0]
             .params
             .iter()
             .filter_map(|param| param.as_literal())
             .collect();
         assert_eq!(values, ["a.com", "b.com"]);
+        assert_eq!(rules[1].name, "a");
     }
 
     #[test]
-    fn deduplicates_params() {
-        let rules = rules("routing { domain(a.com, a.com, b.com) -> direct }");
+    fn never_merges_named_rules_even_with_the_same_action() {
+        let rules = vec![
+            rule("a", "domain(a.com)", direct()),
+            rule("b", "domain(b.com)", direct()),
+        ];
+        let rules = SortFunctionsOptimizer.optimize(rules).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].name, "a");
+        assert_eq!(rules[1].name, "b");
+    }
+
+    #[test]
+    fn deduplicates_parameters_inside_one_predicate() {
+        let rules = vec![rule(
+            "a",
+            "domain(example.com, example.com, other.com)",
+            direct(),
+        )];
         let rules = DeduplicateParamsOptimizer.optimize(rules).unwrap();
-        assert_eq!(rules[0].and_functions[0].params.len(), 2);
+        assert_eq!(
+            rules[0].match_expr.and_functions[0].params.len(),
+            2,
+            "duplicates are removed, order is preserved"
+        );
     }
 }

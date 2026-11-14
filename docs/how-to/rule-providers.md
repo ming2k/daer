@@ -1,6 +1,6 @@
-# Manage Rule Providers and DRB Rule Sets
+# Manage Rule Sets and DRB Artifacts
 
-This guide walks operators through creating, compiling, and distributing high-performance `.drb` (daer Rule Binary) rule sets, and integrating remote rule subscriptions using declarative `[[rule-provider]]` declarations.
+This guide walks operators through creating, compiling, and distributing high-performance `.drb` (daer Rule Binary) rule sets, and integrating remote rule subscriptions using declarative `[[rule-set]]` declarations.
 
 ---
 
@@ -104,24 +104,24 @@ daer-drb compile cn-ip.rules -o geoip-cn.drb
 Declare local file or remote HTTP providers in your daemon configuration:
 
 ```toml
-schema = 2
+schema = 5
 
 # 1. Local pre-compiled DRB rule set
-[[rule-provider]]
+[[rule-set]]
 name = "company-direct"
 type = "file"
 path = "rules/company-direct.drb"
 format = "drb"
 
 # 2. Remote HTTP rule set with automated 24-hour background sync
-[[rule-provider]]
+[[rule-set]]
 name = "geosite-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
 format = "drb"
 interval = "24h"
 
-[[rule-provider]]
+[[rule-set]]
 name = "geoip-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
@@ -129,15 +129,23 @@ format = "drb"
 interval = "24h"
 
 [routing]
-rules = [
+fallback = "direct"
     # Match both IP intervals and domains from company-direct
-    "provider(company-direct) -> direct",
+[[routing.rule]]
+name = "rule-1"
+match = "rule-set(company-direct)"
+action = "direct"
 
     # Route domestic traffic directly
-    "provider(geosite-cn) -> direct",
-    "provider(geoip-cn) -> direct",
-]
-fallback = "proxy"
+[[routing.rule]]
+name = "rule-2"
+match = "rule-set(geosite-cn)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-3"
+match = "rule-set(geoip-cn)"
+action = "direct"
 ```
 
 ### Where to put local rule files
@@ -175,7 +183,7 @@ The tracked source of truth is `config/geosite-tags.txt`, `config/geoip-tags.txt
 `config/rules.toml`, and the files under `rules/`. Upstream `.dat` files and compiled `.drb`
 files are build inputs/outputs, not repository content.
 
-End users reference the public URLs in `[[rule-provider]]`, receiving automated background updates without manual maintenance or root privileges.
+End users reference the public URLs in `[[rule-set]]`, receiving automated background updates without manual maintenance or root privileges.
 
 For a fully local install — building the artifacts, verifying them, copying them to
 `/var/lib/daer/rules`, and declaring file providers — see
@@ -204,14 +212,31 @@ Organize rules strictly by **outbound action** and **independent update lifecycl
 In `daer.toml`:
 ```toml
 [routing]
-rules = [
-    "provider(block-ads) -> block",
-    "provider(corporate) -> direct",
-    "provider(geosite-cn) -> direct",
-    "provider(geoip-cn) -> direct",
-    "provider(proxy-special) -> specialized_proxy_group",
-]
-fallback = "proxy"
+fallback = "direct"
+[[routing.rule]]
+name = "rule-1"
+match = "rule-set(block-ads)"
+action = "block"
+
+[[routing.rule]]
+name = "rule-2"
+match = "rule-set(corporate)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-3"
+match = "rule-set(geosite-cn)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-4"
+match = "rule-set(geoip-cn)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-5"
+match = "rule-set(proxy-special)"
+action = { election = "specialized_proxy_group" }
 ```
 
 ### Critical Anti-Patterns to Avoid
@@ -279,16 +304,15 @@ through an artifact shows the same rules without their `@` markers.
 The following configuration deploys the compiled Loyalsoldier rule sets with automated 24-hour background synchronization and line-rate eBPF kernel offload:
 
 ```toml
-schema = 2
+schema = 5
 
-[global]
 wan-interface = ["eth0"]
 lan-interface = ["lan0"]
 
 # ── 1. Declare Rule Providers ──────────────────────────────────────────────
 
 # Ad & tracking rejection (daily update)
-[[rule-provider]]
+[[rule-set]]
 name = "ads"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-category-ads-all.drb"
@@ -296,7 +320,7 @@ format = "drb"
 interval = "24h"
 
 # Private subnets (RFC1918 / Loopback)
-[[rule-provider]]
+[[rule-set]]
 name = "private-ips"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-private.drb"
@@ -304,7 +328,7 @@ format = "drb"
 interval = "168h"
 
 # Mainland China Domains (daily update)
-[[rule-provider]]
+[[rule-set]]
 name = "geosite-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-cn.drb"
@@ -312,7 +336,7 @@ format = "drb"
 interval = "24h"
 
 # Mainland China IP CIDRs (weekly update)
-[[rule-provider]]
+[[rule-set]]
 name = "geoip-cn"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geoip-cn.drb"
@@ -320,7 +344,7 @@ format = "drb"
 interval = "168h"
 
 # Designated GFW Proxy Domains (daily update)
-[[rule-provider]]
+[[rule-set]]
 name = "geosite-gfw"
 type = "http"
 url = "https://github.com/daeuniverse/drb-sets/releases/latest/download/geosite-geolocation-!cn.drb"
@@ -330,23 +354,46 @@ interval = "24h"
 # ── 2. Evaluation Order (Coarse-Grained Pipeline) ──────────────────────────
 
 [routing]
-rules = [
+fallback = "direct"
+
+[routing.sniff]
+# The sets below carry domains; DNS/Fake-IP is consulted first, then a bounded peek.
+enabled = true
+timeout = "30ms"
+
     # 1. Block ads and analytics trackers
-    "provider(ads) -> block",
+[[routing.rule]]
+name = "rule-1"
+match = "rule-set(ads)"
+action = "block"
 
     # 2. Bypass private LAN subnets
-    "provider(private-ips) -> direct",
+[[routing.rule]]
+name = "rule-2"
+match = "rule-set(private-ips)"
+action = "direct"
 
     # 3. Direct route domestic IPs first, then domestic domains
-    "provider(geoip-cn) -> direct",
-    "provider(geosite-cn) -> direct",
+[[routing.rule]]
+name = "rule-3"
+match = "rule-set(geoip-cn)"
+action = "direct"
+
+[[routing.rule]]
+name = "rule-4"
+match = "rule-set(geosite-cn)"
+action = "direct"
 
     # 4. Explicit proxy for known GFW domains
-    "provider(geosite-gfw) -> proxy",
-]
+[[routing.rule]]
+name = "rule-5"
+match = "rule-set(geosite-gfw)"
+action = { election = "proxy" }
+
 
 # 5. Default fallback for unmatched traffic
-fallback = "proxy"
 ```
 
-This configuration lowers to fewer than **10 match sets** in the kernel, ensuring full eBPF line-rate offload with zero userspace deferrals for un-sniffed or IP-forwarded packets.
+The pure-IP prefix remains in the kernel; the first domain set creates the deferral boundary,
+and the suffix is evaluated in `daer-control` as ADR-0011 describes. Keep the IP rules first if
+line-rate handling of private and domestic addresses matters.

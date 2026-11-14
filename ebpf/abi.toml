@@ -75,21 +75,6 @@ rust_const = "DEVICE_IFINDEX"
 generationality = "shared"
 
 [[maps]]
-name = "fast_sock"
-rust_const = "FAST_SOCK"
-generationality = "shared"
-
-[[maps]]
-name = "tcp_offload_pause"
-rust_const = "TCP_OFFLOAD_PAUSE"
-generationality = "shared"
-
-[[maps]]
-name = "tcp_offload_sent"
-rust_const = "TCP_OFFLOAD_SENT"
-generationality = "shared"
-
-[[maps]]
 name = "routing_handoff_map"
 rust_const = "ROUTING_HANDOFF"
 generationality = "per-generation"
@@ -207,16 +192,6 @@ rust_const = "LAN_EGRESS_L3"
 section = "classifier/lan_egress_l3"
 
 [[programs]]
-name = "tproxy_lan_wan_egress_l2"
-rust_const = "LAN_WAN_EGRESS_L2"
-section = "classifier/lan_wan_egress_l2"
-
-[[programs]]
-name = "tproxy_lan_wan_egress_l3"
-rust_const = "LAN_WAN_EGRESS_L3"
-section = "classifier/lan_wan_egress_l3"
-
-[[programs]]
 name = "tproxy_wan_ingress_l2"
 rust_const = "WAN_INGRESS_L2"
 section = "classifier/wan_ingress_l2"
@@ -235,16 +210,6 @@ section = "classifier/wan_egress_l2"
 name = "tproxy_wan_egress_l3"
 rust_const = "WAN_EGRESS_L3"
 section = "classifier/wan_egress_l3"
-
-[[programs]]
-name = "tproxy_wan_lan_ingress_l2"
-rust_const = "WAN_LAN_INGRESS_L2"
-section = "classifier/wan_lan_ingress_l2"
-
-[[programs]]
-name = "tproxy_wan_lan_ingress_l3"
-rust_const = "WAN_LAN_INGRESS_L3"
-section = "classifier/wan_lan_ingress_l3"
 
 [[programs]]
 name = "tproxy_wan_cg_connect4"
@@ -275,21 +240,6 @@ section = "cgroup/sock_create"
 name = "tproxy_wan_cg_sock_release"
 rust_const = "WAN_CG_SOCK_RELEASE"
 section = "cgroup/sock_release"
-
-[[programs]]
-name = "tcp_offload_redirect"
-rust_const = "TCP_OFFLOAD_REDIRECT"
-section = "sk_skb/stream_verdict"
-
-[[programs]]
-name = "tcp_offload_sent_account"
-rust_const = "TCP_OFFLOAD_SENT_ACCOUNT"
-section = "fentry/skb_send_sock"
-
-[[programs]]
-name = "tcp_offload_sent_account_kprobe"
-rust_const = "TCP_OFFLOAD_SENT_ACCOUNT_KPROBE"
-section = "kprobe/skb_send_sock"
 
 # `enum MatchType`, packed, so one byte inside `match_set`.
 [[match_types]]

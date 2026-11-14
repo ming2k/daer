@@ -85,9 +85,6 @@
 #define MAX_ROUTING_HANDOFF_NUM 65536
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
 #define MAX_DOMAIN_ROUTING_NUM 65536
-// MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
-// session occupies two fast_sock entries (one per direction).
-#define MAX_TCP_OFFLOAD_NUM 16384
 #define MAX_ARG_LEN 128
 #define IPV6_MAX_EXTENSIONS 8
 

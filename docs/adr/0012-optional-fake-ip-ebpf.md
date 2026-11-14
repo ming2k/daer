@@ -9,10 +9,10 @@ supersedes: []
 
 # 0012. Pluggable Fake-IP subsystem and eBPF domain-bitmap synthesis
 
-- Status: Accepted
+- Status: Accepted (Amended by ADR-0050)
 - Date: 2026-01-08
 - Deciders: Ming Li
-- Related: [ADR-0004](0004-routing-epochs.md), [ADR-0005](0005-kernel-policy-encoding.md), [ADR-0011](0011-partitioned-kernel-routing.md)
+- Related: [ADR-0004](0004-routing-epochs.md), [ADR-0005](0005-kernel-policy-encoding.md), [ADR-0011](0011-partitioned-kernel-routing.md), [ADR-0050](0050-domain-acquisition-is-explicit.md)
 
 ---
 

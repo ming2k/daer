@@ -38,7 +38,7 @@ daer run [OPTIONS]
 | `--dry-run` | `false` | Report what the daemon would do and **change nothing**: no port bind, no device pair, no private ingress namespace, no sysctl, no policy route, no `bpf()`. Needs no capability. |
 | `--shutdown-timeout <SECONDS>` | `10` | Maximum grace period for live flows after `SIGTERM`/`SIGINT`; the listener stops accepting immediately. `0` exits without draining. The shipped systemd unit passes `5`. |
 
-Reloads on `SIGHUP`, and refreshes `[[rule-provider]]` entries on their configured `interval`.
+Reloads on `SIGHUP`, and refreshes `[[rule-set]]` entries on their configured `interval`.
 Under systemd it reports readiness (`READY=1`), reload (`RELOADING=1`) and shutdown (`STOPPING=1`)
 through `sd_notify`, so `Type=notify` units wait for the datapath to be attached before marking
 the service started.
@@ -54,9 +54,10 @@ With `--object` it also validates the compiled datapath object against the ABI â
 sections, and the BTF `func_info` invariant the kernel enforces â€” without loading it, so the
 check needs no capability and can gate a packaged artifact (ADR-0029).
 
-With `--host` it also checks the host-specific prerequisites: the Linux 6.6+ TCX baseline and
-the host-global sysctls (forwarding on, `rp_filter`/`arp_filter` relaxed). It reads `uname`
-and `/proc/sys`; it still needs no capability and changes nothing. A deployment gate should
+With `--host` it also checks the host-specific prerequisites: the Linux 6.6+ TCX baseline,
+the cgroup v2 hierarchy the `pname` hooks attach to, and the host-global sysctls (forwarding
+on, `rp_filter`/`arp_filter` relaxed). It reads `uname` and `/proc`; it still needs no
+capability and changes nothing. A deployment gate should
 pass this flag so a host that would refuse to start is caught before the service is restarted.
 Without it, `daer check` remains usable as an object/config gate on a build machine whose
 kernel does not match the target.
@@ -70,7 +71,7 @@ daer check [OPTIONS]
 | `-c`, `--config <PATH>` | Path to the configuration file. |
 | `--nodes` | Also print every node in every group with its protocol and security identity. |
 | `--object <PATH>` | Also validate the compiled datapath object. Pass `--object none` to skip it. |
-| `--host` | Also check the host-global sysctl prerequisites. |
+| `--host` | Also check the kernel, cgroup v2, and host-global sysctl prerequisites. |
 
 `--host` adds the kernel and sysctl prerequisites to the check. Exit status is the contract:
 `0` when the configuration and every requested check would run, non-zero otherwise. That is
@@ -90,7 +91,7 @@ daer route 1.1.1.1
 # Resolve with custom port and detailed rule trace
 daer route google.com:8443 --why
 
-# Resolve classic 4-tuple flow with sniffed domain
+# Resolve classic 4-tuple flow with a supplied domain
 daer route 192.168.1.10:41234 93.184.216.34:443 --domain example.com
 ```
 
@@ -100,7 +101,7 @@ daer route 192.168.1.10:41234 93.184.216.34:443 --domain example.com
 | `[DESTINATION]` | Destination address (`ip:port` or `ip`) when target is used as source. |
 | `--source <IP:PORT>` | Client source address (defaults to `127.0.0.1:12345`). |
 | `-c`, `--config <PATH>` | Path to configuration file. |
-| `--domain <NAME>` | The sniffed domain a `domain(...)` rule would see (auto-inferred if target is a domain). |
+| `--domain <NAME>` | The domain fact a `domain(...)` rule would see (auto-inferred if the target is a domain). |
 | `--why` | Print every rule and predicate evaluation trace, including shadowed rules. |
 
 Exit status: `0` when the flow has a usable outbound, non-zero when it would be dropped

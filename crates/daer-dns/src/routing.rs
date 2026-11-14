@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
 
-use daer_config::{Config, Function, FunctionOrString, Param, RoutingRule};
+use daer_config::{Config, DnsRule, Function, FunctionOrString, Param};
 use ipnet::IpNet;
 use regex::Regex;
 
@@ -388,7 +388,7 @@ impl RequestRouter {
         for rule in &config.dns.request.rules {
             rules.push(RequestRule {
                 selectors: compile_selectors(rule, block)?,
-                decision: Decision::parse(&rule.outbound.name, &upstreams)?,
+                decision: Decision::parse(&rule.upstream.name, &upstreams)?,
             });
         }
 
@@ -482,7 +482,7 @@ impl ResponseRouter {
             }
             rules.push(ResponseRule {
                 selectors,
-                action: ResponseAction::parse(&rule.outbound.name, &upstreams)?,
+                action: ResponseAction::parse(&rule.upstream.name, &upstreams)?,
             });
         }
 
@@ -543,7 +543,7 @@ fn fallback_name(fallback: &FunctionOrString) -> Result<String, RoutingError> {
 }
 
 fn compile_selectors(
-    rule: &RoutingRule,
+    rule: &DnsRule,
     block: &'static str,
 ) -> Result<Vec<RequestSelector>, RoutingError> {
     if rule.and_functions.is_empty() {

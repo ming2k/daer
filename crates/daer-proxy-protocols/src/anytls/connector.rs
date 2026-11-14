@@ -90,8 +90,8 @@ impl AnyTlsConnector {
             &anytls.server,
             anytls.port,
             &anytls.password,
-            anytls.sni.as_deref(),
-            anytls.allow_insecure,
+            anytls.tls.sni.as_deref(),
+            anytls.tls.allow_insecure,
             anytls.idle_sessions,
             options,
         )

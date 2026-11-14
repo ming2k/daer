@@ -26,7 +26,8 @@
 //! idle peer are `daer-relay`'s. Everything that answers *which outbound, which node, and
 //! why* is here: the compiled routing program, the node groups with their measured state,
 //! the health scheduler that fills that state, subscription and rule-provider resolution,
-//! and the sniffing that turns a peeked ClientHello into a name a rule can match.
+//! and domain acquisition: Fake-IP, a unique DNS-snooper candidate, or the explicit
+//! bounded sniff fallback.
 //!
 //! # Why the split is where it is
 //!
@@ -68,13 +69,14 @@
 pub mod daemon;
 pub mod datapath;
 pub mod decide;
+pub mod domain;
 pub mod election;
 pub mod generation;
 pub mod health;
 pub mod load;
 pub mod netns;
 pub mod rule_provider;
-pub mod sniff;
+mod sniff;
 pub mod subscription;
 
 pub use daemon::{
@@ -85,6 +87,10 @@ pub use datapath::{DEVICE, DatapathError, PEER};
 pub use decide::{
     ElectionHealth, ElectionIdentity, Explanation, GroupIdentity, NodeIdentity, Router,
     RouterOptions, Verdict,
+};
+pub use domain::{
+    DomainLookup, DomainOutcome, DomainPlan, DomainResolver, DomainSource, NamedDetail,
+    UnnamedReason,
 };
 pub use election::ElectionOverrides;
 pub use generation::{Generation, GenerationId, Generations, ReloadError, ReloadReport};
@@ -102,7 +108,6 @@ pub use rule_provider::{
     ResolvedRuleProvider, RuleProviderResolution, refresh_rule_provider, resolve_rule_providers,
     resolve_rule_providers_with,
 };
-pub use sniff::{Outcome, Unnamed, sniff_stream};
 pub use subscription::{
     Resolution, cache_directory, resolve_subscriptions, resolve_subscriptions_with,
 };

@@ -10,9 +10,9 @@ no `CAP_NET_ADMIN`:
 `scripts/verify/kernel-check.sh` covers (1) and the attach mechanics. (2) is what the steps
 below do on a real box. Everything that *can* be verified without privilege is, and is written
 to fail when it is wrong: the kernel policy table against the userspace evaluator
-(`crates/daer-routing/tests/kernel_policy.rs`), the ABI against the compiled object, and the
+(`tests/integration/routing_kernel_policy.rs`), the ABI against the compiled object, and the
 transparent path with a real `nftables tproxy` rule plus a negative control
-(`crates/daer-control/tests/transparent.rs`, [ADR-0007](../adr/0007-verification.md)).
+(`tests/e2e/control_transparent.rs`, [ADR-0007](../adr/0007-verification.md)).
 
 ## Step 0 — build on the target machine
 
@@ -23,13 +23,13 @@ that will run it**:
 cd /path/to/daer
 
 # vmlinux.h from the running kernel
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/kern/headers/vmlinux.h
 
 cargo xtask ebpf       # -> target/ebpf/datapath.bpf.o
 cargo build --release  # -> target/release/daer
 
 # the userspace must be green before the kernel side is worth testing
-cargo test --workspace
+cargo nextest run --workspace -E 'kind(lib) + kind(bin)' && cargo nextest run --workspace -E 'binary(integration)' && cargo test --workspace --doc
 ```
 
 Needs `clang`, `bpftool`, `ip`, and `go` (only for the optional `docs/how-to/vision-lab.md` lab).
@@ -50,10 +50,12 @@ Expected:
 ```text
 3. loading the object into the kernel (this runs the verifier)
   ok  the object loaded and passed the verifier
-       loaded 23 maps
-       loaded 23 programs
+       loaded 22 maps
+       loaded 16 programs
 4. attaching a TCX link to a real interface
   ok  a TCX program attached to lo
+5a. attaching the pname cgroup hooks
+  ok  the six pname cgroup hooks attached to cgroup v2
 ```
 
 **Send me this output either way.** If step 3 fails, the log at
@@ -68,22 +70,33 @@ Save as `/tmp/daer-test.toml`. Replace `wan-interface` with your outbound interf
 (`ip route show default` names it) and `lan-interface` with the one clients use.
 
 ```toml
-schema = 2
+schema = 5
 
-[global]
 wan-interface = ["eth0"]        # <-- yours
 lan-interface = ["eth1"]        # <-- yours, the network you proxy *from*
-# Strongly recommended: separates daer's own outbound flows from client flows.
-so-mark = 0x64616572
 log-level = "debug"
 
 [[node]]
-# Use your own link. `pbk`, `sid` and the clock all have to match the node, and a
-# mismatch makes the node *forward* the flow to the impersonated site rather than
-# refuse it — see the note in crates/daer-outbound/tests/reality_live.rs.
-url = "vless://<uuid>@<host>:443?encryption=none&security=reality&sni=<sni>&pbk=<pbk>&sid=<sid>&type=tcp&fp=chrome#edge"
+name = "edge"
+type = "vless"
+server = "<host>"
+port = 443
+uuid = "<uuid>"
 # A node whose user is configured for Vision *refuses* a client that omits the flow, so
-# add `&flow=xtls-rprx-vision` whenever the node expects it.
+# set this whenever the node expects it.
+flow = "xtls-rprx-vision"
+
+# `pbk`, `sid` and the clock all have to match the node, and a mismatch makes the node
+# *forward* the flow to the impersonated site rather than refuse it — see the note in
+# tests/e2e/protocols_reality_live.rs.
+[node.security]
+type = "reality"
+sni = "<sni>"
+public-key = "<pbk>"
+short-id = "<sid>"
+
+[node.transport]
+type = "tcp"
 
 [[group]]
 name = "proxy-pool"
@@ -97,10 +110,16 @@ type = "min-moving-avg"
 # `dip(...)` is representable in the kernel; `pname(...)` and `domain(...)` are not,
 # so this pair is what decides the tier. Both are correct, and the startup log says
 # which one you got.
-rules = [
-  "provider(private) -> direct",
-]
-fallback = "proxy"
+fallback = { election = "proxy" }
+
+[routing.sniff]
+enabled = true
+timeout = "30ms"
+
+[[routing.rule]]
+name = "private"
+match = "rule-set(private)"
+action = "direct"
 ```
 
 Check it compiles before starting — `daer route` uses the same generation the data path
@@ -235,21 +254,22 @@ Any of these, whichever is the first thing that does not match:
 
 Not bugs to chase — known gaps, so a test does not get spent on them:
 
-* **UDP datagrams are relayed but not proven through `tproxy`.** `TPROXY` is a `PREROUTING`
-  target, and a locally-generated datagram never reaches that hook inside a single network
-  namespace, which is the only topology available without mount privileges for `ip netns`. A
-  counter rule saw zero packets. Test with TCP (`curl`, `https`) and treat a QUIC hang as
-  expected until this is proven on a two-namespace box.
+* **UDP datagrams are proven through `tproxy` only by the privileged two-namespace tests.**
+  `tests/e2e/control_transparent_udp4.rs` and `tests/e2e/control_transparent_udp6.rs` build real client/origin
+  namespaces; a single-namespace fixture is invalid because `TPROXY` matches on the ingress
+  interface. The unprivileged workspace suite still skips the UDP end-to-end cases, so use
+  `scripts/verify/e2e-check.sh` (or the CI `3-udp4`/`3-udp6` gates) before claiming UDP coverage.
 * **vmess / plain vless / anytls / hysteria2 / tuic** are not implemented. Only
   `vless + REALITY + Vision`, `trojan`, `shadowsocks` and `socks5`/`http` dial.
 * **A `domain(...)` or `pname(...)` rule puts every flow on the userspace path.** The kernel
-  table is published either as a faithful translation or as a one-entry deferral (ADR-0005), and
-  those two predicates need kernel tables (`domain_routing_map`, `cookie_pid_map`) this build
-  does not maintain. The startup log names the rule that forced it. Traffic is still correct;
-  the fast path is what you lose.
+  table is published either as a faithful translation or as a one-entry deferral (ADR-0005).
+  `domain(...)` needs the DNS-derived `domain_routing_map`; `pname(...)` has its cgroup v2
+  map and hooks, but the kernel policy still defers it to the userspace evaluator. The
+  startup log names the rule that forced it. Traffic is still correct; the fast path is what
+  you lose.
 
   Verified for you: the tier decision, the entry count, the LPM tries and the outbound
-  connectivity entries are all published, and `crates/daer-routing/tests/kernel_policy.rs`
+  connectivity entries are all published, and `tests/integration/routing_kernel_policy.rs`
   cross-checks the encoded table against the userspace evaluator flow by flow.
 
   So: the datapath attaches, the redirect mechanics work, and the kernel-side *policy* is

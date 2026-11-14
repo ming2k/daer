@@ -92,13 +92,15 @@ context the packet has already lost.
    forwarded by the host to the client. On the way out, the listener's socket mark identifies
    the packet as daer's own traffic so the WAN egress program does not redirect it again.
 
-5. **The host namespace's old policy routing is removed at startup.**
-   A run that crashes before this release can leave a host-level mark rule in table 2023. The
-   new namespace cannot remove host state, and a stale mark rule would capture marked listener
-   replies. `PreparedIngress::prepare` calls
-   [`clear_host_policy_routing`](../../crates/daer-control/src/datapath.rs) before creating the
-   new pair. This is a one-way migration: the current architecture never installs host policy
-   routing.
+5. **Historical: the host namespace's old policy routing was removed at startup.**
+   A run before this release could leave a host-level mark rule in table 2023. The new
+   namespace cannot remove host state, and a stale mark rule would capture marked listener
+   replies. The original implementation called `clear_host_policy_routing` before creating the
+   new pair, as a one-way migration.
+   > Superseded by [ADR-0042](0042-tcx-only-linux-6-6.md): current builds do not adopt or
+   > repair pre-TCX state. Remove a stale host qdisc/filter or table-2023 entry explicitly;
+   > see [Test Environment Requirements](../dev/test-environment.md). The function no longer
+   > exists in the tree.
 
 6. **The privilege and lifecycle are explicit.**
    Creating the named namespace, moving a link into it, entering it with `setns(2)`, and
@@ -126,12 +128,12 @@ without `ExecStopPost`.
   daemon's mount namespace with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`.
 - The host `/run/netns` is untouched. A mount left by an older daemon is removed before the
   private tmpfs is mounted; a regular file left by a crashed `ip netns add` is unlinked.
-- `daer-cleanup` remains necessary for host state that is not namespace-owned: the WAN/LAN
-  TC filters and the qdiscs a classic attach created. A current (v2) journal carries only
-  those records; it no longer removes the namespace, the pair, or a host sysctl. A pre-v2
-  journal still triggers the full legacy restore.
-  > Amended by [ADR-0042](0042-tcx-only-linux-6-6.md): TCX removes the host TC filters and
-  > qdiscs from the ownership model, so `daer-cleanup` and the journal are deleted.
+- At the time, `daer-cleanup` was still necessary for host state that was not
+  namespace-owned: the WAN/LAN TC filters and the qdiscs a classic attach created. A
+  current (v2) journal carried only those records; it no longer removed the namespace, the
+  pair, or a host sysctl. A pre-v2 journal still triggered the full legacy restore.
+  > Amended by [ADR-0042](0042-tcx-only-linux-6-6.md): TCX removed the host TC filters and
+  > qdiscs from the ownership model, so `daer-cleanup` and the journal were deleted.
 
 ## Consequences
 
@@ -171,7 +173,7 @@ without `ExecStopPost`.
 | The peer has a reply path | `IngressNamespace::configure_peer` requires address, link route, default route, and permanent neighbor; `ip -n daer0ns route` shows it. A missing route makes the listener's SYN-ACK disappear with no error in userspace. |
 | The namespace mount is private | `netns_lifecycle` starts a host-mount-namespace child before `prepare` and asserts `/proc/<child>/root/run/netns/daer0ns` does not exist while the ingress is alive. |
 | A clean shutdown removes both ends | `IngressNamespace`'s drop deletes the namespace; deleting the peer removes the veth pair. `ip link show daer0` on the host and the private `/run/netns/daer0ns` must both be empty afterward. |
-| The host does not keep the old policy | `clear_host_policy_routing` runs before the pair exists, so `ip rule show` has no table-2023 entry after startup. |
+| The host does not install or repair old policy | Current builds install policy routing only inside `daer0ns`; a stale host table-2023 entry from a pre-TCX release is outside the supported upgrade path and must be removed by the operator. |
 
 `crates/daer-control/tests/netns_lifecycle.rs` is the real-kernel topology falsifier. It is
 gated on `DAER_NETNS_TEST=1` because it owns `daer0ns` and `daer0`/`daer0peer`; the privileged

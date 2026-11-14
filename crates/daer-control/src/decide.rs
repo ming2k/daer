@@ -21,12 +21,12 @@
 //! # What a TCP flow knows, and what it does not
 //!
 //! A redirected TCP flow gives the matcher four things: source address, source
-//! port, destination address and destination port, plus `TCP`. Everything else —
-//! the sniffed domain, the client's process name, the DSCP field, the source MAC —
-//! lives in the kernel's connection state and is not available to the ingress path
-//! yet. Those facts are supplied as "unknown" (`None`/zero) rather than guessed, so
-//! a rule that depends on them cannot match by accident. Sniffing
-//! (`daer-sniff`) and the state map are what will fill them in.
+//! port, destination address and destination port, plus `TCP`. The domain fact is
+//! acquired by [`crate::domain::DomainResolver`] (Fake-IP, DNS snooper, or the
+//! explicit `[routing.sniff]` fallback). The client's process name, the DSCP field
+//! and the source MAC live in the kernel's connection state. Facts that are not
+//! available are supplied as "unknown" (`None`/zero) rather than guessed, so a rule
+//! that depends on them cannot match by accident.
 //!
 //! # Why the groups are built once
 //!
@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daer_common::net::MacAddr;
-use daer_config::{Config, ElectionKind, FunctionOrString, ProbeSettings};
+use daer_config::{Config, ElectionKind, OutboundKind, ProbeSettings};
 use daer_outbound::{
     Dialer, DialerId, DialerOptions, DirectDialer, ElectionRuntime, FilterSet, NodeDialer,
     NodeGraph, NotifyOutcome, OutboundError, Property, Protocol, Security, UdpConnector, Upstream,
@@ -56,14 +56,14 @@ use daer_outbound::{
 use daer_relay::relay::DatagramLeg;
 use daer_relay::{Accepted, FlowFacts, RelayError};
 use daer_routing::{
-    AliasOptimizer, DeduplicateParamsOptimizer, MatchFacts, MatchSet, MergeAndSortOptimizer,
-    NormalizedProgram, Outbound, RecordingSink, RoutingError, RulesBuilder, Trace, first_hit,
-    is_builtin_outbound, outbound_name, parse_outbound,
+    DeduplicateParamsOptimizer, MatchFacts, MatchSet, NormalizedProgram, Outbound, RecordingSink,
+    RoutingError, RulesBuilder, SortFunctionsOptimizer, Trace, first_hit,
 };
 use daer_routing::{L4ProtoMask, ProcessName};
 
 use serde::Serialize;
 
+use crate::domain::{DomainOutcome, DomainPlan, DomainResolver, DomainSource};
 use crate::election::ElectionOverrides;
 use crate::generation::GenerationId;
 
@@ -124,7 +124,9 @@ pub struct ElectionIdentity {
     /// `group:<name>` or `node:<name>`.
     pub input: String,
     pub kind: ElectionKind,
-    pub probe: ProbeSettings,
+    /// The scheduled probe, or `None` for a manual election (never probed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeSettings>,
     pub candidates: usize,
     /// The node pinned by `daer elect`, if any.
     pub pinned: Option<String>,
@@ -196,12 +198,13 @@ pub struct Explanation {
     pub generation: GenerationId,
     /// The matching rule's index, or `None` for the fallback.
     pub rule: Option<usize>,
+    /// The rule's stable name, or `None` for the fallback.
+    pub rule_name: Option<String>,
     /// The rule as the engine evaluated it.
     ///
-    /// Normalized, not verbatim: the optimizer rewrites `dport` to `port`, sorts
-    /// parameters and merges adjacent rules, so this is the text that actually
-    /// fired. Reporting the raw input instead would risk showing a rule the engine
-    /// never evaluated.
+    /// The optimizer sorts predicates and parameters inside the rule, so this is
+    /// the text that actually fired. Rule order and rule identity are never
+    /// rewritten.
     pub rule_text: String,
     pub outbound: Outbound,
     /// Elections the flow could have gone to, for a rule that did not match.
@@ -229,17 +232,12 @@ impl Explanation {
     /// meaningless.
     #[must_use]
     pub fn outbound_is_actionable(&self) -> bool {
-        if &*self.outbound.name == outbound_name::BLOCK {
-            return false;
+        match self.outbound.kind {
+            OutboundKind::Block => false,
+            OutboundKind::Direct => true,
+            // An election is actionable only when it actually selected a node.
+            OutboundKind::Election => self.selected.is_some(),
         }
-        // `direct` and any built-in outbound are always actionable; only a group has
-        // to have a node.
-        if daer_routing::is_builtin_outbound(&self.outbound.name) {
-            return true;
-        }
-        // A group the explanation lists but for which no node was selected is
-        // empty after filtering (or entirely dead).
-        self.selected.is_some()
     }
 }
 
@@ -250,7 +248,10 @@ impl fmt::Display for Explanation {
             "{} → {}  [{}]",
             self.source, self.destination, self.generation
         )?;
-        writeln!(f, "  decided by : {}", self.rule_text)?;
+        match &self.rule_name {
+            Some(name) => writeln!(f, "  decided by : rule {name:?}: {}", self.rule_text)?,
+            None => writeln!(f, "  decided by : {}", self.rule_text)?,
+        }
         write!(
             f,
             "  outbound   : {} (mark {})",
@@ -269,22 +270,27 @@ impl fmt::Display for Explanation {
 /// What the router needs besides the configuration.
 #[derive(Debug, Clone, Default)]
 pub struct RouterOptions {
-    /// The socket mark to put on daer's own outbound sockets, overriding `global.so-mark`.
+    /// The socket mark to put on daer's own outbound sockets.
     ///
-    /// # Why an override exists at all
+    /// # Why this is a process option, not configuration
     ///
-    /// `SO_MARK` needs `CAP_NET_ADMIN`, so a configuration alone cannot decide it: an
-    /// unprivileged run (`--no-datapath`, a container probe, the test suite) must dial without
-    /// a mark or every dial fails, and a privileged run **must** dial with one or the proxy
-    /// captures its own traffic.
+    /// `SO_MARK` needs `CAP_NET_ADMIN`, so the value cannot come from a file: an
+    /// unprivileged run (`--no-datapath`, a container probe, the test suite) must dial
+    /// without a mark or every dial fails, and a privileged run **must** dial with one or
+    /// the proxy captures its own traffic.
     ///
-    /// That is not a hypothetical. With the mark absent, `daer`'s own connection to an origin
-    /// matches the same `tproxy` rule as a client's, is redirected back into the listener, and
-    /// the result is an unbounded loop: the end-to-end test observed **17,134** accepted flows
-    /// for a single client request before this override existed. The process knows which case it
-    /// is in (it either attached a datapath or it did not), so it decides once, here, and the
-    /// generation carries the answer.
-    pub so_mark: Option<Option<u32>>,
+    /// The value itself is an internal loop-evasion identity. A privileged run uses
+    /// [`daer_common::consts::DEFAULT_SOCKET_MARK`]; `--no-datapath` and diagnostics pass
+    /// `None`. `Some(mark)` exists for tests and future privileged callers that need a
+    /// different identity; `None` means no mark, never "read it from configuration".
+    ///
+    /// That is not hypothetical. With the mark absent, `daer`'s own connection to an
+    /// origin matches the same `tproxy` rule as a client's, is redirected back into the
+    /// listener, and the result is an unbounded loop: the end-to-end test observed
+    /// **17,134** accepted flows for a single client request before the mark was threaded
+    /// through. The process knows which case it is in (it either attached a datapath or it
+    /// did not), so it decides once, here, and the generation carries the answer.
+    pub so_mark: Option<u32>,
     /// Synthetic Fake-IP allocation pool (ADR-0012).
     pub fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
     /// Observational DNS Snooper for Real-IP mode (ADR-0011).
@@ -292,7 +298,7 @@ pub struct RouterOptions {
     /// The datapath's per-flow facts, when a datapath is attached.
     ///
     /// `None` is the honest state for `--no-datapath`, the diagnostics, and every test: the
-    /// router then matches on addresses and the sniffed name only, and a rule needing a MAC,
+    /// router then matches on addresses and the acquired domain only, and a rule needing a MAC,
     /// a DSCP, or a process name does not match by accident.
     pub kernel_observer: Option<Arc<dyn KernelObserver>>,
     /// Where a dial's measurement goes.
@@ -320,7 +326,7 @@ impl RouterOptions {
     /// The defaults, with the configuration's own directory recorded.
     ///
     /// `config` is accepted rather than ignored: a caller reading a file passes its path so a
-    /// relative `[[rule-provider]] path` resolves beside it, and the signature is the place
+    /// relative `[[rule-set]] path` resolves beside it, and the signature is the place
     /// that requirement is visible.
     #[must_use]
     pub fn for_config(config: impl AsRef<std::path::Path>) -> Self {
@@ -379,17 +385,17 @@ impl RouterOptions {
 
     /// Forces the socket mark daer's own dials carry.
     ///
-    /// `Some(None)` disables marking explicitly (an unprivileged run); `Some(Some(mark))` forces
-    /// one; `None` leaves it to `global.so-mark`.
+    /// `Some(mark)` marks every daer socket; `None` disables marking (an unprivileged
+    /// run, a diagnostic, or the test suite). The configuration cannot set this value.
     #[must_use]
     pub fn with_socket_mark(mut self, mark: Option<u32>) -> Self {
-        self.so_mark = Some(mark);
+        self.so_mark = mark;
         self
     }
 
     /// The mark this generation's dialers apply.
-    fn effective_so_mark(&self, config: &Config) -> Option<u32> {
-        self.so_mark.unwrap_or(config.global.so_mark)
+    fn effective_so_mark(&self) -> Option<u32> {
+        self.so_mark
     }
 }
 
@@ -399,11 +405,9 @@ pub struct Router {
     /// Which generation this router serves. Every flow log carries it, so a log
     /// slice is self-explaining: which configuration made this decision.
     generation: GenerationId,
-    /// How long to look for a name before routing by address.
-    ///
-    /// A zero budget disables sniffing entirely, which is what a configuration with no
-    /// domain rules wants: it removes a syscall and a wait from every flow.
-    sniffing_timeout: Duration,
+    /// How this generation obtains a domain, and whether payload inspection is
+    /// allowed. Built once from the lowered policy so TCP, UDP and diagnostics agree.
+    domain: DomainResolver,
     /// Kept so a generation can report the *semantic* identity of its routing
     /// policy: "did the reload change where traffic goes?" is a different question
     /// from "did the file change?".
@@ -429,8 +433,6 @@ pub struct Router {
     node_catalog: Vec<NodeIdentity>,
     /// Runtime `daer elect` overrides, shared across generations.
     overrides: Arc<ElectionOverrides>,
-    fake_ip: Option<Arc<daer_dns::FakeIpPool>>,
-    dns_snooper: Option<Arc<daer_dns::DnsSnooper>>,
     /// The datapath's per-flow facts, when one is attached.
     kernel_observer: Option<Arc<dyn KernelObserver>>,
     /// Where a dial's measurement goes.
@@ -462,55 +464,34 @@ impl Router {
             .map_err(|error| RoutingError::new(error.to_string()))?;
 
         // `geoip:` / `geosite:` are gone with the Protobuf reader (ADR-0014/ADR-0015): a rule
-        // names a `provider(...)`, and the provider is a compiled `.drb` set. There is no
+        // names a `rule-set(...)`, and the set is a compiled `.drb`. There is no
         // optimizer here that could resurrect the retired format.
         let program = NormalizedProgram::new(
-            &config.routing.rules,
+            &config.routing.rule,
             config.routing.fallback.clone(),
-            &[
-                &AliasOptimizer,
-                &MergeAndSortOptimizer,
-                &DeduplicateParamsOptimizer,
-            ],
+            &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
         )?;
 
-        // The mark daer's own dials carry. `RouterOptions` overrides the configuration because
-        // `SO_MARK` needs `CAP_NET_ADMIN`: an unprivileged run must not mark, and a privileged
-        // one must (see `RouterOptions::so_mark` for the loop it prevents).
-        let so_mark = options.effective_so_mark(config);
+        // The mark daer's own dials carry. It is a process option because `SO_MARK` needs
+        // `CAP_NET_ADMIN`: an unprivileged run must not mark, and a privileged one must
+        // (see `RouterOptions::so_mark` for the loop it prevents).
+        let so_mark = options.effective_so_mark();
         let dialer_options = {
             let options = DialerOptions::new(so_mark, DEFAULT_DIAL_TIMEOUT);
-            // `global.tls.profile`: unknown names are a load-time error. A silently defaulted
+            // `tls.profile`: unknown names are a load-time error. A silently defaulted
             // profile is a ClientHello the operator did not choose, and the handshake that fails
             // because of it reports nothing that points at the profile.
-            let options = match &config.global.tls.profile {
+            let options = match &config.tls.profile {
                 Some(name) => options
                     .with_tls_profile(name)
                     .map_err(|error| RoutingError::new(error.to_string()))?,
                 None => options,
             };
-            // `[global.tls] fragment`: unknown or reversed ranges are a load-time error, because
+            // `[tls] fragment`: unknown or reversed ranges are a load-time error, because
             // an operator who asked for a shaped handshake must not silently get the default one.
-            let fragment = daer_outbound::fragment::Fragment::from_config(&config.global.tls)
+            let fragment = daer_outbound::fragment::Fragment::from_config(&config.tls)
                 .map_err(RoutingError::new)?;
             options.with_fragment(fragment)
-        };
-        // Sniffing is only worth its cost when a rule can use a name. Deciding that here,
-        // once per generation, keeps the per-flow path free of the question.
-        let needs_domain = program
-            .rules
-            .iter()
-            .any(|rule| rule.and_functions.iter().any(|f| f.name == "domain"));
-        // Sniffing is only worth its cost when a rule can use a name. `auto-sniff-punt` = false
-        // means the operator wants the name only *after* the flow reaches userspace, never as a
-        // reason to hold the flow up, so the budget becomes zero and routing falls back to the
-        // address — which is what `global.auto-sniff-punt` documents.
-        let sniffing_timeout = if needs_domain && config.global.auto_sniff_punt {
-            Duration::from_nanos(
-                u64::try_from(config.global.sniffing_timeout.as_nanos()).unwrap_or(0),
-            )
-        } else {
-            Duration::ZERO
         };
         let (groups, elections) = build_resources_and_elections(config, &dialer_options)?;
         let node_names: Vec<String> = config
@@ -519,7 +500,6 @@ impl Router {
             .map(|node| Property::from_node(node).name)
             .collect();
         let node_catalog = node_catalog(config, &groups);
-        let known: Vec<String> = elections.keys().cloned().collect();
 
         let mut sink = RecordingSink::default();
         let mut fallback = None;
@@ -529,8 +509,9 @@ impl Router {
                 None => RulesBuilder::new(&mut sink),
             };
             program.lower(&mut builder, |value| {
-                let outbound = fallback_outbound(value)?;
-                check_target(&outbound.name, &known)?;
+                daer_config::validate::check_action_target(config, value, "routing.fallback")
+                    .map_err(|error| RoutingError::new(error.to_string()))?;
+                let outbound = Outbound::from_action(value)?;
                 fallback = Some(outbound);
                 Ok(())
             })?;
@@ -542,8 +523,9 @@ impl Router {
 
         // Every rule target must resolve too, not just the fallback.
         for rule in &program.rules {
-            let outbound = parse_outbound(&rule.outbound)?;
-            check_target(&outbound.name, &known)?;
+            daer_config::validate::check_action_target(config, &rule.action, "routing.rule.action")
+                .map_err(|error| RoutingError::new(error.to_string()))?;
+            Outbound::from_action(&rule.action)?;
         }
 
         let fake_ip = match &options.fake_ip {
@@ -566,7 +548,11 @@ impl Router {
             .dns_snooper
             .clone()
             .or_else(|| Some(Arc::new(daer_dns::DnsSnooper::default())));
+        let domain_plan = DomainPlan::build(config, &sink.matches)
+            .map_err(|error| RoutingError::new(error.to_string()))?;
         let mut warnings = sink.warnings.clone();
+        warnings.extend(domain_plan.warnings().iter().cloned());
+        let domain = DomainResolver::new(domain_plan, fake_ip, dns_snooper);
         let mut election_names: Vec<&String> = elections.keys().collect();
         election_names.sort();
         for name in election_names {
@@ -585,7 +571,7 @@ impl Router {
 
         Ok(Self {
             generation,
-            sniffing_timeout,
+            domain,
             program,
             matches: sink.matches,
             fallback,
@@ -600,8 +586,6 @@ impl Router {
             node_catalog,
             elections: std::sync::RwLock::new(elections),
             overrides: Arc::clone(&options.overrides),
-            fake_ip,
-            dns_snooper,
             kernel_observer: options.kernel_observer.clone(),
             dial_observer: options.dial_observer.clone(),
             so_mark,
@@ -664,16 +648,10 @@ impl Router {
         &self.fallback
     }
 
-    /// The Fake-IP pool, if active.
+    /// The effective domain-acquisition plan.
     #[must_use]
-    pub fn fake_ip(&self) -> Option<&Arc<daer_dns::FakeIpPool>> {
-        self.fake_ip.as_ref()
-    }
-
-    /// The DNS snooper, if configured.
-    #[must_use]
-    pub fn dns_snooper(&self) -> Option<&Arc<daer_dns::DnsSnooper>> {
-        self.dns_snooper.as_ref()
+    pub const fn domain_plan(&self) -> &DomainPlan {
+        self.domain.plan()
     }
 
     /// Resolves one flow.
@@ -684,51 +662,55 @@ impl Router {
     /// has no selectable node, or when the dial fails. The flow is closed by the
     /// caller in every one of those cases.
     pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, RelayError> {
-        // 1. Check if destination IP maps to a domain via Fake-IP or DNS Snooping.
-        let known_domain = self.known_domain(flow.destination);
+        // The resolver owns the whole policy: Fake-IP, the DNS snooper, and the bounded
+        // payload fallback. This path only consumes its answer.
+        let outcome = self
+            .domain
+            .resolve_tcp(&flow.stream, flow.source, flow.destination)
+            .await;
+        self.log_domain(&flow.flow_id, flow.destination, &outcome);
+        let verdict = self.verdict_for_flow(flow.source, flow.destination, outcome.domain());
+        self.dial_with_authority(flow, verdict, outcome.domain())
+            .await
+    }
 
-        if let Some(domain) = known_domain {
-            daer_observe::debug!(daer_observe::EventCode::FlowDnsMapping,
-                flow_id = %flow.flow_id,
-                generation = %self.generation,
-                destination = %flow.destination,
-                domain = %domain,
-                "flow resolved via dns mapping"
-            );
-            let verdict = self.verdict_for_flow(flow.source, flow.destination, Some(&domain));
-            return self.dial_with_authority(flow, verdict, Some(&domain)).await;
-        }
-
-        // Sniff before deciding: the name is the only way a `domain(...)` rule can fire.
-        // The stream is peeked, never consumed, so the origin still receives every byte.
-        if !self.sniffing_timeout.is_zero() {
-            let outcome = crate::sniff::sniff_stream(&flow.stream, self.sniffing_timeout).await;
-            if outcome.is_named() {
-                daer_observe::debug!(daer_observe::EventCode::FlowSniffed,
-                    flow_id = %flow.flow_id,
-                    generation = %self.generation,
-                    destination = %flow.destination,
-                    sniffed = %outcome.describe(),
-                    "flow sniffed"
-                );
-            } else {
+    fn log_domain(
+        &self,
+        flow_id: &daer_observe::FlowId,
+        destination: SocketAddr,
+        outcome: &DomainOutcome,
+    ) {
+        match outcome {
+            DomainOutcome::Named { domain, source, .. } => match source {
+                DomainSource::FakeIp | DomainSource::DnsSnooper => {
+                    daer_observe::debug!(daer_observe::EventCode::FlowDnsMapping,
+                        flow_id = %flow_id,
+                        generation = %self.generation,
+                        destination = %destination,
+                        domain = %domain,
+                        "flow resolved via dns mapping"
+                    );
+                }
+                DomainSource::Sniff => {
+                    daer_observe::debug!(daer_observe::EventCode::FlowSniffed,
+                        flow_id = %flow_id,
+                        generation = %self.generation,
+                        destination = %destination,
+                        sniffed = %outcome.describe(),
+                        "flow sniffed"
+                    );
+                }
+            },
+            DomainOutcome::Unnamed { .. } => {
                 daer_observe::trace!(daer_observe::EventCode::FlowNotSniffed,
-                    flow_id = %flow.flow_id,
+                    flow_id = %flow_id,
                     generation = %self.generation,
-                    destination = %flow.destination,
+                    destination = %destination,
                     reason = %outcome.describe(),
                     "flow not sniffed"
                 );
             }
-            // The name is borrowed from `outcome`, which lives to the end of this block;
-            // the verdict is computed inside it so no borrow outlives the outcome.
-            let name = outcome.name();
-            let verdict = self.verdict_for_flow(flow.source, flow.destination, name);
-            return self.dial_with_authority(flow, verdict, name).await;
         }
-
-        let verdict = self.verdict_for_flow(flow.source, flow.destination, None);
-        self.dial_with_authority(flow, verdict, None).await
     }
 
     /// Dials the outbound leg for a decided flow.
@@ -758,13 +740,13 @@ impl Router {
             "flow decided"
         );
 
-        if &*outbound.name == outbound_name::BLOCK {
+        if outbound.kind == OutboundKind::Block {
             return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
                 destination: flow.destination,
             }));
         }
 
-        if &*outbound.name == outbound_name::DIRECT {
+        if outbound.kind == OutboundKind::Direct {
             let direct_authority = flow.destination.to_string();
             let established = self
                 .direct
@@ -881,7 +863,7 @@ impl Router {
 
     /// The routing verdict for a datagram flow, without dialing.
     ///
-    /// Takes [`FlowFacts`] and an optional sniffed domain name (e.g. from QUIC).
+    /// Takes [`FlowFacts`] and the optional domain acquired by [`crate::domain`].
     #[must_use]
     pub fn verdict_for_datagram(&self, facts: FlowFacts, domain: Option<&str>) -> Verdict {
         self.verdict_with_kernel(
@@ -897,9 +879,9 @@ impl Router {
     ///
     /// # Why the datagram half needs this and TCP could do without it
     ///
-    /// TCP's [`Router::resolve`] walks the same three sources of a name — Fake-IP, the DNS
-    /// snooper, then a QUIC/TLS sniff — and passes the winner to
-    /// [`Router::dial_with_authority`]. The datagram relay used to skip all of it and dial
+    /// TCP's [`Router::resolve`] walks the same sources of a name — Fake-IP, a unique
+    /// DNS-snooper candidate, then the explicit `[routing.sniff]` fallback — and passes the
+    /// winner to [`Router::dial_with_authority`]. The datagram relay used to skip all of it and dial
     /// `original_destination`, which is correct only when the destination is a real
     /// address. With Fake-IP enabled the destination is a synthetic `198.18.0.0/15`
     /// address, so dialing it sends the flow to a host that does not exist; with DNS
@@ -913,7 +895,7 @@ impl Router {
     #[must_use]
     pub fn dial_target(&self, facts: FlowFacts, domain: Option<&str>) -> String {
         let verdict = self.verdict_for_datagram(facts, domain);
-        if &*verdict.outbound.name == outbound_name::DIRECT {
+        if verdict.outbound.kind == OutboundKind::Direct {
             return facts.destination.to_string();
         }
         match domain {
@@ -922,24 +904,25 @@ impl Router {
         }
     }
 
-    /// The name a datagram flow's destination is known by, if any.
+    /// Opens a datagram leg from the flow's first payload.
     ///
-    /// Fake-IP first, then the DNS snooper: the same order [`Router::resolve`] uses for
-    /// TCP, kept in one place so the two halves of the data path cannot disagree about
-    /// which source of truth wins.
-    #[must_use]
-    pub fn known_domain(&self, destination: SocketAddr) -> Option<String> {
-        let from_fake_ip = self
-            .fake_ip
-            .as_ref()
-            .and_then(|fake_ip| fake_ip.reverse_lookup_ip(destination.ip()));
-        from_fake_ip
-            .or_else(|| {
-                self.dns_snooper
-                    .as_ref()
-                    .and_then(|snooper| snooper.lookup(destination.ip()))
-            })
-            .map(|domain| domain.to_string())
+    /// This is the one entry point the relay calls. Name acquisition, including the
+    /// bounded first-datagram parse, happens here rather than in the transport.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Router::open_datagram`].
+    pub async fn open_datagram_with_payload(
+        &self,
+        facts: FlowFacts,
+        payload: &[u8],
+    ) -> Result<DatagramLeg, RelayError> {
+        let outcome = self
+            .domain
+            .resolve_datagram(facts.source, facts.destination, payload);
+        self.log_domain(&facts.flow_id, facts.destination, &outcome);
+        let verdict = self.verdict_for_datagram(facts, outcome.domain());
+        self.open_datagram(facts, &verdict, outcome.domain()).await
     }
 
     /// Opens the datagram leg for a decided flow.
@@ -973,7 +956,7 @@ impl Router {
             "datagram flow decided"
         );
 
-        if &*outbound.name == outbound_name::BLOCK {
+        if outbound.kind == OutboundKind::Block {
             return Err(RelayError::Rejected(daer_relay::Reject::Blocked {
                 destination: facts.destination,
             }));
@@ -984,7 +967,7 @@ impl Router {
         // to a target the rule that opened the leg never chose.
         let target = self.dial_target(facts, domain);
 
-        if &*outbound.name == outbound_name::DIRECT {
+        if outbound.kind == OutboundKind::Direct {
             // The mark is already baked into `datagram_direct` when the generation
             // was built, so a per-flow copy would only add a rebuild.
             return Ok(DatagramLeg {
@@ -1132,7 +1115,11 @@ impl Router {
                 name: name.clone(),
                 input: route.input.clone(),
                 kind: route.kind,
-                probe: route.probe.clone(),
+                probe: if route.kind == ElectionKind::Manual {
+                    None
+                } else {
+                    Some(route.probe.clone())
+                },
                 candidates: route.runtime.len(),
                 pinned,
                 effective,
@@ -1153,7 +1140,7 @@ impl Router {
         self.explain_with_domain(source, destination, None)
     }
 
-    /// Explains the decision for a flow, with a sniffed domain.
+    /// Explains the decision for a flow, with an acquired domain.
     ///
     /// # What this cannot see, and why that is correct
     ///
@@ -1175,12 +1162,12 @@ impl Router {
         domain: Option<&str>,
     ) -> Explanation {
         let verdict = self.verdict_with_domain(source, destination, domain);
-        let rule_text = match verdict.rule {
+        let (rule_name, rule_text) = match verdict.rule {
             Some(index) => self.program.rules.get(index).map_or_else(
-                || "<rule index out of range>".to_owned(),
-                ToString::to_string,
+                || (None, "<rule index out of range>".to_owned()),
+                |rule| (Some(rule.name.clone()), rule.to_string()),
             ),
-            None => format!("fallback -> {}", self.fallback.name),
+            None => (None, format!("fallback -> {}", self.fallback)),
         };
         let locked = self.elections.read().unwrap_or_else(|e| e.into_inner());
         let mut elections: Vec<String> = locked.keys().cloned().collect();
@@ -1191,6 +1178,7 @@ impl Router {
             destination,
             generation: self.generation,
             rule: verdict.rule,
+            rule_name,
             rule_text,
             outbound: verdict.outbound,
             elections,
@@ -1214,7 +1202,7 @@ impl Router {
         self.trace_with_domain(source, destination, None)
     }
 
-    /// Why each rule did or did not fire, for a flow with a sniffed domain.
+    /// Why each rule did or did not fire, for a flow with an acquired domain.
     #[must_use]
     pub fn trace_with_domain(
         &self,
@@ -1244,7 +1232,7 @@ impl Router {
         self.verdict_with_domain(source, destination, None)
     }
 
-    /// The routing verdict for a flow, with a sniffed domain.
+    /// The routing verdict for a flow, with an acquired domain.
     ///
     /// A domain-sensitive rule (`domain(… )`) only fires through this entry point;
     /// [`Router::verdict_for`] supplies `None` and therefore cannot match one. That is the
@@ -1289,7 +1277,7 @@ impl Router {
             .unwrap_or_default()
     }
 
-    /// The routing verdict for one L4 protocol, with a sniffed domain.
+    /// The routing verdict for one L4 protocol, with an acquired domain.
     ///
     /// The protocol is a parameter rather than a constant because `l4proto(tcp)` and
     /// `l4proto(udp)` are ordinary rule terms: matching a datagram flow as TCP would
@@ -1527,9 +1515,10 @@ pub struct KernelFacts {
 impl KernelFacts {
     /// Builds the facts from a `routing_handoff_map` entry.
     ///
-    /// A `pid` of `0` means the cgroup hooks were not attached (see ADR-0011's kernel
-    /// policy), and the C leaves `pname` empty in that case; the process name is then
-    /// reported as unknown rather than as the empty string a rule could match.
+    /// A `pid` of `0` means the process was not observed for this flow (for example a
+    /// LAN-client connection, which has no local process), and the C leaves `pname` empty
+    /// in that case; the process name is then reported as unknown rather than as the empty
+    /// string a rule could match.
     #[must_use]
     pub fn from_handoff(result: &daer_ebpf::abi::RoutingResult) -> Self {
         let process_name = if result.pid == 0 {
@@ -1628,12 +1617,12 @@ impl KernelObserver for HandoffObserver {
 
 /// Facts for a flow, with whatever the datapath observed.
 ///
-/// The domain is supplied when the caller sniffed one — an absent domain is the honest
+/// The domain is supplied by the acquisition policy — an absent domain is the honest
 /// default, because a guessed one would route traffic through the wrong outbound. The
 /// kernel-supplied fields come from [`KernelFacts`], which is the default (all unknown) for
 /// a flow the kernel never handed off.
 ///
-/// One construction for both callers — the hot path, which may have sniffed and may have a
+/// One construction for both callers — the hot path, which may have acquired a name and may have a
 /// handoff entry, and the diagnostic entry points, which have neither — so the two cannot
 /// drift.
 fn facts_with_kernel<'a>(
@@ -1673,7 +1662,7 @@ fn rule_boundaries(rules: &[daer_config::RoutingRule]) -> Vec<usize> {
     let mut boundaries = Vec::with_capacity(rules.len());
     let mut accumulated = 0usize;
     for rule in rules {
-        for function in &rule.and_functions {
+        for function in &rule.match_expr.and_functions {
             let mut keys: Vec<&str> = Vec::new();
             for param in &function.params {
                 if !keys.contains(&param.key.as_str()) {
@@ -1685,20 +1674,6 @@ fn rule_boundaries(rules: &[daer_config::RoutingRule]) -> Vec<usize> {
         boundaries.push(accumulated);
     }
     boundaries
-}
-
-fn fallback_outbound(fallback: &FunctionOrString) -> Result<Outbound, RoutingError> {
-    let function = fallback.as_function().map_err(RoutingError::new)?;
-    parse_outbound(&function)
-}
-
-fn check_target(name: &str, elections: &[String]) -> Result<(), RoutingError> {
-    if is_builtin_outbound(name) || elections.iter().any(|election| election == name) {
-        return Ok(());
-    }
-    Err(RoutingError::new(format!(
-        "outbound {name:?} is not an election; define it in an [[election]] table"
-    )))
 }
 
 /// Builds a relay dial error and emits the one `warn` event that names its stage and code.
@@ -1894,11 +1869,11 @@ fn build_resources_and_elections(
             dialers.push(Dialer::new(id, property, offset));
         }
 
-        let probe = election.resolved_probe(&config.global.probe);
+        let probe = election.resolved_probe();
         let runtime = ElectionRuntime::new(
             election.name.clone(),
             election.kind.selection_policy(),
-            probe.tolerance,
+            election.effective_tolerance(),
             dialers,
         );
         elections.insert(
@@ -1931,418 +1906,4 @@ impl daer_relay::Decide for Router {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_trace_and_the_verdict_never_disagree() {
-        // Two ways of asking the same question must not diverge: the trace is what a
-        // bug report is diagnosed with, the verdict is what the data path acts on.
-        let router = router(TWO_RULES);
-        for port in [80u16, 443, 8080] {
-            let (source, destination) = flow(port);
-            let verdict = router.verdict_for(source, destination);
-            let trace = router.trace(source, destination);
-            assert_eq!(trace.decided_by, verdict.rule, "port {port}");
-            assert_eq!(
-                trace.outbound.map(|outbound| outbound.name),
-                Some(verdict.outbound.name),
-                "the trace must report the effective outbound, fallback included (port {port})"
-            );
-        }
-    }
-
-    #[test]
-    fn the_explanation_carries_the_predicate_that_blocked_a_rule() {
-        let router = router(TWO_RULES);
-        let (source, destination) = flow(80);
-        let explanation = router.explain(source, destination);
-
-        let skipped = &explanation.trace.rules[0];
-        assert_eq!(skipped.rule, 0);
-        let blocking = skipped.blocking().expect("a blocking predicate");
-        assert_eq!(blocking.predicate, "port(443)");
-    }
-
-    fn router(src: &str) -> Router {
-        let config = daer_config::toml_config::load_str(src).expect("config loads");
-        Router::new(&config, GenerationId::new(7), &RouterOptions::default())
-            .expect("router builds")
-    }
-
-    fn flow(destination_port: u16) -> (SocketAddr, SocketAddr) {
-        (
-            "192.168.1.10:41234".parse().expect("source"),
-            SocketAddr::from(([93, 184, 216, 34], destination_port)),
-        )
-    }
-
-    const TWO_RULES: &str = r#"
-[routing]
-rules = ["dport(443) -> block", "dport(80) -> direct"]
-fallback = "direct"
-"#;
-
-    #[test]
-    fn a_verdict_names_the_rule_that_decided() {
-        let router = router(TWO_RULES);
-
-        let (source, destination) = flow(443);
-        let verdict = router.verdict_for(source, destination);
-        assert_eq!(verdict.rule, Some(0));
-        assert_eq!(&*verdict.outbound.name, "block");
-        assert_eq!(verdict.describe(), "rule 0");
-
-        let (source, destination) = flow(80);
-        let verdict = router.verdict_for(source, destination);
-        assert_eq!(verdict.rule, Some(1));
-        assert_eq!(&*verdict.outbound.name, "direct");
-        assert_eq!(verdict.describe(), "rule 1");
-    }
-
-    #[test]
-    fn an_unmatched_flow_is_attributed_to_the_fallback() {
-        let router = router(TWO_RULES);
-        let (source, destination) = flow(8080);
-        let verdict = router.verdict_for(source, destination);
-        assert_eq!(verdict.rule, None, "no rule matched");
-        assert_eq!(verdict.describe(), "fallback");
-        assert_eq!(&*verdict.outbound.name, "direct");
-    }
-
-    #[test]
-    fn an_explanation_names_the_configured_rule() {
-        let router = router(TWO_RULES);
-        let (source, destination) = flow(443);
-        let explanation = router.explain(source, destination);
-
-        assert_eq!(explanation.rule, Some(0));
-        // `dport` was normalized to `port` by the alias optimizer; the explanation
-        // reports what the engine evaluated, not the file's spelling.
-        assert_eq!(
-            explanation.rule_text, "port(443) -> block",
-            "the evaluated rule text, not an internal index"
-        );
-        assert_eq!(&*explanation.outbound.name, "block");
-
-        let rendered = explanation.to_string();
-        assert!(rendered.contains("decided by"), "{rendered}");
-        assert!(rendered.contains("port(443) -> block"), "{rendered}");
-        assert!(rendered.contains("gen7"), "{rendered}");
-    }
-
-    #[test]
-    fn an_explanation_of_a_fallback_says_so() {
-        let router = router(TWO_RULES);
-        let (source, destination) = flow(8080);
-        let explanation = router.explain(source, destination);
-        assert_eq!(explanation.rule, None);
-        assert_eq!(explanation.rule_text, "fallback -> direct");
-        assert_eq!(&*explanation.outbound.name, "direct");
-        // The fallback is a rule like any other; naming it is not a failure.
-        assert!(explanation.to_string().contains("fallback -> direct"));
-    }
-
-    #[test]
-    fn an_explanation_lists_the_groups_that_exist() {
-        let router = router(
-            r#"
-[[node]]
-tag = "n1"
-type = "socks5"
-server = "127.0.0.1"
-port = 1080
-
-[[election]]
-name = "proxy"
-node = "n1"
-type = "manual"
-
-[routing]
-rules = []
-fallback = "proxy"
-"#,
-        );
-        let (source, destination) = flow(80);
-        let explanation = router.explain(source, destination);
-        assert_eq!(explanation.elections, ["proxy"]);
-        assert_eq!(&*explanation.outbound.name, "proxy");
-    }
-
-    #[test]
-    fn a_domain_rule_only_matches_when_a_domain_is_supplied() {
-        // The property the data path depends on: without a sniffed name a `domain(...)`
-        // rule cannot fire, so it cannot route by a guess.
-        let router = router(
-            r#"
-[routing]
-rules = ["domain(example.com) -> block"]
-fallback = "direct"
-"#,
-        );
-        let (source, destination) = flow(443);
-
-        let without = router.verdict_with_domain(source, destination, None);
-        assert_eq!(&*without.outbound.name, "direct", "no domain, no match");
-        assert_eq!(without.rule, None);
-
-        let with = router.verdict_with_domain(source, destination, Some("www.example.com"));
-        assert_eq!(&*with.outbound.name, "block");
-        assert_eq!(with.describe(), "rule 0", "the domain rule fired");
-
-        let other = router.verdict_with_domain(source, destination, Some("example.org"));
-        assert_eq!(
-            &*other.outbound.name, "direct",
-            "a different name does not match"
-        );
-    }
-
-    #[test]
-    fn sniffing_is_enabled_only_when_a_domain_rule_exists() {
-        // Deciding this per generation keeps a syscall and a wait off every flow of a
-        // configuration that cannot use a name.
-        let with_domain =
-            router("[routing]\nrules = [\"domain(a) -> direct\"]\nfallback = \"direct\"\n");
-        assert!(!with_domain.sniffing_timeout.is_zero());
-
-        let without_domain = router(TWO_RULES);
-        assert!(
-            without_domain.sniffing_timeout.is_zero(),
-            "no domain rule, no sniffing cost"
-        );
-    }
-
-    #[test]
-    fn an_explanation_can_show_what_a_sniffed_name_changed() {
-        let router = router(
-            r#"
-[routing]
-rules = ["domain(example.com) -> block"]
-fallback = "direct"
-"#,
-        );
-        let (source, destination) = flow(443);
-        let explanation = router.explain_with_domain(source, destination, Some("api.example.com"));
-        assert_eq!(explanation.rule, Some(0));
-        assert_eq!(explanation.rule_text, "domain(example.com) -> block");
-        assert_eq!(&*explanation.outbound.name, "block");
-    }
-
-    #[test]
-    fn the_router_reports_the_generation_it_serves() {
-        let router = router(TWO_RULES);
-        assert_eq!(router.generation(), GenerationId::new(7));
-        assert_eq!(router.generation().to_string(), "gen7");
-    }
-
-    #[test]
-    fn facts_carry_the_tuple_and_leave_the_unknowns_unknown() {
-        let (source, destination) = flow(443);
-        let facts = facts_with_kernel(
-            source,
-            destination,
-            None,
-            L4ProtoMask::TCP,
-            KernelFacts::default(),
-        );
-        assert_eq!(facts.source_port, 41_234);
-        assert_eq!(facts.dest_port, 443);
-        assert_eq!(facts.l4proto, L4ProtoMask::TCP);
-        // The ingress cannot know these; a rule that needs them must not match.
-        assert!(facts.domain.is_none());
-        assert!(facts.process_name.is_unspecified());
-        assert_eq!(facts.dscp, 0);
-        assert_eq!(facts.mac, MacAddr([0; 6]));
-    }
-
-    /// An observer that reports fixed facts, standing in for the datapath's map.
-    #[derive(Debug)]
-    struct FixedObserver(KernelFacts);
-
-    impl KernelObserver for FixedObserver {
-        fn observe(
-            &self,
-            _source: SocketAddr,
-            _destination: SocketAddr,
-            _l4proto: u8,
-        ) -> Option<KernelFacts> {
-            Some(self.0)
-        }
-    }
-
-    #[test]
-    fn a_mac_rule_matches_only_when_the_datapath_supplied_the_mac() {
-        // The falsifier for the silently-inert rule class. `mac(...)` was compiled into the
-        // userspace half of a partitioned policy, and `MatchFacts` was built with `[0; 6]`, so
-        // the rule could never fire: a configuration that read "this device goes direct"
-        // proxied it instead, with no warning and no log line.
-        let source = r#"
-[[node]]
-name = "n1"
-type = "direct"
-
-[[election]]
-name = "proxy"
-node = "n1"
-type = "manual"
-
-[routing]
-rules = ["mac(00:11:22:33:44:55) -> block"]
-fallback = "proxy"
-"#;
-        let (from, to) = flow(443);
-
-        // Without an observer: the rule cannot fire, and the fallback applies.
-        let blind = router(source);
-        assert_eq!(
-            &*blind.verdict_for_flow(from, to, None).outbound.name,
-            "proxy"
-        );
-
-        // With the datapath's facts: the rule fires.
-        let mut name = [0u8; daer_routing::TASK_COMM_LEN];
-        name[..4].copy_from_slice(b"curl");
-        let observer = Arc::new(FixedObserver(KernelFacts {
-            mac: MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
-            dscp: 0,
-            process_name: daer_routing::ProcessName::from_bytes_truncated(&name),
-        }));
-        let config = daer_config::toml_config::load_str(source).expect("config loads");
-        let seeing = Router::new(
-            &config,
-            GenerationId::new(7),
-            &RouterOptions::default().with_kernel_observer(Some(observer)),
-        )
-        .expect("router builds");
-        assert_eq!(
-            &*seeing.verdict_for_flow(from, to, None).outbound.name,
-            "block"
-        );
-    }
-
-    #[test]
-    fn a_pname_rule_matches_only_when_the_datapath_supplied_the_process() {
-        let source = r#"
-[[node]]
-name = "n1"
-type = "direct"
-
-[[election]]
-name = "proxy"
-node = "n1"
-type = "manual"
-
-[routing]
-rules = ["pname(curl) -> block"]
-fallback = "proxy"
-"#;
-        let (from, to) = flow(443);
-        let mut name = [0u8; daer_routing::TASK_COMM_LEN];
-        name[..4].copy_from_slice(b"curl");
-
-        let observer = Arc::new(FixedObserver(KernelFacts {
-            mac: MacAddr([0; 6]),
-            dscp: 0,
-            process_name: daer_routing::ProcessName::from_bytes_truncated(&name),
-        }));
-        let config = daer_config::toml_config::load_str(source).expect("config loads");
-        let router = Router::new(
-            &config,
-            GenerationId::new(7),
-            &RouterOptions::default().with_kernel_observer(Some(observer)),
-        )
-        .expect("router builds");
-        assert_eq!(
-            &*router.verdict_for_flow(from, to, None).outbound.name,
-            "block"
-        );
-
-        // A different process name must not match, which is what proves the rule is reading
-        // the fact rather than the presence of an observer.
-        let other = Arc::new(FixedObserver(KernelFacts::default()));
-        let config = daer_config::toml_config::load_str(source).expect("config loads");
-        let router = Router::new(
-            &config,
-            GenerationId::new(7),
-            &RouterOptions::default().with_kernel_observer(Some(other)),
-        )
-        .expect("router builds");
-        assert_eq!(
-            &*router.verdict_for_flow(from, to, None).outbound.name,
-            "proxy"
-        );
-    }
-
-    #[test]
-    fn a_pid_of_zero_reports_the_process_name_as_unknown() {
-        // `pid == 0` means the cgroup hooks are not attached, and the C leaves `pname` empty.
-        // Treating the empty array as a name would let `pname()` match an empty string.
-        let result = daer_ebpf::abi::RoutingResult {
-            pid: 0,
-            pname: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
-            mac: [1, 2, 3, 4, 5, 6],
-            dscp: 46,
-            ..daer_ebpf::abi::RoutingResult::default()
-        };
-        let facts = KernelFacts::from_handoff(&result);
-        assert!(facts.process_name.is_unspecified());
-        // The MAC and DSCP are still real: they come from the packet, not from the hooks.
-        assert_eq!(facts.mac, MacAddr([1, 2, 3, 4, 5, 6]));
-        assert_eq!(facts.dscp, 46);
-    }
-
-    #[test]
-    fn a_runtime_election_overrides_the_configured_rule() {
-        let router = router(
-            "schema = 2\n\n\
-             [[node]]\nname = \"n1\"\ntype = \"direct\"\n\n\
-             [[node]]\nname = \"n2\"\ntype = \"direct\"\n\n\
-             [[group]]\nname = \"pool\"\n\n\
-             [[election]]\nname = \"proxy\"\ngroup = \"pool\"\ntype = \"min\"\n\n\
-             [routing]\nrules = []\nfallback = \"proxy\"\n",
-        );
-        router.elect("proxy", "n2").expect("n2 is a candidate");
-        assert_eq!(router.node_identity("proxy").unwrap().node, "n2");
-        assert!(router.elect("proxy", "missing").is_err());
-        router.reset_election("proxy").expect("resets");
-        assert!(router.node_identity("proxy").is_some());
-        assert!(router.reset_election("missing").is_err());
-    }
-
-    #[test]
-    fn a_detoured_node_reports_its_inner_hop() {
-        let router = router(
-            "schema = 2\n\n\
-             [[node]]\nname = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\n\
-             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n\n\
-             [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
-             [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
-             [routing]\nrules = []\nfallback = \"proxy\"\n",
-        );
-        let identity = router.node_identity("proxy").expect("selection");
-        assert_eq!(identity.node, "outer");
-        assert_eq!(identity.detour.as_deref(), Some("inner"));
-        let nodes = router.nodes();
-        assert_eq!(nodes.len(), 2, "both resources are visible: {nodes:#?}");
-        let outer = nodes
-            .iter()
-            .find(|node| node.node == "outer")
-            .expect("outer is in the catalog");
-        assert_eq!(outer.detour.as_deref(), Some("inner"));
-    }
-
-    #[test]
-    fn a_broken_detour_fails_the_generation_instead_of_dropping_the_node() {
-        let config = daer_config::toml_config::load_str(
-            "schema = 2\n\n\
-             [[node]]\nname = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n\n\
-             [[group]]\nname = \"proxy-pool\"\nfilters = [\"name(outer)\"]\n\n\
-             [[election]]\nname = \"proxy\"\ngroup = \"proxy-pool\"\ntype = \"random\"\n\n\
-             [routing]\nrules = []\nfallback = \"proxy\"\n",
-        )
-        .expect("parses");
-        let error = Router::new(&config, GenerationId::new(7), &RouterOptions::default())
-            .expect_err("an explicitly named missing hop is not an unselectable leaf");
-        assert!(error.to_string().contains("missing"), "{error}");
-    }
-}
+mod tests;

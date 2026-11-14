@@ -99,10 +99,9 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	return redirect_to_control_plane_ingress();
 }
 
-/* LAN-ingress role body. Takes the packet already parsed by the middle layer
- * so that a dual-role attachment (wan_lan_ingress) parses exactly once. Kept
- * inline so the role's locals live in whichever middle-layer frame drives it
- * (the combined 512-byte stack budget of the call chains is tight). */
+/* LAN-ingress role body. Takes the packet already parsed by the middle layer.
+ * Kept inline so the role's locals live in the caller's frame (the combined
+ * 512-byte stack budget of the call chains is tight). */
 static __always_inline int
 tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			struct parsed_packet *pkt)
@@ -457,8 +456,7 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 	return (skb->mark & 0x100) == 0x100;
 }
 
-/* WAN-ingress role body. Takes the packet already parsed by the middle layer
- * so a dual-role attachment (wan_lan_ingress) parses exactly once. */
+/* WAN-ingress role body. Takes the packet already parsed by the middle layer. */
 static __always_inline int
 tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			struct parsed_packet *pkt)
@@ -534,52 +532,5 @@ SEC("classifier/wan_ingress_l3")
 int tproxy_wan_ingress_l3(struct __sk_buff *skb)
 {
 	return do_tproxy_wan_ingress(skb, 0);
-}
-
-/* Dual-role hook: parse the packet once and run both roles on the same parsed
- * result. Parsing twice was both wasteful and a correctness hazard: the two
- * roles could observe different parser outcomes (e.g. the fast path falling
- * back to the slow path between calls) and disagree on forwarding. */
-static __noinline int
-do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
-{
-	__u32 scratch_key = 0;
-	struct parsed_packet *pkt =
-		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
-
-	if (!pkt)
-		return DAER_TC_DROP;
-
-	__builtin_memset(pkt, 0, sizeof(*pkt));
-	int ret = parse_packet(skb, link_h_len, pkt);
-
-	if (ret) {
-		if (ret < 0) {
-			return DAER_TC_DROP;
-		}
-		report_parse_passthrough(ret);
-		/* The wan_ingress role used to consume the packet first and
-		 * return DAER_TC_PASS for an unclassifiable frame, which made the
-		 * dual-role hook stop before the lan_ingress role. Preserve
-		 * that forwarding decision. */
-		return DAER_TC_PASS;
-	}
-
-	ret = tproxy_wan_ingress_role(skb, link_h_len, pkt);
-	if (ret != DAER_TC_CONTINUE)
-		return ret;
-	return tproxy_lan_ingress_role(skb, link_h_len, pkt);
-}
-
-SEC("classifier/wan_lan_ingress_l2")
-int tproxy_wan_lan_ingress_l2(struct __sk_buff *skb)
-{
-	return do_tproxy_wan_lan_ingress(skb, 14);
-}
-
-SEC("classifier/wan_lan_ingress_l3")
-int tproxy_wan_lan_ingress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_wan_lan_ingress(skb, 0);
 }
 

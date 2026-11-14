@@ -19,6 +19,7 @@ test state, and restores what it can on exit.
 | Linux 6.6+ with TCX | `uname -r` |
 | BTF available | `test -f /sys/kernel/btf/vmlinux` |
 | Root or the documented capabilities | `id`; `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON`, `CAP_SYS_ADMIN` |
+| cgroup v2 unified hierarchy | `test -f /sys/fs/cgroup/cgroup.controllers`; the six `pname` hooks attach there |
 | A default route on a real WAN interface | `ip route show default` |
 | `ip`, `nft`, `bpftool`, `curl`, `tcpdump`, `nsenter`, `sysctl`, `python3` | `command -v ...` |
 | A built release binary and object | `target/release/daer`, `target/ebpf/datapath.bpf.o` |
@@ -68,6 +69,7 @@ sudo ip6tables-save 2>/dev/null || true
 ss -lntup | grep -E ':(53|12345)\b' || true
 
 # eBPF attachment and cgroup hooks
+test -f /sys/fs/cgroup/cgroup.controllers && echo cgroup-v2=ok
 sudo bpftool net
 sudo bpftool link show
 sudo bpftool cgroup tree
@@ -184,8 +186,9 @@ the delivery check prove the wrong thing.
 `daer` does not adopt or repair pre-TCX state. A stale host qdisc/filter or old dae rule is
 outside the supported upgrade path; remove it explicitly, or use a fresh test host.
 
-The current default `so-mark` is `0x64616572` (ASCII `daer`). If a site config explicitly sets
-an older `so-mark`, update the firewall/rule that matches it at the same time.
+The socket mark is internal: `0x64616572` (ASCII `daer`). It is not a configuration key, so a
+test host must not carry a firewall/rule that matches a site-chosen mark; the datapath compares
+the internal value itself.
 
 ### 3.3 Acceptance
 

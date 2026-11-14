@@ -17,15 +17,11 @@ libc.workspace = true
 # which is what lets `daer check` gate a packaged artifact unprivileged (ADR-0029).
 aya-obj = "0.3"
 
-[dev-dependencies]
-libc.workspace = true
 
 [features]
 default = ["loader"]
 loader = ["dep:aya"]
 
-[[test]]
-name = "kernel"
 
 [lints]
 workspace = true

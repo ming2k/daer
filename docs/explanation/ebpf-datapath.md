@@ -72,8 +72,13 @@ Because `Slot 1` is populated completely before `active_slot` is flipped, the ke
 
 Not all routing predicates can be executed in the kernel.
 - Predicates like `dip(cidr)`, `sport(range)`, `l4proto(tcp)` are lowerable directly to BPF LPM trie and hash tables.
-- Predicates like `domain(...)` (which requires early TLS/HTTP sniffing in userspace) or `pname(...)` (client process name recovery) cannot be evaluated at the raw packet TC hook before TCP handshake.
+- `domain(...)` requires early TLS/HTTP sniffing in userspace. `pname(...)` is observed by the
+  six cgroup v2 hooks and carried through `routing_handoff_map`; the raw packet itself does
+  not carry a process name.
 
 `daer` verifies whether the compiled policy is **provably equivalent** to userspace rules (ADR-0005):
 - If all firing rules are kernel-supported, the policy runs on the kernel fast path.
-- If any rule requires domain sniffing, the datapath publishes a **deferral** action: all traffic is handed to `daer-control` for userspace sniffing and decision, logging the exact reason at startup.
+- If any rule requires a userspace fact, the datapath publishes a **deferral** action from that
+  rule's boundary: the suffix is handed to `daer-control`, which applies the
+  `[routing.sniff]` policy (DNS/Fake-IP first, payload inspection only when enabled), logging
+  the exact reason at startup.

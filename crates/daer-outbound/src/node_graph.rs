@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn a_chain_is_built_once_and_shared() {
         let config = config(
-            "schema = 2\n\
+            "schema = 5\n\
              [[node]]\ntag = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
              [[node]]\ntag = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"inner\"\n",
         );
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn an_unknown_detour_is_an_error() {
         let config = config(
-            "schema = 2\n\
+            "schema = 5\n\
              [[node]]\ntag = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"missing\"\n",
         );
         let mut graph = NodeGraph::new(
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn a_cycle_is_rejected_even_if_the_validator_was_skipped() {
         let config = config(
-            "schema = 2\n\
+            "schema = 5\n\
              [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n\
              [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"a\"\n",
         );
@@ -201,44 +201,6 @@ mod tests {
         .expect("graph");
         let error = graph.build_named("a").expect_err("must fail");
         assert!(error.to_string().contains("cycle"), "{error}");
-    }
-
-    #[test]
-    fn a_direct_node_can_be_an_inner_hop() {
-        let config = config(
-            "schema = 2\n\
-             [[node]]\ntag = \"local\"\ntype = \"direct\"\n\
-             [[node]]\ntag = \"outer\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"local\"\n",
-        );
-        let mut graph = NodeGraph::new(
-            &config.node,
-            DialerOptions::new(None, std::time::Duration::from_secs(1)),
-        )
-        .expect("graph");
-        let outer = graph.build_named("outer").expect("builds");
-        assert_eq!(outer.detour().map(|node| node.label()), Some("local"));
-    }
-
-    #[test]
-    fn a_direct_node_cannot_be_an_outer_hop() {
-        // A direct node has no server leg, so there is nothing for a detour to replace. The
-        // inner outbound is the thing to route to; accepting the alias would make `direct`
-        // report one protocol while carrying another.
-        // Bypass `load_str`: the validator refuses this shape, and the builder must refuse it
-        // too rather than relying on the earlier pass.
-        let mut alias = daer_config::Node::from_link("direct").expect("direct node");
-        alias.name = Some("alias".to_owned());
-        alias.detour = Some("inner".to_owned());
-        let inner =
-            daer_config::Node::from_link("socks5://127.0.0.1:1080#inner").expect("inner node");
-        let nodes = vec![inner, alias];
-        let mut graph = NodeGraph::new(
-            &nodes,
-            DialerOptions::new(None, std::time::Duration::from_secs(1)),
-        )
-        .expect("graph");
-        let error = graph.build_named("alias").expect_err("must fail");
-        assert!(error.to_string().contains("direct"), "{error}");
     }
 
     /// A minimal SOCKS5 server that connects to the requested target and splices bytes.
@@ -467,7 +429,7 @@ mod tests {
     #[test]
     fn a_chain_can_be_arbitrarily_deep() {
         let config = config(
-            "schema = 2\n\
+            "schema = 5\n\
              [[node]]\ntag = \"c\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1082\n\
              [[node]]\ntag = \"b\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1081\ndetour = \"c\"\n\
              [[node]]\ntag = \"a\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\ndetour = \"b\"\n",
@@ -488,9 +450,9 @@ mod tests {
     #[test]
     fn a_hysteria2_outer_hop_is_refused_with_the_reason() {
         let config = config(
-            "schema = 2\n\
+            "schema = 5\n\
              [[node]]\ntag = \"inner\"\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n\
-             [[node]]\ntag = \"hy\"\ntype = \"hysteria2\"\nserver = \"127.0.0.1\"\nports = { ranges = [[443, 443]] }\npassword = \"secret\"\ndetour = \"inner\"\n",
+             [[node]]\ntag = \"hy\"\ntype = \"hysteria2\"\nserver = \"127.0.0.1\"\nports = \"443\"\npassword = \"secret\"\ndetour = \"inner\"\n",
         );
         let mut graph = NodeGraph::new(
             &config.node,

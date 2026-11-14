@@ -18,7 +18,9 @@ different privilege requirements and different reversibility:
 2. **System resource acquisition** — create the private ingress namespace, create and move
    the `daer0`/`daer0peer` pair, bind the transparent listeners inside the namespace, read
    its MAC and ifindex, write sysctls, and install the namespace-local policy route.
-3. **Kernel attachment** — load the object, attach 23 programs to `clsact` and cgroup hooks.
+3. **Kernel attachment** — load the object, attach the TCX classifier links, and attach
+   the six cgroup v2 hooks that make `pname` work. The inherited TCP-offload programs were
+   removed in the 2026-11-14 amendment to ADR-0024.
 
 Step 1 needs nothing. Step 2 needs `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` and mutates the box.
 Step 3 needs `CAP_BPF` in addition, plus `CAP_PERFMON` for the verifier's `allow_ptr_leaks`

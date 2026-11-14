@@ -97,7 +97,7 @@ daer route 192.168.1.10:41234 93.184.216.34:443 -c config.toml
 
 ```
 192.168.1.10:41234 → 93.184.216.34:443  [gen1]
-  decided by : !domain(internal.example) && port(443) -> proxy
+  decided by : rule "not-internal-https": !domain(internal.example) && dport(443) -> election "proxy"
   outbound   : proxy (mark 0)
 ```
 
@@ -136,7 +136,7 @@ daer route 192.168.1.10:41234 93.184.216.34:443 --why -c config.toml
 
 ```
 192.168.1.10:41234 → 93.184.216.34:443  [gen1]
-  decided by : !domain(internal.example) && port(443) -> proxy
+  decided by : rule "not-internal-https": !domain(internal.example) && dport(443) -> election "proxy"
   outbound   : proxy (mark 0)
 
 rule 0 [skipped]
@@ -144,7 +144,7 @@ rule 0 [skipped]
   -> dip(10.0.0.0/8) did not match
 rule 1 [fired]
   v !domain(internal.example)
-  v port(443)
+  v dport(443)
 ```
 
 Three statuses, and the distinction between the last two is the usual answer to a
@@ -190,17 +190,20 @@ number never has to be looked up by hand.
 
 ### Facts the ingress does not have
 
-A redirected TCP flow supplies addresses, ports and `TCP`. The sniffed domain, the
+A redirected TCP flow supplies addresses, ports and `TCP`. The domain fact, the
 client's process name, DSCP and the source MAC live in the kernel's connection
-state and are **not** available to the ingress yet. They are passed as unknown
-(`domain = None`, `process_name` unspecified, `dscp = 0`, zero MAC), which means:
+state and are **not** available to the LAN ingress path: a LAN client has no local
+process name. They are passed as unknown (`domain = None`, `process_name`
+unspecified, `dscp = 0`, zero MAC), which means:
 
-> a rule that depends on them cannot match on the ingress path.
+> a rule that depends on them cannot match a LAN-client flow on the ingress path.
 
 That is a correctness property, not a limitation to work around: a guessed domain
-would silently route traffic through the wrong outbound. `daer-sniff` and the state
-map are what fill them in, and until then the honest answer is "this rule never
-fires here" — visible as a rule that never appears in `flow decided` logs.
+would silently route traffic through the wrong outbound. `daer-control::domain`
+fills the domain from Fake-IP, a unique DNS-snooper candidate, or the explicit
+`[routing.sniff]` fallback; the cgroup hooks fill `pname` for host-originated
+egress, and the kernel handoff fills the other facts. A fact nobody observed is
+reported as unknown rather than guessed.
 
 ## 4. "Traffic is not being served at all."
 
@@ -271,9 +274,9 @@ The configuration layer reports before anything runs:
   from the model.
 
 ```
-invalid expression "domain(a) direct"
-line 1:10 domain(a) direct
-              ^: expected '->' in the routing rule
+invalid expression "domain(a) -> direct"
+line 1:12 domain(a) -> direct
+               ^: unexpected '->' after the match expression
 ```
 
 ## 5b. "Did the reload disturb traffic?"
@@ -389,9 +392,9 @@ Sniffing returns a decision, and the decision is the answer:
 
 The cases that look like bugs and are not:
 
-* **QUIC always returns `None`.** A QUIC Initial is encrypted; recovering the SNI needs
-  header-protection removal and TLS reassembly, which is not implemented. A "clever"
-  approximation would report wrong names, which is worse than routing by IP.
+* **QUIC is readable only from the Initial packet.** The parser removes header protection,
+  decrypts the Initial and reads the SNI from its CRYPTO frame. Later datagrams are not a
+  name source; a flow whose first packet is not an Initial is routed by address.
 * **TLS with ECH returns `None`.** Encrypted ClientHello hides the name from a proxy by
   design; reporting the outer name as the inner one would be a lie.
 * **A ClientHello split across records still works.** Fragments are concatenated before
@@ -459,8 +462,9 @@ remote [udp] unusable: no transport for upstream "remote"
   remote [udp] unusable: no transport for upstream "remote"
 ```
 
-It exits non-zero in that case, so it works as a gate. `daer run` starts the resolver when
-`dns.bind` or `[dns.fake-ip]` asks for one, and logs `dns server started` with the address.
+It exits non-zero in that case, so it works as a gate. `daer run` starts the resolver only
+when `dns.bind` is set, and logs `dns server started` with the address. Fake-IP is an answer
+mode of that listener and requires an explicit `dns.bind`.
 
 `dns.bind` is an **IP**, not an address: the port is always 53. A port inside `dns.bind` is
 rejected with the field name rather than silently interpreted, because "bind 127.0.0.1:5353"
@@ -529,7 +533,7 @@ leak, so `Property::security` cannot reach one.
 
 ```
 10.0.0.5:40000 → 93.184.216.34:443  [gen1]
-  decided by : port(443) -> proxy
+  decided by : rule "https-proxy": dport(443) -> election "proxy"
   outbound   : proxy (mark 0)
   node       : proxy: hk-ss [ss | cipher aes-256-gcm]
 ```
@@ -588,4 +592,4 @@ routes nothing.
 | `daer-outbound::property` | a node's security identity is derived structurally and cannot contain a credential |
 | `daer-ebpf::epoch` | a failed publish leaves the active slot unchanged; a stamp is verified before the commit; generation 0 is never published |
 | `daer-sniff` | no panic on hostile bytes; `NeedMore` is bounded by `MAX_SNIFF_LEN`; a name is reported only when it is actually present |
-| `daer-control::sniff` | sniffing never consumes the stream; both a byte budget and a time budget bound it; failing to sniff is an outcome, not an error |
+| `daer-control::domain` | Fake-IP wins without sniffing; a unique DNS candidate skips sniffing; ambiguous/missing DNS obeys the explicit mode; TCP peeks without consuming and UDP never waits |

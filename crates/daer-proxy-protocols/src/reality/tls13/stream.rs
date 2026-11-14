@@ -516,15 +516,24 @@ fn build_client_hello(
         body.extend_from_slice(&0x0304u16.to_be_bytes());
         push_extension(&mut extensions, 43, &body);
     }
-    // key_share (51): one entry, the hybrid group.
+    // key_share (51): the hybrid group, plus the classic X25519 share over the same
+    // ephemeral secret. Current nodes require the hybrid; older nodes only inspect the
+    // classic share. Both make the REALITY tag valid because the server slices the same
+    // X25519 public key out of whichever share it accepts.
     {
-        let mut entry = Vec::new();
-        entry.extend_from_slice(&crate::reality::hybrid::GROUP.to_be_bytes());
-        entry.extend_from_slice(&(share.len() as u16).to_be_bytes());
-        entry.extend_from_slice(&share);
+        let x25519 = exchange.x25519_public();
+        let mut entries = Vec::new();
+        for (group, body) in [
+            (crate::reality::hybrid::GROUP, share.as_slice()),
+            (0x001d, x25519.as_slice()),
+        ] {
+            entries.extend_from_slice(&group.to_be_bytes());
+            entries.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            entries.extend_from_slice(body);
+        }
         let mut body = Vec::new();
-        body.extend_from_slice(&(entry.len() as u16).to_be_bytes());
-        body.extend_from_slice(&entry);
+        body.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        body.extend_from_slice(&entries);
         push_extension(&mut extensions, 51, &body);
     }
     // ALPN (16), only when asked for: a REALITY node may not speak any.
@@ -640,10 +649,10 @@ fn parse_server_hello(message: &[u8]) -> Result<Negotiated, HandshakeError> {
             }
             51 => {
                 let chosen = Reader::new(body).u16()?;
-                if chosen != crate::reality::hybrid::GROUP {
+                if chosen != crate::reality::hybrid::GROUP && chosen != 0x001d {
                     return fail(format!(
                         "the server selected key-share group {chosen:#06x}; this client \
-                         offers only X25519MLKEM768 ({:#06x})",
+                         offers X25519MLKEM768 ({:#06x}) and X25519 (0x001d)",
                         crate::reality::hybrid::GROUP
                     ));
                 }
@@ -658,8 +667,8 @@ fn parse_server_hello(message: &[u8]) -> Result<Negotiated, HandshakeError> {
     Ok(Negotiated { suite, group })
 }
 
-/// The server's key share, from its `key_share` extension.
-fn server_key_share(message: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+/// The server's key share for `expected`, from its `key_share` extension.
+fn server_key_share(message: &[u8], expected: u16) -> Result<Vec<u8>, HandshakeError> {
     let body = message
         .get(4..)
         .ok_or_else(|| HandshakeError("ServerHello is too short".to_owned()))?;
@@ -680,9 +689,9 @@ fn server_key_share(message: &[u8]) -> Result<Vec<u8>, HandshakeError> {
         if kind == 51 {
             let mut share = Reader::new(body);
             let group = share.u16()?;
-            if group != crate::reality::hybrid::GROUP {
+            if group != expected {
                 return fail(format!(
-                    "the server's key share is group {group:#06x}, not X25519MLKEM768"
+                    "the server's key share is group {group:#06x}, not {expected:#06x}"
                 ));
             }
             let key_len = share.u16()? as usize;
@@ -703,16 +712,21 @@ fn key_exchange(
     server_hello: &[u8],
     negotiated: &Negotiated,
 ) -> Result<Vec<u8>, HandshakeError> {
-    if negotiated.group != crate::reality::hybrid::GROUP {
-        return fail(format!(
-            "the server selected key-share group {:#06x}; this client offers only \
-             X25519MLKEM768 ({:#06x}), which is what a current REALITY node requires",
-            negotiated.group,
+    let peer = server_key_share(server_hello, negotiated.group)?;
+    match negotiated.group {
+        crate::reality::hybrid::GROUP => {
+            Ok(exchange.complete(&peer).map_err(HandshakeError)?.to_vec())
+        }
+        0x001d => Ok(exchange
+            .complete_x25519(&peer)
+            .map_err(HandshakeError)?
+            .to_vec()),
+        other => fail(format!(
+            "the server selected key-share group {other:#06x}; this client offers \
+             X25519MLKEM768 ({:#06x}) and X25519 (0x001d)",
             crate::reality::hybrid::GROUP
-        ));
+        )),
     }
-    let peer = server_key_share(server_hello)?;
-    Ok(exchange.complete(&peer).map_err(HandshakeError)?.to_vec())
 }
 
 /// Extracts the leaf certificate DER from a Certificate message.
@@ -1192,6 +1206,49 @@ mod tests {
             &share[crate::reality::hybrid::MLKEM_ENCAPSULATION_KEY_LEN..],
             &public.to_bytes(),
             "the share's tail is the X25519 public key"
+        );
+        let classic = exchange.x25519_public();
+        assert!(
+            message
+                .windows(classic.len())
+                .any(|window| window == classic),
+            "the classic X25519 share is offered beside the hybrid one"
+        );
+    }
+
+    #[test]
+    fn a_server_hello_can_select_classic_x25519() {
+        // Older nodes answer the classic share; the parser and key-share extractor must
+        // accept it beside the hybrid path.
+        let share = [0x2a; 32];
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&43u16.to_be_bytes());
+        extensions.extend_from_slice(&2u16.to_be_bytes());
+        extensions.extend_from_slice(&0x0304u16.to_be_bytes());
+        extensions.extend_from_slice(&51u16.to_be_bytes());
+        extensions.extend_from_slice(&(2 + 2 + share.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&0x001du16.to_be_bytes());
+        extensions.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&share);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0); // session id
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(0); // compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut message = vec![message_type::SERVER_HELLO];
+        message.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        message.extend_from_slice(&body);
+
+        let negotiated = parse_server_hello(&message).expect("parses");
+        assert_eq!(negotiated.group, 0x001d);
+        assert_eq!(
+            server_key_share(&message, 0x001d).expect("share"),
+            share.to_vec()
         );
     }
 

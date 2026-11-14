@@ -54,8 +54,9 @@ pub const AUTH_KEY_LEN: usize = 32;
 ///
 /// A server configured with `minClientVer` drops a hello whose version reads as zero — and
 /// because REALITY forwards an unauthenticated flow to the impersonated site, the symptom
-/// is a working TLS connection to the wrong host rather than an error.
-pub const VERSION: [u8; 4] = [26, 10, 29, 0];
+/// is a working TLS connection to the wrong host rather than an error. Keep this in sync
+/// with `../Xray-core/core/core.go` (`Version_x`/`Version_y`/`Version_z`).
+pub const VERSION: [u8; 4] = [26, 11, 9, 0];
 
 /// A REALITY authentication tag, ready to be placed in `legacy_session_id`.
 ///
@@ -321,6 +322,70 @@ mod tests {
         // fields instead of padding would be read as a different version and time.
         let auth = RealityAuth::new(&[1u8; 32], &[0xaa, 0xbb], SystemTime::now()).expect("builds");
         assert_eq!(auth.short_id, [0xaa, 0xbb, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_tag_plaintext_is_version_time_short_id_and_the_aad_is_zeroed() {
+        // This is the wire contract the Xray server parses. Decrypting our own tag is the
+        // only test that pins the plaintext layout and the zeroed-session-id AAD together;
+        // a mismatch either forwards the flow silently or is rejected as malformed.
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use std::time::Duration;
+
+        const SESSION_ID: usize = 4 + 2 + 32 + 1;
+        let server_secret = StaticSecret::from([0x42; 32]);
+        let server_public = PublicKey::from(&server_secret).to_bytes();
+        let client_secret = [0x11; 32];
+        let now = UNIX_EPOCH + Duration::from_secs(0x0102_0304);
+        let auth = RealityAuth::with_secret(&server_public, b"sid", now, client_secret)
+            .expect("auth builds");
+        let random = [0x22; 32];
+        let hello = hello_with_random(random);
+        let sealed = auth.seal(&hello).expect("tag seals");
+
+        let shared =
+            StaticSecret::from(client_secret).diffie_hellman(&PublicKey::from(server_public));
+        let key = schedule::hkdf_sha256(shared.as_bytes(), &random[..20], b"REALITY", AUTH_KEY_LEN);
+        assert_eq!(
+            sealed.auth_key, key,
+            "the auth key must match the server's derivation"
+        );
+
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("auth key");
+        let mut zeroed = hello.clone();
+        zeroed[SESSION_ID..SESSION_ID + AUTH_KEY_LEN].fill(0);
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&random[20..]),
+                Payload {
+                    msg: &sealed.tag,
+                    aad: &zeroed,
+                },
+            )
+            .expect("the tag opens over a zeroed session id");
+        assert_eq!(&plaintext[..4], &VERSION, "version");
+        assert_eq!(
+            &plaintext[4..8],
+            &0x0102_0304u32.to_be_bytes(),
+            "unix seconds"
+        );
+        assert_eq!(&plaintext[8..], b"sid\0\0\0\0\0", "short id is padded");
+
+        let mut tagged = hello.clone();
+        tagged[SESSION_ID..SESSION_ID + AUTH_KEY_LEN].copy_from_slice(&sealed.tag);
+        assert!(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&random[20..]),
+                    Payload {
+                        msg: &sealed.tag,
+                        aad: &tagged,
+                    },
+                )
+                .is_err(),
+            "the tag must not verify over itself; the server zeroes the field before opening"
+        );
     }
 
     #[test]

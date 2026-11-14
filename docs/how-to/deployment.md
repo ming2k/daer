@@ -10,13 +10,15 @@ What a box needs to run `daer` as a transparent proxy, and what to check when it
 
 | Thing | Why |
 | --- | --- |
-| Linux 6.6+ | TCX (`BPF_TCX_INGRESS`/`BPF_TCX_EGRESS`), `bpf_loop`, and the cgroup hooks the datapath uses |
+| Linux 6.6+ | TCX (`BPF_TCX_INGRESS`/`BPF_TCX_EGRESS`), `bpf_loop`, and the verifier features the datapath uses. The six cgroup v2 hooks for `pname` are attached at startup. |
 | `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` | load and attach the datapath (`CAP_PERFMON` enables the verifier's `allow_ptr_leaks` for variable-offset packet parsing); `IP_TRANSPARENT` on the listeners |
 | `CAP_SYS_ADMIN` | create the private `daer0ns` ingress namespace, unshare its private mount namespace, create the veth peer directly inside it, and `setns` to bind the listeners and attach the peer program (ADR-0038, ADR-0042) |
 | `ip` | create the `daer0`/`daer0peer` pair and configure the ingress namespace |
+| cgroup v2 | the six `pname` hooks attach to the unified hierarchy (`/sys/fs/cgroup` by default, `DAER_CGROUP_PATH` overrides); cgroup v1 is rejected. This is a startup requirement and is checked by `daer check --host`. The cgroup namespace must expose the sockets daer is supposed to observe (the host root for a host-wide gateway). |
+| `kill` in `/usr/bin` | the unit's `ExecReload` sends `SIGHUP`; install procps-ng or the equivalent |
 | Host sysctls | `net.ipv4.ip_forward=1`, `net.ipv4.conf.all.forwarding=1`, `net.ipv4.conf.all.rp_filter=0`, `net.ipv4.conf.all.arp_filter=0`; `net.ipv6.conf.all.forwarding=1` on a dual-stack kernel. `daer` checks them at startup and refuses to change them. |
 | the datapath object | `cargo xtask ebpf`, or one shipped with the package |
-| `[[rule-provider]]` sources | only when a rule says `provider(<name>)`; a `file` provider is read from `/var/lib/daer/rules/` (or the declared path), an `http` one is cached under `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it explicitly) |
+| `[[rule-set]]` sources | only when a rule says `rule-set(<name>)`; a `file` provider is read from `/var/lib/daer/rules/` (or the declared path), an `http` one is cached under `/var/cache/daer/rules` (`DAER_RULE_CACHE_DIR` overrides; the shipped unit sets it explicitly) |
 
 TC attachment is TCX-only: every hook is an fd-owned `bpf_link`, and the daemon creates no
 `clsact` qdisc. The minimum kernel is 6.6. There is no classic `cls_bpf` fallback and no
@@ -73,11 +75,11 @@ The package plan (`packaging/daer.plan.toml`) calls `cargo xtask install` for th
 reason, then adds only distribution files such as the example configuration and JSON schema.
 
 `cargo xtask ebpf` needs `DAER_DATAPATH_SRC` (defaults to `ebpf/kern`) and `DAER_BPF_HEADERS`
-(defaults to `ebpf/headers`). `ebpf/headers/vmlinux.h` is per-kernel and is not vendored;
-generate it where the object is built:
+(defaults to `ebpf/kern/headers`). `ebpf/kern/headers/vmlinux.h` must match the target kernel;
+regenerate it where the object is built, or point `DAER_BPF_HEADERS` at a generated tree:
 
 ```sh
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/headers/vmlinux.h
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/kern/headers/vmlinux.h
 ```
 
 A `vmlinux.h` from a newer kernel than the target's is the usual cause of a verifier
@@ -96,22 +98,33 @@ The supported deployment is system-wide:
 | `/var/lib/daer/rules/` | Operator-managed local `.drb` / `.rules` files. |
 | `/var/cache/daer/rules/` | Disposable HTTP provider cache. |
 
-A file provider reads only the path declared in its `[[rule-provider]]` entry. The daemon
+A file provider reads only the path declared in its `[[rule-set]]` entry. The daemon
 does not scan `/var/lib/daer/rules` automatically. Relative paths resolve against
 `/etc/daer/`; prefer absolute paths.
 
 ## Configuration
 
+### Upgrading a schema-4 file
+
+Schema 5 is a clean break:
+
+- remove `[global]`; move `log-level`, `lan-interface`, `wan-interface` and
+  `disable-waiting-network` to the top level;
+- rename `[global.tls]` to `[tls]`;
+- remove `[global.probe]`; put probe keys on the `[[election]]` that uses them;
+- remove `so-mark` entirely; the mark is internal (`0x64616572`), and a host firewall must
+  not match a site-chosen value.
+
+Run `daer check` before restarting; a schema-4 file is rejected by name, not silently
+reinterpreted.
+
 The minimum that proxies anything:
 
 ```toml
-schema = 2
+schema = 5
 
-[global]
-wan-interface = ["auto"]      # or the interface name
+wan-interface = ["eth1"]      # or "auto" when it resolves a different interface
 lan-interface = ["eth0"]      # the network you are proxying traffic *from*
-# Strongly recommended; see "The socket mark" below.
-so-mark = 0x64616572
 
 [[node]]
 name = "edge"
@@ -135,8 +148,21 @@ group = "proxy-pool"
 type = "min-moving-avg"
 
 [routing]
-rules = ["provider(private) -> direct", "provider(cn) -> direct"]
-fallback = "proxy"
+fallback = { election = "proxy" }
+
+[routing.sniff]
+enabled = true
+timeout = "30ms"
+
+[[routing.rule]]
+name = "private"
+match = "rule-set(private)"
+action = "direct"
+
+[[routing.rule]]
+name = "cn"
+match = "rule-set(cn)"
+action = "direct"
 ```
 
 Check it before starting:
@@ -198,15 +224,16 @@ It *listens* only when the configuration asks for it:
 | Configuration | DNS listener |
 | --- | --- |
 | `dns.bind` set | started on that address (port 53) |
-| `[dns.fake-ip] enabled = true` | started on `dns.bind`, default `0.0.0.0:53` |
-| neither | **not** started; the daemon logs at `INFO` that it is not the box's resolver |
+| `[dns.fake-ip] enabled = true` without `dns.bind` | **load error**; Fake-IP is an answer mode, not a listener |
+| `dns.bind` unset | **not** started; the daemon logs at `INFO` that it is not the box's resolver |
 
 Binding `0.0.0.0:53` unconditionally would be a regression, not a convenience: a box already
 running `systemd-resolved` would see `daer run` fail with `EADDRINUSE`, and a box that does not
-want daer as its resolver would have one installed anyway. Fake-IP counts as a request because
-the feature is inert without a resolver handing out the synthetic addresses.
+want daer as its resolver would have one installed anyway. Fake-IP does not imply a listener:
+the synthetic address is useless unless the operator chooses the interface and port that hand
+it to clients.
 
-## The socket mark
+## The socket mark is internal
 
 The datapath recognises daer's own traffic by `skb->mark`, not by port. Without a consistent
 mark, daer's *outbound* connection to an origin is caught by its own datapath and redirected
@@ -214,12 +241,8 @@ back into its own listener: the flow appears to hang with no error in any log. T
 end-to-end test measured **17,134** accepted flows for a single client request before the mark
 was threaded through.
 
-```toml
-[global]
-so-mark = 0x64616572
-```
-
-`daer run` applies that value in every place that creates a socket and logs it once:
+The mark is not a configuration key. A privileged run applies the fixed constant
+`0x64616572` (ASCII `daer`) to every socket it creates and logs it once:
 
 ```text
 INFO listening for redirected flows port=12345 so_mark=Some(1684104562) namespace=Some("daer0ns") generation=gen1
@@ -238,9 +261,9 @@ The ingress policy rule is keyed by `iif daer0peer`, not by the mark: the mark o
 replies is what makes the host skip them, and a mark rule inside `daer0ns` would instead route
 those replies to `lo`.
 
-When the datapath is enabled, an absent `global.so-mark` uses the non-zero default `0x64616572`
-because a mark of `0` is exactly the self-capture case. `--no-datapath` uses no mark: nothing
-is redirected, so there is no loop to evade.
+`--no-datapath` uses no mark: nothing is redirected, so there is no loop to evade. A
+configured `0` would be the self-capture case, and any other site-chosen value would have to be
+kept in sync with the datapath, which is why the value is internal.
 
 ## The redirect and the policy routing
 
@@ -339,6 +362,10 @@ NotifyAccess=main
 # nothing. The daemon feeds this at half the interval, including while a reload is running.
 WatchdogSec=30s
 User=root
+# Status snapshots, event streams, incident bundles and subscription caches can
+# contain flow metadata or node credentials. Keep unit-created files private even
+# though the application also sets explicit modes on the artifacts it writes.
+UMask=0077
 # Runtime election control is root-only by default. Opt in to a group with a drop-in
 # that sets SupplementaryGroups= and DAER_ADMIN_GROUP; see below.
 
@@ -351,7 +378,7 @@ OOMScoreAdjust=-100
 # There is deliberately no ExecStartPre=/usr/bin/daer check:
 # `daer run` performs the identical load_resolved validation before it binds a socket or
 # mutates kernel state, and Type=notify above makes systemd wait for that gate. Running
-# `daer check` first repeated every subscription and rule-provider fetch on each start and
+# `daer check` first repeated every subscription and rule-set fetch on each start and
 # restart, doubling startup network work without adding a check.
 ExecStart=/usr/bin/daer run -c /etc/daer/config.toml --object /usr/lib/daer/datapath.bpf.o --shutdown-timeout 5
 ExecReload=/usr/bin/kill -HUP $MAINPID
@@ -391,8 +418,13 @@ ProtectControlGroups=true
 # ProtectKernelTunables must remain false: daer tunes per-device sysctls on the host end
 # (daer0) and, through daer0ns, on the peer.
 ProtectKernelTunables=false
+SystemCallArchitectures=native
 LockPersonality=true
 RestrictRealtime=true
+RestrictSUIDSGID=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectHostname=true
 PrivateTmp=true
 # The listener and the device pair need the network, so `PrivateNetwork` is off.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
@@ -425,6 +457,21 @@ Environment=DAER_RULE_CACHE_DIR=/var/cache/daer/rules
 [Install]
 WantedBy=multi-user.target
 ```
+
+`UMask=0077` is not cosmetic: `/etc/daer/persist.d` contains subscription links,
+`/var/lib/daer/incidents` contains redacted flow evidence, and `/run/daer` contains the
+status/event stream. The daemon also sets `0600` on the files it writes and `0700` on those
+directories, so a foreground run has the same property; the package and install script
+tighten artifacts created by an older build.
+
+### Upgrading from a pre-TCX 0.0.x build
+
+A pre-TCX install may have `/run/daer/restore` (or a versioned recovery journal) and a host
+`clsact` filter/table-2023 rule. Current daer does not replay that journal or adopt the host
+state. Stop the old service and let its `daer-cleanup` finish, or remove the old qdisc/filter
+explicitly, before installing 0.1.0. The installer removes the old helper and object so they
+cannot be invoked by the wrong unit; it does not guess whether old host state is safe to
+delete.
 
 To install and enable it:
 
@@ -465,7 +512,7 @@ only changes the named election's current choice.
 The unit does **not** run `daer check` as an `ExecStartPre=`. `daer run` performs the same
 `load_resolved` validation before it binds a socket or mutates kernel state, and `Type=notify`
 makes systemd wait for the daemon's `READY=1`. A separate check would repeat every subscription
-and rule-provider fetch on each start and restart, doubling the startup network work without
+and rule-set fetch on each start and restart, doubling the startup network work without
 testing anything the daemon does not test itself. Keep `daer check` in deployment pipelines and
 before a manual edit; it is still the command that answers "will this configuration run".
 
@@ -499,7 +546,7 @@ The steps that matter are 4 and 7:
   ok   every in-kernel datapath case passed
 ```
 
-Step 7 runs 58 self-checking BPF programs (`pktgen`/`setup`/`check` triples from
+Step 7 runs the self-checking BPF programs (`pktgen`/`setup`/`check` triples from
 `ebpf/kern/tests/bpf_test.c`) through `BPF_PROG_TEST_RUN`. It is the only check in the
 repository that executes the datapath's own routing, conntrack and redirect logic inside the
 kernel, so a green step 4 with a skipped step 7 means the object loads and nothing more.
@@ -589,17 +636,19 @@ Be aware before trusting it with traffic:
   have to maintain from DNS answers; this build does not maintain it. Every flow is then
   handed to userspace, which is correct but costs a relay hop. The daemon says which tier it
   is in at startup — see [ADR-0005](../adr/0005-kernel-policy-encoding.md). The facts the kernel
-  did observe (source MAC, DSCP, process name) **are** read back from
-  `routing_handoff_map`, so `mac(...)`, `dscp(...)`, and `pname(...)` rules do match on that
-  path.
-* **IPv4 `tproxy` datagrams are not proven end to end** in the unprivileged workspace
-  suite. `TPROXY` matches on the ingress interface, so a real fixture needs the origin in a
-  second network namespace; a single-namespace fixture cannot work because the origin and the
-  transparent reply socket must own the same `(address, port)`. The privileged e2e gate runs
-  `transparent_udp6.rs`, which builds the real client/origin two-namespace topology and is
-  required as `3-udp6` in CI. What *is* proven without that topology: the reply leaves from
-  the original destination (not from the transparent port), one client port talking to two
-  destinations gets two sessions, and the reply-socket cache evicts instead of leaking fds.
+  did observe (source MAC, DSCP, and local process name) are read back from
+  `routing_handoff_map`, so `mac(...)`, `dscp(...)`, and `pname(...)` rules match on that path.
+  `pname` describes the local process that opened a host-originated flow; a LAN client's
+  flow has no local process name, and a socket established before the daemon started may not
+  have a record yet. The six cgroup v2 hooks must attach successfully at startup or the daemon
+  refuses to run.
+* **UDP `tproxy` is covered by the privileged two-namespace tests.** `TPROXY` matches on the
+  ingress interface, so a single-namespace fixture is invalid. The privileged e2e gate runs
+  both `transparent_udp4.rs` and `transparent_udp6.rs`, required as `3-udp4` and `3-udp6` in
+  CI. The unprivileged workspace suite still skips those two end-to-end cases; what *is*
+  proven without the topology: the reply leaves from the original destination (not from the
+  transparent port), one client port talking to two destinations gets two sessions, and the
+  reply-socket cache evicts instead of leaking fds.
 * **IPv6 dual-stack** is implemented for TCP and UDP, including the `udp6` listener slot and
   independent IPv4/IPv6 Fake-IP pools. IPv6-only operation still depends on the host having
   IPv6 forwarding and a default route; the daemon configures both best-effort and reports a

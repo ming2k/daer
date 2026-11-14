@@ -200,9 +200,6 @@ impl Property {
     pub fn from_node(node: &daer_config::Node) -> Self {
         let name = node.name.clone().unwrap_or_else(|| node.default_name());
         let (protocol, address, udp, security) = match &node.endpoint {
-            daer_config::NodeEndpoint::Direct(_) => {
-                (Protocol::Direct, String::new(), true, Security::None)
-            }
             daer_config::NodeEndpoint::Socks5(n) => (
                 Protocol::Socks5,
                 format!("{}:{}", n.server, n.port),
@@ -232,8 +229,8 @@ impl Property {
                 format!("{}:{}", n.server, n.port),
                 false,
                 Security::Tls {
-                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
-                    allow_insecure_requested: n.allow_insecure,
+                    server_name: n.tls.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.tls.allow_insecure,
                 },
             ),
             daer_config::NodeEndpoint::AnyTls(n) => (
@@ -241,8 +238,8 @@ impl Property {
                 format!("{}:{}", n.server, n.port),
                 true,
                 Security::Tls {
-                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
-                    allow_insecure_requested: n.allow_insecure,
+                    server_name: n.tls.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.tls.allow_insecure,
                 },
             ),
             daer_config::NodeEndpoint::Hysteria2(n) => (
@@ -250,8 +247,8 @@ impl Property {
                 format!("{}:{}", n.server, n.ports.to_link_port()),
                 true,
                 Security::Tls {
-                    server_name: n.sni.clone().unwrap_or_else(|| n.server.clone()),
-                    allow_insecure_requested: n.allow_insecure,
+                    server_name: n.tls.sni.clone().unwrap_or_else(|| n.server.clone()),
+                    allow_insecure_requested: n.tls.allow_insecure,
                 },
             ),
             // The security layer decides what is reported, not the protocol: a `vless` node over
@@ -310,13 +307,9 @@ impl Property {
         subscription_name: impl Into<String>,
     ) -> Self {
         let link = link.trim();
-        let (protocol, address) = if link.is_empty() || link == "direct" {
-            (Protocol::Direct, String::new())
-        } else {
-            match link.split_once("://") {
-                Some((scheme, rest)) => (Protocol::from_scheme(scheme), authority_of(rest)),
-                None => (Protocol::Other(link.to_owned()), String::new()),
-            }
+        let (protocol, address) = match link.split_once("://") {
+            Some((scheme, rest)) => (Protocol::from_scheme(scheme), authority_of(rest)),
+            None => (Protocol::Other(link.to_owned()), String::new()),
         };
         let udp = matches!(
             protocol,

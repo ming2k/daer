@@ -20,17 +20,17 @@ use crate::relay::datagram::{DatagramLeg, DatagramRouter, OpenDatagram};
 
 /// A datagram router that answers `direct` for everything.
 ///
-/// Reports no known domain and opens a plain [`UdpConnector`] session to the literal
-/// destination, which is exactly what the control plane does for a `direct` verdict.
+/// Opens a plain [`UdpConnector`] session to the literal destination, which is exactly
+/// what the control plane does for a `direct` verdict.
 #[derive(Debug)]
 pub struct DirectRouter;
 
 impl DatagramRouter for DirectRouter {
-    fn known_domain(&self, _destination: SocketAddr) -> Option<String> {
-        None
-    }
-
-    fn open_datagram<'a>(&'a self, facts: FlowFacts, _domain: Option<&'a str>) -> OpenDatagram<'a> {
+    fn open_datagram<'a>(
+        &'a self,
+        facts: FlowFacts,
+        _initial_payload: &'a [u8],
+    ) -> OpenDatagram<'a> {
         Box::pin(async move {
             let connector: Arc<dyn netune::DatagramConnector> =
                 Arc::new(UdpConnector::new().with_socket_config(SocketConfig::default()));
@@ -47,14 +47,10 @@ impl DatagramRouter for DirectRouter {
 pub struct RefusingRouter(pub &'static str);
 
 impl DatagramRouter for RefusingRouter {
-    fn known_domain(&self, _destination: SocketAddr) -> Option<String> {
-        None
-    }
-
     fn open_datagram<'a>(
         &'a self,
         _facts: FlowFacts,
-        _domain: Option<&'a str>,
+        _initial_payload: &'a [u8],
     ) -> OpenDatagram<'a> {
         let reason = self.0;
         Box::pin(async move {

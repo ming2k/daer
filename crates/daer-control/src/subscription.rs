@@ -245,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn a_configuration_without_subscriptions_is_untouched() {
         let mut config = config_with(
-            "schema = 2\n[[node]]\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
+            "schema = 5\n[[node]]\ntype = \"socks5\"\nserver = \"127.0.0.1\"\nport = 1080\n",
         );
         let before = config.node.len();
         let resolution = resolve_subscriptions_with(
@@ -265,7 +265,7 @@ mod tests {
     async fn a_failing_subscription_with_no_cache_contributes_nothing_and_says_so() {
         // Port 1 on loopback refuses instantly, so this test needs no network.
         let mut config = config_with(
-            "schema = 2\n[[subscription]]\ntag = \"dead\"\nurl = \"http://127.0.0.1:1/sub\"\n",
+            "schema = 5\n[[subscription]]\ntag = \"dead\"\nurl = \"http://127.0.0.1:1/sub\"\n",
         );
         let directory =
             std::env::temp_dir().join(format!("daer-sub-resolve-{}", std::process::id()));
@@ -303,7 +303,7 @@ mod tests {
             .expect("writes");
 
         let mut config = config_with(
-            "schema = 2\n[[subscription]]\ntag = \"tag\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\n",
+            "schema = 5\n[[subscription]]\ntag = \"tag\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\n",
         );
         let resolution = resolve_subscriptions_with(
             &mut config,
@@ -338,7 +338,7 @@ mod tests {
             .expect("writes");
 
         let mut config = config_with(
-            "schema = 2\n[[subscription]]\nname = \"mysub\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\ndetour = \"inner\"\n",
+            "schema = 5\n[[subscription]]\nname = \"mysub\"\nurl = \"http://127.0.0.1:1/sub\"\npersist = true\ndetour = \"inner\"\n",
         );
         let _ = resolve_subscriptions_with(
             &mut config,

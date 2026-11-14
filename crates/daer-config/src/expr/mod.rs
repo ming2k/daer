@@ -7,19 +7,21 @@
 //!
 //! | Where | Shape | Example |
 //! | --- | --- | --- |
-//! | `routing.rules` | `predicate && … -> outbound` | `domain(a.com) && port(443) -> proxy` |
+//! | `routing.rule.match` | `predicate && …` | `domain(a.com) && dport(443)` |
 //! | `group.filters` | `predicate && …` | `sub(sub) && !name(keyword: 'ExpireAt:')` |
-//! | `group.policy`, `dns.*.fallback` | name or call | `fixed(0)`, `min-moving-avg` |
+//! | `dns.request.rules` | `predicate && … -> upstream` | `qname(ads) -> reject` |
+//! | `dns.*.fallback` | name or call | `fixed(0)`, `min-moving-avg` |
 //!
 //! They stay expressions because a boolean combination over arbitrary predicates
 //! has no faithful tabular encoding, and because the parsed form — a
-//! [`RoutingRule`] / [`Function`] tree — is exactly what the routing engine
-//! consumes. Everything else in the configuration is data.
+//! [`MatchExpr`] / [`DnsRule`] / [`Function`] tree — is exactly what the routing
+//! engine consumes. Everything else in the configuration is data.
 //!
 //! ```text
-//! rule                := predicate ('&&' predicate)* '->' outbound
+//! match               := predicate ('&&' predicate)*
+//! dns-rule            := match '->' upstream
 //! predicate           := '!'? name '(' (parameter (',' parameter)*)? ')'
-//! outbound            := literal | predicate
+//! upstream            := literal | predicate
 //! parameter           := name ':' literal | literal
 //! value               := literal (',' literal)* | predicate ('&&' predicate)*
 //! literal             := NAME | OTHER | QUOTED
@@ -29,28 +31,37 @@
 //! Two properties matter for error quality:
 //!
 //! * a comment starts only at a token boundary, so `a#b` is one identifier and not
-//!   "identifier, comment";
-//! * `->` wins over a bare `-` at token start, so `f(a)->direct` parses and
-//!   `a->b` is a syntax error rather than a subtraction.
+//!   "identifier, comment".
 
 mod ast;
 mod lexer;
 mod parser;
 
-pub use ast::{Function, Param, ParamValue, RoutingRule};
+pub use ast::{DnsRule, Function, MatchExpr, Param, ParamValue};
 pub use lexer::{Lexer, Token, TokenKind};
 pub use parser::Parser;
 
 use crate::error::ParseError;
 
-/// Parses one routing rule.
+/// Parses one routing match: a conjunction of predicates.
+///
+/// The action is not part of this text; it is a typed outbound on the rule table.
 ///
 /// # Errors
 ///
-/// Returns a positioned [`ParseError`] when the text is not a rule, including
-/// when it holds more than one.
-pub fn parse_rule(src: &str) -> Result<RoutingRule, ParseError> {
-    Parser::new(src)?.parse_rule()
+/// Returns a positioned [`ParseError`] when the text is not a match expression,
+/// including when it holds an action arrow.
+pub fn parse_match_expr(src: &str) -> Result<MatchExpr, ParseError> {
+    Parser::new(src)?.parse_match()
+}
+
+/// Parses one DNS rule (`predicate && … -> upstream`).
+///
+/// # Errors
+///
+/// Returns a positioned [`ParseError`] when the text is not a DNS rule.
+pub fn parse_dns_rule_expr(src: &str) -> Result<DnsRule, ParseError> {
+    Parser::new(src)?.parse_dns_rule()
 }
 
 /// Parses one value: a bare name (`min-moving-avg`) or a call (`fixed(0)`).

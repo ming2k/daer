@@ -11,16 +11,13 @@ use std::str::FromStr;
 /// Binary name used by daer's own artifacts.
 pub const APP_NAME: &str = "daer";
 
-/// skb mark used to identify daer-originated traffic (`TPROXY_MARK` in
-/// `ebpf/kern/datapath.bpf.c`). This is the one definition of the mark; the `ip rule`
-/// selector the control plane installs is formatted from it (ADR-0023).
-pub const TPROXY_MARK: u32 = 0x0800_0000;
-
-/// Default `SO_MARK` for daer-originated sockets when `global.so-mark` is absent.
+/// The `SO_MARK` daer applies to its own sockets, and the value the datapath compares
+/// against its `PARAM.socket_mark`.
 ///
 /// `0x6461_6572` is the ASCII bytes `daer` in network (= big-endian) order. It is non-zero,
 /// unlikely to collide with a routing mark, and self-describing in a packet capture or an
-/// nftables rule. `0` means "no mark" to the kernel and is the value that causes self-capture.
+/// nftables rule. `0` means "no mark" to the kernel and is the value that causes self-capture,
+/// so this is an internal constant rather than a configuration key.
 pub const DEFAULT_SOCKET_MARK: u32 = 0x6461_6572;
 
 /// Default bound for `MAX_MATCH_SET_LEN`, the number of 32-bit match words the
@@ -249,11 +246,7 @@ mod tests {
     #[test]
     fn every_constant_has_a_reader() {
         // (name, is this constant still expected to exist?)
-        let constants = [
-            ("APP_NAME", true),
-            ("TPROXY_MARK", true),
-            ("MAX_MATCH_SET_LEN", true),
-        ];
+        let constants = [("APP_NAME", true), ("MAX_MATCH_SET_LEN", true)];
 
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

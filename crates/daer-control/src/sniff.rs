@@ -21,8 +21,8 @@
 //! # Why a deadline and not a byte limit alone
 //!
 //! A client can open a connection and dribble one byte at a time, which no byte limit
-//! stops. [`sniffing_timeout`] bounds the *whole* attempt: once it expires the flow is
-//! routed by whatever is known, which is the IP. The byte budget
+//! stops. The `[routing.sniff] timeout` budget bounds the *whole* attempt: once it
+//! expires the flow is routed by whatever is known, which is the IP. The byte budget
 //! ([`MAX_SNIFF_LEN`]) bounds memory; the deadline bounds time. Both are needed, and
 //! neither is optional.
 //!
@@ -47,7 +47,7 @@ const PEEK_CHUNK: usize = 8192;
 /// How long to wait between peeks when the prefix says "need more".
 ///
 /// Short enough not to be the latency people notice, long enough not to spin. The
-/// `sniffing-timeout` budget governs the total; this only paces the retries.
+/// `[routing.sniff] timeout` governs the total; this only paces the retries.
 const RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
 /// What sniffing learned, and why it stopped.
@@ -62,36 +62,6 @@ pub enum Outcome {
     },
     /// No name. Route by address.
     Unnamed(Unnamed),
-}
-
-impl Outcome {
-    /// The name, when one was found.
-    #[must_use]
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Self::Named { name, .. } => Some(name),
-            Self::Unnamed(_) => None,
-        }
-    }
-
-    /// True when the flow can be routed by domain.
-    #[must_use]
-    pub fn is_named(&self) -> bool {
-        matches!(self, Self::Named { .. })
-    }
-
-    /// A one-line reason, for the flow log.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Named {
-                name,
-                protocol,
-                bytes,
-            } => format!("{protocol} sni={name} after {bytes}B"),
-            Self::Unnamed(reason) => reason.to_string(),
-        }
-    }
 }
 
 /// Why no name was produced.
@@ -175,22 +145,6 @@ pub async fn sniff_stream(stream: &TcpStream, budget: Duration) -> Outcome {
             }
         }
     }
-}
-
-/// Whether a stream is worth peeking at all.
-///
-/// A flow whose first byte is already buffered is worth a sniff; one with nothing pending
-/// costs a syscall and a wait. Exposed so a caller can skip the timer entirely when the
-/// answer is already obvious — and so the decision is testable without sockets.
-#[must_use]
-pub fn is_worth_sniffing(first_byte: Option<u8>) -> bool {
-    first_byte.is_some()
-}
-
-/// The peek buffer size, exposed for tests and for sizing the caller's own buffers.
-#[must_use]
-pub const fn peek_chunk() -> usize {
-    PEEK_CHUNK
 }
 
 #[cfg(test)]
@@ -310,7 +264,6 @@ mod tests {
             .await
             .expect("writes");
         let outcome = sniff_stream(&server, Duration::from_secs(1)).await;
-        assert_eq!(outcome.name(), Some("http.example.com"));
         // The exact byte count is whatever the peek returned; the name and protocol are
         // the contract.
         match outcome {
@@ -355,29 +308,5 @@ mod tests {
                 "{rendered}"
             );
         }
-    }
-
-    #[test]
-    fn an_outcome_describes_itself() {
-        let named = Outcome::Named {
-            name: "a.example".to_owned(),
-            protocol: Protocol::Tls,
-            bytes: 120,
-        };
-        assert!(named.is_named());
-        assert_eq!(named.name(), Some("a.example"));
-        assert_eq!(named.describe(), "tls sni=a.example after 120B");
-
-        let unnamed = Outcome::Unnamed(Unnamed::TimedOut);
-        assert!(!unnamed.is_named());
-        assert_eq!(unnamed.name(), None);
-        assert!(unnamed.describe().contains("timed out") || unnamed.describe().contains("timeout"));
-    }
-
-    #[test]
-    fn sniffing_is_skipped_when_nothing_is_buffered() {
-        assert!(is_worth_sniffing(Some(0x16)));
-        assert!(!is_worth_sniffing(None));
-        assert_eq!(peek_chunk(), PEEK_CHUNK);
     }
 }

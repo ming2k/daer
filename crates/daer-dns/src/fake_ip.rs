@@ -272,16 +272,70 @@ impl FakeIpPool {
 }
 
 /// The observational DNS Snooping cache for Real-IP mode (ADR-0011).
+///
+/// A real address is not a unique name: a shared CDN can serve many domains. The
+/// snooper therefore keeps the *candidate set* for one `(client, resolved)` pair and
+/// reports ambiguity instead of letting the last response silently win.
 #[derive(Debug)]
 pub struct DnsSnooper {
     max_entries: usize,
     state: Mutex<SnooperState>,
 }
 
+/// The outcome of a snooper lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnoopLookup {
+    /// Exactly one live domain is associated with the pair.
+    Unique(Arc<str>),
+    /// More than one live domain is associated with the pair; the caller must not guess.
+    Ambiguous { candidates: usize },
+    /// No live mapping exists.
+    None,
+}
+
 #[derive(Debug, Default)]
 struct SnooperState {
-    entries: HashMap<IpAddr, (Arc<str>, Instant)>,
-    order: VecDeque<(IpAddr, Instant)>,
+    entries: HashMap<(IpAddr, IpAddr), HashMap<Arc<str>, Instant>>,
+    /// Insertion order, used for bounded eviction. An entry is stale when its expiry
+    /// no longer matches the map (the same domain was successfully re-recorded).
+    order: VecDeque<((IpAddr, IpAddr), Arc<str>, Instant)>,
+    len: usize,
+}
+
+impl SnooperState {
+    fn evict_one(&mut self) {
+        while let Some((key, domain, expires_at)) = self.order.pop_front() {
+            let live = self
+                .entries
+                .get(&key)
+                .and_then(|domains| domains.get(&domain))
+                .is_some_and(|current| *current == expires_at);
+            if !live {
+                continue;
+            }
+            if let Some(domains) = self.entries.get_mut(&key) {
+                domains.remove(&domain);
+                if domains.is_empty() {
+                    self.entries.remove(&key);
+                }
+            }
+            self.len = self.len.saturating_sub(1);
+            return;
+        }
+        // Every order entry was stale. Rebuild the count from the maps rather than
+        // letting the bound drift.
+        self.len = self.entries.values().map(HashMap::len).sum();
+    }
+
+    fn compact(&mut self) {
+        let entries = &self.entries;
+        self.order.retain(|(key, domain, expires_at)| {
+            entries
+                .get(key)
+                .and_then(|domains| domains.get(domain))
+                .is_some_and(|current| current == expires_at)
+        });
+    }
 }
 
 impl Default for DnsSnooper {
@@ -299,42 +353,74 @@ impl DnsSnooper {
         }
     }
 
-    /// Records an observed DNS resolution for an IP address.
-    pub fn record(&self, ip: IpAddr, domain: &str, ttl_secs: u64) {
+    /// Records an observed DNS resolution for one client and one resolved address.
+    pub fn record(&self, client: IpAddr, resolved: IpAddr, domain: &str, ttl_secs: u64) {
         let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs.clamp(5, 86_400));
+        let key = (client, resolved);
+        let domain: Arc<str> = Arc::from(normalized.as_str());
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
-        while state.entries.len() >= self.max_entries {
-            if let Some((old_ip, _)) = state.order.pop_front() {
-                state.entries.remove(&old_ip);
-            } else {
-                break;
-            }
+        let fresh = state
+            .entries
+            .entry(key)
+            .or_default()
+            .insert(Arc::clone(&domain), expires_at)
+            .is_none();
+        state.order.push_back((key, domain, expires_at));
+        if fresh {
+            state.len += 1;
         }
-
-        let domain_arc: Arc<str> = Arc::from(normalized.as_str());
-        state.entries.insert(ip, (domain_arc, expires_at));
-        state.order.push_back((ip, expires_at));
+        while state.len > self.max_entries {
+            state.evict_one();
+        }
+        if state.order.len() > self.max_entries.saturating_mul(4) {
+            state.compact();
+        }
     }
 
-    /// Recovers the domain associated with `ip`, if known and unexpired.
+    /// Recovers the candidate domains associated with `(client, resolved)`.
     #[must_use]
-    pub fn lookup(&self, ip: IpAddr) -> Option<Arc<str>> {
+    pub fn lookup(&self, client: IpAddr, resolved: IpAddr) -> SnoopLookup {
+        let key = (client, resolved);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((domain, expires_at)) = state.entries.get(&ip) {
-            if Instant::now() < *expires_at {
-                return Some(domain.clone());
-            }
-            state.entries.remove(&ip);
+        let Some(domains) = state.entries.get_mut(&key) else {
+            return SnoopLookup::None;
+        };
+        let before = domains.len();
+        let now = Instant::now();
+        domains.retain(|_, expires_at| *expires_at > now);
+        let removed = before - domains.len();
+        let candidates: Vec<Arc<str>> = domains.keys().cloned().collect();
+        let empty = domains.is_empty();
+        state.len = state.len.saturating_sub(removed);
+        if empty {
+            state.entries.remove(&key);
         }
-        None
+        match candidates.len() {
+            0 => SnoopLookup::None,
+            1 => SnoopLookup::Unique(candidates.into_iter().next().expect("one candidate")),
+            count => SnoopLookup::Ambiguous { candidates: count },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fake_ip_is_disabled_by_default() {
+        // ADR-0012 `[INV-FAKEIP-01]`: the default is isolation, not convenience. A default
+        // that silently enabled synthesis would change what every client sees on the wire;
+        // this test makes that regression fail instead of relying on the prose.
+        let pool = FakeIpPool::from_config(&FakeIpConfig::default()).expect("default builds");
+        let inside: Ipv4Addr = "198.18.0.1".parse().expect("address");
+
+        assert!(!pool.is_enabled());
+        assert!(!pool.contains_ip(IpAddr::V4(inside)));
+        assert_eq!(pool.reverse_lookup(inside), None);
+    }
 
     #[test]
     fn fake_ip_allocation_and_reverse_lookup() {
@@ -526,13 +612,65 @@ mod tests {
     #[test]
     fn snooper_records_and_retrieves() {
         let snooper = DnsSnooper::new(10);
+        let client: IpAddr = "192.168.1.10".parse().unwrap();
         let ip: IpAddr = "93.184.216.34".parse().unwrap();
-        snooper.record(ip, "example.com", 60);
+        snooper.record(client, ip, "example.com", 60);
 
-        let domain = snooper.lookup(ip).expect("lookup hit");
-        assert_eq!(&*domain, "example.com");
+        assert_eq!(
+            snooper.lookup(client, ip),
+            SnoopLookup::Unique(Arc::from("example.com"))
+        );
 
         let unknown: IpAddr = "1.2.3.4".parse().unwrap();
-        assert_eq!(snooper.lookup(unknown), None);
+        assert_eq!(snooper.lookup(client, unknown), SnoopLookup::None);
+    }
+
+    #[test]
+    fn snooper_reports_ambiguity_instead_of_the_last_writer() {
+        let snooper = DnsSnooper::new(10);
+        let client: IpAddr = "192.168.1.10".parse().unwrap();
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        snooper.record(client, ip, "a.example", 60);
+        snooper.record(client, ip, "b.example", 60);
+
+        assert_eq!(
+            snooper.lookup(client, ip),
+            SnoopLookup::Ambiguous { candidates: 2 }
+        );
+    }
+
+    #[test]
+    fn snooper_keeps_its_candidate_bound() {
+        let snooper = DnsSnooper::new(2);
+        let client: IpAddr = "192.168.1.10".parse().unwrap();
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        snooper.record(client, ip, "a.example", 60);
+        snooper.record(client, ip, "b.example", 60);
+        snooper.record(client, ip, "c.example", 60);
+
+        assert_eq!(
+            snooper.lookup(client, ip),
+            SnoopLookup::Ambiguous { candidates: 2 },
+            "the third mapping must evict the oldest, not grow the set"
+        );
+    }
+
+    #[test]
+    fn snooper_separates_clients_for_the_same_address() {
+        let snooper = DnsSnooper::new(10);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        let client_a: IpAddr = "192.168.1.10".parse().unwrap();
+        let client_b: IpAddr = "192.168.1.11".parse().unwrap();
+        snooper.record(client_a, ip, "a.example", 60);
+        snooper.record(client_b, ip, "b.example", 60);
+
+        assert_eq!(
+            snooper.lookup(client_a, ip),
+            SnoopLookup::Unique(Arc::from("a.example"))
+        );
+        assert_eq!(
+            snooper.lookup(client_b, ip),
+            SnoopLookup::Unique(Arc::from("b.example"))
+        );
     }
 }

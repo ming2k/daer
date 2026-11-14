@@ -10,12 +10,18 @@
 //! `#[ignore]`d. The name/ABI checks in `tests/object.rs` run unprivileged.
 
 use std::fmt;
+use std::fs::File;
+use std::os::fd::AsFd as _;
+use std::path::{Path, PathBuf};
 
 use aya::Ebpf;
 use aya::EbpfError;
 use aya::EbpfLoader;
 use aya::maps::Array;
 use aya::maps::MapError;
+use aya::programs::CgroupAttachMode;
+use aya::programs::CgroupSock;
+use aya::programs::CgroupSockAddr;
 use aya::programs::LinkOrder;
 use aya::programs::ProgramError;
 use aya::programs::tc::SchedClassifier;
@@ -37,6 +43,8 @@ pub enum LoadError {
     Program(ProgramError),
     /// A map operation failed.
     Map(MapError),
+    /// The cgroup v2 hooks could not be opened or attached.
+    Cgroup(String),
     /// The object is missing a map, program or global this crate references.
     NotFound(String),
     /// The kernel does not provide the required attachment primitive.
@@ -50,6 +58,7 @@ impl fmt::Display for LoadError {
             Self::Load(err) => write!(f, "failed to load eBPF object: {err}"),
             Self::Program(err) => write!(f, "eBPF program error: {err}"),
             Self::Map(err) => write!(f, "eBPF map error: {err}"),
+            Self::Cgroup(message) => write!(f, "cgroup attachment: {message}"),
             Self::NotFound(name) => write!(f, "eBPF object is missing \"{name}\""),
             Self::Unsupported(message) => write!(f, "unsupported attachment: {message}"),
         }
@@ -63,6 +72,7 @@ impl std::error::Error for LoadError {
             Self::Load(err) => Some(err),
             Self::Program(err) => Some(err),
             Self::Map(err) => Some(err),
+            Self::Cgroup(_) => None,
             Self::NotFound(_) => None,
             Self::Unsupported(_) => None,
         }
@@ -252,6 +262,91 @@ pub fn require_tcx() -> Result<(), LoadError> {
 /// booting a second kernel.
 fn tcx_available(current: KernelVersion) -> bool {
     current >= KernelVersion::new(6, 6, 0)
+}
+
+/// The default cgroup v2 mount used for the process-name hooks.
+pub const DEFAULT_CGROUP_PATH: &str = "/sys/fs/cgroup";
+
+/// Resolves the cgroup v2 root the process-name hooks attach to.
+///
+/// `DAER_CGROUP_PATH` is an explicit deployment override for a cgroup namespace
+/// whose root is not `/sys/fs/cgroup`. The path must be a cgroup v2 mount
+/// (`cgroup.controllers` exists); cgroup v1 has no equivalent attach point for
+/// these programs.
+///
+/// # Errors
+///
+/// Returns [`LoadError::Unsupported`] when the path exists but is not cgroup v2.
+pub fn cgroup_v2_path() -> Result<PathBuf, LoadError> {
+    let path = std::env::var_os("DAER_CGROUP_PATH")
+        .map_or_else(|| PathBuf::from(DEFAULT_CGROUP_PATH), PathBuf::from);
+    if path.join("cgroup.controllers").is_file() {
+        return Ok(path);
+    }
+    Err(LoadError::Unsupported(format!(
+        "{} is not a cgroup v2 mount; daer's pname hooks require cgroup v2 \
+         (set DAER_CGROUP_PATH to the unified hierarchy if it is mounted elsewhere)",
+        path.display()
+    )))
+}
+
+/// Attaches the six cgroup hooks that populate `cookie_pid_map`.
+///
+/// The hooks are attached to the cgroup v2 root, so sockets created by every
+/// process on the host (and in every descendant cgroup) get a process name. The
+/// links are owned by the loaded `Ebpf` object: dropping it, or exiting the
+/// process, detaches them. No bpffs pin is created.
+///
+/// # Errors
+///
+/// Returns [`LoadError::Cgroup`] when the mount cannot be opened or a hook does
+/// not load/attach. A daemon that cannot establish these hooks must not serve a
+/// configuration that uses `pname(...)`: the predicate would otherwise be inert.
+pub fn attach_cgroup_hooks(ebpf: &mut Ebpf, path: &Path) -> Result<(), LoadError> {
+    if !path.join("cgroup.controllers").is_file() {
+        return Err(LoadError::Unsupported(format!(
+            "{} is not a cgroup v2 mount",
+            path.display()
+        )));
+    }
+    let cgroup = File::open(path)
+        .map_err(|error| LoadError::Cgroup(format!("cannot open {}: {error}", path.display())))?;
+
+    attach_cgroup_sock(ebpf, names::program::WAN_CG_SOCK_CREATE, &cgroup)?;
+    attach_cgroup_sock(ebpf, names::program::WAN_CG_SOCK_RELEASE, &cgroup)?;
+    for name in [
+        names::program::WAN_CG_CONNECT4,
+        names::program::WAN_CG_CONNECT6,
+        names::program::WAN_CG_SENDMSG4,
+        names::program::WAN_CG_SENDMSG6,
+    ] {
+        attach_cgroup_sock_addr(ebpf, name, &cgroup)?;
+    }
+    Ok(())
+}
+
+fn attach_cgroup_sock(ebpf: &mut Ebpf, name: &str, cgroup: &File) -> Result<(), LoadError> {
+    let program = ebpf
+        .program_mut(name)
+        .ok_or_else(|| LoadError::NotFound(name.to_owned()))?;
+    let sock: &mut CgroupSock = program.try_into().map_err(LoadError::Program)?;
+    sock.load()
+        .map_err(|error| LoadError::Cgroup(format!("cannot load {name}: {error}")))?;
+    sock.attach(cgroup.as_fd(), CgroupAttachMode::AllowMultiple)
+        .map_err(|error| LoadError::Cgroup(format!("cannot attach {name}: {error}")))?;
+    Ok(())
+}
+
+fn attach_cgroup_sock_addr(ebpf: &mut Ebpf, name: &str, cgroup: &File) -> Result<(), LoadError> {
+    let program = ebpf
+        .program_mut(name)
+        .ok_or_else(|| LoadError::NotFound(name.to_owned()))?;
+    let sock: &mut CgroupSockAddr = program.try_into().map_err(LoadError::Program)?;
+    sock.load()
+        .map_err(|error| LoadError::Cgroup(format!("cannot load {name}: {error}")))?;
+    sock.attach(cgroup.as_fd(), CgroupAttachMode::AllowMultiple)
+        .map_err(|error| LoadError::Cgroup(format!("cannot attach {name}: {error}")))?;
+    Ok(())
 }
 
 /// Attaches one TC program to `interface` in `direction` using a TCX `bpf_link`.

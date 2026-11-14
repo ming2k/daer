@@ -24,7 +24,7 @@
 //!
 //! The handshake is length-prefixed by a fixed-size header, so a passive observer learns the
 //! shape of the first flight. Trojan's answer is to look like HTTPS — which is why the node is
-//! reached with a TLS fingerprint profile (see `[global.tls] profile`) rather than with
+//! reached with a TLS fingerprint profile (see `[tls] profile`) rather than with
 //! rustls' default identity. This module does not invent a padding scheme or a fake HTTP
 //! request: an unauthenticated wrong guess about what a server expects is worse than a
 //! consistent identity, and the identity is what netune is for.
@@ -276,7 +276,7 @@ impl TrojanConnector {
 
         // The platform trust store, not a pinned set, unless the operator explicitly chose
         // `allow-insecure`. The profile is compiled into the config here, so
-        // `global.tls.profile` reaches the wire for Trojan just as it does for VLESS/VMess.
+        // `tls.profile` reaches the wire for Trojan just as it does for VLESS/VMess.
         let config =
             crate::security::tls::profile_config(options.tls_profile, parsed.allow_insecure)?;
         let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)

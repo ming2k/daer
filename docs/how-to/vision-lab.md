@@ -119,7 +119,7 @@ Xtls Unpadding new block, content 56 padding 0   command 1
 
 | Test | Answers |
 | --- | --- |
-| `tests/reality_interop.rs` | **CI's gate**: start a local reference `xray` inbound and carry bytes both ways through REALITY + Vision. Skips with a reason without `xray`. Carries the negative controls (a wrong `pbk`, a non-REALITY server) |
+| `tests/e2e/protocols_reality_interop.rs` | **CI's gate**: start a local reference `xray` inbound and carry bytes both ways through REALITY + Vision. Skips with a reason without `xray`. Carries the negative controls (a wrong `pbk`, a non-REALITY server) |
 | `tests/vision_lab.rs` | is the Vision frame right, with REALITY out of the path? |
 | `tests/reality_live.rs` | does a *third-party* node authenticate us and carry bytes, end to end? Needs `DAER_REALITY_LINK`; not a CI gate, because a public node is someone else's uptime and someone else's config |
 | `tests/reality_tag_audit.rs` | are the ClientHello offsets and groups still as REALITY needs? |
@@ -129,7 +129,7 @@ Run the ignored ones with `-- --include-ignored`.
 
 ## The interop test starts its own server
 
-`tests/reality_interop.rs` is the one to run before touching the REALITY or Vision paths, and
+`tests/e2e/protocols_reality_interop.rs` is the one to run before touching the REALITY or Vision paths, and
 the one CI relies on. It needs no configuration and no credential:
 
 ```sh
@@ -138,7 +138,7 @@ XRAY_BIN=../Xray-core/xray cargo test -p daer-proxy-protocols --test reality_int
 ```
 
 It generates a key pair with `xray x25519`, starts a REALITY inbound on a free port **and its own
-TLS 1.3 impersonation target** from `crates/daer-proxy-protocols/tests/fixtures/` (a seven-certificate
+TLS 1.3 impersonation target** from `tests/fixtures/` (a seven-certificate
 chain, so the handshake has the record lengths REALITY needs to mimic), points the node's
 `freedom` outbound at a local HTTP origin, and asserts that the origin's body comes back through
 the tunnel: `Content-Length`, then the exact bytes. Then it asserts the *two* negations that make

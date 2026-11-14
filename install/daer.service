@@ -18,6 +18,10 @@ NotifyAccess=main
 # nothing. The daemon feeds this at half the interval, including while a reload is running.
 WatchdogSec=30s
 User=root
+# Status snapshots, event streams, incident bundles and subscription caches can
+# contain flow metadata or node credentials. Keep unit-created files private even
+# though the application also sets explicit modes on the artifacts it writes.
+UMask=0077
 # Runtime election control is root-only by default. To delegate it to an operator group,
 # add a drop-in with `SupplementaryGroups=daer-admin` and
 # `Environment=DAER_ADMIN_GROUP=daer-admin`; the daemon then makes
@@ -82,8 +86,13 @@ ProtectControlGroups=true
 # ProtectKernelTunables must remain false: daer tunes per-device sysctls on the host end
 # (daer0) and, through daer0ns, on the peer.
 ProtectKernelTunables=false
+SystemCallArchitectures=native
 LockPersonality=true
 RestrictRealtime=true
+RestrictSUIDSGID=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectHostname=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 

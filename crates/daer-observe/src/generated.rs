@@ -960,7 +960,7 @@ impl EventCode {
             Self::NetnsCleanupFailed => Some("The namespace mount is private to the daemon's mount namespace. Inspect it with `nsenter --mount=/proc/<pid>/ns/mnt ip netns list`."),
             Self::ProtocolAnyTlsAlert => Some("The node rejected the session; check credentials and the node's policy."),
             Self::ProtocolAnyTlsSessionError => None,
-            Self::ObserveRingDropped => Some("Increase `global.diagnostics.event-buffer` or reduce debug volume; the event stream is incomplete."),
+            Self::ObserveRingDropped => Some("Reduce debug volume; the diagnostic ring has a fixed capacity, so the event stream is incomplete."),
             Self::IncidentCaptureFailed => Some("Check that /var/lib/daer/incidents or /run/daer is writable; the panic/signal itself is still reported on stderr."),
             Self::IncidentCapture => Some("Attach the bundle to the incident record; do not paste raw logs separately."),
             Self::ElectionPinned => None,

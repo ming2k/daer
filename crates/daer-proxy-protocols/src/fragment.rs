@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Slicing the ClientHello to defeat a middlebox that matches it as one write (`global.tls`).
+//! Slicing the ClientHello to defeat a middlebox that matches it as one write (`[tls]`).
 //!
 //! # What this is for
 //!
@@ -79,7 +79,7 @@ impl Range {
     }
 }
 
-/// What to do when fragmenting, parsed from `[global.tls]`.
+/// What to do when fragmenting, parsed from `[tls]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fragment {
     /// Bytes per write.
@@ -112,9 +112,9 @@ impl Fragment {
         }
         Ok(Some(Self {
             length: Range::parse(&tls.fragment_length)
-                .map_err(|error| format!("global.tls.fragment-length: {error}"))?,
+                .map_err(|error| format!("tls.fragment-length: {error}"))?,
             interval: Range::parse(&tls.fragment_interval)
-                .map_err(|error| format!("global.tls.fragment-interval: {error}"))?,
+                .map_err(|error| format!("tls.fragment-interval: {error}"))?,
             limit: DEFAULT_LIMIT,
         }))
     }

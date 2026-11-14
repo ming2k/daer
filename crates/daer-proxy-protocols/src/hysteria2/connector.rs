@@ -67,6 +67,7 @@ pub struct Hysteria2Connector {
     brutal: Option<Arc<BrutalConfig>>,
     quic: daer_config::Hysteria2Quic,
     ports: PortSet,
+    hopping: daer_config::PortHopping,
     options: DialerOptions,
     state: Arc<AsyncMutex<Option<Connection>>>,
 }
@@ -121,6 +122,7 @@ pub struct Hysteria2Params<'a> {
     pub obfs: Option<&'a daer_config::Hysteria2Obfs>,
     pub congestion: daer_config::Hysteria2Congestion,
     pub quic: &'a daer_config::Hysteria2Quic,
+    pub hopping: &'a daer_config::PortHopping,
 }
 
 impl Hysteria2Connector {
@@ -134,6 +136,12 @@ impl Hysteria2Connector {
     #[must_use]
     pub const fn ports(&self) -> &PortSet {
         &self.ports
+    }
+
+    /// The configured port-hopping schedule.
+    #[must_use]
+    pub const fn hopping(&self) -> &daer_config::PortHopping {
+        &self.hopping
     }
 
     /// Builds a connector directly from typed parameters.
@@ -162,7 +170,7 @@ impl Hysteria2Connector {
         }
         // The hop schedule is validated here rather than at dial time: a 1-second schedule
         // looks like a working node that the server drops connections on.
-        HopSchedule::from_ports(params.ports).map_err(ProxyProtocolError::UnsupportedLink)?;
+        HopSchedule::from_hopping(params.hopping).map_err(ProxyProtocolError::UnsupportedLink)?;
 
         let obfs = match params.obfs {
             Some(obfs) => {
@@ -193,6 +201,7 @@ impl Hysteria2Connector {
             brutal,
             quic: params.quic.clone(),
             ports: params.ports.clone(),
+            hopping: *params.hopping,
             options,
             state: Arc::new(AsyncMutex::new(None)),
         })
@@ -208,14 +217,15 @@ impl Hysteria2Connector {
                     server: &hy2.server,
                     ports: &hy2.ports,
                     password: &hy2.password,
-                    sni: hy2.sni.as_deref(),
-                    allow_insecure: hy2.allow_insecure,
-                    pin_sha256: hy2.pin_sha256.as_deref(),
-                    up_mbps: hy2.up_mbps,
-                    down_mbps: hy2.down_mbps,
+                    sni: hy2.tls.sni.as_deref(),
+                    allow_insecure: hy2.tls.allow_insecure,
+                    pin_sha256: hy2.tls.pin_sha256.as_deref(),
+                    up_mbps: hy2.bandwidth.up_mbps,
+                    down_mbps: hy2.bandwidth.down_mbps,
                     obfs: hy2.obfs.as_ref(),
-                    congestion: hy2.congestion,
+                    congestion: hy2.quic.congestion,
                     quic: &hy2.quic,
+                    hopping: &hy2.port_hopping,
                 },
                 options,
             ),
@@ -354,8 +364,8 @@ impl Hysteria2Connector {
         if self.quic.init_conn_receive_window > 0 {
             transport.initial_max_data = self.quic.init_conn_receive_window;
         }
-        transport.max_idle_timeout = Some(if self.quic.max_idle_timeout_ms > 0 {
-            Duration::from_millis(self.quic.max_idle_timeout_ms)
+        transport.max_idle_timeout = Some(if self.quic.max_idle_timeout.as_nanos() > 0 {
+            Duration::from_nanos(u64::try_from(self.quic.max_idle_timeout.as_nanos()).unwrap_or(0))
         } else {
             Duration::from_secs(30)
         });
@@ -363,8 +373,8 @@ impl Hysteria2Connector {
         // Keep-alives are what stop a NAT from dropping the flow's mapping; the reference
         // sends one every 10 s by default and the value here follows that, because a
         // Hysteria node is usually reached through a NAT.
-        let keep_alive = Some(if self.quic.keep_alive_period_ms > 0 {
-            Duration::from_millis(self.quic.keep_alive_period_ms)
+        let keep_alive = Some(if self.quic.keep_alive_period.as_nanos() > 0 {
+            Duration::from_nanos(u64::try_from(self.quic.keep_alive_period.as_nanos()).unwrap_or(0))
         } else {
             Duration::from_secs(10)
         });
@@ -403,8 +413,8 @@ impl Hysteria2Connector {
         }
 
         let authority = self.authority();
-        let schedule =
-            HopSchedule::from_ports(&self.ports).map_err(ProxyProtocolError::UnsupportedLink)?;
+        let schedule = HopSchedule::from_hopping(&self.hopping)
+            .map_err(ProxyProtocolError::UnsupportedLink)?;
 
         let (connector, factory) = self.quic_connector()?;
         let trace = collector.is_enabled().then(|| collector.clone());
@@ -667,16 +677,24 @@ mod tests {
             obfs: None,
             congestion: daer_config::Hysteria2Congestion::Bbr,
             quic: &DEFAULT_QUIC,
+            hopping: &DEFAULT_HOPPING,
         }
     }
+
+    const DEFAULT_HOPPING: daer_config::PortHopping = daer_config::PortHopping {
+        interval: daer_config::TimeSpan::ZERO,
+        min_interval: daer_config::TimeSpan::ZERO,
+        max_interval: daer_config::TimeSpan::ZERO,
+    };
 
     const DEFAULT_QUIC: daer_config::Hysteria2Quic = daer_config::Hysteria2Quic {
         init_stream_receive_window: 0,
         max_stream_receive_window: 0,
         init_conn_receive_window: 0,
         max_conn_receive_window: 0,
-        max_idle_timeout_ms: 0,
-        keep_alive_period_ms: 0,
+        max_idle_timeout: daer_config::TimeSpan::ZERO,
+        keep_alive_period: daer_config::TimeSpan::ZERO,
+        congestion: daer_config::Hysteria2Congestion::Bbr,
         disable_path_mtu_discovery: false,
         disable_segmentation_offload: false,
     };
@@ -820,8 +838,9 @@ mod tests {
             max_stream_receive_window: 1_000_000,
             init_conn_receive_window: 0,
             max_conn_receive_window: 0,
-            max_idle_timeout_ms: 0,
-            keep_alive_period_ms: 0,
+            max_idle_timeout: daer_config::TimeSpan::ZERO,
+            keep_alive_period: daer_config::TimeSpan::ZERO,
+            congestion: daer_config::Hysteria2Congestion::Bbr,
             disable_path_mtu_discovery: false,
             disable_segmentation_offload: false,
         };
@@ -850,8 +869,9 @@ mod tests {
             max_stream_receive_window: 0,
             init_conn_receive_window: 2_000_000,
             max_conn_receive_window: 0,
-            max_idle_timeout_ms: 60_000,
-            keep_alive_period_ms: 5_000,
+            max_idle_timeout: daer_config::TimeSpan::from_secs(60),
+            keep_alive_period: daer_config::TimeSpan::from_secs(5),
+            congestion: daer_config::Hysteria2Congestion::Bbr,
             disable_path_mtu_discovery: true,
             disable_segmentation_offload: true,
         };

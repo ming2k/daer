@@ -7,11 +7,11 @@
 //! [`toml_config::to_string`] renders the canonical form, and [`validate::normalize`]
 //! applies the defaults and rejects values that cannot be honoured.
 //!
-//! Three things in the schema are *expressions* rather than data — routing rules,
-//! group filters and policy names — and they are parsed by [`expr`], because a
-//! boolean combination over arbitrary predicates has no faithful tabular
-//! encoding, and because the parsed tree is exactly what the routing engine
-//! consumes. Everything else is data.
+//! A few things in the schema are *expressions* rather than data — a routing
+//! rule's `match`, group filters, DNS rules and policy names — and they are
+//! parsed by [`expr`], because a boolean combination over arbitrary predicates
+//! has no faithful tabular encoding, and because the parsed tree is exactly what
+//! the routing engine consumes. Everything else is data.
 
 mod error;
 pub mod expr;
@@ -23,17 +23,18 @@ pub mod toml_config;
 pub mod validate;
 
 pub use error::ParseError;
-pub use expr::{Function, Param, ParamValue, RoutingRule};
+pub use expr::{DnsRule, Function, MatchExpr, Param, ParamValue, parse_dns_rule_expr};
 pub use model::{
-    AnyTlsEndpoint, AnyTlsNode, Config, DirectEndpoint, DirectNode, Dns, DnsRouting, Election,
-    ElectionKind, FakeIpConfig, Filter, Flow, FunctionOrString, Global, Group, HttpEndpoint,
-    HttpNode, Hysteria2Congestion, Hysteria2Endpoint, Hysteria2Node, Hysteria2Obfs, Hysteria2Quic,
-    Node, NodeEndpoint, PortSet, ProbeMode, ProbeSettings, ProviderFormat, ProviderType,
-    RealitySecurity, Routing, RuleProvider, SCHEMA_VERSION, SecurityConfig, ShadowsocksEndpoint,
-    ShadowsocksNode, Socks5Endpoint, Socks5Node, StructuredNode, Subscription, Tls, TlsSecurity,
-    TransportConfig, TrojanEndpoint, TrojanNode, VlessEndpoint, VlessNode, VmessCipher,
-    VmessEndpoint, VmessNode, WsTransport, parse_filter_expr, parse_rule_expr, parse_value_expr,
-    render_functions,
+    AnyTlsEndpoint, AnyTlsNode, BuiltinOutbound, Config, Dns, DnsRouting, Election, ElectionAction,
+    ElectionKind, FakeIpConfig, Filter, Flow, FunctionOrString, Group, HttpEndpoint, HttpNode,
+    Hysteria2Bandwidth, Hysteria2Congestion, Hysteria2Endpoint, Hysteria2Node, Hysteria2Obfs,
+    Hysteria2Quic, Hysteria2Tls, Node, NodeEndpoint, NodeTls, OutboundAction, OutboundKind,
+    PortHopping, PortSet, ProbeMode, ProbeSettings, ProviderFormat, ProviderType, RealitySecurity,
+    Routing, RoutingRule, RuleProvider, SCHEMA_VERSION, SecurityConfig, ShadowsocksEndpoint,
+    ShadowsocksNode, SniffConfig, Socks5Endpoint, Socks5Node, StructuredNode, Subscription, Tls,
+    TlsSecurity, TransportConfig, TrojanEndpoint, TrojanNode, VlessEndpoint, VlessNode,
+    VmessCipher, VmessEndpoint, VmessNode, WanInterface, WsTransport, parse_filter_expr,
+    parse_match_expr, parse_value_expr, render_functions,
 };
 pub use scalar::{Bandwidth, TimeSpan, parse_bandwidth, parse_duration, parse_integer};
 pub use toml_config::{Loaded, load, load_str};

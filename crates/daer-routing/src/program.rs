@@ -2,7 +2,9 @@
 
 //! The normalized routing program shared by every backend.
 
-use daer_config::{FunctionOrString, RoutingRule};
+use std::collections::HashSet;
+
+use daer_config::{OutboundAction, RoutingRule};
 
 use crate::builder::{MatchSink, RulesBuilder};
 use crate::error::RoutingError;
@@ -15,16 +17,28 @@ use crate::optimizer::{RulesOptimizer, apply_optimizers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedProgram {
     pub rules: Vec<RoutingRule>,
-    pub fallback: FunctionOrString,
+    pub fallback: OutboundAction,
 }
 
 impl NormalizedProgram {
     /// Clones `rules`, applies `optimizers`, and keeps `fallback` as written.
     pub fn new(
         rules: &[RoutingRule],
-        fallback: FunctionOrString,
+        fallback: OutboundAction,
         optimizers: &[&dyn RulesOptimizer],
     ) -> Result<Self, RoutingError> {
+        let mut names = HashSet::with_capacity(rules.len());
+        for rule in rules {
+            let name = rule.name.trim();
+            if name.is_empty() {
+                return Err(RoutingError::new("a routing rule has an empty name"));
+            }
+            if !names.insert(name) {
+                return Err(RoutingError::new(format!(
+                    "duplicate routing rule name {name:?}"
+                )));
+            }
+        }
         let rules = apply_optimizers(rules, optimizers)?;
         Ok(Self { rules, fallback })
     }
@@ -34,7 +48,7 @@ impl NormalizedProgram {
     pub fn lower<S: MatchSink>(
         &self,
         builder: &mut RulesBuilder<'_, S>,
-        add_fallback: impl FnOnce(&FunctionOrString) -> Result<(), RoutingError>,
+        add_fallback: impl FnOnce(&OutboundAction) -> Result<(), RoutingError>,
     ) -> Result<(), RoutingError> {
         builder.apply(&self.rules)?;
         add_fallback(&self.fallback)
@@ -45,27 +59,27 @@ impl NormalizedProgram {
 mod tests {
     use super::*;
     use crate::builder::RecordingSink;
-    use crate::optimizer::AliasOptimizer;
+    use daer_config::{BuiltinOutbound, ElectionAction};
 
-    /// Fixtures are written as config used to read: a `routing { … }` wrapper
-    /// around one rule per line. Only the lines matter.
-    fn rules(src: &str) -> Vec<RoutingRule> {
-        let body = src.trim();
-        let body = body.strip_prefix("routing {").unwrap_or(body);
-        let body = body.strip_suffix('}').unwrap_or(body);
-        body.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| daer_config::parse_rule_expr(line).expect("parses"))
-            .collect()
+    fn rule(name: &str, expr: &str, action: OutboundAction) -> RoutingRule {
+        RoutingRule {
+            name: name.to_owned(),
+            match_expr: daer_config::parse_match_expr(expr).expect("parses"),
+            action,
+        }
     }
 
     #[test]
     fn lowers_through_the_program() {
+        let rules = [rule(
+            "https",
+            "dport(443)",
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
+        )];
         let program = NormalizedProgram::new(
-            &rules("routing { dport(443) -> direct }"),
-            FunctionOrString::Name("direct".to_owned()),
-            &[&AliasOptimizer],
+            &rules,
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
+            &[],
         )
         .expect("normalizes");
 
@@ -74,8 +88,7 @@ mod tests {
         let mut fallback_seen = false;
         program
             .lower(&mut builder, |fallback| {
-                fallback_seen =
-                    matches!(fallback, FunctionOrString::Name(name) if name == "direct");
+                fallback_seen = *fallback == OutboundAction::Builtin(BuiltinOutbound::Direct);
                 Ok(())
             })
             .expect("lowers");
@@ -85,20 +98,40 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_parsed_fallback() {
-        let program = NormalizedProgram::new(
-            &rules("routing { dport(443) -> direct }"),
-            FunctionOrString::Name("my_group".to_owned()),
+    fn duplicate_rule_names_are_rejected_even_without_the_config_validator() {
+        let rules = [
+            rule(
+                "same",
+                "dport(443)",
+                OutboundAction::Builtin(BuiltinOutbound::Direct),
+            ),
+            rule(
+                "same",
+                "dport(80)",
+                OutboundAction::Builtin(BuiltinOutbound::Block),
+            ),
+        ];
+        let error = NormalizedProgram::new(
+            &rules,
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
             &[],
         )
-        .expect("normalizes");
-        assert_eq!(
-            program.fallback,
-            FunctionOrString::Name("my_group".to_owned())
-        );
-        assert!(matches!(
-            program.rules[0].and_functions[0].name.as_str(),
-            "dport"
-        ));
+        .expect_err("duplicate identities are ambiguous");
+        assert!(error.message.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn keeps_the_typed_fallback() {
+        let rules = [rule(
+            "https",
+            "dport(443)",
+            OutboundAction::Builtin(BuiltinOutbound::Direct),
+        )];
+        let fallback = OutboundAction::Election(ElectionAction {
+            election: "proxy".to_owned(),
+        });
+        let program = NormalizedProgram::new(&rules, fallback.clone(), &[]).expect("normalizes");
+        assert_eq!(program.fallback, fallback);
+        assert_eq!(program.rules[0].match_expr.and_functions[0].name, "dport");
     }
 }

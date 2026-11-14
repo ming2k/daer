@@ -29,7 +29,6 @@ pub struct NodeDialer {
 }
 
 enum NodeTransport {
-    Direct(DirectTransport),
     Proxy(ProxyTransport),
     Protocol(ProxyDialer),
 }
@@ -47,7 +46,6 @@ impl fmt::Debug for NodeDialer {
 impl fmt::Debug for NodeTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Direct(dialer) => f.debug_tuple("Direct").field(dialer).finish(),
             Self::Proxy(dialer) => f.debug_tuple("Proxy").field(dialer).finish(),
             Self::Protocol(dialer) => f.debug_tuple("Protocol").field(dialer).finish(),
         }
@@ -87,16 +85,6 @@ impl NodeDialer {
     ) -> Result<Self, OutboundError> {
         let label = node.label();
         let transport = match &node.endpoint {
-            daer_config::NodeEndpoint::Direct(_) => {
-                if options.is_detoured() {
-                    return Err(OutboundError::UnsupportedLink(
-                        "a direct node has no server leg to replace; remove detour and route to \
-                         the inner node's group instead"
-                            .to_owned(),
-                    ));
-                }
-                NodeTransport::Direct(DirectTransport::new(&options))
-            }
             daer_config::NodeEndpoint::Socks5(n) => {
                 let link = n.to_link();
                 let proxy = Proxy::parse(&link)
@@ -128,19 +116,10 @@ impl NodeDialer {
     pub fn from_link(link: &str, options: DialerOptions) -> Result<Self, OutboundError> {
         let link = link.trim();
         let label = safe_link_label(link);
-        if link.is_empty() || link == "direct" {
-            if options.is_detoured() {
-                return Err(OutboundError::UnsupportedLink(
-                    "a direct node has no server leg to replace; remove detour and route to \
-                     the inner node's group instead"
-                        .to_owned(),
-                ));
-            }
-            return Ok(Self {
-                label,
-                transport: NodeTransport::Direct(DirectTransport::new(&options)),
-                detour: None,
-            });
+        if link.is_empty() || link == "direct" || link.starts_with("direct://") {
+            return Err(OutboundError::UnsupportedLink(
+                "`direct` is a routing verdict, not a node link".to_owned(),
+            ));
         }
 
         if let Some(scheme) = chain_head_scheme(link) {
@@ -249,9 +228,6 @@ impl NodeDialer {
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
         match &self.transport {
-            NodeTransport::Direct(dialer) => {
-                dialer.connect_with_collector(authority, collector).await
-            }
             NodeTransport::Proxy(dialer) => {
                 dialer.connect_with_collector(authority, collector).await
             }
@@ -271,9 +247,6 @@ impl NodeDialer {
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
         match &self.transport {
-            NodeTransport::Direct(_) => Err(OutboundError::UnsupportedLink(
-                "a direct node has no remote server to probe".to_owned(),
-            )),
             NodeTransport::Proxy(dialer) => dialer.connect_server(collector).await,
             NodeTransport::Protocol(dialer) => Ok(dialer.connect_server(collector).await?),
         }
@@ -282,7 +255,6 @@ impl NodeDialer {
     #[must_use]
     pub fn protocol(&self) -> Protocol {
         match &self.transport {
-            NodeTransport::Direct(_) => Protocol::Direct,
             NodeTransport::Proxy(dialer) => dialer.protocol(),
             NodeTransport::Protocol(dialer) => dialer.protocol().into(),
         }
@@ -299,7 +271,6 @@ impl NodeDialer {
     #[must_use]
     pub fn datagram(&self) -> Option<Arc<dyn DatagramConnector>> {
         match &self.transport {
-            NodeTransport::Direct(dialer) => dialer.datagram_connector(),
             NodeTransport::Proxy(dialer) => dialer.datagram_connector(),
             NodeTransport::Protocol(dialer) => dialer.datagram_connector(),
         }
@@ -359,44 +330,6 @@ impl ServerDialer for NodeServerDialer {
 
     fn route_shape(&self) -> Option<String> {
         Some(format!("detour:{}", self.node.label()))
-    }
-}
-
-pub struct DirectTransport {
-    base: Arc<dyn ServerDialer>,
-}
-
-impl fmt::Debug for DirectTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DirectTransport")
-            .field("server", &self.base)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DirectTransport {
-    pub fn new(options: &DialerOptions) -> Self {
-        Self {
-            base: options.base().clone(),
-        }
-    }
-
-    pub async fn connect_with_collector(
-        &self,
-        authority: &str,
-        collector: &TraceCollector,
-    ) -> Result<Established, OutboundError> {
-        self.base
-            .connect(authority, collector)
-            .await
-            .map_err(OutboundError::from)
-    }
-
-    /// The datagram twin of [`Self::connect`]: the base dialer applies the same
-    /// socket configuration, so `SO_MARK` travels with it and a direct datagram
-    /// flow is not captured by the proxy's own routing rules.
-    fn datagram_connector(&self) -> Option<Arc<dyn DatagramConnector>> {
-        self.base.datagram()
     }
 }
 
@@ -608,11 +541,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_and_empty_links_use_the_direct_transport() {
-        for link in ["", "direct"] {
-            let dialer = NodeDialer::from_link(link, options()).expect("builds");
-            assert_eq!(dialer.protocol(), Protocol::Direct, "link {link:?}");
-            assert!(dialer.detour().is_none());
+    fn direct_links_are_routing_verdicts_not_node_links() {
+        for link in ["", "direct", "direct://local"] {
+            let error = NodeDialer::from_link(link, options()).expect_err("must fail");
+            assert!(
+                error.to_string().contains("routing verdict"),
+                "{link:?}: {error}"
+            );
         }
     }
 

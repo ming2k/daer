@@ -17,7 +17,7 @@ use crate::drb::{DrbSet, RuleProviderPool};
 use crate::error::RoutingError;
 use crate::ipset::IpIndex;
 use crate::matcher::{MatchSet, MatchValue};
-use crate::outbound::{MatchTarget, parse_outbound};
+use crate::outbound::{MatchTarget, Outbound};
 use crate::values::{
     IpVersionMask, L4ProtoMask, ProcessName, parse_dscp, parse_ip_version, parse_l4_proto,
     parse_mac_addresses, parse_port_ranges, parse_prefixes, parse_process_names,
@@ -160,16 +160,14 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
         self.sink
     }
 
-    /// Lowers every rule. `rule.and_functions` must already be normalized
-    /// (aliases rewritten, parameters sorted), otherwise `dip`/`dport` and the
-    /// bare `domain` key are rejected — the same contract as the Go optimizer
-    /// pipeline.
+    /// Lowers every rule. `rule.match_expr.and_functions` must already be normalized
+    /// (parameters sorted), otherwise the canonical predicate names are rejected.
     pub fn apply(&mut self, rules: &[RoutingRule]) -> Result<(), RoutingError> {
         for rule in rules {
-            let outbound = parse_outbound(&rule.outbound)?;
-            let function_count = rule.and_functions.len();
+            let outbound = Outbound::from_action(&rule.action)?;
+            let function_count = rule.match_expr.and_functions.len();
 
-            for (function_index, function) in rule.and_functions.iter().enumerate() {
+            for (function_index, function) in rule.match_expr.and_functions.iter().enumerate() {
                 let groups = group_params_by_key(&function.params);
                 let group_count = groups.len();
 
@@ -200,12 +198,13 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
         let negated = function.negated;
 
         match function.name.as_str() {
-            "provider" => {
+            "rule-set" => {
                 require_bare(function, key)?;
                 for (index, name) in values.iter().enumerate() {
-                    let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
-                        RoutingError::new(format!("unknown rule provider: {name}"))
-                    })?;
+                    let set = self
+                        .providers
+                        .and_then(|p| p.get(name))
+                        .ok_or_else(|| RoutingError::new(format!("unknown rule set: {name}")))?;
                     let t = if index + 1 == values.len() {
                         target.clone()
                     } else {
@@ -215,24 +214,27 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                 }
                 Ok(())
             }
-            "domain" => {
-                if key == "provider" {
-                    for (index, name) in values.iter().enumerate() {
-                        let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
-                            RoutingError::new(format!("unknown rule provider: {name}"))
-                        })?;
-                        let t = if index + 1 == values.len() {
-                            target.clone()
-                        } else {
-                            MatchTarget::logical_or(target.mark(), target.must())
-                        };
-                        if !set.domains().is_empty() {
-                            self.sink
-                                .add_domain_index(negated, set.domains().clone(), &t)?;
-                        }
+            "domain-set" => {
+                require_bare(function, key)?;
+                for (index, name) in values.iter().enumerate() {
+                    let set = self
+                        .providers
+                        .and_then(|p| p.get(name))
+                        .ok_or_else(|| RoutingError::new(format!("unknown rule set: {name}")))?;
+                    let t = if index + 1 == values.len() {
+                        target.clone()
+                    } else {
+                        MatchTarget::logical_or(target.mark(), target.must())
+                    };
+                    if !set.domains().is_empty() {
+                        self.sink
+                            .add_domain_index(negated, set.domains().clone(), &t)?;
                     }
-                    Ok(())
-                } else if is_retired_dat_key(key) {
+                }
+                Ok(())
+            }
+            "domain" => {
+                if is_retired_dat_key(key) {
                     Err(retired_dat_key("domain", key))
                 } else if matches!(key, "full" | "suffix" | "domain" | "root_domain") {
                     Err(RoutingError::new(format!(
@@ -249,7 +251,7 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                     // Hand the sink complete patterns rather than a key it would have to
                     // reassemble. A bare param (`domain(example.com)`) and an exact prefix
                     // (`domain(=example.com)`) carry their spelling verbatim so
-                    // `DomainTable::compile` classifies them under CRS v2 (ADR-0036).
+                    // `DomainTable::compile` classifies them under CRS v3 (ADR-0036).
                     let patterns: Vec<String> = values
                         .iter()
                         .map(|value| {
@@ -264,34 +266,35 @@ impl<'a, S: MatchSink> RulesBuilder<'a, S> {
                     self.sink.add_domain(negated, &patterns, target)
                 }
             }
-            "ip" => {
-                if key == "provider" {
-                    for (index, name) in values.iter().enumerate() {
-                        let set = self.providers.and_then(|p| p.get(name)).ok_or_else(|| {
-                            RoutingError::new(format!("unknown rule provider: {name}"))
-                        })?;
-                        let t = if index + 1 == values.len() {
-                            target.clone()
-                        } else {
-                            MatchTarget::logical_or(target.mark(), target.must())
-                        };
-                        if let Some(ip) = set.to_ip_index() {
-                            self.sink.add_ip_index(negated, ip, &t)?;
-                        }
+            "ip-set" => {
+                require_bare(function, key)?;
+                for (index, name) in values.iter().enumerate() {
+                    let set = self
+                        .providers
+                        .and_then(|p| p.get(name))
+                        .ok_or_else(|| RoutingError::new(format!("unknown rule set: {name}")))?;
+                    let t = if index + 1 == values.len() {
+                        target.clone()
+                    } else {
+                        MatchTarget::logical_or(target.mark(), target.must())
+                    };
+                    if let Some(ip) = set.to_ip_index() {
+                        self.sink.add_ip_index(negated, ip, &t)?;
                     }
-                    Ok(())
-                } else {
-                    require_bare(function, key)?;
-                    let prefixes = parse_prefixes(values)?;
-                    self.sink.add_ip(negated, &prefixes, target)
                 }
+                Ok(())
+            }
+            "dip" => {
+                require_bare(function, key)?;
+                let prefixes = parse_prefixes(values)?;
+                self.sink.add_ip(negated, &prefixes, target)
             }
             "sip" => {
                 require_bare(function, key)?;
                 let prefixes = parse_prefixes(values)?;
                 self.sink.add_source_ip(negated, &prefixes, target)
             }
-            "port" => {
+            "dport" => {
                 require_bare(function, key)?;
                 let ranges = parse_port_ranges(values)?;
                 self.sink.add_port(negated, &ranges, target)
@@ -363,9 +366,9 @@ fn is_retired_dat_key(key: &str) -> bool {
 fn retired_dat_key(function: &str, key: &str) -> RoutingError {
     RoutingError::new(format!(
         "{function}({key}: ...): the `{key}:` key names a Protobuf .dat file, which this build \
-         no longer reads (ADR-0014). Declare the category as a `[[rule-provider]]` and write \
-         `provider(<name>)`, or `{function}(provider: <name>)` to use only that provider's \
-         {}. See `daer-drb`.",
+         no longer reads (ADR-0014). Declare the category as a `[[rule-set]]` and write \
+         `rule-set(<name>)`, or `ip-set(<name>)` / `domain-set(<name>)` to use only that \
+         set's {}. See `daer-drb`.",
         if function == "domain" {
             "domains"
         } else {
@@ -700,10 +703,10 @@ impl MatchSink for ValidationSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizer::{AliasOptimizer, RulesOptimizer};
 
-    /// Fixtures are written as config used to read: a `routing { … }` wrapper
-    /// around one rule per line. Only the lines matter.
+    /// Test fixtures use the compact DNS-rule spelling to separate the match from
+    /// its action. Production flow rules are `[[routing.rule]]` tables; the match
+    /// language is identical.
     fn rules(src: &str) -> Vec<RoutingRule> {
         let body = src.trim();
         let body = body.strip_prefix("routing {").unwrap_or(body);
@@ -711,7 +714,28 @@ mod tests {
         body.lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(|line| daer_config::parse_rule_expr(line).expect("parses"))
+            .enumerate()
+            .map(|(index, line)| {
+                let parsed = daer_config::parse_dns_rule_expr(line).expect("parses");
+                let action = match parsed.upstream.name.as_str() {
+                    "direct" => {
+                        daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Direct)
+                    }
+                    "block" => {
+                        daer_config::OutboundAction::Builtin(daer_config::BuiltinOutbound::Block)
+                    }
+                    election => {
+                        daer_config::OutboundAction::Election(daer_config::ElectionAction {
+                            election: election.to_owned(),
+                        })
+                    }
+                };
+                RoutingRule {
+                    name: format!("r{index}"),
+                    match_expr: daer_config::MatchExpr::new(parsed.and_functions),
+                    action,
+                }
+            })
             .collect()
     }
 
@@ -724,18 +748,15 @@ mod tests {
     fn retired_dat_keys_name_the_replacement() {
         for (rule, function, data) in [
             ("domain(geosite:cn) -> direct", "domain", "domains"),
-            ("dip(geoip:cn) -> direct", "ip", "addresses"),
+            ("dip(geoip:cn) -> direct", "dip", "addresses"),
             ("sip(geoip:private) -> direct", "sip", "addresses"),
         ] {
-            // The alias optimizer runs first in the real pipeline (`dip` -> `ip`), so the
-            // fixture has to reflect what lowering actually sees.
-            let rules = AliasOptimizer.optimize(rules(rule)).expect("optimizes");
             let error = RulesBuilder::new(&mut RecordingSink::default())
-                .apply(&rules)
+                .apply(&rules(rule))
                 .expect_err("a .dat key must not lower");
             let message = error.to_string();
             assert!(message.contains("ADR-0014"), "{rule}: {message}");
-            assert!(message.contains("[[rule-provider]]"), "{rule}: {message}");
+            assert!(message.contains("[[rule-set]]"), "{rule}: {message}");
             assert!(message.contains(data), "{rule}: {message}");
             assert!(
                 !message.contains("unsupported parameter key"),
@@ -750,9 +771,8 @@ mod tests {
     }
 
     #[test]
-    fn lowers_aliases_and_keys_after_optimization() {
+    fn lowers_canonical_ip_and_port_predicates() {
         let rules = rules("routing { dip(1.0.0.0/8) && dport(80, 443) -> direct }");
-        let rules = AliasOptimizer.optimize(rules).expect("optimizes");
 
         let mut sink = RecordingSink::default();
         RulesBuilder::new(&mut sink).apply(&rules).expect("lowers");
@@ -768,18 +788,23 @@ mod tests {
     }
 
     #[test]
-    fn unoptimized_aliases_are_unknown_functions() {
-        let rules = rules("routing { dip(1.0.0.0/8) -> direct }");
-        let mut sink = RecordingSink::default();
-        let error = RulesBuilder::new(&mut sink)
-            .apply(&rules)
-            .expect_err("must fail");
-        assert!(error.message.contains("unknown function: dip"), "{error}");
+    fn retired_predicate_aliases_are_unknown_functions() {
+        for alias in ["ip(1.0.0.0/8)", "port(443)", "provider(cn)"] {
+            let rule = format!("routing {{ {alias} -> direct }}");
+            let mut sink = RecordingSink::default();
+            let error = RulesBuilder::new(&mut sink)
+                .apply(&rules(&rule))
+                .expect_err("an alias must not lower");
+            assert!(
+                error.message.contains("unknown function"),
+                "{alias}: {error}"
+            );
+        }
     }
 
     #[test]
     fn named_parameters_are_rejected_for_bare_functions() {
-        let rules = rules("routing { port(bogus: 443) -> direct }");
+        let rules = rules("routing { dport(bogus: 443) -> direct }");
         let mut sink = RecordingSink::default();
         let error = RulesBuilder::new(&mut sink)
             .apply(&rules)
@@ -793,12 +818,12 @@ mod tests {
 
     #[test]
     fn invalid_operands_are_reported_with_the_rule() {
-        let rules = rules("routing { ip(not-an-ip) -> direct }");
+        let rules = rules("routing { dip(not-an-ip) -> direct }");
         let mut sink = RecordingSink::default();
         let error = RulesBuilder::new(&mut sink)
             .apply(&rules)
             .expect_err("must fail");
-        assert!(error.message.starts_with("in 'ip("), "{error}");
+        assert!(error.message.starts_with("in 'dip("), "{error}");
     }
 
     /// A bare name is a suffix, exactly as it is in rule text.
@@ -916,6 +941,23 @@ mod tests {
         let mut other = facts;
         other.process_name = ProcessName::from_bytes_truncated(b"c");
         assert!(crate::matcher::evaluate(&sink.matches, &other).is_err());
+    }
+
+    #[test]
+    fn pname_lowers_as_a_first_class_predicate() {
+        let rules = rules("routing { pname(curl) -> direct }");
+        let mut sink = RecordingSink::default();
+        RulesBuilder::new(&mut sink).apply(&rules).expect("lowers");
+        assert!(
+            sink.warnings.is_empty(),
+            "pname is supported by the attached cgroup hooks: {:?}",
+            sink.warnings
+        );
+        assert_eq!(sink.matches.len(), 1);
+        assert!(matches!(
+            sink.matches[0].value,
+            crate::matcher::MatchValue::ProcessName(_)
+        ));
     }
 
     #[test]

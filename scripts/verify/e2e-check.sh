@@ -95,90 +95,114 @@ else
     bad "cannot bring loopback up"
 fi
 
-section "2. building the test binaries (as $builder, so cargo is findable)"
-build_one() {
-    local pkg="$1" target="$2" var="$3" log="$logs/build-$2.log"
-    if ! as_builder env -u SUDO_USER cargo test -p "$pkg" --test "$target" --no-run \
-            >"$log" 2>&1; then
-        bad "the $target test binary did not build; see $log"
-        sed -n '$p' "$log" | sed 's/^/       /'
-        printf -v "$var" '%s' ""
-        return
-    fi
-    local bin
-    # Do not expand `$target-*` on the command line: a long-lived `target/` can contain
-    # tens of thousands of incremental objects, and `ls` then dies with E2BIG before it can
-    # select the newest test binary. `find` filters the directory internally.
-    bin="$(find target/debug/deps -maxdepth 1 -type f -name "$target-*" -perm -u+x \
-        -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
-    if [[ -z "$bin" ]]; then
-        bad "no $target test binary under target/debug/deps"
-        printf -v "$var" '%s' ""
-    else
-        ok "binary: $bin"
-        printf -v "$var" '%s' "$bin"
-    fi
-}
+section "2. building the workspace E2E test binary (as $builder, so cargo is findable)"
+# One test target contains every privileged case. The old script built six separate binaries,
+# which linked the same dependency graph six times; `tests/e2e/main.rs` is one link and one
+# discovery step. The individual test functions are selected by name below.
+# The reload test starts the real binary, so both artifacts are built as the invoking user.
+if ! as_builder env -u SUDO_USER cargo build -p daer-cli --bin daer \
+        >"$logs/build-daemon.log" 2>&1; then
+    bad "the daemon binary did not build; see $logs/build-daemon.log"
+fi
 
-binary_transparent=""
-binary_udp6=""
-binary_netns=""
-binary_reload=""
-build_one daer-control transparent binary_transparent
-build_one daer-control transparent_udp6 binary_udp6
-build_one daer-control netns_lifecycle binary_netns
-build_one daer-cli reload binary_reload
-
-section "3. the transparent data path (a real tproxy redirect into a real origin)"
-# `tests/transparent.rs` is the only proof that a redirected flow is actually proxied, and it
-# installs its own `nftables tproxy` rule. The test creates and removes its own
-# `ip daer-test` table, so this script does not disturb the operator's rules.
-if ! command -v nft >/dev/null 2>&1; then
-    skip "3-tcp" "nft is not installed; the transparent-path test cannot install its redirect"
-elif [[ -z "$binary_transparent" ]]; then
-    skip "3-tcp" "no transparent test binary; the build failed above"
+binary_e2e=""
+if ! as_builder env -u SUDO_USER cargo test -p daer-tests --test e2e --no-run \
+        >"$logs/build-e2e.log" 2>&1; then
+    bad "the workspace e2e test binary did not build; see $logs/build-e2e.log"
+    sed -n '$p' "$logs/build-e2e.log" | sed 's/^/       /'
 else
-    if "$binary_transparent" --nocapture --test-threads=1 >"$logs/transparent.log" 2>&1 \
-            && grep -q "test result: ok" "$logs/transparent.log"; then
-        # Report each path separately: the datagram test skips itself on a box that cannot
-        # create a second network namespace while the TCP path — the one that matters — passes.
-        if grep -q "a_redirected_flow_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
-            ok "a redirected flow reached the daemon, was proxied, and the origin's nonce came back"
-        else
-            bad "the TCP data path did not report a pass; see $logs/transparent.log"
-        fi
-        if grep -q "a_redirected_ipv6_flow_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
-            ok "the IPv6 TCP path reached the daemon and returned the origin's nonce"
-        else
-            skip "3-tcp6" "the IPv6 TCP path skipped itself (no usable IPv6 loopback); see $logs/transparent.log"
-        fi
-        if grep -q "a_redirected_datagram_is_proxied_by_the_daemon ... ok" "$logs/transparent.log"; then
-            ok "a redirected datagram reached the daemon and the reply came back to the client port"
-        else
-            skip "3-udp" "the UDP path skipped itself (a second network namespace is needed); see $logs/transparent.log"
-        fi
-        grep -E "^test " "$logs/transparent.log" | sed 's/^/       /'
+    binary_e2e="$(find target/debug -type f -name 'e2e-*' -perm -u+x \
+        -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
+    if [[ -z "$binary_e2e" ]]; then
+        bad "no e2e test binary under target/debug"
     else
-        bad "the transparent data path failed; see $logs/transparent.log"
-        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent.log" 2>/dev/null \
-            | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
+        ok "binary: $binary_e2e"
     fi
 fi
 
-section "3a. IPv6 UDP through a real two-namespace tproxy topology"
-# The in-process test creates a client namespace, an origin namespace and the veth/nft/policy
-# fixture itself. A skip means the host cannot create namespaces; `DAER_REQUIRE=3-udp6` makes
-# that a failure in the privileged CI job.
-if [[ -z "$binary_udp6" ]]; then
-    skip "3-udp6" "no IPv6 UDP test binary; the build failed above"
+# Runs one test by exact name, with root privileges. `sudo` wrapped the script as a whole;
+# this function only makes the selection explicit.
+run_exact() {
+    local log="$1" name="$2"
+    shift 2
+    if [[ -z "$binary_e2e" ]]; then
+        return 125
+    fi
+    "$binary_e2e" --exact --nocapture --test-threads=1 "$name" "$@" >"$log" 2>&1
+}
+
+# True when exactly the selected test ran, even if it skipped itself.
+exact_finished() {
+    grep -q "test result: ok. 1 passed" "$1"
+}
+
+# True only when the selected test ran and did not print a skip reason.
+exact_passed() {
+    exact_finished "$1" && ! exact_skipped "$1"
+}
+
+exact_skipped() {
+    grep -q "skipped: " "$1"
+}
+
+section "3. the transparent data path (a real tproxy redirect into a real origin)"
+# `control_transparent.rs` installs its own `nftables tproxy` rule and removes its own
+# `ip daer-test` table. The TCP positive control is paired with a negative control that must
+# fail without the daemon; the datagram relay wiring is the in-process half of UDP.
+if ! command -v nft >/dev/null 2>&1; then
+    skip "3-tcp" "nft is not installed; the transparent-path test cannot install its redirect"
+elif [[ -z "$binary_e2e" ]]; then
+    skip "3-tcp" "no e2e test binary; the build failed above"
 else
-    if "$binary_udp6" --nocapture --test-threads=1 >"$logs/transparent-udp6.log" 2>&1 \
-            && grep -q "test result: ok" "$logs/transparent-udp6.log"; then
-        if grep -q "skipped: " "$logs/transparent-udp6.log"; then
-            skip "3-udp6" "the IPv6 UDP topology skipped itself; see $logs/transparent-udp6.log"
+    run_exact "$logs/transparent-tcp.log" control_transparent::a_redirected_flow_is_proxied_by_the_daemon
+    if exact_skipped "$logs/transparent-tcp.log"; then
+        skip "3-tcp" "the TCP data path skipped itself (no CAP_NET_ADMIN or nftables); see $logs/transparent-tcp.log"
+    else
+        tcp_ok=0
+        exact_passed "$logs/transparent-tcp.log" && tcp_ok=1
+        run_exact "$logs/transparent-negative.log" control_transparent::the_negative_control_fails_without_the_daemon
+        if [[ "$tcp_ok" -eq 1 ]] && exact_passed "$logs/transparent-negative.log"; then
+            ok "a redirected flow reached the daemon and the negative control failed without it"
         else
-            ok "a redirected IPv6 datagram reached the daemon and the reply returned"
+            bad "the TCP data path or its negative control failed; see $logs/transparent-tcp.log and $logs/transparent-negative.log"
+            perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent-tcp.log" 2>/dev/null \
+                | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
         fi
+    fi
+
+    run_exact "$logs/transparent-tcp6.log" control_transparent::a_redirected_ipv6_flow_is_proxied_by_the_daemon
+    if exact_passed "$logs/transparent-tcp6.log"; then
+        ok "the IPv6 TCP path reached the daemon and returned the origin's nonce"
+    elif exact_skipped "$logs/transparent-tcp6.log"; then
+        skip "3-tcp6" "the IPv6 TCP path skipped itself (no usable IPv6 loopback); see $logs/transparent-tcp6.log"
+    else
+        bad "the IPv6 TCP data path failed; see $logs/transparent-tcp6.log"
+    fi
+
+    run_exact "$logs/transparent-wiring.log" control_transparent::the_datagram_relay_is_wired_into_the_daemon
+    if exact_passed "$logs/transparent-wiring.log"; then
+        ok "the datagram relay is wired into the daemon"
+    else
+        bad "the datagram relay wiring failed; see $logs/transparent-wiring.log"
+    fi
+
+    # The single-namespace IPv4 UDP fixture is invalid: the origin and the transparent reply
+    # socket must own the same address and port. The two-namespace tests own that path.
+    skip "3-udp" "the single-namespace IPv4 UDP fixture is invalid; 3-udp4 is the real gate"
+fi
+
+section "3a. IPv6 UDP through a real two-namespace tproxy topology"
+# The test creates a client namespace, an origin namespace and the veth/nft/policy fixture
+# itself. A skip means the host cannot create namespaces; `DAER_REQUIRE=3-udp4,3-udp6` makes
+# that a failure in the privileged CI job.
+if [[ -z "$binary_e2e" ]]; then
+    skip "3-udp6" "no e2e test binary; the build failed above"
+else
+    run_exact "$logs/transparent-udp6.log" control_transparent_udp6::a_redirected_ipv6_datagram_is_proxied_by_the_daemon
+    if exact_passed "$logs/transparent-udp6.log"; then
+        ok "a redirected IPv6 datagram reached the daemon and the reply returned"
+    elif exact_skipped "$logs/transparent-udp6.log"; then
+        skip "3-udp6" "the IPv6 UDP topology skipped itself; see $logs/transparent-udp6.log"
     else
         bad "the IPv6 UDP data path failed; see $logs/transparent-udp6.log"
         perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent-udp6.log" 2>/dev/null \
@@ -186,22 +210,42 @@ else
     fi
 fi
 
-section "3b. the private ingress namespace"
+section "3b. IPv4 UDP through a real two-namespace tproxy topology"
+# The IPv4 variant owns the same client/origin topology as the IPv6 test. It is the gate that
+# closes the long-standing "IPv4 UDP not proven" gap; `3-udp4` makes its skip fatal in CI.
+if [[ -z "$binary_e2e" ]]; then
+    skip "3-udp4" "no e2e test binary; the build failed above"
+else
+    run_exact "$logs/transparent-udp4.log" control_transparent_udp4::a_redirected_ipv4_datagram_is_proxied_by_the_daemon
+    if exact_passed "$logs/transparent-udp4.log"; then
+        ok "a redirected IPv4 datagram reached the daemon and the reply returned"
+    elif exact_skipped "$logs/transparent-udp4.log"; then
+        skip "3-udp4" "the IPv4 UDP topology skipped itself; see $logs/transparent-udp4.log"
+    else
+        bad "the IPv4 UDP data path failed; see $logs/transparent-udp4.log"
+        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/transparent-udp4.log" 2>/dev/null \
+            | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
+    fi
+fi
+
+section "3c. the private ingress namespace"
 # This owns daer0ns and daer0/daer0peer for the duration of one test. It proves the namespace
 # is created, the peer moves, the policy is ingress-keyed, the return route exists, and drop
 # removes both the namespace and the host end. A running daer service must be stopped first.
-if [[ -z "$binary_netns" ]]; then
-    skip "3-netns" "no netns_lifecycle test binary; the build failed above"
+if [[ -z "$binary_e2e" ]]; then
+    skip "3-netns" "no e2e test binary; the build failed above"
 elif systemctl is-active --quiet daer 2>/dev/null; then
     skip "3-netns" "the daer service is running and owns daer0ns; stop it before this check"
 else
-    if DAER_NETNS_TEST=1 "$binary_netns" --nocapture --test-threads=1 \
-            >"$logs/netns.log" 2>&1 && grep -q "test result: ok" "$logs/netns.log"; then
+    DAER_NETNS_TEST=1 run_exact "$logs/netns-prepare.log" control_netns_lifecycle::prepare_and_drop_the_private_ingress
+    DAER_NETNS_TEST=1 run_exact "$logs/netns-listener.log" control_netns_lifecycle::the_transparent_listener_binds_inside_the_namespace
+    if exact_skipped "$logs/netns-prepare.log" || exact_skipped "$logs/netns-listener.log"; then
+        skip "3-netns" "the private ingress test skipped itself; see $logs/netns-prepare.log and $logs/netns-listener.log"
+    elif exact_passed "$logs/netns-prepare.log" && exact_passed "$logs/netns-listener.log"; then
         ok "daer0ns, the peer move, iif policy, return route, and teardown all hold"
-        grep -E "^test " "$logs/netns.log" | sed 's/^/       /'
     else
-        bad "the private ingress lifecycle failed; see $logs/netns.log"
-        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/netns.log" 2>/dev/null \
+        bad "the private ingress lifecycle failed; see $logs/netns-prepare.log and $logs/netns-listener.log"
+        perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/netns-prepare.log" "$logs/netns-listener.log" 2>/dev/null \
             | awk '/panicked|assertion|must/{print "       " $0; if (++n == 3) exit}'
     fi
 fi
@@ -215,18 +259,14 @@ section "4. reload: a SIGHUP must not abort the daemon"
 # `daer run` used to panic on its first `SIGHUP` because `reload` called `block_on` inside the
 # multi-threaded runtime. No unit test could catch it: the defect is in the interaction between
 # the signal loop and the runtime, so it needs a real process and a real signal.
-if [[ -z "$binary_reload" ]]; then
-    skip "4" "no reload test binary; the build failed above"
-elif [[ ! -x "$binary_reload" ]]; then
-    bad "reload test binary is not executable: $binary_reload"
+if [[ -z "$binary_e2e" ]]; then
+    skip "4" "no e2e test binary; the build failed above"
 else
-    if "$binary_reload" --nocapture --test-threads=1 >"$logs/reload.log" 2>&1 \
-            && grep -q "test result: ok" "$logs/reload.log"; then
-        if grep -q "skipped: the daemon could not start here" "$logs/reload.log"; then
-            skip "4" "the reload test skipped itself; see $logs/reload.log"
-        else
-            ok "the daemon survived SIGHUP and published generation 2"
-        fi
+    run_exact "$logs/reload.log" cli_reload::the_daemon_survives_a_hangup_and_publishes_a_new_generation
+    if exact_passed "$logs/reload.log"; then
+        ok "the daemon survived SIGHUP and published generation 2"
+    elif exact_skipped "$logs/reload.log"; then
+        skip "4" "the reload test skipped itself; see $logs/reload.log"
     else
         bad "reload failed; see $logs/reload.log"
         perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' "$logs/reload.log" 2>/dev/null \
