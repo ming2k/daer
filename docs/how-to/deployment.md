@@ -469,7 +469,7 @@ tighten artifacts created by an older build.
 A pre-TCX install may have `/run/daer/restore` (or a versioned recovery journal) and a host
 `clsact` filter/table-2023 rule. Current daer does not replay that journal or adopt the host
 state. Stop the old service and let its `daer-cleanup` finish, or remove the old qdisc/filter
-explicitly, before installing 0.1.0. The installer removes the old helper and object so they
+explicitly, before installing 0.0.14. The installer removes the old helper and object so they
 cannot be invoked by the wrong unit; it does not guess whether old host state is safe to
 delete.
 
