@@ -20,7 +20,7 @@ They are now implemented in `daer-dns`:
 | Item | Earlier claim | Truth |
 | --- | --- | --- |
 | DNS over UDP upstream | "needs the datagram transport from netune" | **Wrong as a blocker.** A direct UDP upstream does not need proxy datagram support. Implemented in `daer-dns/src/transport.rs`; it now uses netune's `UdpConnector` so the daemon's `SocketConfig`/`SO_MARK` and trace vocabulary apply uniformly. |
-| DoT upstream | "needs the TLS client from netune" | **Wrong.** `netune::TlsConnector` returns `Established { stream: Box<dyn Transport> }`, a byte pipe. DNS-over-TLS is the existing length-prefixed framing inside it. Implemented. |
+| DoT upstream | "needs the TLS client from netune" | **Wrong.** `netune::TlsRouterConnector` returns an `Established` whose `stream` is a `Box<dyn Transport>` — a byte pipe. DNS-over-TLS is the existing length-prefixed framing inside it. Implemented. |
 | DoH upstream | "needs the TLS client from netune" | **Wrong.** `netune::Client::request` takes a body and returns a response; RFC 8484 is `POST` with `application/dns-message`. Implemented. |
 
 All four upstream protocols (`udp`, `tcp`, `tls`, `https`) are now real and
@@ -92,18 +92,20 @@ These seams are exactly right and `daer` depends on them:
   needing a netune change per protocol. A dial nobody observes passes
   `TraceCollector::disabled()`; an observed dial installs a sink before connecting.
   Chained proxies (`a -> b`) nest the same way.
-- **`Transport` is a public blanket trait** (`connect.rs:23`: `pub trait Transport`
-  with `impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T`). This is
-  the seam that makes a REALITY client possible **without any netune change**: a
+- **`Transport` is a public trait** (`connect.rs`: `pub trait Transport`). Since
+  netune 0.1.0 it is no longer blanket-implemented for every `AsyncRead + AsyncWrite`;
+  a caller-supplied stream wraps itself in `netune::Untapped`, and daer's own adapters
+  implement `Transport`, forwarding `socket_tap()` where the wrapped stream exposes it.
+  This is the seam that makes a REALITY client possible **without any netune change**: a
   handshake `daer` owns can hand its resulting stream to netune as an `Established`
   value. See ADR-0010.
 - `EgressConfinement::Unrestricted` is the default (`connect.rs:163`) — daer must
   reach private addresses, so `strict_public()` must never be used on the data
   path.
-- `SocketConfig::mark` runs before `connect(2)` (`socket.rs:39`) — this is what
+- `SocketConfig::mark` runs before `connect(2)` (`socket.rs`) — this is what
   internal socket mark needs, applied before the SYN rather than after the handshake.
-- `Client::request(target, head, Option<Bytes>)` (`client.rs:115`) is what the DoH
-  upstream and the subscription fetcher use; `TlsConnector` is what the DoT upstream
+- `Client::request(target, head, Option<Bytes>)` (`client.rs`) is what the DoH
+  upstream and the subscription fetcher use; `TlsRouterConnector` is what the DoT upstream
   uses.
 - `QuicUdpSocketFactory` builds one socket stack per connection after egress
   confinement and before the first Initial packet, and receives the connector's

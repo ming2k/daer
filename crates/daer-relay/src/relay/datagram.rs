@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -292,6 +292,75 @@ impl Peer {
 /// per-datagram condition. One refused peer is counted in
 /// [`DatagramStats::snapshot`]'s `dropped_failed`, because a refused flow must not stop
 /// the socket serving the others.
+const NEGATIVE_REFUSAL_TTL: Duration = Duration::from_secs(10);
+const NEGATIVE_REFUSAL_CAP: usize = 256;
+
+fn is_persistent_refusal(code: daer_observe::ErrorCode) -> bool {
+    use daer_observe::diagnostic::codes;
+    matches!(
+        code,
+        codes::RELAY_DIAL_UNSUPPORTED
+            | codes::RELAY_DIAL_NO_DATAGRAM
+            | codes::RELAY_DIAL_NO_NODE
+            | codes::RELAY_DIAL_UNKNOWN_ELECTION
+    )
+}
+
+/// Bounded short-TTL negative cache suppressing repeated identical persistent datagram
+/// refusals (such as QUIC retransmissions to an outbound node without datagram support)
+/// without muting transient errors or caching forever across reloads.
+struct NegativeRefusalCache {
+    ttl: Duration,
+    cap: usize,
+    entries: HashMap<(IpAddr, SocketAddr), Instant>,
+}
+
+impl Default for NegativeRefusalCache {
+    fn default() -> Self {
+        Self::new(NEGATIVE_REFUSAL_TTL, NEGATIVE_REFUSAL_CAP)
+    }
+}
+
+impl NegativeRefusalCache {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn is_suppressed(&mut self, key: (IpAddr, SocketAddr), now: Instant) -> bool {
+        match self.entries.get(&key) {
+            Some(&expires_at) if expires_at > now => true,
+            Some(_) => {
+                self.entries.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record(&mut self, key: (IpAddr, SocketAddr), code: daer_observe::ErrorCode, now: Instant) {
+        if self.cap == 0 || self.ttl.is_zero() || !is_persistent_refusal(code) {
+            return;
+        }
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
+            self.entries.retain(|_, &mut expires_at| expires_at > now);
+            if self.entries.len() >= self.cap
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, expires_at)| *expires_at)
+                    .map(|(k, _)| *k)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, now + self.ttl);
+    }
+}
+
 pub async fn serve_datagrams(
     ingress: Arc<dyn DatagramIngress>,
     router: Arc<dyn DatagramRouter>,
@@ -300,6 +369,7 @@ pub async fn serve_datagrams(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RelayError> {
     let peers: Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let negative_refusals = Arc::new(Mutex::new(NegativeRefusalCache::default()));
     let mut buffer = vec![0u8; options.max_datagram_size];
     // A reap tick that does not depend on traffic: a silent relay would otherwise
     // never shrink its table, which is exactly the case where it grows.
@@ -322,7 +392,7 @@ pub async fn serve_datagrams(
                 // across an await makes the whole relay future non-`Send`.
                 let live = peers.lock().await.len();
                 daer_observe::info!(daer_observe::EventCode::DatagramIngressStopped,
-                    sessions = live,
+                    in_flight = live,
                     "datagram ingress stopped; live sessions keep replying"
                 );
                 return Ok(());
@@ -361,20 +431,28 @@ pub async fn serve_datagrams(
             destination: original_destination,
         };
 
-        let peer =
-            match peer_for(&peers, key, datagram.flow_id, &buffer[..received], &service).await {
-                Some(peer) => peer,
-                None => {
-                    // Opening failed or the table was full: distinguish the two, because
-                    // one is a capacity signal and the other a policy or transport one.
-                    if peers.lock().await.len() >= service.options.max_sessions {
-                        service.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        service.stats.dropped_failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    continue;
+        let peer = match peer_for(
+            &peers,
+            &negative_refusals,
+            key,
+            datagram.flow_id,
+            &buffer[..received],
+            &service,
+        )
+        .await
+        {
+            Some(peer) => peer,
+            None => {
+                // Opening failed or the table was full: distinguish the two, because
+                // one is a capacity signal and the other a policy or transport one.
+                if peers.lock().await.len() >= service.options.max_sessions {
+                    service.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    service.stats.dropped_failed.fetch_add(1, Ordering::Relaxed);
                 }
-            };
+                continue;
+            }
+        };
 
         // Liveness is "sent recently", so it is refreshed on every datagram, not only
         // when the session opened.
@@ -412,6 +490,7 @@ pub async fn serve_datagrams(
 /// duplicate the routing decision's side effects.
 async fn peer_for(
     peers: &Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>>,
+    negative_refusals: &Arc<Mutex<NegativeRefusalCache>>,
     key: SessionKey,
     flow_id: daer_observe::FlowId,
     initial_payload: &[u8],
@@ -438,6 +517,22 @@ async fn peer_for(
         }
     }
 
+    let neg_key = (address.ip(), original_destination);
+    if negative_refusals
+        .lock()
+        .await
+        .is_suppressed(neg_key, Instant::now())
+    {
+        daer_observe::trace!(
+            daer_observe::EventCode::DatagramRefusalSuppressed,
+            flow_id = %flow_id,
+            source = %address,
+            destination = %original_destination,
+            "suppressed repeated datagram refusal"
+        );
+        return None;
+    }
+
     let facts = FlowFacts {
         flow_id,
         source: address,
@@ -449,12 +544,17 @@ async fn peer_for(
     let leg = match service.router.open_datagram(facts, initial_payload).await {
         Ok(leg) => leg,
         Err(error) => {
+            negative_refusals
+                .lock()
+                .await
+                .record(neg_key, error.code, Instant::now());
             daer_observe::warn!(
                 daer_observe::EventCode::DatagramFlowRefused,
                 flow_id = %flow_id,
                 source = %address,
                 destination = %original_destination,
                 %error,
+                error_code = %error.code,
                 "datagram flow refused"
             );
             return None;

@@ -419,7 +419,8 @@ async fn fetch_http_provider(
                 && let Ok(set) = DrbSet::decode(&cached_bytes)
             {
                 daer_observe::debug!(daer_observe::EventCode::ProviderNotModified,
-                    provider = %tag,
+                    tag = %tag,
+                    status = 304u16,
                     "rule provider not modified (HTTP 304); loaded from cached DRB"
                 );
                 return Ok((set, true));
@@ -453,8 +454,8 @@ async fn fetch_http_provider(
                 && let Ok(set) = DrbSet::decode(&cached_bytes)
             {
                 daer_observe::warn!(daer_observe::EventCode::ProviderCacheFallback,
-                    %fetch_err,
-                    provider = %tag,
+                    error = %fetch_err,
+                    tag = %tag,
                     cache = %cache_file.display(),
                     "rule provider fetch failed; loaded from cached DRB"
                 );

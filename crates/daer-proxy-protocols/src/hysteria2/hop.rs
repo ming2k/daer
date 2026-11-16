@@ -287,7 +287,7 @@ pub fn base_socket(
     config: &QuicSocketConfig,
 ) -> Result<tokio::net::UdpSocket, ProxyProtocolError> {
     config.create_tokio_socket(target).map_err(|error| {
-        ProxyProtocolError::Connect(format!("create udp socket for {target}: {error}"))
+        ProxyProtocolError::tcp(format!("create udp socket for {target}: {error}"))
     })
 }
 
@@ -303,10 +303,10 @@ pub fn build_stack(
     obfs: Option<&Obfs>,
 ) -> Result<SocketStack, ProxyProtocolError> {
     let base = base_socket(target, config)?;
-    let hop =
-        Arc::new(HopSocket::new(base).map_err(|error| {
-            ProxyProtocolError::Connect(format!("inspect udp socket: {error}"))
-        })?);
+    let hop = Arc::new(
+        HopSocket::new(base)
+            .map_err(|error| ProxyProtocolError::tcp(format!("inspect udp socket: {error}")))?,
+    );
     // Obfuscation sits directly above the socket: one salt per datagram, so it must be the
     // last thing that touches the bytes before `sendmsg`.
     let socket: Arc<dyn QuicUdpSocket> = match obfs {

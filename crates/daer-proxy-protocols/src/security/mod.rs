@@ -36,7 +36,6 @@ use std::time::Duration;
 
 use netune::Transport;
 use netune_trace::TraceCollector;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::ProxyProtocolError;
 
@@ -47,7 +46,7 @@ pub mod tls;
 pub struct Opaque {
     pub stream: Box<dyn Transport>,
     /// Set by a security layer whose record layer can be bypassed. `None` means "there is
-    /// nothing to switch off", which is the truth for `none` and for TLS: rustls has no
+    /// nothing to switch off", which is the truth for `none` and for netune TLS: it has no
     /// splice path here, so a `Direct` from the peer is only ever sent in response to a
     /// client that could splice.
     pub raw_read: Option<Arc<AtomicBool>>,
@@ -146,18 +145,34 @@ impl Security {
         timeout: Duration,
     ) -> Result<Opaque, ProxyProtocolError>
     where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        S: Transport + 'static,
+    {
+        self.wrap_until(
+            stream,
+            node_host,
+            recorder,
+            tokio::time::Instant::now() + timeout,
+        )
+        .await
+    }
+
+    /// Wraps `stream` in this layer within `deadline`.
+    pub async fn wrap_until<S>(
+        &self,
+        stream: S,
+        node_host: &str,
+        recorder: &TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> Result<Opaque, ProxyProtocolError>
+    where
+        S: Transport + 'static,
     {
         match self {
             Self::None => Ok(Opaque::plain(Box::new(stream))),
-            Self::Tls(params) => tls::wrap(stream, params, node_host, recorder, timeout).await,
-            Self::Reality(security) => security.wrap(stream, timeout).await,
+            Self::Tls(params) => {
+                tls::wrap_until(stream, params, node_host, recorder, deadline).await
+            }
+            Self::Reality(security) => security.wrap_until(stream, deadline).await,
         }
     }
-}
-
-/// A shared, lazily built rustls provider, so every TLS security layer in the process
-/// handshakes with the same crypto backend.
-pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }

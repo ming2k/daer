@@ -31,6 +31,7 @@ fastrand.workspace = true
 getrandom.workspace = true
 netune.workspace = true
 netune-http1.workspace = true
+netune-tls.workspace = true
 netune-trace.workspace = true
 netune-ws.workspace = true
 netune-quic.workspace = true

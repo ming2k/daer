@@ -29,7 +29,7 @@ mod observe;
 mod property;
 pub mod subscription;
 
-pub use alive::{AliveDialerSet, DialerId, NotifyOutcome};
+pub use alive::{AliveDialerSet, CooldownOutcome, DialerId, NotifyOutcome};
 pub use check::{CheckError, CheckUrl, HttpChecker, HttpMethod, Scheme, TcpChecker, UdpDnsChecker};
 pub use dialer::Dialer;
 pub use direct::DirectDialer;

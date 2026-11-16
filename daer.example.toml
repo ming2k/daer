@@ -26,6 +26,10 @@ log-level = "info"
 wan-interface = "auto"
 
 disable-waiting-network = false
+# Total deadline for one outbound connection: DNS + TCP + TLS + proxy handshake.
+#dial-timeout = "10s"
+# TCP keepalive idle time on outbound sockets; "0s" disables keepalive.
+#tcp-keepalive = "30s"
 
 
 [tls]
@@ -217,6 +221,11 @@ type = "min-moving-avg"
 #interval = "30s"
 #timeout = "5s"
 #udp-dns = ["1.1.1.1:53", "8.8.8.8:53", "2001:4860:4860::8888:53"]
+# Consecutive live-flow dial failures before a candidate enters passive cooldown.
+# 0 disables passive cooldown.
+#failure-threshold = 3
+# How long a cooled-down candidate is skipped before it is retried; "0s" disables.
+#cooldown = "30s"
 
 [dns]
 # "any", "ipv4", or "ipv6".

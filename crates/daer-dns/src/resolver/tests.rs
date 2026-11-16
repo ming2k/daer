@@ -406,6 +406,28 @@ default = "direct"
 }
 
 #[test]
+fn upstream_error_codes_follow_the_typed_error() {
+    use daer_observe::diagnostic::codes;
+
+    assert_eq!(
+        super::upstream_error_code(&UpstreamError::Missing("tag".to_owned())),
+        codes::DNS_UPSTREAM_UNSUPPORTED
+    );
+    assert_eq!(
+        super::upstream_error_code(&UpstreamError::Timeout("slow".to_owned())),
+        codes::DNS_UPSTREAM_TIMEOUT
+    );
+    assert_eq!(
+        super::upstream_error_code(&UpstreamError::Connect("refused".to_owned())),
+        codes::DNS_UPSTREAM_CONNECT
+    );
+    assert_eq!(
+        super::upstream_error_code(&UpstreamError::Failed("malformed".to_owned())),
+        codes::DNS_UPSTREAM_PROTOCOL
+    );
+}
+
+#[test]
 fn stats_describe_an_idle_resolver() {
     let resolver = resolver(BASE, FakeUpstream::answering(&[[1, 2, 3, 4]], 60));
     let stats = resolver.stats().snapshot();

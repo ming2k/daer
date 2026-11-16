@@ -30,6 +30,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::RealityAuth;
@@ -831,6 +832,12 @@ impl<'a> Reader<'a> {
 
 // ── The stream ──────────────────────────────────────────────────────────────
 
+impl<S: Transport> Transport for Tls13Connection<S> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.io.socket_tap()
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Connection<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1120,8 +1127,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Connection<S> {
     }
 }
 
+/// Constructs an AEAD-paired `Tls13Connection` over an in-memory duplex feeder for unit tests.
+#[cfg(test)]
+pub(crate) fn paired_for_test() -> (
+    Tls13Connection<tokio::io::DuplexStream>,
+    RecordLayer,
+    tokio::io::DuplexStream,
+) {
+    let key = [0x5au8; 32];
+    let iv = [0x3cu8; 12];
+    let (feeder, remote) = tokio::io::duplex(64 * 1024);
+    let mut connection = Tls13Connection {
+        io: remote,
+        layer: RecordLayer::new(),
+        reading: Reading::Header {
+            filled: 0,
+            bytes: [0u8; RecordHeader::LEN],
+        },
+        awaiting_write: Vec::new(),
+        written: 0,
+        raw_read: Arc::new(AtomicBool::new(false)),
+    };
+    connection.layer.read_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("read key"));
+    let mut peer = RecordLayer::new();
+    peer.write_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("write key"));
+    (connection, peer, feeder)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::paired_for_test as paired_connection;
     use super::*;
 
     #[test]
@@ -1347,35 +1382,6 @@ mod tests {
         message.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
         message.extend_from_slice(body);
         message
-    }
-
-    /// A connection whose read key matches the returned peer's write key.
-    ///
-    /// The connection's socket is a duplex whose other half is returned as the feeder, so a
-    /// test can write exactly the records it wants the connection to see.
-    fn paired_connection() -> (
-        Tls13Connection<tokio::io::DuplexStream>,
-        RecordLayer,
-        tokio::io::DuplexStream,
-    ) {
-        let key = [0x5au8; 32];
-        let iv = [0x3cu8; 12];
-        let (feeder, remote) = tokio::io::duplex(64 * 1024);
-        let mut connection = Tls13Connection {
-            io: remote,
-            layer: RecordLayer::new(),
-            reading: Reading::Header {
-                filled: 0,
-                bytes: [0u8; RecordHeader::LEN],
-            },
-            awaiting_write: Vec::new(),
-            written: 0,
-            raw_read: Arc::new(AtomicBool::new(false)),
-        };
-        connection.layer.read_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("read key"));
-        let mut peer = RecordLayer::new();
-        peer.write_key = Some(TrafficKey::new(0x1303, &key, &iv).expect("write key"));
-        (connection, peer, feeder)
     }
 
     #[tokio::test]

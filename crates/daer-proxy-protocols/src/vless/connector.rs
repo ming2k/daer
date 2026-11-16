@@ -30,10 +30,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
-    DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError, Transport,
+    ConnectError, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams,
+    NetError, Transport,
 };
-use netune_trace::TraceCollector;
+use netune_trace::{DiagnosticPhase, TraceCollector};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::time::Instant;
 
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
@@ -155,6 +157,17 @@ impl VlessConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
+        self.connect_within(authority, recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens a VLESS session to `authority` (`host:port`) within a single shared `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
         let header = encode_request(&Request {
             uuid: self.parsed_uuid,
             command: Command::Tcp,
@@ -162,25 +175,38 @@ impl VlessConnector {
             authority,
         })?;
 
-        let (opaque, local_port) = self.open_stream(recorder).await?;
+        let (opaque, local_port) = self.open_stream_until(recorder, deadline).await?;
         let alpn_protocol = opaque.alpn_protocol.clone();
         let alpn = alpn_protocol
             .as_deref()
             .map(|name| netune_trace::Alpn::from_name(Some(name)));
-        let stream = self.write_head(opaque, &header).await.map_err(|error| {
-            ProxyProtocolError::Connect(format!(
-                "write the VLESS request to {}: {error}",
-                self.server
-            ))
-        })?;
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
+        let stream = tokio::time::timeout(remaining, self.write_head(opaque, &header))
+            .await
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Handshake,
+                    format!(
+                        "write VLESS request to {} exceeded {} ms",
+                        self.server,
+                        remaining.as_millis()
+                    ),
+                )
+            })?
+            .map_err(|error| {
+                ProxyProtocolError::handshake(format!(
+                    "write the VLESS request to {}: {error}",
+                    self.server
+                ))
+            })?;
 
-        Ok(Established {
-            stream,
-            local_port,
-            socket: None,
-            alpn,
-            alpn_protocol,
-        })
+        Ok(Established::new(stream)
+            .with_local_port(local_port)
+            .with_alpn(alpn, alpn_protocol))
     }
 
     /// Writes the request head through the opaque stream, applying the flow to the payload.
@@ -225,19 +251,16 @@ impl VlessConnector {
         Ok(Box::new(stream))
     }
 
-    /// Dials, upgrades the transport, and applies the security layer.
-    async fn open_stream(
+    /// Dials, upgrades the transport, and applies the security layer within `deadline`.
+    async fn open_stream_until(
         &self,
         recorder: &TraceCollector,
+        deadline: Instant,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
         let established = self
             .base
-            .connect(&self.server, recorder)
-            .await
-            .map_err(|error| match error {
-                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
-                other => ProxyProtocolError::Connect(other.to_string()),
-            })?;
+            .connect_within(&self.server, recorder, deadline)
+            .await?;
         let local_port = established.local_port;
 
         // ADR-0028's order is security **then** transport, which is the opposite of what the
@@ -253,12 +276,12 @@ impl VlessConnector {
             (Some(fragment), Security::Reality(_)) => {
                 let stream = crate::fragment::FragmentingIo::new(established.stream, *fragment);
                 self.security
-                    .wrap(stream, &self.host, recorder, self.timeout)
+                    .wrap_until(stream, &self.host, recorder, deadline)
                     .await?
             }
             _ => {
                 self.security
-                    .wrap(established.stream, &self.host, recorder, self.timeout)
+                    .wrap_until(established.stream, &self.host, recorder, deadline)
                     .await?
             }
         };
@@ -267,12 +290,12 @@ impl VlessConnector {
         let raw_read = opaque.raw_read;
         let stream = self
             .transport
-            .wrap(
+            .wrap_until(
                 opaque.stream,
                 &self.host,
                 self.security.sni_hint(),
                 recorder,
-                self.timeout,
+                deadline,
             )
             .await?;
         Ok((
@@ -291,7 +314,19 @@ impl VlessConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        self.base.connect(&self.server, recorder).await
+        self.connect_server_within(recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens the bare TCP stream to this VLESS server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base
+            .connect_within(&self.server, recorder, deadline)
+            .await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this VLESS node.
@@ -330,39 +365,56 @@ impl VlessConnector {
         })
         .map_err(|error| NetError::Protocol(error.to_string()))?;
 
+        let deadline = Instant::now() + self.timeout;
         let (opaque, local_port) = self
-            .open_stream(recorder)
+            .open_stream_until(recorder, deadline)
             .await
-            .map_err(|error| NetError::Connect(error.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.server))?;
         let mut stream = opaque.stream;
-        stream
-            .write_all(&header)
-            .await
-            .map_err(|error| NetError::Connect(format!("write VLESS UDP header: {error}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|error| NetError::Connect(format!("flush VLESS UDP header: {error}")))?;
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )
+        .map_err(|error| error.into_net_error(&self.server))?;
 
-        // The response header (`version || addon_len || addons`) precedes the first datagram,
-        // so it is consumed once rather than by every `recv`.
-        let mut response = [0u8; 2];
-        stream
-            .read_exact(&mut response)
-            .await
-            .map_err(|error| NetError::Connect(format!("read VLESS response header: {error}")))?;
-        if response[0] != 0 {
-            return Err(NetError::Protocol(format!(
-                "VLESS response version {} is not 0",
-                response[0]
-            )));
-        }
-        if response[1] > 0 {
-            let mut addons = vec![0u8; response[1] as usize];
-            stream.read_exact(&mut addons).await.map_err(|error| {
-                NetError::Connect(format!("read VLESS response addons: {error}"))
-            })?;
-        }
+        let addons = tokio::time::timeout(remaining, async {
+            stream.write_all(&header).await?;
+            stream.flush().await?;
+
+            // The response header (`version || addon_len || addons`) precedes the first datagram,
+            // so it is consumed once rather than by every `recv`.
+            let mut response = [0u8; 2];
+            stream.read_exact(&mut response).await?;
+            if response[0] != 0 {
+                return Err(NetError::Protocol(format!(
+                    "VLESS response version {} is not 0",
+                    response[0]
+                )));
+            }
+            if response[1] > 0 {
+                let mut addons = vec![0u8; response[1] as usize];
+                stream.read_exact(&mut addons).await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            NetError::Connect(ConnectError::timeout(
+                DiagnosticPhase::Proxy,
+                &self.server,
+                "VLESS UDP handshake",
+                remaining,
+            ))
+        })?;
+        addons.map_err(|error| match error {
+            other @ NetError::Protocol(_) => other,
+            other => NetError::Connect(ConnectError::protocol(
+                DiagnosticPhase::Proxy,
+                &self.server,
+                format!("VLESS UDP handshake with {}: {other}", self.server),
+            )),
+        })?;
 
         Ok(EstablishedDatagrams {
             datagrams: Box::new(VlessDatagramSession::new(stream)),

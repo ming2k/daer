@@ -4,15 +4,16 @@
 //!
 //! # netune owns the handshake
 //!
-//! The `ClientConfig` is built from netune's profile registry, then handed to
-//! [`netune::TlsConnector`]. That keeps the handshake, its timeout and its trace events in
-//! one implementation; daer only decides the node's ALPN offer and certificate policy.
+//! The [`TlsProfile`] is resolved from netune's preset registry, then driven by
+//! [`netune::TlsRouterConnector`] (or [`netune_tls::OwnedTlsConnector`] with [`AcceptAny`] when
+//! `allow-insecure = true`). That keeps the handshake, its timeout and its trace events in one
+//! implementation; daer only decides the node's ALPN offer and certificate policy.
 //!
-//! netune's stock `TlsConnector::platform` offers `http/1.1` because its consumer is an HTTP
+//! netune's `NetuneDefault` preset offers `http/1.1` because its primary consumer is an HTTP
 //! client. A `vless` node speaks no ALPN at all (or `h2`), and offering `http/1.1` to it is
-//! a fingerprint the operator did not choose. The profile's ALPN field expresses that
-//! difference without a second TLS handshake: the profile still supplies cipher suites,
-//! groups and extension order, and the connector still performs the handshake.
+//! a fingerprint the operator did not choose. Overriding `blueprint.alpn` via
+//! [`TlsProfile::with_alpn`] expresses that difference without changing the rest of the
+//! declarative `ClientHelloBlueprint` (cipher suites, groups, extensions).
 //!
 //! # Certificate policy
 //!
@@ -20,17 +21,19 @@
 //! node with a self-signed certificate) and is honoured, but it is never a default: a
 //! daemon that silently stopped verifying would be a vulnerability nobody configured.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Mutex;
 
 use netune::{
-    Connector, Established, NetError, Preset, Target, TlsConnector, TlsProfile, Transport, Verifier,
+    ConnectError, Connector, Established, NetError, Preset, ServerCertVerifier, Target, TlsProfile,
+    TlsRouterConnector, Transport,
 };
-use netune_trace::TraceCollector;
-use tokio::io::{AsyncRead, AsyncWrite};
+use netune_tls::{OwnedConnectParams, OwnedTlsConnector, ProtectorsKind};
+use netune_trace::{
+    Alpn, DiagnosticCode, DiagnosticPhase, DiagnosticRecord, EventKind, TraceCollector,
+};
 
 use crate::error::ProxyProtocolError;
-use crate::security::{Opaque, crypto_provider};
+use crate::security::Opaque;
 
 /// The parameters of a standard-TLS security layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,49 +56,36 @@ impl TlsParams {
     }
 }
 
-/// Wraps `stream` in TLS.
+/// Wraps `stream` in TLS within `deadline`.
 ///
 /// `alpn` is the node's own list; when it is empty the profile's defaults are dropped too,
 /// because a node that asked for no ALPN must receive no ALPN extension — offering one
 /// would change the hello the operator configured.
-pub(super) async fn wrap<S>(
+pub(super) async fn wrap_until<S>(
     stream: S,
     params: &TlsParams,
     node_host: &str,
     recorder: &TraceCollector,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Opaque, ProxyProtocolError>
 where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    S: Transport + 'static,
 {
-    let config = build_config(params)?;
+    let profile = profile_for(params)?;
     let server_name = params.sni(node_host).to_owned();
-    let target = Target::tls(server_name.clone(), server_name.clone());
+    let established = wrap_profile(
+        stream,
+        &profile,
+        &server_name,
+        params.allow_insecure,
+        recorder,
+        deadline,
+    )
+    .await?;
 
-    // The stream is already established: this connector exists only so netune's TLS layer
-    // can own the handshake and trace events. It deliberately cannot be called twice,
-    // because a security layer wraps exactly one stream.
-    //
-    // The deadline is daer's, not netune's: `ProxyProtocolError::Timeout` is a distinct
-    // contract used by health checks and the relay, and netune's handshake timeout reports a
-    // generic connect failure. `None` is netune's documented mode for a caller that owns the
-    // outer deadline.
-    let connector =
-        TlsConnector::new(Preconnected::new(stream), config).with_handshake_timeout(None);
-    let established =
-        match tokio::time::timeout(timeout, connector.connect(&target, recorder)).await {
-            Ok(result) => result.map_err(|error| {
-                ProxyProtocolError::Connect(format!("TLS handshake with {server_name}: {error}"))
-            })?,
-            // netune's pinned tracer has no diagnostic-record API. The caller's deadline is
-            // the only place that can keep `Timeout` distinct from a certificate or protocol
-            // error, which is why the outer bound is not delegated to netune here.
-            Err(_) => return Err(ProxyProtocolError::Timeout),
-        };
-
-    // rustls exposes no splice path, so there is nothing for a `Direct` command to switch
-    // off here. A node that sends `Direct` on this layer is answered with `End` instead, and
-    // Vision keeps unpadding — which is correct, and is why the switch is `None`.
+    // netune's TLS stream exposes no splice path, so there is nothing for a `Direct` command to
+    // switch off here. A node that sends `Direct` on this layer is answered with `End` instead,
+    // and Vision keeps unpadding — which is correct, and is why the switch is `None`.
     let Established {
         stream,
         alpn_protocol,
@@ -113,6 +103,53 @@ where
     })
 }
 
+/// Applies `profile` TLS handshake to an already-connected `stream` within `deadline`.
+pub(crate) async fn wrap_profile<S>(
+    stream: S,
+    profile: &TlsProfile,
+    server_name: &str,
+    allow_insecure: bool,
+    recorder: &TraceCollector,
+    deadline: tokio::time::Instant,
+) -> Result<Established, ProxyProtocolError>
+where
+    S: Transport + 'static,
+{
+    let remaining =
+        ProxyProtocolError::remaining_until(deadline, daer_observe::DialStage::Tls, server_name)?;
+    let target = Target::tls(server_name.to_owned(), server_name.to_owned());
+
+    // The stream is already established: this connector wraps that single socket so netune's TLS
+    // layer owns the ClientHello fingerprint, certificate verification, and trace events.
+    // Verified mode sets `with_handshake_timeout(None)` and insecure mode runs `OwnedTlsConnector`
+    // directly, so both modes share this single outer `deadline` and yield `DialStage::Tls` on
+    // timeout rather than racing two timers.
+    let connector =
+        ProfiledTlsConnector::new(Preconnected::new(stream), profile.clone(), allow_insecure);
+    match tokio::time::timeout(remaining, connector.connect(&target, recorder)).await {
+        Ok(Ok(established)) => Ok(established),
+        Ok(Err(error)) => {
+            if error.is_timeout() {
+                Err(ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Tls,
+                    format!("TLS handshake with {server_name}: {error}"),
+                ))
+            } else {
+                Err(ProxyProtocolError::tls(format!(
+                    "TLS handshake with {server_name}: {error}"
+                )))
+            }
+        }
+        Err(_) => Err(ProxyProtocolError::timeout(
+            daer_observe::DialStage::Tls,
+            format!(
+                "TLS handshake with {server_name} exceeded {} ms",
+                remaining.as_millis()
+            ),
+        )),
+    }
+}
+
 /// A one-shot [`Connector`] over an already-established stream.
 ///
 /// netune's TLS layer wraps a `Connector`, but ADR-0028 applies TLS *above* a transport
@@ -125,7 +162,7 @@ struct Preconnected {
 impl Preconnected {
     fn new<S>(stream: S) -> Self
     where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        S: Transport + 'static,
     {
         Self {
             stream: Mutex::new(Some(Box::new(stream))),
@@ -145,45 +182,26 @@ impl Connector for Preconnected {
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .ok_or_else(|| {
-                NetError::Connect(
-                    "the TLS security layer was asked to connect twice for one stream".to_owned(),
-                )
+                NetError::Connect(ConnectError::config(
+                    DiagnosticPhase::Tls,
+                    "the TLS security layer was asked to connect twice for one stream",
+                ))
             })?;
-        Ok(Established {
-            stream,
-            local_port: None,
-            socket: None,
-            alpn: None,
-            alpn_protocol: None,
-        })
+        Ok(Established::new(stream))
     }
 }
 
-/// Compiles the profile and the node's ALPN into one client config.
 /// The TLS identity this layer presents.
 ///
-/// Split out from [`build_config`] so the invariant *"the trust setting does not change the
-/// identity"* is assertable: `TlsProfile` exposes its suites, groups and ALPN, while
-/// `rustls::ClientConfig` exposes none of them. Testing it through the config would have meant
-/// asserting nothing.
+/// Split out so the invariant *"the trust setting does not change the identity"* is assertable
+/// directly on [`TlsProfile`]'s declarative `ClientHelloBlueprint`.
 fn profile_for(params: &TlsParams) -> Result<TlsProfile, ProxyProtocolError> {
-    let mut profile = resolve_profile(params.fingerprint.as_deref())?;
-
-    // `fingerprint` is an assertion about what the peer sees; `allow-insecure` is an assertion
-    // about what we accept. They are orthogonal, so only the verifier moves — the suites, groups
-    // and extension order stay exactly as the profile chose them.
-    if params.allow_insecure {
-        profile.verifier = Verifier::Roots(rustls::RootCertStore::empty());
-    }
+    let profile = resolve_profile(params.fingerprint.as_deref())?;
 
     // A node that names no ALPN must offer no ALPN. `netune-default` offers `http/1.1`, which is
     // netune's own consumer's identity, not this node's.
-    profile.alpn_protocols = params
-        .alpn
-        .iter()
-        .map(|protocol| protocol.as_bytes().to_vec())
-        .collect();
-    Ok(profile)
+    let alpn_slices: Vec<&[u8]> = params.alpn.iter().map(String::as_bytes).collect();
+    Ok(profile.with_alpn(&alpn_slices))
 }
 
 /// Resolves a netune preset name (or the deployment default) to profile data.
@@ -192,7 +210,7 @@ fn profile_for(params: &TlsParams) -> Result<TlsProfile, ProxyProtocolError> {
 /// registers the versioned `chrome-current`. Resolving the suffix is not leniency for its own
 /// sake: an error here means the node cannot load at all, and the operator wrote the spelling
 /// the rest of the ecosystem uses.
-fn resolve_profile(fingerprint: Option<&str>) -> Result<TlsProfile, ProxyProtocolError> {
+pub(crate) fn resolve_profile(fingerprint: Option<&str>) -> Result<TlsProfile, ProxyProtocolError> {
     match fingerprint {
         Some(name) => {
             let preset = Preset::by_name(name)
@@ -207,99 +225,139 @@ fn resolve_profile(fingerprint: Option<&str>) -> Result<TlsProfile, ProxyProtoco
                 })?;
             Ok(preset.profile())
         }
-        None => Ok(TlsProfile::netune_default()),
+        None => Ok(Preset::NetuneDefault.profile()),
     }
 }
 
-/// Compiles the profile into one client config.
-fn build_config(params: &TlsParams) -> Result<Arc<rustls::ClientConfig>, ProxyProtocolError> {
-    let profile = profile_for(params)?;
-    compile_profile(profile, params.allow_insecure)
-}
-
-/// Builds a profile-driven config for a product TLS layer outside the standard security
-/// layer (Trojan and AnyTLS).
+/// A TLS connector that applies a resolved [`TlsProfile`] and trust policy (`allow_insecure`)
+/// orthogonally.
 ///
-/// The profile's own ALPN offer is preserved: those protocols previously used
-/// `TlsConnector::platform`, whose `http/1.1` offer is the same default, but a configured
-/// fingerprint must keep the ALPN it declares.
-pub(crate) fn profile_config(
-    fingerprint: Option<&str>,
-    allow_insecure: bool,
-) -> Result<Arc<rustls::ClientConfig>, ProxyProtocolError> {
-    compile_profile(resolve_profile(fingerprint)?, allow_insecure)
+/// When `allow_insecure` is `false`, [`TlsRouterConnector`] owns the handshake, PSK resumption,
+/// and trace events. When `allow_insecure` is `true`, [`OwnedTlsConnector`] drives the exact
+/// same `ClientHelloBlueprint` with [`AcceptAny`] so the trust setting never alters the wire
+/// identity.
+pub(crate) struct ProfiledTlsConnector<C: Connector> {
+    mode: ProfiledTlsMode<C>,
+    profile: TlsProfile,
 }
 
-fn compile_profile(
-    profile: TlsProfile,
-    allow_insecure: bool,
-) -> Result<Arc<rustls::ClientConfig>, ProxyProtocolError> {
-    let built = profile
-        .build(Arc::clone(&crypto_provider()))
-        .map_err(|error| {
-            ProxyProtocolError::Connect(format!("TLS profile {:?}: {error}", profile.name))
-        })?;
-    let mut config = (*built).clone();
-    if allow_insecure {
-        // `root_certificates(empty)` cannot express "accept anything", so the *verifier* is
-        // replaced on the already-profiled config. This is the only `dangerous()` call on the
-        // crate's TLS path, and it is reachable only from `allow-insecure = true`.
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(AcceptAny));
+enum ProfiledTlsMode<C: Connector> {
+    Verified(TlsRouterConnector<C>),
+    Insecure(C),
+}
+
+impl<C: Connector> ProfiledTlsConnector<C> {
+    pub(crate) fn new(inner: C, profile: TlsProfile, allow_insecure: bool) -> Self {
+        let mode = if allow_insecure {
+            ProfiledTlsMode::Insecure(inner)
+        } else {
+            let router = TlsRouterConnector::new(inner)
+                .with_profile_named(profile.name, profile.clone())
+                .with_handshake_timeout(None);
+            ProfiledTlsMode::Verified(router)
+        };
+        Self { mode, profile }
     }
-    Ok(Arc::new(config))
+}
+
+impl<C: Connector> Connector for ProfiledTlsConnector<C> {
+    fn socket_shape(&self) -> Option<String> {
+        match &self.mode {
+            ProfiledTlsMode::Verified(router) => router.socket_shape(),
+            ProfiledTlsMode::Insecure(inner) => inner.socket_shape(),
+        }
+    }
+
+    fn route_shape(&self) -> Option<String> {
+        match &self.mode {
+            ProfiledTlsMode::Verified(router) => router.route_shape(),
+            ProfiledTlsMode::Insecure(inner) => inner.route_shape(),
+        }
+    }
+
+    async fn connect(
+        &self,
+        target: &Target,
+        recorder: &TraceCollector,
+    ) -> Result<Established, NetError> {
+        match &self.mode {
+            ProfiledTlsMode::Verified(router) => {
+                if target.tls_server_name().is_some() {
+                    let routed = target.clone().with_tls_profile(self.profile.name);
+                    router.connect(&routed, recorder).await
+                } else {
+                    router.connect(target, recorder).await
+                }
+            }
+            ProfiledTlsMode::Insecure(inner) => {
+                let established = inner.connect(target, recorder).await?;
+                let Some(server_name) = target.tls_server_name().map(str::to_owned) else {
+                    return Ok(established);
+                };
+                recorder.mark(EventKind::TlsStart, 0, 0);
+                let (hello, shares) = self.profile.connect_params(&server_name)?;
+                let stream = OwnedTlsConnector
+                    .connect(
+                        established.stream,
+                        OwnedConnectParams { hello, shares },
+                        AcceptAny,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let message = format!("TLS handshake with {server_name}: {error}");
+                        recorder.record_error(
+                            DiagnosticRecord::new(DiagnosticCode::EGRESS_TLS_FAILED)
+                                .with_phase(DiagnosticPhase::Tls)
+                                .with_message(message.clone()),
+                        );
+                        NetError::Connect(ConnectError::tls(&server_name, message))
+                    })?;
+
+                let alpn = match stream.alpn() {
+                    Some(b"http/1.1") => Alpn::Http11,
+                    Some(b"h2") => Alpn::H2,
+                    _ => Alpn::Unknown,
+                };
+                let alpn_protocol = stream.alpn().map(<[u8]>::to_vec);
+                let version_code = match stream.protectors_kind() {
+                    ProtectorsKind::Tls13 => 13u32,
+                    ProtectorsKind::Tls12 => 12u32,
+                };
+                recorder.mark(EventKind::TlsEnd, 0, 0);
+                recorder.mark(EventKind::TlsInfo, u32::from(alpn.code()), version_code);
+
+                Ok(Established::new(Box::new(stream))
+                    .with_local_port(established.local_port)
+                    .with_socket(established.socket)
+                    .with_alpn(Some(alpn), alpn_protocol))
+            }
+        }
+    }
 }
 
 /// Accepts any certificate chain.
 ///
 /// Reached only through `node.security.allow-insecure = true`, which is a decision an
 /// operator writes down. The name says what it does so a reviewer cannot miss it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct AcceptAny;
 
-impl rustls::client::danger::ServerCertVerifier for AcceptAny {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
+impl ServerCertVerifier for AcceptAny {
+    fn verify_chain(
+        &mut self,
+        _server_name: &str,
+        _end_entity: &[u8],
+        _intermediates: &[Vec<u8>],
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -312,11 +370,11 @@ mod tests {
             alpn: Vec::new(),
             fingerprint: None,
         };
-        let config = build_config(&params).expect("builds");
+        let profile = profile_for(&params).expect("builds");
         assert!(
-            config.alpn_protocols.is_empty(),
+            profile.blueprint.alpn.is_empty(),
             "offered {:?}",
-            config.alpn_protocols
+            profile.blueprint.alpn
         );
 
         // The control: an explicit list survives verbatim and in order.
@@ -324,9 +382,9 @@ mod tests {
             alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
             ..params
         };
-        let config = build_config(&params).expect("builds");
+        let profile = profile_for(&params).expect("builds");
         assert_eq!(
-            config.alpn_protocols,
+            profile.blueprint.alpn,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
     }
@@ -350,7 +408,10 @@ mod tests {
             fingerprint: Some("chrome-current".to_owned()),
         })
         .expect("the versioned name resolves too");
-        assert_eq!(bare.cipher_suites, versioned.cipher_suites);
+        assert_eq!(
+            bare.blueprint.cipher_suites,
+            versioned.blueprint.cipher_suites
+        );
         assert_eq!(bare.name, versioned.name);
 
         // A name that matches neither spelling is still refused, with the list.
@@ -374,7 +435,7 @@ mod tests {
             alpn: Vec::new(),
             fingerprint: Some("chrom".to_owned()),
         };
-        let error = build_config(&params).expect_err("typo must fail");
+        let error = profile_for(&params).expect_err("typo must fail");
         let message = error.to_string();
         assert!(message.contains("chrom"), "{message}");
         assert!(message.contains("chrome"), "{message}");
@@ -401,32 +462,24 @@ mod tests {
         let insecure_profile = profile_for(&insecure).expect("builds");
 
         assert_eq!(
-            secure_profile.cipher_suites, insecure_profile.cipher_suites,
+            secure_profile.blueprint.cipher_suites, insecure_profile.blueprint.cipher_suites,
             "the suite allowlist is the profile's, in both arms"
         );
         assert_eq!(
-            secure_profile.kx_groups, insecure_profile.kx_groups,
+            secure_profile.blueprint.supported_groups, insecure_profile.blueprint.supported_groups,
             "the group allowlist is the profile's, in both arms"
         );
         assert_eq!(
-            secure_profile.alpn_protocols, insecure_profile.alpn_protocols,
+            secure_profile.blueprint.alpn, insecure_profile.blueprint.alpn,
             "ALPN must not depend on the trust setting"
         );
-        // `netune::Verifier` derives no `PartialEq` (it wraps a `RootCertStore`), so the
-        // distinction is asserted by shape rather than by equality.
-        assert!(
-            matches!(secure_profile.verifier, Verifier::Platform),
-            "the trusted arm keeps the platform store"
-        );
-        assert!(
-            matches!(insecure_profile.verifier, Verifier::Roots(_)),
-            "the insecure arm replaces the verifier, and that is the only thing it changes"
+        assert_eq!(
+            secure_profile.blueprint, insecure_profile.blueprint,
+            "the full ClientHello blueprint must be identical regardless of allow_insecure"
         );
 
         // And the control: `chrome-current` really is the named preset and not the deployment
-        // default. The comparison is on the *name* and on `alpn_protocols`, because a profile
-        // expresses "use the provider's defaults" for suites and groups as `None` — asserting a
-        // difference there would have compared `None` with `None` and passed for the wrong reason.
+        // default.
         let plain = profile_for(&TlsParams {
             server_name: None,
             allow_insecure: true,
@@ -437,7 +490,7 @@ mod tests {
         assert_eq!(plain.name, "netune-default");
         assert_eq!(insecure_profile.name, "chrome-current");
         assert_ne!(
-            plain.alpn_protocols, insecure_profile.alpn_protocols,
+            plain.blueprint.alpn, insecure_profile.blueprint.alpn,
             "the default offers `http/1.1`; a node that named none must offer none"
         );
     }
@@ -460,11 +513,11 @@ mod tests {
 
     #[test]
     fn a_product_tls_profile_reaches_the_connector_config() {
-        let config = profile_config(Some("chrome"), true).expect("profile config");
+        let profile = resolve_profile(Some("chrome")).expect("profile resolves");
         let preset = Preset::by_name("chrome-current").expect("preset");
         assert_eq!(
-            config.alpn_protocols,
-            preset.profile().alpn_protocols,
+            profile.blueprint.alpn,
+            preset.profile().blueprint.alpn,
             "Trojan/AnyTLS must use the configured fingerprint's ALPN, not a bare platform config"
         );
     }
@@ -488,18 +541,26 @@ mod tests {
             alpn: Vec::new(),
             fingerprint: None,
         };
-        let result = wrap(
-            tokio::net::TcpStream::connect(address)
-                .await
-                .expect("connects"),
+        let result = wrap_until(
+            netune::Untapped(
+                tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connects"),
+            ),
             &params,
             "localhost",
             &TraceCollector::disabled(),
-            Duration::from_millis(50),
+            tokio::time::Instant::now() + Duration::from_millis(50),
         )
         .await;
         assert!(
-            matches!(result, Err(ProxyProtocolError::Timeout)),
+            matches!(
+                result,
+                Err(ProxyProtocolError::Timeout {
+                    stage: daer_observe::DialStage::Tls,
+                    ..
+                })
+            ),
             "a stalled TLS handshake must keep the caller's timeout contract, got {result:?}"
         );
         server.abort();
@@ -541,14 +602,16 @@ mod tests {
             alpn: vec!["h2".to_owned()],
             fingerprint: None,
         };
-        let mut opaque = wrap(
-            tokio::net::TcpStream::connect(address)
-                .await
-                .expect("connects"),
+        let mut opaque = wrap_until(
+            netune::Untapped(
+                tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connects"),
+            ),
             &params,
             "localhost",
             &TraceCollector::disabled(),
-            Duration::from_secs(2),
+            tokio::time::Instant::now() + Duration::from_secs(2),
         )
         .await
         .expect("TLS handshake");
@@ -601,14 +664,16 @@ mod tests {
             alpn: vec!["daer-probe".to_owned()],
             fingerprint: None,
         };
-        let opaque = wrap(
-            tokio::net::TcpStream::connect(address)
-                .await
-                .expect("connects"),
+        let opaque = wrap_until(
+            netune::Untapped(
+                tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connects"),
+            ),
             &params,
             "localhost",
             &TraceCollector::disabled(),
-            Duration::from_secs(2),
+            tokio::time::Instant::now() + Duration::from_secs(2),
         )
         .await
         .expect("TLS handshake");

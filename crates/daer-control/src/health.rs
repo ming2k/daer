@@ -213,6 +213,10 @@ pub struct Scheduler {
     /// Last time each candidate was probed, so a slower election is not hammered at the
     /// shortest tick.
     last: Mutex<std::collections::HashMap<(String, DialerId), std::time::Instant>>,
+    /// Process-wide ID allocator, shared with flows and queries so a probe id is unique
+    /// within one daemon run even across scheduler restarts.
+    ids: Arc<daer_observe::Ids>,
+    consecutive_failures: Mutex<std::collections::HashMap<(String, DialerId), u32>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -224,9 +228,22 @@ impl std::fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
-    /// Builds a scheduler for one routing generation.
+    /// Builds a scheduler for one routing generation with a private ID allocator.
+    ///
+    /// Production callers use [`Self::new_with_ids`] with the daemon's allocator; the
+    /// private allocator keeps unit tests independent and is never shared across runs.
     #[must_use]
     pub fn new(router: Arc<Router>, interval: Duration) -> Self {
+        Self::new_with_ids(router, interval, Arc::new(daer_observe::Ids::new()))
+    }
+
+    /// Builds a scheduler whose probe ids come from `ids`.
+    #[must_use]
+    pub fn new_with_ids(
+        router: Arc<Router>,
+        interval: Duration,
+        ids: Arc<daer_observe::Ids>,
+    ) -> Self {
         let socket_config = daer_outbound::SocketConfig {
             mark: router.socket_mark(),
             ..daer_outbound::SocketConfig::default()
@@ -238,6 +255,8 @@ impl Scheduler {
             forced: None,
             write: Mutex::new(()),
             last: Mutex::new(std::collections::HashMap::new()),
+            ids,
+            consecutive_failures: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -266,7 +285,7 @@ impl Scheduler {
         for (election, rows) in self.router.elections_for_probes() {
             for row in rows {
                 if row.address.is_none() && row.node.detour().is_none() {
-                    daer_observe::debug!(daer_observe::EventCode::HealthNodeUnprobeable,%election, %row.name, "node has no literal address; not probed");
+                    daer_observe::debug!(daer_observe::EventCode::HealthNodeUnprobeable, %election, node = %row.name, "node has no literal address; not probed");
                     continue;
                 }
                 targets.push(ProbeTarget {
@@ -476,9 +495,13 @@ impl Scheduler {
                 );
                 break;
             }
+            let probe_id = self.ids.probe();
+            let key = (result.target.election.clone(), result.target.dialer);
             match (&result.latency, &result.failure) {
                 (Some(latency), _) => {
+                    self.consecutive_failures.lock().await.remove(&key);
                     daer_observe::trace!(daer_observe::EventCode::HealthNodeAlive,
+                        probe_id = %probe_id,
                         election = %result.target.election,
                         node = %result.target.name,
                         latency_ns = latency.as_nanos(),
@@ -486,10 +509,18 @@ impl Scheduler {
                     )
                 }
                 (None, Some(failure)) => {
+                    let count = {
+                        let mut counts = self.consecutive_failures.lock().await;
+                        let count = counts.entry(key).or_insert(0);
+                        *count = count.saturating_add(1);
+                        *count
+                    };
                     daer_observe::warn!(daer_observe::EventCode::HealthProbeFailed,
+                        probe_id = %probe_id,
                         election = %result.target.election,
                         node = %result.target.name,
                         %failure,
+                        consecutive_failures = count,
                         "node probe failed"
                     )
                 }
@@ -508,6 +539,7 @@ impl Scheduler {
         if self.interval.is_zero() {
             daer_observe::debug!(
                 daer_observe::EventCode::HealthProbingDisabled,
+                interval = "0s",
                 "health probing disabled (check-interval is zero)"
             );
             return;
@@ -624,23 +656,33 @@ fn clone_target(target: &ProbeTarget) -> ProbeTarget {
 
 /// Spawns a scheduler for `router` unless probing is disabled or there is nothing probe.
 ///
+/// Probe ids are allocated from `ids`, the daemon's process-wide allocator, so a restart
+/// after a reload cannot reuse an id from the previous scheduler.
+///
 /// Returns `None` when every election disables probing or when no node has a literal
 /// address to probe.
 #[must_use]
 pub fn spawn(
     router: Arc<Router>,
+    ids: Arc<daer_observe::Ids>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval = shortest_interval(&router).unwrap_or(Duration::ZERO);
     if interval.is_zero() || !has_measurable_nodes(&router) {
+        let reason = if interval.is_zero() {
+            "check-interval is zero"
+        } else {
+            "no node has a measurable address"
+        };
         daer_observe::debug!(
             daer_observe::EventCode::DaemonHealthDisabled,
             probes = with_interval(interval),
+            reason,
             "health probing not started; see election probe intervals and node addresses"
         );
         return None;
     }
-    let scheduler = Scheduler::new(router, interval);
+    let scheduler = Scheduler::new_with_ids(router, interval, ids);
     let mut shutdown = shutdown;
     Some(tokio::spawn(async move {
         let stopped = async move {

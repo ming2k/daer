@@ -130,12 +130,13 @@ fn spawn_xray(
     );
 }
 
-/// Starts a TLS server on an ephemeral port and returns the port.
+/// Starts a TLS server on an ephemeral port that streams `response_chunks` after an HTTP header
+/// and returns the port.
 ///
 /// The certificate is generated per run and self-signed; the client below accepts any
 /// certificate, because the question is whether the *bytes* survive the tunnel and not whether a
 /// throwaway fixture is trusted.
-fn tls_origin() -> u16 {
+fn tls_origin_with_chunks(chunks: Vec<Vec<u8>>) -> u16 {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["tls-inside.test".to_owned()])
         .expect("generates a certificate");
@@ -160,6 +161,7 @@ fn tls_origin() -> u16 {
         .set_nonblocking(true)
         .expect("the listener is non-blocking");
 
+    let chunks = Arc::new(chunks);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -173,17 +175,30 @@ fn tls_origin() -> u16 {
                     return;
                 };
                 let acceptor = acceptor.clone();
+                let chunks = Arc::clone(&chunks);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
                     };
                     let mut buffer = [0u8; 1024];
                     let _ = tls.read(&mut buffer).await;
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
-                        BODY.len()
+                    let total_len: usize = chunks.iter().map(Vec::len).sum();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total_len}\r\nConnection: close\r\n\r\n"
                     );
-                    let _ = tls.write_all(reply.as_bytes()).await;
+                    let mut iter = chunks.iter();
+                    let mut first = header.into_bytes();
+                    if let Some(chunk0) = iter.next() {
+                        first.extend_from_slice(chunk0);
+                    }
+                    if tls.write_all(&first).await.is_err() {
+                        return;
+                    }
+                    for chunk in iter {
+                        if tls.write_all(chunk).await.is_err() {
+                            return;
+                        }
+                    }
                     let _ = tls.flush().await;
                     let _ = tls.shutdown().await;
                 });
@@ -193,16 +208,15 @@ fn tls_origin() -> u16 {
     port
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_tls_stream_survives_the_peer_switching_to_a_raw_copy() {
-    let Some(xray) = xray() else {
-        eprintln!("skipped: no `xray` binary (set XRAY_BIN to a reference build)");
-        return;
-    };
+async fn run_tls_inside_probe(
+    tag: &str,
+    chunks: Vec<Vec<u8>>,
+    iterations: usize,
+) -> Option<Vec<u8>> {
+    let xray = xray()?;
+    let origin_port = tls_origin_with_chunks(chunks);
 
-    let origin_port = tls_origin();
-
-    let dir = std::env::temp_dir().join(format!("daer-tls-inside-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("daer-tls-inside-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("creates the fixture directory");
 
     // ── the impersonation target: only REALITY's `ServerHello` comes from here.
@@ -290,54 +304,111 @@ async fn a_tls_stream_survives_the_peer_switching_to_a_raw_copy() {
     let dialer = ProxyDialer::from_link(&link, DialerOptions::new(None, Duration::from_secs(10)))
         .expect("the link must parse");
 
-    let established = tokio::time::timeout(
-        Duration::from_secs(20),
-        dialer.connect(&format!("127.0.0.1:{origin_port}")),
-    )
-    .await
-    .expect("the connect must not hang")
-    .expect("the session must be established");
-
-    // ── TLS *inside* the tunnel. This is the part that used to die: the node answers with a
-    // `Direct` block and a client that keeps decrypting reads ciphertext as plaintext.
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
         .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from("tls-inside.test").expect("a valid name");
-    let mut tls = tokio::time::timeout(
-        Duration::from_secs(20),
-        connector.connect(server_name, established.stream),
-    )
-    .await
-    .expect("the inner TLS handshake must not hang")
-    .unwrap_or_else(|error| {
-        panic!(
-            "the inner TLS handshake must complete ({error}); the node's log said:\n{}",
-            std::fs::read_to_string(&node_log).unwrap_or_default()
+
+    let mut first_reply = None;
+    for iter in 0..iterations {
+        let established = tokio::time::timeout(
+            Duration::from_secs(20),
+            dialer.connect(&format!("127.0.0.1:{origin_port}")),
         )
-    });
-
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: tls-inside.test\r\nConnection: close\r\n\r\n")
         .await
-        .expect("the request must be written");
+        .expect("the connect must not hang")
+        .expect("the session must be established");
 
-    let mut reply = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(20), tls.read_to_end(&mut reply)).await;
-    assert!(
-        read.is_ok(),
-        "the reply never arrived; the node's log said:\n{}",
-        std::fs::read_to_string(&node_log).unwrap_or_default()
-    );
-    read.expect("checked above")
-        .expect("the reply must be readable");
+        // ── TLS *inside* the tunnel. This is the part that used to die: the node answers with a
+        // `Direct` block and a client that keeps decrypting reads ciphertext as plaintext.
+        let server_name =
+            rustls::pki_types::ServerName::try_from("tls-inside.test").expect("a valid name");
+        let mut tls = tokio::time::timeout(
+            Duration::from_secs(20),
+            connector.connect(server_name, established.stream),
+        )
+        .await
+        .expect("the inner TLS handshake must not hang")
+        .unwrap_or_else(|error| {
+            panic!(
+                "the inner TLS handshake must complete ({error}) on iter {iter}; the node's log said:\n{}",
+                std::fs::read_to_string(&node_log).unwrap_or_default()
+            )
+        });
+
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: tls-inside.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request must be written");
+
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(20), tls.read_to_end(&mut reply)).await;
+        assert!(
+            read.is_ok(),
+            "the reply never arrived on iter {iter}; the node's log said:\n{}",
+            std::fs::read_to_string(&node_log).unwrap_or_default()
+        );
+        read.expect("checked above").unwrap_or_else(|error| {
+            panic!(
+                "the reply must be readable on iter {iter} ({error}); the node's log said:\n{}",
+                std::fs::read_to_string(&node_log).unwrap_or_default()
+            )
+        });
+
+        if let Some(prev) = &first_reply {
+            assert_eq!(&reply, prev, "reply mismatched on iter {iter}");
+        } else {
+            first_reply = Some(reply);
+        }
+    }
+
+    first_reply
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tls_stream_survives_the_peer_switching_to_a_raw_copy() {
+    let Some(reply) = run_tls_inside_probe("small", vec![BODY.as_bytes().to_vec()], 1).await else {
+        eprintln!("skipped: no `xray` binary (set XRAY_BIN to a reference build)");
+        return;
+    };
 
     let text = String::from_utf8_lossy(&reply);
     assert!(
         text.contains(BODY),
         "the origin's body must survive the tunnel's raw-copy switch; got {text:?}"
+    );
+}
+
+/// Multi-connection e2e regression against `xray` (`Command::Direct` -> raw-copy splice) for a
+/// multi-chunk 48 KiB inner TLS HTTP response. (Deterministic multi-outer-record `Direct`
+/// splitting is pinned directly in `daer_proxy_protocols::vless::vision::tests`.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_large_chunked_tls_stream_survives_vision_splice() {
+    let chunk_sizes = [16000usize, 16384, 8192, 8192];
+    let mut chunks = Vec::with_capacity(chunk_sizes.len());
+    let mut expected_body = Vec::new();
+    for (idx, size) in chunk_sizes.into_iter().enumerate() {
+        let byte = b'a' + (idx as u8 % 26);
+        let chunk = vec![byte; size];
+        expected_body.extend_from_slice(&chunk);
+        chunks.push(chunk);
+    }
+
+    let Some(reply) = run_tls_inside_probe("large", chunks, 5).await else {
+        eprintln!("skipped: no `xray` binary (set XRAY_BIN to a reference build)");
+        return;
+    };
+
+    let marker = b"\r\n\r\n";
+    let body_start = reply
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("HTTP header separator must exist in reply")
+        + marker.len();
+    assert_eq!(
+        &reply[body_start..],
+        expected_body.as_slice(),
+        "large chunked TLS body must arrive byte-for-byte intact through Vision + raw-copy splice"
     );
 }
 

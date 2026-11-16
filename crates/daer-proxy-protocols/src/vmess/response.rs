@@ -37,6 +37,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 
 use crate::vmess::header::{self, Session};
@@ -120,6 +121,12 @@ async fn read_header<S: AsyncRead + Unpin>(stream: &mut S, session: &Session) ->
         )
     })?;
     Ok(())
+}
+
+impl<S: Transport> Transport for ResponseHeaderStream<S> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for ResponseHeaderStream<S> {

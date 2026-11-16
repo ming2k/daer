@@ -585,6 +585,7 @@ async fn start_dns(
         if intercept_dns {
             daer_observe::info!(
                 daer_observe::EventCode::DaemonDnsStarted,
+                plan = "intercept",
                 fake_ip = fake_ip.is_enabled(),
                 "transparent dns interception active: :53 flows are answered in-process \
                  without `dns.bind` or /etc/resolv.conf changes"
@@ -700,6 +701,7 @@ async fn report_plan(
 
     daer_observe::info!(
         daer_observe::EventCode::DryRunReport,
+        stage = "preflight",
         "--dry-run: nothing is bound, created or attached; this is a report only"
     );
 
@@ -738,7 +740,12 @@ async fn report_plan(
         control_plane_pid = param.control_plane_pid,
         "would listen for redirected flows"
     );
-    daer_observe::info!(daer_observe::EventCode::DryRunInterfaces,?plan.lan, ?plan.wan, "would attach to these interfaces");
+    daer_observe::info!(
+        daer_observe::EventCode::DryRunInterfaces,
+        lan = ?plan.lan,
+        wan = ?plan.wan,
+        "would attach to these interfaces"
+    );
 
     if options.no_datapath {
         daer_observe::warn!(
@@ -766,6 +773,7 @@ async fn report_plan(
         daer_observe::EventCode::DryRunPairState,
         device_present = device,
         peer_present = peer,
+        state = %pair_state,
         "{pair_state}"
     );
 
@@ -1027,9 +1035,16 @@ async fn serve_until_signal(inputs: ServeInputs<'_>) -> anyhow::Result<()> {
                         .saturating_add(std::time::Duration::from_secs(5)),
                 );
                 let drained = drain(daemon, options.shutdown_timeout).await;
+                daemon.supervisor.begin_shutdown();
+                let stats = daemon.stats();
                 daer_observe::info!(daer_observe::EventCode::DaemonShutdown,
                     drained,
                     in_flight = daemon.supervisor.in_flight(),
+                    accepted = stats.accepted,
+                    rejected = stats.rejected,
+                    failed = stats.failed,
+                    exhausted = stats.exhausted,
+                    panicked = stats.panicked,
                     "shutdown complete"
                 );
                 return Ok(());
@@ -1250,6 +1265,7 @@ async fn refresh_due_providers(
                 daer_observe::warn!(daer_observe::EventCode::ProviderRefreshFailed,
                     %tag,
                     error = refreshed.error.as_deref().unwrap_or("unknown"),
+                    error_code = %daer_observe::diagnostic::codes::PROVIDER_FETCH,
                     "rule provider refresh failed; keeping the running rule set"
                 );
             }
@@ -1301,6 +1317,7 @@ fn publish_generation(daemon: &Daemon, ebpf: Option<&daer_control::datapath::Att
     match published {
         Ok(Ok(())) => {}
         Ok(Err(error)) => daer_observe::error!(daer_observe::EventCode::DatapathRepublishFailed,
+            generation = %generation.id(),
             %error,
             "republishing kernel policy failed; kernel will use previous slot"
         ),
@@ -1370,6 +1387,7 @@ async fn wait_for_interfaces(
                 daer_observe::info!(
                     daer_observe::EventCode::DaemonWaitingRoute,
                     waited_ms = started.elapsed().as_millis(),
+                    disable_waiting_network = false,
                     "waiting for a default route (disable-waiting-network = false)"
                 );
             }
@@ -1422,7 +1440,11 @@ impl HealthScheduler {
         let (stop, watch) = tokio::sync::watch::channel(false);
         // The election targets carry their own probe settings; the scheduler takes only
         // the router and derives the shortest tick from them.
-        let handle = daer_control::spawn_health_scheduler(generation.router_arc(), watch);
+        let handle = daer_control::spawn_health_scheduler(
+            generation.router_arc(),
+            Arc::clone(&daemon.ids),
+            watch,
+        );
         match handle {
             Some(handle) => {
                 daer_observe::info!(daer_observe::EventCode::DaemonHealthStarted,
@@ -1433,8 +1455,15 @@ impl HealthScheduler {
                 self.current = Some((stop, handle));
             }
             None => {
+                let reason = if interval.as_std().is_none_or(|d| d.is_zero()) {
+                    "check-interval is zero"
+                } else {
+                    "no node has a measurable address"
+                };
                 daer_observe::debug!(
                     daer_observe::EventCode::DaemonHealthDisabled,
+                    probes = 0usize,
+                    reason,
                     "health scheduling not started (the interval is zero or no node has a \
                      literal address to probe)"
                 );
@@ -1493,7 +1522,6 @@ async fn reload(
     health: &mut HealthScheduler,
     socket_config: SocketConfig,
 ) -> Option<RuleProviderPool> {
-    let started = std::time::Instant::now();
     let loaded = match daer_control::load_resolved_with_socket_config(
         &options.config,
         DEFAULT_LOAD_TIMEOUT,
@@ -1505,7 +1533,14 @@ async fn reload(
         Err(error) => {
             // A file that no longer parses is the common reload failure; the running policy
             // is untouched, which is the whole point of building before swapping.
-            daer_observe::error!(daer_observe::EventCode::GenerationReloadRejected,%error, "reload rejected; the running generation is unchanged");
+            daer_observe::error!(
+                daer_observe::EventCode::GenerationReloadRejected,
+                generation = "pending",
+                serving = %daemon.generation().describe(),
+                %error,
+                error_code = %daer_observe::diagnostic::codes::CONFIG_INVALID,
+                "reload rejected; the running generation is unchanged"
+            );
             return None;
         }
     };
@@ -1524,11 +1559,6 @@ async fn reload(
             for warning in generation.warnings() {
                 daer_observe::warn!(daer_observe::EventCode::DaemonConfigWarning,%warning, "configuration warning");
             }
-            daer_observe::info!(daer_observe::EventCode::GenerationReloaded,
-                generation = %generation.describe(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "reloaded"
-            );
             // The caller's refresh pool must be the one the new generation routes with,
             // otherwise the next timer tick would re-fetch against rules that are no longer
             // in use and report every provider as changed.
@@ -1537,10 +1567,7 @@ async fn reload(
                     .unwrap_or_else(|shared| (*shared).clone()),
             )
         }
-        Err(error) => {
-            daer_observe::error!(daer_observe::EventCode::GenerationReloadRejected,%error, "reload rejected; the running generation is unchanged");
-            None
-        }
+        Err(_) => None,
     }
 }
 

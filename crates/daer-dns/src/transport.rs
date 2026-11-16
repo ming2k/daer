@@ -20,7 +20,7 @@
 //! | --- | --- | --- |
 //! | `udp` | RFC 1035 §4.2.1 | netune's [`UdpConnector`], one connected session per query |
 //! | `tcp` | RFC 1035 §4.2.2 | netune's [`TcpConnector`], with the daemon's socket policy |
-//! | `tls` / `dot` | RFC 7858 | netune's [`TlsConnector`], used only as a byte pipe |
+//! | `tls` / `dot` | RFC 7858 | netune's [`TlsRouterConnector`], used only as a byte pipe |
 //! | `https` / `doh` | RFC 8484 | netune's HTTP client, for framing and `Content-Type` |
 //!
 //! Every one of these is fully implemented. A protocol that could not be built is a
@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use netune::{
     Client, ClientConfig, Connector, DatagramConnector, Method, Pool, RequestHead, SocketConfig,
-    Target, TcpConnector, TlsConnector, UdpConnector,
+    Target, TcpConnector, TlsRouterConnector, UdpConnector,
 };
 use netune_trace::TraceCollector;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -297,7 +297,7 @@ async fn timed<R>(
     future: impl std::future::Future<Output = Result<R, UpstreamError>>,
 ) -> Result<R, UpstreamError> {
     tokio::time::timeout(timeout, future).await.map_err(|_| {
-        UpstreamError::Failed(format!(
+        UpstreamError::Timeout(format!(
             "{name} did not answer within {}ms",
             timeout.as_millis()
         ))
@@ -334,6 +334,10 @@ impl UdpUpstream {
 }
 
 impl Upstream for UdpUpstream {
+    fn transport(&self) -> &'static str {
+        "udp"
+    }
+
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a> {
         Box::pin(async move {
             let payload = payload_bytes(query)?;
@@ -350,10 +354,10 @@ impl Upstream for UdpUpstream {
                     .connect(&address.to_string(), &TraceCollector::disabled())
                     .await
                     .map_err(|error| {
-                        UpstreamError::Failed(format!("connect to {address}: {error}"))
+                        UpstreamError::Connect(format!("connect to {address}: {error}"))
                     })?;
                 session.datagrams.send(&payload).await.map_err(|error| {
-                    UpstreamError::Failed(format!("send to {address}: {error}"))
+                    UpstreamError::Connect(format!("send to {address}: {error}"))
                 })?;
 
                 // EDNS0 advertises the client's buffer size; without a reply larger than
@@ -367,7 +371,7 @@ impl Upstream for UdpUpstream {
                         .clamp(512, MAX_MESSAGE)
                 ];
                 let read = session.datagrams.recv(&mut buffer).await.map_err(|error| {
-                    UpstreamError::Failed(format!("receive from {address}: {error}"))
+                    UpstreamError::Connect(format!("receive from {address}: {error}"))
                 })?;
                 buffer.truncate(read);
                 Ok::<Vec<u8>, UpstreamError>(buffer)
@@ -414,6 +418,10 @@ impl TcpUpstream {
 }
 
 impl Upstream for TcpUpstream {
+    fn transport(&self) -> &'static str {
+        "tcp"
+    }
+
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a> {
         Box::pin(async move {
             let payload = payload_bytes(query)?;
@@ -429,7 +437,7 @@ impl Upstream for TcpUpstream {
                     .connect(&target, &TraceCollector::disabled())
                     .await
                     .map_err(|error| {
-                        UpstreamError::Failed(format!("connect to {address}: {error}"))
+                        UpstreamError::Connect(format!("connect to {address}: {error}"))
                     })?;
                 let mut stream = established.stream;
                 write_length_prefixed(&mut stream, length, &payload, address).await?;
@@ -456,15 +464,15 @@ async fn write_length_prefixed<S: AsyncWriteExt + Unpin>(
     stream
         .write_all(&length.to_be_bytes())
         .await
-        .map_err(|error| UpstreamError::Failed(format!("write length to {address}: {error}")))?;
+        .map_err(|error| UpstreamError::Connect(format!("write length to {address}: {error}")))?;
     stream
         .write_all(payload)
         .await
-        .map_err(|error| UpstreamError::Failed(format!("write body to {address}: {error}")))?;
+        .map_err(|error| UpstreamError::Connect(format!("write body to {address}: {error}")))?;
     stream
         .flush()
         .await
-        .map_err(|error| UpstreamError::Failed(format!("flush to {address}: {error}")))
+        .map_err(|error| UpstreamError::Connect(format!("flush to {address}: {error}")))
 }
 
 async fn read_length_prefixed<S: AsyncReadExt + Unpin>(
@@ -475,7 +483,7 @@ async fn read_length_prefixed<S: AsyncReadExt + Unpin>(
     stream
         .read_exact(&mut length_bytes)
         .await
-        .map_err(|error| UpstreamError::Failed(format!("read length from {address}: {error}")))?;
+        .map_err(|error| UpstreamError::Connect(format!("read length from {address}: {error}")))?;
     let length = usize::from(u16::from_be_bytes(length_bytes));
     if length == 0 {
         return Err(UpstreamError::Failed(format!(
@@ -486,7 +494,7 @@ async fn read_length_prefixed<S: AsyncReadExt + Unpin>(
     stream
         .read_exact(&mut response)
         .await
-        .map_err(|error| UpstreamError::Failed(format!("read body from {address}: {error}")))?;
+        .map_err(|error| UpstreamError::Connect(format!("read body from {address}: {error}")))?;
     Ok(response)
 }
 
@@ -495,12 +503,12 @@ async fn read_length_prefixed<S: AsyncReadExt + Unpin>(
 /// DNS over TLS (RFC 7858).
 ///
 /// The TLS stack is netune's: this module opens a byte stream through
-/// [`TlsConnector`] and speaks the same length-prefixed framing as plain TCP inside it.
+/// [`TlsRouterConnector`] and speaks the same length-prefixed framing as plain TCP inside it.
 /// The identity presented is `Target::tls`'s business, so a resolver honours the same
 /// fingerprint profile as every other dial.
 pub struct TlsUpstream {
     common: Common,
-    connector: TlsConnector<TcpConnector>,
+    connector: TlsRouterConnector<TcpConnector>,
 }
 
 impl fmt::Debug for TlsUpstream {
@@ -518,16 +526,11 @@ impl fmt::Debug for TlsUpstream {
 impl TlsUpstream {
     fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Result<Self, UpstreamError> {
         let common = Common::new(spec, socket_config.clone());
-        let connector = TlsConnector::platform(
+        let connector = TlsRouterConnector::new(
             TcpConnector::new()
                 .with_socket_config(socket_config)
                 .with_connect_timeout(Some(common.timeout)),
-        )
-        .map_err(|error| {
-            UpstreamError::Failed(format!(
-                "DNS-over-TLS needs a platform trust store: {error}"
-            ))
-        })?;
+        );
         Ok(Self { common, connector })
     }
 
@@ -546,6 +549,10 @@ impl TlsUpstream {
 }
 
 impl Upstream for TlsUpstream {
+    fn transport(&self) -> &'static str {
+        "dot"
+    }
+
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a> {
         Box::pin(async move {
             use netune::Connector;
@@ -563,7 +570,7 @@ impl Upstream for TlsUpstream {
                         .connect(&target, &recorder)
                         .await
                         .map_err(|error| {
-                            UpstreamError::Failed(format!("TLS to {server_name}: {error}"))
+                            UpstreamError::Connect(format!("TLS to {server_name}: {error}"))
                         })?;
                 let mut stream = established.stream;
                 write_length_prefixed(&mut stream, length, &payload, address).await?;
@@ -586,7 +593,7 @@ impl Upstream for TlsUpstream {
 /// benefit (cacheability) does not apply to a resolver that has its own cache.
 pub struct HttpsUpstream {
     common: Common,
-    client: Client<TlsConnector<TcpConnector>>,
+    client: Client,
     path: String,
 }
 
@@ -603,23 +610,15 @@ impl fmt::Debug for HttpsUpstream {
 impl HttpsUpstream {
     fn new(spec: &UpstreamSpec, socket_config: SocketConfig) -> Result<Self, UpstreamError> {
         let common = Common::new(spec, socket_config.clone());
-        let connector = TlsConnector::platform(
+        let connector = TlsRouterConnector::new(
             TcpConnector::new()
                 .with_socket_config(socket_config)
                 .with_connect_timeout(Some(common.timeout)),
-        )
-        .map_err(|error| {
-            UpstreamError::Failed(format!(
-                "DNS-over-HTTPS needs a platform trust store: {error}"
-            ))
-        })?;
-        let config = ClientConfig {
-            // A redirect on a DNS endpoint is a configuration error, not a hop to follow:
-            // silently querying a different host would send the query somewhere the
-            // operator did not name.
-            max_redirects: 0,
-            ..ClientConfig::default()
-        };
+        );
+        // A redirect on a DNS endpoint is a configuration error, not a hop to follow:
+        // silently querying a different host would send the query somewhere the
+        // operator did not name.
+        let config = ClientConfig::default().with_max_redirects(0);
         Ok(Self {
             common,
             client: Client::new(connector, Pool::default(), config),
@@ -642,6 +641,10 @@ impl HttpsUpstream {
 }
 
 impl Upstream for HttpsUpstream {
+    fn transport(&self) -> &'static str {
+        "doh"
+    }
+
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a> {
         Box::pin(async move {
             let payload = payload_bytes(query)?;
@@ -659,7 +662,7 @@ impl Upstream for HttpsUpstream {
                     .request(&target, head, Some(body))
                     .await
                     .map_err(|error| {
-                        UpstreamError::Failed(format!("DoH to {server_name}: {error}"))
+                        UpstreamError::Connect(format!("DoH to {server_name}: {error}"))
                     })?;
                 let status = response.head.status;
                 if !status.is_success() {
@@ -670,7 +673,7 @@ impl Upstream for HttpsUpstream {
                 }
                 let mut body = response.body;
                 let bytes = body.read_to_end().await.map_err(|error| {
-                    UpstreamError::Failed(format!("read DoH body from {server_name}: {error}"))
+                    UpstreamError::Connect(format!("read DoH body from {server_name}: {error}"))
                 })?;
                 Ok::<Vec<u8>, UpstreamError>(bytes.to_vec())
             };
@@ -715,6 +718,10 @@ impl ChainUpstream {
 }
 
 impl Upstream for ChainUpstream {
+    fn transport(&self) -> &'static str {
+        "chain"
+    }
+
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a> {
         Box::pin(async move {
             let mut last: Option<UpstreamError> = None;

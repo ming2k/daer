@@ -56,6 +56,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The command byte of a block.
@@ -285,8 +286,9 @@ struct ReadSide {
     raw: Vec<u8>,
     /// Bytes ready to be handed to the caller.
     ready: Vec<u8>,
-    /// Set when the block just parsed said `Direct`, so the reader can switch the layer below
-    /// before it consumes another byte. Cleared once the switch has been made.
+    /// Set once a `Direct` block finishes (after both its content and padding are consumed),
+    /// so the reader switches the layer below to raw copy at the exact post-Direct boundary.
+    /// Cleared once the switch has been made.
     saw_direct: bool,
 }
 
@@ -339,9 +341,6 @@ impl ReadSide {
                             continue;
                         }
                     };
-                    if self.command == Command::Direct {
-                        self.saw_direct = true;
-                    }
                     self.phase = if content_len > 0 {
                         Phase::Content {
                             remaining: content_len,
@@ -404,7 +403,14 @@ impl ReadSide {
     fn finish_block(&mut self) -> Phase {
         match self.command {
             Command::Continue => Phase::Header,
-            Command::End | Command::Direct => Phase::Raw,
+            Command::End => Phase::Raw,
+            // Only once a `Direct` block's content and padding are fully drained is the peer's
+            // outer TLS record stream complete; switching earlier causes subsequent encrypted outer
+            // records carrying the rest of the block to be read raw without decryption.
+            Command::Direct => {
+                self.saw_direct = true;
+                Phase::Raw
+            }
         }
     }
 }
@@ -426,7 +432,7 @@ pub(super) struct VisionStream<S> {
     written: usize,
     /// The record layer's raw-copy switch, when the layer below has one.
     ///
-    /// `None` for a plaintext or rustls-backed stream: neither has a splice path, and a
+    /// `None` for a plaintext or netune-TLS stream: neither has a splice path, and a
     /// `Direct` command on such a stream is answered with `End` instead (see
     /// [`crate::security::Opaque::raw_read`]).
     raw_read: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -503,6 +509,12 @@ impl<S> VisionStream<S> {
     }
 }
 
+impl<S: Transport> Transport for VisionStream<S> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
+    }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -545,7 +557,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
                     // dies with `the record was altered`.
                     if self.read.saw_direct {
                         self.read.saw_direct = false;
-                        // `None` means the layer below has no record layer to bypass (rustls,
+                        // `None` means the layer below has no record layer to bypass (netune TLS,
                         // or a plaintext stream). Vision still stops unpadding — the phase moved
                         // to `Raw` — which is what the reference does for a peer answered with
                         // `End`.
@@ -967,5 +979,161 @@ mod tests {
         let mut reader = ReadSide::new(UUID);
         reader.push(&stream.inner.written);
         assert_eq!(reader.ready, b"first-blocksecond-block");
+    }
+
+    /// Falsifier ([INV-VERIFY-01]): if `saw_direct` flips in `Phase::Header` before `content`
+    /// and `padding` finish, intermediate `push()` calls after partial content or partial
+    /// padding report `saw_direct == true` prematurely.
+    #[test]
+    fn direct_waits_until_content_and_padding_complete_before_signaling_raw_copy() {
+        // Case 1: split across header, partial content, content/padding boundary, partial padding.
+        let mut read = ReadSide::new(UUID);
+        let mut payload = block(Some(UUID), Command::Direct, b"0123456789", 8);
+        payload.extend_from_slice(b"after-raw");
+
+        let header_end = 16 + 5;
+        let content_mid = header_end + 4;
+        let content_end = header_end + 10;
+        let padding_mid = content_end + 3;
+        let padding_end = content_end + 8;
+
+        read.push(&payload[..content_mid]);
+        assert!(
+            !read.saw_direct,
+            "saw_direct must stay false while Direct content still has bytes remaining"
+        );
+        assert!(matches!(read.phase, Phase::Content { remaining: 6 }));
+
+        read.push(&payload[content_mid..content_end]);
+        assert!(
+            !read.saw_direct,
+            "saw_direct must stay false once content completes if Direct padding still remains"
+        );
+        assert!(matches!(read.phase, Phase::Padding { remaining: 8 }));
+
+        read.push(&payload[content_end..padding_mid]);
+        assert!(
+            !read.saw_direct,
+            "saw_direct must stay false while Direct padding still has bytes remaining"
+        );
+        assert!(matches!(read.phase, Phase::Padding { remaining: 5 }));
+
+        read.push(&payload[padding_mid..]);
+        assert!(
+            read.saw_direct,
+            "saw_direct must flip true once the entire Direct block (content + padding) finishes"
+        );
+        assert!(matches!(read.phase, Phase::Raw));
+        assert_eq!(read.ready, b"0123456789after-raw");
+        assert_eq!(payload[padding_end..].len(), 9);
+
+        // Case 2: zero-padding Direct block must stay false mid-content and flip on last content byte.
+        let mut zero_pad = ReadSide::new(UUID);
+        let blk = block(Some(UUID), Command::Direct, b"hello", 0);
+        zero_pad.push(&blk[..16 + 5 + 2]);
+        assert!(!zero_pad.saw_direct);
+        zero_pad.push(&blk[16 + 5 + 2..]);
+        assert!(zero_pad.saw_direct);
+        assert!(matches!(zero_pad.phase, Phase::Raw));
+        assert_eq!(zero_pad.ready, b"hello");
+
+        // Case 3: zero-content Direct block with split padding.
+        let mut zero_content = ReadSide::new(UUID);
+        let blk = block(Some(UUID), Command::Direct, b"", 6);
+        zero_content.push(&blk[..16 + 5 + 2]);
+        assert!(!zero_content.saw_direct);
+        zero_content.push(&blk[16 + 5 + 2..]);
+        assert!(zero_content.saw_direct);
+        assert!(matches!(zero_content.phase, Phase::Raw));
+        assert!(zero_content.ready.is_empty());
+
+        // Case 4: empty Direct block (content = 0, padding = 0) flips immediately.
+        let mut empty = ReadSide::new(UUID);
+        empty.push(&block(Some(UUID), Command::Direct, b"", 0));
+        assert!(empty.saw_direct);
+        assert!(matches!(empty.phase, Phase::Raw));
+        assert!(empty.ready.is_empty());
+
+        // Control: Continue followed by split Direct waits for Direct padding, not Continue.
+        let mut chained = ReadSide::new(UUID);
+        let mut two = block(Some(UUID), Command::Continue, b"first", 4);
+        two.extend_from_slice(&block(None, Command::Direct, b"second", 5));
+        let cut = 16 + 5 + 5 + 4 + 5 + 3;
+        chained.push(&two[..cut]);
+        assert!(!chained.saw_direct);
+        chained.push(&two[cut..]);
+        assert!(chained.saw_direct);
+        assert_eq!(chained.ready, b"firstsecond");
+    }
+
+    /// Reproduces the multi-record `Command::Direct` boundary bug through the actual production
+    /// `Tls13Connection -> ResponseHeaderStream -> VisionStream` downlink stack:
+    /// - outer REALITY AEAD record 1 carries VLESS `[0, 0]` + `Continue` + `Direct` header + prefix
+    ///   of `Direct` content (`> 4096`B so `VisionStream` reads it across multiple polls);
+    /// - outer REALITY AEAD record 2 carries the remaining `Direct` content + 30B Vision padding;
+    /// - trailing bytes are raw unencrypted post-Direct payload written straight to the wire.
+    ///
+    /// Falsifier ([INV-VERIFY-01]): with `saw_direct` set in `Phase::Header`, `raw_read` flips
+    /// after record 1 so `Tls13Connection` stops decrypting outer record 2 and leaks its raw
+    /// `[17 03 03 ...]` ciphertext + outer AEAD tag into the inner payload.
+    #[tokio::test]
+    async fn vision_stream_waits_for_split_direct_block_before_enabling_raw_read() {
+        use crate::reality::tls13::record::ContentType;
+        use crate::reality::tls13::stream::paired_for_test;
+        use crate::vless::response::ResponseHeaderStream;
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (conn, mut peer, mut feeder) = paired_for_test();
+        let raw_read = conn.raw_read_switch();
+
+        let continue_payload = vec![b'C'; 3900];
+        let direct_payload_part1 = vec![b'D'; 1054];
+        let direct_payload_part2 = vec![b'E'; 1162];
+        let mut full_direct = direct_payload_part1.clone();
+        full_direct.extend_from_slice(&direct_payload_part2);
+        let direct_wire = block(None, Command::Direct, &full_direct, 30);
+
+        // VLESS response header [version=0, addons_len=0] + Continue + Direct header + part 1.
+        let mut rec1_plain = vec![0u8, 0u8];
+        rec1_plain.extend_from_slice(&block(Some(UUID), Command::Continue, &continue_payload, 20));
+        rec1_plain.extend_from_slice(&direct_wire[..5 + direct_payload_part1.len()]);
+        let rec2_plain = &direct_wire[5 + direct_payload_part1.len()..];
+        let rec3_raw = b"RAW-INNER-TLS-RECORD".to_vec();
+
+        let mut wire = peer
+            .frame(ContentType::ApplicationData, &rec1_plain)
+            .expect("frames outer REALITY record 1");
+        wire.extend_from_slice(
+            &peer
+                .frame(ContentType::ApplicationData, rec2_plain)
+                .expect("frames outer REALITY record 2"),
+        );
+        wire.extend_from_slice(&rec3_raw);
+
+        tokio::spawn(async move {
+            feeder.write_all(&wire).await.expect("feeds wire");
+            feeder.shutdown().await.expect("closes feeder");
+        });
+
+        let mut stream = VisionStream::new_answering(
+            ResponseHeaderStream::new(conn),
+            UUID,
+            Some(std::sync::Arc::clone(&raw_read)),
+        );
+        let mut out = Vec::new();
+        stream
+            .read_to_end(&mut out)
+            .await
+            .expect("reading across split Direct outer records succeeds");
+
+        let mut expected = continue_payload;
+        expected.extend_from_slice(&full_direct);
+        expected.extend_from_slice(&rec3_raw);
+        assert_eq!(out, expected);
+        assert!(
+            raw_read.load(Ordering::Acquire),
+            "raw_read must be enabled once the split Direct block has finished"
+        );
     }
 }

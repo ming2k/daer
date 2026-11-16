@@ -110,11 +110,30 @@ impl TransportLayer {
         recorder: &TraceCollector,
         timeout: Duration,
     ) -> Result<Box<dyn Transport>, ProxyProtocolError> {
+        self.wrap_until(
+            stream,
+            node_host,
+            sni,
+            recorder,
+            tokio::time::Instant::now() + timeout,
+        )
+        .await
+    }
+
+    /// Applies this layer within the shared `deadline`.
+    pub async fn wrap_until(
+        &self,
+        stream: Box<dyn Transport>,
+        node_host: &str,
+        sni: Option<&str>,
+        recorder: &TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> Result<Box<dyn Transport>, ProxyProtocolError> {
         match self {
             Self::Tcp => Ok(stream),
             Self::Ws(params) => {
                 let host = self.host_for(node_host, sni).to_owned();
-                let upgraded = upgrade(stream, params, &host, recorder, timeout).await?;
+                let upgraded = upgrade(stream, params, &host, recorder, deadline).await?;
                 Ok(Box::new(upgraded))
             }
         }
@@ -132,11 +151,13 @@ async fn upgrade<S>(
     params: &WsParams,
     host: &str,
     recorder: &TraceCollector,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<WsByteStream<S>, ProxyProtocolError>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let remaining =
+        ProxyProtocolError::remaining_until(deadline, daer_observe::DialStage::Handshake, host)?;
     let key = netune_ws::generate_key();
     let path = if params.path.is_empty() {
         "/"
@@ -155,29 +176,44 @@ where
     for (name, value) in &params.headers {
         head = head.with_raw_header(name.as_str(), value.as_str());
     }
-    tokio::time::timeout(timeout, write_request_head(&mut stream, &head))
+    tokio::time::timeout(remaining, write_request_head(&mut stream, &head))
         .await
-        .map_err(|_| ProxyProtocolError::Timeout)?
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "write the WebSocket upgrade request to {host} exceeded {} ms",
+                    remaining.as_millis()
+                ),
+            )
+        })?
         .map_err(|error| {
-            ProxyProtocolError::Connect(format!("write the WebSocket upgrade request: {error}"))
+            ProxyProtocolError::handshake(format!("write the WebSocket upgrade request: {error}"))
         })?;
 
+    let remaining =
+        ProxyProtocolError::remaining_until(deadline, daer_observe::DialStage::Handshake, host)?;
     // The reader keeps any bytes that followed the head: a server may write its first frame in the
     // same segment as `101 Switching Protocols`, and dropping them loses the start of the tunnel.
     // The 16 KiB ceiling matches the old hand-written parser and is tighter than netune's default.
-    let limits = Limits {
-        max_head_bytes: 16 * 1024,
-        ..Limits::default()
-    };
+    let limits = Limits::default().with_max_head_bytes(16 * 1024);
     let mut reader = Http1Reader::with_limits(stream, limits);
-    let response = tokio::time::timeout(timeout, reader.read_response_head(&Method::GET))
+    let response = tokio::time::timeout(remaining, reader.read_response_head(&Method::GET))
         .await
-        .map_err(|_| ProxyProtocolError::Timeout)?
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "read the WebSocket upgrade response from {host} exceeded {} ms",
+                    remaining.as_millis()
+                ),
+            )
+        })?
         .map_err(|error| {
-            ProxyProtocolError::Connect(format!("read the WebSocket upgrade response: {error}"))
+            ProxyProtocolError::handshake(format!("read the WebSocket upgrade response: {error}"))
         })?;
     if response.status != http::StatusCode::SWITCHING_PROTOCOLS {
-        return Err(ProxyProtocolError::Connect(format!(
+        return Err(ProxyProtocolError::handshake(format!(
             "the node answered the WebSocket upgrade with {}, not 101 Switching Protocols. \
              A 400 or 404 here is what a `wss` node answers a request that did not arrive \
              inside TLS, or a path the node does not serve",
@@ -190,13 +226,12 @@ where
         .get("sec-websocket-accept")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| {
-            ProxyProtocolError::Connect(
-                "the WebSocket upgrade response has no valid Sec-WebSocket-Accept header"
-                    .to_owned(),
+            ProxyProtocolError::handshake(
+                "the WebSocket upgrade response has no valid Sec-WebSocket-Accept header",
             )
         })?;
     netune_ws::verify_handshake(&key, accept).map_err(|error| {
-        ProxyProtocolError::Connect(format!(
+        ProxyProtocolError::handshake(format!(
             "the node's Sec-WebSocket-Accept does not match the key: {error}"
         ))
     })?;

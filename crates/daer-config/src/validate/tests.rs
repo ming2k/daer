@@ -27,6 +27,8 @@ fn an_unknown_http_method_is_rejected() {
         interval: Some(crate::TimeSpan::from_secs(30)),
         timeout: Some(crate::TimeSpan::from_secs(5)),
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("must fail");
     assert_eq!(error.field, "election.method");
@@ -47,6 +49,8 @@ fn an_election_url_mode_requires_a_url() {
         interval: Some(crate::TimeSpan::from_secs(30)),
         timeout: Some(crate::TimeSpan::from_secs(5)),
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("url mode needs a URL");
     assert_eq!(error.field, "election.url");
@@ -67,6 +71,8 @@ fn a_server_mode_election_cannot_carry_a_url() {
         interval: Some(crate::TimeSpan::from_secs(30)),
         timeout: Some(crate::TimeSpan::from_secs(5)),
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("server mode cannot carry a URL");
     assert_eq!(error.field, "election.url");
@@ -87,6 +93,8 @@ fn a_latency_election_cannot_disable_probing() {
         interval: Some(crate::TimeSpan::ZERO),
         timeout: None,
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("a latency election needs probes");
     assert_eq!(error.field, "election.interval");
@@ -107,6 +115,8 @@ fn a_manual_election_rejects_probe_settings() {
         interval: None,
         timeout: None,
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("a manual election is never probed");
     assert_eq!(error.field, "election.probe");
@@ -128,6 +138,8 @@ fn tolerance_belongs_to_the_moving_average_policy() {
         interval: Some(crate::TimeSpan::from_secs(30)),
         timeout: None,
         tolerance: Some(crate::TimeSpan::from_secs(1)),
+        failure_threshold: None,
+        cooldown: None,
     }];
     let error = normalize(&mut config).expect_err("only min-moving-avg uses tolerance");
     assert_eq!(error.field, "election.tolerance");
@@ -146,6 +158,8 @@ fn tolerance_belongs_to_the_moving_average_policy() {
         interval: Some(crate::TimeSpan::from_secs(30)),
         timeout: None,
         tolerance: Some(crate::TimeSpan::from_secs(1)),
+        failure_threshold: None,
+        cooldown: None,
     }];
     normalize(&mut config).expect("min-moving-avg consumes tolerance");
 }
@@ -435,6 +449,8 @@ fn an_election_action_is_accepted() {
         interval: None,
         timeout: None,
         tolerance: None,
+        failure_threshold: None,
+        cooldown: None,
     }];
     config.routing.default = crate::model::OutboundAction::Election("proxy".to_owned());
     normalize(&mut config).expect("an election action is valid");
@@ -467,4 +483,52 @@ fn duplicate_node_names_are_rejected_because_detour_needs_one_target() {
     // The control: a chain with distinct names is accepted.
     config.node = vec![node("a", Some("b")), node("b", None)];
     normalize(&mut config).expect("distinct names are fine");
+}
+
+#[test]
+fn dial_timeout_tcp_keepalive_and_election_cooldown_validation() {
+    let mut zero_timeout = valid();
+    zero_timeout.dial_timeout = crate::TimeSpan::ZERO;
+    assert_eq!(
+        normalize(&mut zero_timeout)
+            .expect_err("zero dial-timeout must fail")
+            .field,
+        "dial-timeout"
+    );
+
+    let mut neg_keepalive = valid();
+    neg_keepalive.tcp_keepalive = crate::TimeSpan::from_secs(-1);
+    assert_eq!(
+        normalize(&mut neg_keepalive)
+            .expect_err("negative keepalive must fail")
+            .field,
+        "tcp-keepalive"
+    );
+
+    let mut zero_keepalive = valid();
+    zero_keepalive.tcp_keepalive = crate::TimeSpan::ZERO;
+    normalize(&mut zero_keepalive).expect("0s keepalive explicitly disables keepalive");
+
+    let mut neg_cooldown = valid();
+    neg_cooldown.election = vec![crate::model::Election {
+        name: "proxy".to_owned(),
+        group: None,
+        node: Some("n".to_owned()),
+        kind: crate::model::ElectionKind::Manual,
+        mode: None,
+        url: None,
+        method: None,
+        udp_dns: None,
+        interval: None,
+        timeout: None,
+        tolerance: None,
+        failure_threshold: Some(3),
+        cooldown: Some(crate::TimeSpan::from_secs(-5)),
+    }];
+    assert_eq!(
+        normalize(&mut neg_cooldown)
+            .expect_err("negative cooldown must fail")
+            .field,
+        "election.cooldown"
+    );
 }

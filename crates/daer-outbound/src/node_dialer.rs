@@ -4,7 +4,9 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use daer_observe::DialStage;
 use daer_proxy_protocols::ProxyDialer;
 pub use daer_proxy_protocols::options::DialerOptions;
 use daer_proxy_protocols::server::{ServerConnector, ServerDialer};
@@ -12,6 +14,7 @@ use netune::{
     Connector, DatagramConnector, Established, Proxy, ProxyConnector, Socks5DatagramConnector,
 };
 use netune_trace::TraceCollector;
+use tokio::time::Instant;
 
 use crate::error::OutboundError;
 use crate::property::Protocol;
@@ -30,7 +33,7 @@ pub struct NodeDialer {
 
 enum NodeTransport {
     Proxy(ProxyTransport),
-    Protocol(ProxyDialer),
+    Protocol(Box<ProxyDialer>),
 }
 
 impl fmt::Debug for NodeDialer {
@@ -102,7 +105,7 @@ impl NodeDialer {
             )?,
             endpoint => {
                 let dialer = ProxyDialer::from_node(endpoint, options)?;
-                NodeTransport::Protocol(dialer)
+                NodeTransport::Protocol(Box::new(dialer))
             }
         };
         Ok(Self {
@@ -146,7 +149,7 @@ impl NodeDialer {
             let dialer = ProxyDialer::from_link(link, options)?;
             return Ok(Self {
                 label,
-                transport: NodeTransport::Protocol(dialer),
+                transport: NodeTransport::Protocol(Box::new(dialer)),
                 detour: None,
             });
         }
@@ -237,6 +240,25 @@ impl NodeDialer {
         }
     }
 
+    /// Opens a TCP connection within `deadline`, recording the attempt into `collector`.
+    pub async fn connect_with_collector_within(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, OutboundError> {
+        match &self.transport {
+            NodeTransport::Proxy(dialer) => {
+                dialer
+                    .connect_with_collector_within(authority, collector, deadline)
+                    .await
+            }
+            NodeTransport::Protocol(dialer) => Ok(dialer
+                .connect_with_collector_within(authority, collector, deadline)
+                .await?),
+        }
+    }
+
     /// Opens the bare stream to this node's server, before the protocol handshake.
     ///
     /// A health probe of a detoured node must test the *chain* to the node's own server, not
@@ -249,6 +271,20 @@ impl NodeDialer {
         match &self.transport {
             NodeTransport::Proxy(dialer) => dialer.connect_server(collector).await,
             NodeTransport::Protocol(dialer) => Ok(dialer.connect_server(collector).await?),
+        }
+    }
+
+    /// Opens the bare stream to this node's server within `deadline`.
+    pub async fn probe_server_within(
+        &self,
+        collector: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, OutboundError> {
+        match &self.transport {
+            NodeTransport::Proxy(dialer) => dialer.connect_server_within(collector, deadline).await,
+            NodeTransport::Protocol(dialer) => {
+                Ok(dialer.connect_server_within(collector, deadline).await?)
+            }
         }
     }
 
@@ -313,10 +349,21 @@ impl ServerDialer for NodeServerDialer {
         Box::pin(async move {
             node.connect_with_collector(authority, recorder)
                 .await
-                .map_err(|error| match error {
-                    OutboundError::Timeout => daer_proxy_protocols::ProxyProtocolError::Timeout,
-                    other => daer_proxy_protocols::ProxyProtocolError::Connect(other.to_string()),
-                })
+                .map_err(|error| error.into_proxy_error())
+        })
+    }
+
+    fn connect_within<'a>(
+        &'a self,
+        authority: &'a str,
+        recorder: &'a TraceCollector,
+        deadline: Instant,
+    ) -> daer_proxy_protocols::server::ServerFuture<'a> {
+        let node = Arc::clone(&self.node);
+        Box::pin(async move {
+            node.connect_with_collector_within(authority, recorder, deadline)
+                .await
+                .map_err(|error| error.into_proxy_error())
         })
     }
 
@@ -334,9 +381,10 @@ impl ServerDialer for NodeServerDialer {
 }
 
 pub struct ProxyTransport {
-    connector: ProxyConnector<ServerConnector>,
+    proxy: Proxy,
     base: Arc<dyn ServerDialer>,
     server: String,
+    timeout: Duration,
     protocol: Protocol,
     /// `None` when the node cannot carry datagrams. A SOCKS5 UDP associate is a session with
     /// the proxy server itself; when the server is reached through a detour, the associate's
@@ -368,7 +416,10 @@ impl ProxyTransport {
                     let inner = ServerConnector::new(options.base().clone());
                     Socks5DatagramConnector::new(inner, proxy.clone())
                         .ok()
-                        .map(|connector| Arc::new(connector) as Arc<dyn DatagramConnector>)
+                        .map(|connector| {
+                            Arc::new(connector.with_handshake_timeout(Some(options.timeout)))
+                                as Arc<dyn DatagramConnector>
+                        })
                 }
                 _ => None,
             };
@@ -377,9 +428,10 @@ impl ProxyTransport {
             Proxy::Http { authority, .. } | Proxy::Socks5 { authority, .. } => authority.clone(),
         };
         Self {
-            connector: ProxyConnector::new(ServerConnector::new(Arc::clone(&base)), proxy),
+            proxy,
             base,
             server,
+            timeout: options.timeout,
             protocol,
             datagram,
         }
@@ -399,16 +451,58 @@ impl ProxyTransport {
             .map_err(OutboundError::from)
     }
 
+    async fn connect_server_within(
+        &self,
+        collector: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, OutboundError> {
+        self.base
+            .connect_within(&self.server, collector, deadline)
+            .await
+            .map_err(OutboundError::from)
+    }
+
     pub async fn connect_with_collector(
         &self,
         authority: &str,
         collector: &TraceCollector,
     ) -> Result<Established, OutboundError> {
-        let target = netune::Target::plain(authority);
-        self.connector
-            .connect(&target, collector)
+        self.connect_with_collector_within(authority, collector, Instant::now() + self.timeout)
             .await
-            .map_err(|error| OutboundError::Connect(error.to_string()))
+    }
+
+    pub async fn connect_with_collector_within(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, OutboundError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(OutboundError::timeout(
+                DialStage::Handshake,
+                format!(
+                    "proxy dial to {authority} via {}: deadline expired",
+                    self.server
+                ),
+            ));
+        }
+        let target = netune::Target::plain(authority);
+        let inner = ServerConnector::new(Arc::clone(&self.base)).with_deadline(deadline);
+        let connector = ProxyConnector::new(inner, self.proxy.clone()).with_handshake_timeout(None);
+        tokio::time::timeout(remaining, connector.connect(&target, collector))
+            .await
+            .map_err(|_| {
+                OutboundError::timeout(
+                    DialStage::Handshake,
+                    format!(
+                        "proxy handshake with {} for {authority} exceeded {} ms",
+                        self.server,
+                        remaining.as_millis()
+                    ),
+                )
+            })?
+            .map_err(|error| OutboundError::from_net_error(&error))
     }
 
     pub fn protocol(&self) -> Protocol {

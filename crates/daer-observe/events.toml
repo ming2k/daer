@@ -52,7 +52,7 @@ name = "DaemonDatapathAttached"
 code = "daemon.datapath_attached"
 level = "info"
 message = "datapath attached"
-fields = ["port", "namespace", "device", "peer", "lan", "wan", "object", "object_sha256", "maps", "programs", "policy_hash"]
+fields = ["port", "namespace", "device", "peer", "lan", "wan", "object"]
 
 [[events]]
 name = "DaemonDatapathRebuilt"
@@ -140,7 +140,7 @@ name = "DaemonHealthStarted"
 code = "daemon.health_started"
 level = "info"
 message = "health scheduling started"
-fields = ["interval"]
+fields = ["interval_ms", "generation"]
 
 [[events]]
 name = "DaemonHealthDisabled"
@@ -154,7 +154,7 @@ name = "DaemonWaitingRoute"
 code = "daemon.waiting_route"
 level = "info"
 message = "waiting for a default route"
-fields = ["disable_waiting_network"]
+fields = ["waited_ms", "disable_waiting_network"]
 
 [[events]]
 name = "DaemonWaitingInterfaces"
@@ -189,7 +189,7 @@ name = "DaemonShutdown"
 code = "daemon.shutdown"
 level = "info"
 message = "shutdown complete"
-fields = ["drained", "in_flight", "accepted", "rejected", "failed", "exhausted", "panicked", "datagram", "dns"]
+fields = ["drained", "in_flight", "accepted", "rejected", "failed", "exhausted", "panicked"]
 
 [[events]]
 name = "DaemonStopping"
@@ -259,7 +259,7 @@ name = "DryRunListen"
 code = "dryrun.listen"
 level = "info"
 message = "would listen for redirected flows"
-fields = ["port", "so_mark", "namespace", "generation"]
+fields = ["so_mark", "control_plane_pid"]
 
 [[events]]
 name = "DryRunInterfaces"
@@ -342,7 +342,7 @@ name = "GenerationReloaded"
 code = "generation.reloaded"
 level = "info"
 message = "configuration reloaded"
-fields = ["generation", "previous", "rules", "groups", "elections", "nodes", "routing_changed", "build_ms", "policy_hash", "source"]
+fields = ["generation", "previous", "rules", "groups", "elections", "nodes", "routing_changed", "build_ms", "policy_hash"]
 
 [[events]]
 name = "GenerationStartupRejected"
@@ -410,7 +410,7 @@ name = "ProviderUpdated"
 code = "provider.updated"
 level = "info"
 message = "rule provider updated"
-fields = ["tag", "bytes", "sha256", "generation"]
+fields = ["tag"]
 
 [[events]]
 name = "ProviderUnchanged"
@@ -434,7 +434,7 @@ name = "ProviderRefreshPublished"
 code = "provider.refresh_published"
 level = "info"
 message = "rule provider refresh published a new generation"
-fields = ["tag", "generation", "elapsed_ms"]
+fields = ["providers"]
 
 [[events]]
 name = "ProviderRefreshRejected"
@@ -472,6 +472,20 @@ fields = ["tag", "error"]
 counter = "provider.cache_fallback"
 rate = "provider.cache_fallback"
 remediation = "The rules are stale but serving; check the provider URL and network."
+
+[[events]]
+name = "SubscriptionSummary"
+code = "subscription.summary"
+level = "info"
+message = "subscriptions resolved"
+fields = ["summary", "nodes"]
+
+[[events]]
+name = "ProviderSummary"
+code = "provider.summary"
+level = "info"
+message = "rule providers resolved"
+fields = ["summary"]
 
 
 [[events]]
@@ -559,7 +573,7 @@ name = "FlowRejected"
 code = "flow.rejected"
 level = "debug"
 message = "dropped a flow that was not redirected"
-fields = ["flow_id", "reject", "reason"]
+fields = ["reject"]
 
 [[events]]
 name = "FlowNoOutbound"
@@ -586,14 +600,28 @@ rate = "flow.relay_failed"
 remediation = "The client or origin closed abnormally; inspect the node and the bundle's flow record."
 
 [[events]]
+name = "FlowRelayReset"
+code = "flow.relay_reset"
+level = "debug"
+message = "relay ended on peer reset"
+fields = ["flow_id", "destination", "error"]
+
+[[events]]
 name = "FlowAbnormalEnd"
 code = "flow.abnormal_end"
 level = "warn"
 message = "flow task ended abnormally"
-fields = ["flow_id", "generation", "destination"]
+fields = ["flow_id"]
 counter = "flow.abnormal_end"
 rate = "flow.abnormal_end"
 remediation = "A flow task was cancelled or panicked; collect the incident bundle and inspect the last flow record."
+
+[[events]]
+name = "FlowShutdownAborted"
+code = "flow.shutdown_aborted"
+level = "debug"
+message = "flow task aborted during shutdown"
+fields = ["flow_id"]
 
 [[events]]
 name = "FlowAcceptResourceExhausted"
@@ -631,7 +659,7 @@ name = "FlowDialFailed"
 code = "flow.dial_failed"
 level = "warn"
 message = "flow dial failed"
-fields = ["flow_id", "generation", "destination", "election", "node", "stage", "error_code", "elapsed_ms"]
+fields = ["flow_id", "generation", "destination", "election", "node", "stage", "error_code", "elapsed_ms", "detail"]
 counter = "flow.dial_failed"
 rate = "flow.dial_failed"
 remediation = "Check the selected node and the dial stage; run `daer probe node <node>`."
@@ -666,7 +694,14 @@ name = "DatagramRejected"
 code = "flow.datagram_rejected"
 level = "debug"
 message = "dropped a datagram that was not redirected"
-fields = ["flow_id", "reject", "reason"]
+fields = ["reject"]
+
+[[events]]
+name = "DatagramRefusalSuppressed"
+code = "flow.datagram_refusal_suppressed"
+level = "trace"
+message = "suppressed repeated datagram refusal"
+fields = ["flow_id", "source", "destination"]
 
 [[events]]
 name = "DatagramForwardFailed"
@@ -824,7 +859,7 @@ name = "DnsTransientError"
 code = "dns.transient_error"
 level = "debug"
 message = "dns transient error"
-fields = ["query_id", "peer", "transport", "phase", "error"]
+fields = ["transport", "phase", "error"]
 
 [[events]]
 name = "DnsMalformedQuery"
@@ -838,7 +873,7 @@ name = "DnsSendFailed"
 code = "dns.send_failed"
 level = "warn"
 message = "dns send failed"
-fields = ["query_id", "peer", "transport", "error"]
+fields = ["peer", "transport", "error"]
 counter = "dns.send_failed"
 rate = "dns.send_failed"
 remediation = "The client did not receive its answer; check the listening socket and the reply path."
@@ -963,7 +998,7 @@ name = "DatapathObjectMissing"
 code = "datapath.object_missing"
 level = "error"
 message = "cannot reach the datapath object"
-fields = ["reason", "path"]
+fields = ["reason"]
 counter = "datapath.object_missing"
 rate = "datapath.object_missing"
 remediation = "Run `cargo xtask ebpf` or install the packaged datapath object at the configured path."
@@ -1030,7 +1065,7 @@ name = "DatapathEvent"
 code = "datapath.event"
 level = "warn"
 message = "datapath event"
-fields = ["event_type", "counter", "pid", "pname", "outbound", "l4proto", "sip", "dip", "sport", "dport", "monotonic_ns"]
+fields = ["event_type", "pid", "pname", "outbound", "l4proto", "sip", "dip", "sport", "dport", "monotonic_ns"]
 counter = "datapath.event"
 rate = "datapath.event"
 remediation = "Inspect the named kernel event and counter; repeated overflow or rebind events indicate map or epoch pressure."
@@ -1181,3 +1216,13 @@ fields = ["path", "error"]
 counter = "election.socket_failed"
 rate = "election.socket_failed"
 remediation = "Check that /run/daer is writable and that the daemon user owns it; daer elect and the live status views need this socket."
+
+[[events]]
+name = "ElectionNodeCooldown"
+code = "election.node_cooldown"
+level = "warn"
+message = "node entered passive cooldown after consecutive dial failures"
+fields = ["election", "node", "consecutive_failures", "cooldown_ms", "error_code"]
+counter = "election.node_cooldown"
+rate = "election.node_cooldown"
+remediation = "The node failed consecutive live flow dials and is temporarily deprioritized; verify connectivity to the node or wait for active probes to recover it."

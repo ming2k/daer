@@ -379,8 +379,10 @@ fn status_elect_and_sigterm_form_one_live_contract() {
         !admin_socket.exists(),
         "the admin socket must be removed on shutdown"
     );
+    // Match the panic hook's output, not the `panicked=0` counter that the normal
+    // `daemon.shutdown` event carries.
     assert!(
-        !daemon.log.iter().any(|line| line.contains("panicked")),
+        !daemon.log.iter().any(|line| line.contains("panicked at")),
         "the daemon panicked during shutdown; log:\n{}",
         daemon.log.join("\n")
     );

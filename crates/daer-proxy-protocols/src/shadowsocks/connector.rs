@@ -3,13 +3,16 @@
 //! The shadowsocks `Connector`: link parsing, the handshake, and the framed stream.
 
 use netune::{
-    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target, Transport,
+    ConnectError, Connector, DatagramConnector, Established, EstablishedDatagrams, NetError,
+    Target, Transport,
 };
-use netune_trace::TraceCollector;
+use netune_trace::{DiagnosticPhase, TraceCollector};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
 
 use super::link::{Link, decode_base64_bytes, decode_base64_string};
 use super::v1::{Sealer, ShadowSocksDatagramSession, ShadowSocksStream, master_key, write_salt};
@@ -40,6 +43,7 @@ pub struct ShadowSocksConnector {
     master: Vec<u8>,
     server: String,
     base: Arc<dyn ServerDialer>,
+    timeout: Duration,
 }
 
 impl ShadowSocksConnector {
@@ -76,6 +80,7 @@ impl ShadowSocksConnector {
             master,
             server,
             base: options.base().clone(),
+            timeout: options.timeout,
         })
     }
 
@@ -91,6 +96,7 @@ impl ShadowSocksConnector {
             master: parsed.master_key(),
             server: parsed.server,
             base: options.base().clone(),
+            timeout: options.timeout,
         })
     }
 
@@ -112,67 +118,91 @@ impl ShadowSocksConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
+        self.connect_within(authority, recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Connects to `authority` (`host:port`) through the shadowsocks server within `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
         let (host, port) =
             split_authority(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
         let address = encode_address(host, port).map_err(ProxyProtocolError::UnsupportedLink)?;
 
         let established = self
             .base
-            .connect(&self.server, recorder)
-            .await
-            .map_err(|error| match error {
-                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
-                other => ProxyProtocolError::Connect(other.to_string()),
-            })?;
+            .connect_within(&self.server, recorder, deadline)
+            .await?;
 
         let stream = established.stream;
         let local_port = established.local_port;
         let socket = established.socket;
 
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
         if self.cipher.is_2022() {
-            let ss22_stream =
-                send_client_handshake_2022(stream, self.cipher, &self.master, &address, &[])
-                    .await
-                    .map_err(|e| ProxyProtocolError::Connect(e.to_string()))?;
+            let ss22_stream = tokio::time::timeout(
+                remaining,
+                send_client_handshake_2022(stream, self.cipher, &self.master, &address, &[]),
+            )
+            .await
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Handshake,
+                    format!(
+                        "shadowsocks 2022 handshake with {} exceeded {} ms",
+                        self.server,
+                        remaining.as_millis()
+                    ),
+                )
+            })?
+            .map_err(|e| ProxyProtocolError::handshake(e.to_string()))?;
 
-            Ok(Established {
-                stream: Box::new(ss22_stream),
-                local_port,
-                socket,
-                alpn: None,
-                alpn_protocol: None,
-            })
+            Ok(Established::new(Box::new(ss22_stream))
+                .with_local_port(local_port)
+                .with_socket(socket))
         } else {
             let mut stream = stream;
             let mut salt = vec![0u8; self.cipher.salt_len()];
             fill_random(&mut salt);
             let mut sealer = Sealer::new(self.cipher, &self.master, &salt);
             let request = sealer.seal_chunk(&address).map_err(|error| {
-                ProxyProtocolError::Connect(ShadowSocksError::Crypto(error).to_string())
+                ProxyProtocolError::handshake(ShadowSocksError::Crypto(error).to_string())
             })?;
 
-            write_salt(&mut stream, &salt)
-                .await
-                .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
-            stream
-                .write_all(&request)
-                .await
-                .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
-
-            let mut peer_salt = vec![0u8; self.cipher.salt_len()];
-            read_exact(&mut stream, &mut peer_salt)
-                .await
-                .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+            let peer_salt_res = tokio::time::timeout(remaining, async {
+                write_salt(&mut stream, &salt).await?;
+                stream.write_all(&request).await?;
+                let mut peer_salt = vec![0u8; self.cipher.salt_len()];
+                read_exact(&mut stream, &mut peer_salt).await?;
+                Ok::<Vec<u8>, std::io::Error>(peer_salt)
+            })
+            .await
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Handshake,
+                    format!(
+                        "shadowsocks handshake with {} exceeded {} ms",
+                        self.server,
+                        remaining.as_millis()
+                    ),
+                )
+            })?;
+            let peer_salt =
+                peer_salt_res.map_err(|error| ProxyProtocolError::handshake(error.to_string()))?;
 
             let framed: ShadowSocksStream<Box<dyn Transport>> =
                 ShadowSocksStream::with_sealer(stream, self.cipher, sealer, &peer_salt);
-            Ok(Established {
-                stream: Box::new(framed),
-                local_port,
-                socket,
-                alpn: None,
-                alpn_protocol: None,
-            })
+            Ok(Established::new(Box::new(framed))
+                .with_local_port(local_port)
+                .with_socket(socket))
         }
     }
 
@@ -184,7 +214,19 @@ impl ShadowSocksConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        self.base.connect(&self.server, recorder).await
+        self.connect_server_within(recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens the bare TCP stream to this Shadowsocks server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base
+            .connect_within(&self.server, recorder, deadline)
+            .await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this Shadowsocks node.
@@ -206,10 +248,13 @@ impl ShadowSocksConnector {
         // confinement, socket options and tracing are netune's. This connector supplies only
         // the Shadowsocks framing above the session.
         let connector = self.base.datagram().ok_or_else(|| {
-            NetError::Protocol(format!(
-                "shadowsocks server {} has no datagram leg; a detoured node cannot carry \
-                 shadowsocks UDP until the detour's datagram path is defined",
-                self.server
+            NetError::Connect(ConnectError::config(
+                DiagnosticPhase::Proxy,
+                format!(
+                    "shadowsocks server {} has no datagram leg; a detoured node cannot carry \
+                     shadowsocks UDP until the detour's datagram path is defined",
+                    self.server
+                ),
             ))
         })?;
         let established = connector.connect(&self.server, recorder).await?;
@@ -306,7 +351,7 @@ impl Connector for ShadowSocksConnector {
         async move {
             this.connect(&authority, recorder)
                 .await
-                .map_err(|error| NetError::Connect(error.to_string()))
+                .map_err(|error| error.into_net_error(&authority))
         }
     }
 }

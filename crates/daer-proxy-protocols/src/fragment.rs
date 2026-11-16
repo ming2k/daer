@@ -23,14 +23,15 @@
 //! # Which transports this applies to
 //!
 //! Only the ones whose TLS is daer's: a REALITY session. A `trojan://` node handshakes through
-//! netune's `TlsConnector`, which reads the ClientHello from rustls inside its own `poll_write`
-//! on a socket daer never sees, so `fragment` cannot mean the same thing there. The daemon logs
-//! which is which rather than silently half-applying the setting.
+//! netune's TLS engine, which writes the ClientHello inside its own driver on a stream daer
+//! does not slice at the record-layer handshake boundary, so `fragment` cannot mean the same
+//! thing there. The daemon logs which is which rather than silently half-applying the setting.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A `low-high` range from the configuration, parsed once.
@@ -145,6 +146,12 @@ impl<S> FragmentingIo<S> {
     /// The stream underneath, once the handshake is past.
     pub fn into_inner(self) -> S {
         self.inner
+    }
+}
+
+impl<S: Transport> Transport for FragmentingIo<S> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
     }
 }
 

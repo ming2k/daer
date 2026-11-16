@@ -135,6 +135,7 @@ where
                     flow_id = %flow.flow_id,
                     source = %flow.source,
                     destination = %flow.destination,
+                    l4 = "tcp",
                     "accepted redirected flow"
                 );
                 flow
@@ -157,14 +158,7 @@ where
         let upstream = match decide.decide(&flow).await {
             Ok(upstream) => upstream,
             Err(error) => {
-                metrics.failed.fetch_add(1, Ordering::Relaxed);
-                daer_observe::debug!(
-                    daer_observe::EventCode::FlowNoOutbound,
-                    flow_id = %flow.flow_id,
-                    %error,
-                    destination = %flow.destination,
-                    "no outbound leg"
-                );
+                handle_decision_error(metrics, flow.flow_id, flow.destination, error);
                 continue;
             }
         };
@@ -172,29 +166,11 @@ where
         // The relay owns both halves from here, and the supervisor owns the relay:
         // the loop keeps accepting, and stopping the loop leaves this flow running.
         supervisor.spawn_tracked(flow.flow_id, async move {
-            match splice(flow.stream, upstream).await {
-                Ok(relayed) => {
-                    daer_observe::debug!(daer_observe::EventCode::FlowClosed,
-                        flow_id = %flow.flow_id,
-                        destination = %flow.destination,
-                        to_upstream = relayed.to_upstream,
-                        to_client = relayed.to_client,
-                        elapsed_ms = relayed.elapsed.as_millis(),
-                        "flow closed"
-                    );
-                    relayed
-                }
-                Err(error) => {
-                    daer_observe::warn!(
-                        daer_observe::EventCode::FlowRelayFailed,
-                        flow_id = %flow.flow_id,
-                        %error,
-                        destination = %flow.destination,
-                        "relay failed"
-                    );
-                    Relayed::default()
-                }
-            }
+            handle_splice_result(
+                flow.flow_id,
+                flow.destination,
+                splice(flow.stream, upstream).await,
+            )
         });
     }
 }
@@ -236,6 +212,7 @@ where
                     flow_id = %flow.flow_id,
                     source = %flow.source,
                     destination = %flow.destination,
+                    l4 = "tcp",
                     "accepted redirected flow"
                 );
                 flow
@@ -265,44 +242,83 @@ where
             let upstream = match decide.decide(&flow).await {
                 Ok(upstream) => upstream,
                 Err(error) => {
-                    task_supervisor
-                        .metrics()
-                        .failed
-                        .fetch_add(1, Ordering::Relaxed);
-                    daer_observe::debug!(
-                        daer_observe::EventCode::FlowNoOutbound,
-                        flow_id = %flow_id,
-                        %error,
-                        %destination,
-                        "no outbound leg"
-                    );
+                    handle_decision_error(task_supervisor.metrics(), flow_id, destination, error);
                     return Relayed::default();
                 }
             };
-            match splice(flow.stream, upstream).await {
-                Ok(relayed) => {
-                    daer_observe::debug!(daer_observe::EventCode::FlowClosed,
-                        flow_id = %flow_id,
-                        destination = %destination,
-                        to_upstream = relayed.to_upstream,
-                        to_client = relayed.to_client,
-                        elapsed_ms = relayed.elapsed.as_millis(),
-                        "flow closed"
-                    );
-                    relayed
-                }
-                Err(error) => {
-                    daer_observe::warn!(
-                        daer_observe::EventCode::FlowRelayFailed,
-                        flow_id = %flow_id,
-                        %error,
-                        %destination,
-                        "relay failed"
-                    );
-                    Relayed::default()
-                }
-            }
+            handle_splice_result(flow_id, destination, splice(flow.stream, upstream).await)
         });
+    }
+}
+
+fn handle_decision_error(
+    metrics: &Metrics,
+    flow_id: daer_observe::FlowId,
+    destination: std::net::SocketAddr,
+    error: RelayError,
+) {
+    match error {
+        RelayError::Rejected(reject) => {
+            metrics.rejected.fetch_add(1, Ordering::Relaxed);
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowRejected,
+                %reject,
+                "dropped a flow that was not redirected"
+            );
+        }
+        error => {
+            metrics.failed.fetch_add(1, Ordering::Relaxed);
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowNoOutbound,
+                flow_id = %flow_id,
+                %destination,
+                %error,
+                "no outbound leg"
+            );
+        }
+    }
+}
+
+fn handle_splice_result(
+    flow_id: daer_observe::FlowId,
+    destination: std::net::SocketAddr,
+    result: Result<Relayed, std::io::Error>,
+) -> Relayed {
+    match result {
+        Ok(relayed) => {
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowClosed,
+                flow_id = %flow_id,
+                destination = %destination,
+                outcome = "clean",
+                to_upstream = relayed.to_upstream,
+                to_client = relayed.to_client,
+                elapsed_ms = relayed.elapsed.as_millis(),
+                "flow closed"
+            );
+            relayed
+        }
+        Err(error) if is_expected_peer_reset(&error) => {
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowRelayReset,
+                flow_id = %flow_id,
+                destination = %destination,
+                %error,
+                "relay ended on peer reset"
+            );
+            Relayed::default()
+        }
+        Err(error) => {
+            daer_observe::warn!(
+                daer_observe::EventCode::FlowRelayFailed,
+                flow_id = %flow_id,
+                destination = %destination,
+                %error,
+                error_code = %daer_observe::diagnostic::codes::RELAY_SPLICE,
+                "relay failed"
+            );
+            Relayed::default()
+        }
     }
 }
 
@@ -352,7 +368,7 @@ impl Metrics {
 pub struct ServeStats {
     /// Flows accepted from the ingress.
     pub accepted: u64,
-    /// Flows dropped because they were not redirected by the datapath.
+    /// Flows dropped because they were not redirected or were blocked by policy.
     pub rejected: u64,
     /// Flows whose outbound leg could not be opened.
     pub failed: u64,
@@ -401,6 +417,7 @@ where
             daer_observe::warn!(
                 daer_observe::EventCode::DaemonUdpUnavailable,
                 %error,
+                port = 0u16,
                 "datagram relay stopped"
             );
         }
@@ -408,6 +425,17 @@ where
 
     let (stopped, ()) = tokio::join!(serve(ingress, decide, supervisor, shutdown), relay);
     stopped
+}
+
+/// True for `io::Error` kinds indicating an ordinary peer reset or broken pipe mid-stream.
+#[must_use]
+pub fn is_expected_peer_reset(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 /// True for `accept(2)` failures that mean "out of file descriptors or memory".

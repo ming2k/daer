@@ -295,12 +295,8 @@ daer route 114.114.114.114:443 --why -c /etc/daer/config.toml
 sudo systemctl reload daer
 ```
 
-A successful `daer check` names each provider and its loaded counts, for example:
-
-```text
-rule providers: cn-sites [0 intervals, 110045 domains]; cn-ips [6611 intervals, 0 domains];
-ads [0 intervals, 197248 domains]
-```
+A successful `daer check` reports each resolved provider in the `provider.summary` event;
+its `summary` field names every provider and its loaded counts.
 
 After the reload, the daemon log should show the new generation and the same provider
 counts. If the reload fails to build, the running generation is left untouched; fix the

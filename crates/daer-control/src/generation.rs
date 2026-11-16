@@ -332,6 +332,7 @@ impl Generations {
             daer_observe::error!(daer_observe::EventCode::GenerationStartupRejected,
                 generation = %first,
                 error = %source,
+                error_code = %daer_observe::diagnostic::codes::GENERATION_INVALID,
                 "configuration rejected; nothing is serving"
             );
             ReloadError {
@@ -346,6 +347,7 @@ impl Generations {
             elections = generation.elections,
             nodes = generation.nodes,
             build_ms = generation.build_time().as_millis(),
+            policy_hash = %format_policy_hash(&generation.policy_hash()),
             "configuration loaded"
         );
         Ok(Self {
@@ -386,6 +388,7 @@ impl Generations {
                 generation = %id,
                 serving = %previous.id(),
                 error = %source,
+                error_code = %daer_observe::diagnostic::codes::GENERATION_INVALID,
                 "configuration reload rejected; the running generation is unchanged"
             );
             ReloadError {
@@ -394,6 +397,7 @@ impl Generations {
             }
         })?;
 
+        let policy_hash = format_policy_hash(&generation.policy_hash());
         let routing_changed = generation.policy_hash() != previous.policy_hash();
         let report = ReloadReport {
             generation: generation.id(),
@@ -419,6 +423,7 @@ impl Generations {
             nodes = report.nodes,
             routing_changed = report.routing_changed,
             build_ms = report.build_time.as_millis(),
+            policy_hash = %policy_hash,
             "configuration reloaded"
         );
 
@@ -436,6 +441,15 @@ impl Generations {
     pub fn published(&self) -> u64 {
         self.published.load(Ordering::Relaxed)
     }
+}
+
+fn format_policy_hash(hash: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// The shortest non-zero probe interval any non-manual election asks for.

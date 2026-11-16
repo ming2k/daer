@@ -1,5 +1,5 @@
 name = "daer"
-version = "0.1.1"
+version = "0.1.2"
 release = 1
 description = "eBPF transparent proxy for Linux with a Rust userspace"
 license = "AGPL-3.0-only"
@@ -53,7 +53,7 @@ export CARGO_HOME="${WORKDIR}/.cargo"
 # step is what makes the object buildable at all. The generated files are tracked (ADR-0021,
 # amended), and regenerating anyway is deliberate: it means a hand-edited header cannot
 # survive a package build unnoticed.
-cargo run --package xtask -- ebpf
+cargo run --locked --package xtask -- ebpf
 
 # Compile the userspace binaries: the daemon and the rule-artifact producer.
 cargo build --release --locked
@@ -67,7 +67,7 @@ cargo build --release --locked
 # do with the object it claims to validate. This mirrors `cargo xtask preflight`, which writes
 # the same minimal file for the same reason.
 cat > packaging-check.toml << 'EOF'
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 EOF
@@ -83,7 +83,7 @@ cd source/daer-${VERSION}
 #
 # `daer-drb` is shipped because operators compile their own `.rules` into `.drb`. The
 # daemon never links it — `crates/daer-cli/tests/surface.rs` asserts that closure.
-cargo run --package xtask -- install --prefix /usr --destdir "${STAGING_DIR}"
+cargo run --locked --package xtask -- install --prefix /usr --destdir "${STAGING_DIR}"
 
 # Configuration files
 install -dm755 ${STAGING_DIR}/etc/daer
@@ -92,7 +92,7 @@ cat << 'EOF' > ${STAGING_DIR}/etc/daer/config.toml
 # daer transparent proxy configuration
 # See /etc/daer/example.toml for reference documentation.
 
-schema = 5
+schema = 6
 
 wan-interface = "auto"
 EOF

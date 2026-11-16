@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 
 use daer_config::TimeSpan;
 use netune::{
-    Client, ClientConfig, Connector, DatagramConnector, Established, Method, Pool, RequestHead,
-    SocketConfig, Target, TcpConnector, TlsRouterConnector, UdpConnector,
+    Client, ClientConfig, ConnectError, Connector, DatagramConnector, Established, Method, Pool,
+    RequestHead, SocketConfig, Target, TcpConnector, TlsRouterConnector, UdpConnector,
 };
-use netune_trace::TraceCollector;
-use tokio::time::timeout;
+use netune_trace::{DiagnosticPhase, TraceCollector};
+use tokio::time::{Instant as TokioInstant, timeout_at};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckError {
@@ -233,7 +233,7 @@ impl HttpMethod {
 
 /// Performs the HTTP probe for `tcp_check_url`.
 pub struct HttpChecker {
-    client: Client<TlsRouterConnector<TcpConnector>>,
+    client: Client,
     method: HttpMethod,
     timeout: Duration,
 }
@@ -253,15 +253,14 @@ impl HttpChecker {
     pub fn with_socket_config(self, config: SocketConfig) -> Self {
         let connector = TcpConnector::new()
             .with_socket_config(config)
-            .with_connect_timeout(Some(self.timeout));
-        let connector = TlsRouterConnector::new(connector);
+            .with_connect_timeout(None);
+        let connector = TlsRouterConnector::new(connector).with_handshake_timeout(None);
         let client = Client::new(
             connector,
             Pool::default(),
-            ClientConfig {
-                max_redirects: 0,
-                ..ClientConfig::default()
-            },
+            ClientConfig::default()
+                .with_max_redirects(0)
+                .with_h2_handshake_timeout(None),
         );
         Self {
             client,
@@ -271,12 +270,11 @@ impl HttpChecker {
     }
 
     pub fn new(method: HttpMethod, timeout: Duration) -> Self {
-        let connector = TcpConnector::new().with_connect_timeout(Some(timeout));
-        let connector = TlsRouterConnector::new(connector);
-        let config = ClientConfig {
-            max_redirects: 0,
-            ..ClientConfig::default()
-        };
+        let connector = TcpConnector::new().with_connect_timeout(None);
+        let connector = TlsRouterConnector::new(connector).with_handshake_timeout(None);
+        let config = ClientConfig::default()
+            .with_max_redirects(0)
+            .with_h2_handshake_timeout(None);
         Self {
             client: Client::new(connector, Pool::default(), config),
             method,
@@ -306,11 +304,10 @@ impl HttpChecker {
         url: &CheckUrl,
     ) -> Result<TimeSpan, CheckError> {
         let connector = TunnelConnector::new(established);
-        let connector = TlsRouterConnector::new(connector);
-        let config = ClientConfig {
-            max_redirects: 0,
-            ..ClientConfig::default()
-        };
+        let connector = TlsRouterConnector::new(connector).with_handshake_timeout(None);
+        let config = ClientConfig::default()
+            .with_max_redirects(0)
+            .with_h2_handshake_timeout(None);
         let client = Client::new(connector, Pool::default(), config);
         let target = match url.scheme() {
             Scheme::Http => Target::plain(url.host_header()),
@@ -323,7 +320,13 @@ impl HttpChecker {
         let response = tokio::time::timeout(self.timeout, client.request(&target, head, None))
             .await
             .map_err(|_| CheckError::Timeout)?
-            .map_err(|err| CheckError::Request(err.to_string()))?;
+            .map_err(|err| {
+                if err.is_timeout() {
+                    CheckError::Timeout
+                } else {
+                    CheckError::Request(err.to_string())
+                }
+            })?;
         let elapsed = started.elapsed();
         drop(response);
         Ok(TimeSpan::from_nanos(elapsed.as_nanos() as i64))
@@ -343,7 +346,13 @@ impl HttpChecker {
         let response = tokio::time::timeout(self.timeout, self.client.request(&target, head, None))
             .await
             .map_err(|_| CheckError::Timeout)?
-            .map_err(|err| CheckError::Request(err.to_string()))?;
+            .map_err(|err| {
+                if err.is_timeout() {
+                    CheckError::Timeout
+                } else {
+                    CheckError::Request(err.to_string())
+                }
+            })?;
         let elapsed = started.elapsed();
         drop(response);
         Ok(TimeSpan::from_nanos(elapsed.as_nanos() as i64))
@@ -388,9 +397,10 @@ impl Connector for TunnelConnector {
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .ok_or_else(|| {
-                netune::NetError::Connect(
-                    "the tunnel stream was already consumed; one request per tunnel".to_owned(),
-                )
+                netune::NetError::Connect(ConnectError::config(
+                    DiagnosticPhase::Dispatch,
+                    "the tunnel stream was already consumed; one request per tunnel",
+                ))
             })
     }
 }
@@ -429,11 +439,17 @@ impl TcpChecker {
         let recorder = TraceCollector::disabled();
 
         let started = Instant::now();
-        let established =
-            tokio::time::timeout(self.timeout, self.connector.connect(&target, &recorder))
-                .await
-                .map_err(|_| CheckError::Timeout)?
-                .map_err(|err| CheckError::Request(err.to_string()))?;
+        let established = self
+            .connector
+            .connect(&target, &recorder)
+            .await
+            .map_err(|err| {
+                if err.is_timeout() {
+                    CheckError::Timeout
+                } else {
+                    CheckError::Request(err.to_string())
+                }
+            })?;
         let elapsed = started.elapsed();
         drop(established);
         Ok(TimeSpan::from_nanos(elapsed.as_nanos() as i64))
@@ -472,7 +488,7 @@ impl UdpDnsChecker {
 
     pub fn new(timeout: Duration) -> Self {
         Self {
-            connector: UdpConnector::new().with_connect_timeout(Some(timeout)),
+            connector: UdpConnector::new().with_connect_timeout(None),
             timeout,
         }
     }
@@ -494,17 +510,24 @@ impl UdpDnsChecker {
     pub async fn check(&self, addr: SocketAddr) -> Result<TimeSpan, CheckError> {
         let recorder = TraceCollector::disabled();
         let started = Instant::now();
+        let deadline = TokioInstant::now() + self.timeout;
 
-        let session = timeout(
-            self.timeout,
+        let session = timeout_at(
+            deadline,
             self.connector.connect(&addr.to_string(), &recorder),
         )
         .await
         .map_err(|_| CheckError::Timeout)?
-        .map_err(|err| CheckError::Request(err.to_string()))?;
+        .map_err(|err| {
+            if err.is_timeout() {
+                CheckError::Timeout
+            } else {
+                CheckError::Request(err.to_string())
+            }
+        })?;
 
         let query = dns_probe_query();
-        timeout(self.timeout, session.datagrams.send(&query))
+        timeout_at(deadline, session.datagrams.send(&query))
             .await
             .map_err(|_| CheckError::Timeout)?
             .map_err(|err| CheckError::Request(err.to_string()))?;
@@ -513,7 +536,7 @@ impl UdpDnsChecker {
         // ignores the limit may send more; size from the session so the kernel
         // cannot truncate a reply into a false negative.
         let mut buffer = vec![0u8; session.datagrams.max_datagram_size().clamp(512, 4096)];
-        let received = timeout(self.timeout, session.datagrams.recv(&mut buffer))
+        let received = timeout_at(deadline, session.datagrams.recv(&mut buffer))
             .await
             .map_err(|_| CheckError::Timeout)?
             .map_err(|err| CheckError::Request(err.to_string()))?;

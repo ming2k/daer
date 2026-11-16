@@ -18,14 +18,15 @@
 //! Trojan has no confidentiality of its own, so a `trojan://` node that fell back to
 //! plaintext would put the password and the whole session on the wire in clear text. This
 //! module never constructs a plaintext connector: the only way to reach it is through
-//! [`netune::TlsConnector`], and the target always carries a server name.
+//! netune's owned TLS connector (`TlsRouterConnector` / `OwnedTlsConnector`), and the target
+//! always carries a server name.
 //!
 //! # What the protocol deliberately leaks, and what this refuses to do
 //!
 //! The handshake is length-prefixed by a fixed-size header, so a passive observer learns the
 //! shape of the first flight. Trojan's answer is to look like HTTPS — which is why the node is
-//! reached with a TLS fingerprint profile (see `[tls] profile`) rather than with
-//! rustls' default identity. This module does not invent a padding scheme or a fake HTTP
+//! reached with a TLS fingerprint profile (see `[tls] profile`) rather than with a generic
+//! stock client identity. This module does not invent a padding scheme or a fake HTTP
 //! request: an unauthenticated wrong guess about what a server expects is worse than a
 //! consistent identity, and the identity is what netune is for.
 //!
@@ -42,16 +43,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netune::{
-    Connector, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams, NetError,
-    Target, TlsConnector,
+    ConnectError, DatagramConnector, DatagramTransport, Established, EstablishedDatagrams,
+    NetError, TlsProfile,
 };
-use netune_trace::TraceCollector;
+use netune_trace::{DiagnosticPhase, TraceCollector};
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
-use crate::server::ServerConnector;
+use crate::server::ServerDialer;
 use crate::shadowsocks::connector::{encode_address, split_authority};
 
 /// The command byte for a TCP session.
@@ -220,9 +222,8 @@ pub fn request_header(authority: &str) -> Result<Vec<u8>, String> {
 #[derive(Clone)]
 pub struct TrojanConnector {
     link: Link,
-    /// The TLS stack, from netune. Trojan has no confidentiality of its own, so this is not
-    /// optional and there is no plaintext constructor.
-    tls: Arc<TlsConnector<ServerConnector>>,
+    base: Arc<dyn ServerDialer>,
+    tls_profile: TlsProfile,
     timeout: Duration,
 }
 
@@ -253,13 +254,12 @@ impl TrojanConnector {
             tag: None,
             allow_insecure,
         };
-        let config = crate::security::tls::profile_config(options.tls_profile, allow_insecure)?;
-        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
-            .with_handshake_timeout(None);
+        let tls_profile = crate::security::tls::resolve_profile(options.tls_profile)?;
 
         Ok(Self {
             link,
-            tls: Arc::new(tls),
+            base: options.base().clone(),
+            tls_profile,
             timeout: options.timeout,
         })
     }
@@ -268,23 +268,16 @@ impl TrojanConnector {
     ///
     /// # Errors
     ///
-    /// Returns [`ProxyProtocolError::UnsupportedLink`] when the link does not parse, and
-    /// [`ProxyProtocolError::Connect`] when the TLS profile cannot be built (a certificate store
-    /// that cannot be read is a system problem, not a link problem).
+    /// Returns [`ProxyProtocolError::UnsupportedLink`] when the link does not parse or the TLS
+    /// fingerprint preset is unknown.
     pub fn from_link(link: &str, options: DialerOptions) -> Result<Self, ProxyProtocolError> {
         let parsed = Link::parse(link).map_err(ProxyProtocolError::UnsupportedLink)?;
-
-        // The platform trust store, not a pinned set, unless the operator explicitly chose
-        // `allow-insecure`. The profile is compiled into the config here, so
-        // `tls.profile` reaches the wire for Trojan just as it does for VLESS/VMess.
-        let config =
-            crate::security::tls::profile_config(options.tls_profile, parsed.allow_insecure)?;
-        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
-            .with_handshake_timeout(None);
+        let tls_profile = crate::security::tls::resolve_profile(options.tls_profile)?;
 
         Ok(Self {
             link: parsed,
-            tls: Arc::new(tls),
+            base: options.base().clone(),
+            tls_profile,
             timeout: options.timeout,
         })
     }
@@ -296,18 +289,23 @@ impl TrojanConnector {
     }
 
     /// Opens the bare TCP stream to this Trojan server, before TLS and the request header.
-    ///
-    /// A plaintext target makes netune's TLS connector skip the handshake, which is exactly the
-    /// chain/probe primitive: the caller wants the socket, not the protected session.
     pub async fn connect_server(
         &self,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let target = Target::plain(self.link.server.clone());
-        tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
+        self.connect_server_within(recorder, Instant::now() + self.timeout)
             .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))
+    }
+
+    /// Opens the bare TCP stream to this Trojan server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base
+            .connect_within(&self.link.server, recorder, deadline)
+            .await
     }
 
     /// The TLS name presented for this node.
@@ -328,35 +326,72 @@ impl TrojanConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
+        self.connect_within(authority, recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens a session to `authority` (`host:port`) within a single shared `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
         let header = request_header(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
         let credential = self.link.credential();
 
-        // TLS to the node: the target carries the *node's* address and the name to verify,
-        // which is exactly what `Target::tls` exists for.
-        let target = Target::tls(&self.link.server, &self.link.server_name);
-        let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
-            .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        let tcp_established = self
+            .base
+            .connect_within(&self.link.server, recorder, deadline)
+            .await?;
+        let local_port = tcp_established.local_port;
+        let established = crate::security::tls::wrap_profile(
+            tcp_established.stream,
+            &self.tls_profile,
+            &self.link.server_name,
+            self.link.allow_insecure,
+            recorder,
+            deadline,
+        )
+        .await?;
 
         let mut stream = established.stream;
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
         // Credential and request go in one write: a server that sees the credential alone may
         // wait for the header, and two writes would add a round trip to every connection.
         let mut first_flight = Vec::with_capacity(credential.len() + header.len());
         first_flight.extend_from_slice(&credential);
         first_flight.extend_from_slice(&header);
-        stream
-            .write_all(&first_flight)
-            .await
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
-
-        Ok(Established {
-            stream,
-            local_port: established.local_port,
-            socket: established.socket,
-            alpn: established.alpn,
-            alpn_protocol: established.alpn_protocol,
+        tokio::time::timeout(remaining, async {
+            stream.write_all(&first_flight).await?;
+            stream.flush().await
         })
+        .await
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "Trojan first flight to {} exceeded {} ms",
+                    self.link.server,
+                    remaining.as_millis()
+                ),
+            )
+        })?
+        .map_err(|error| {
+            ProxyProtocolError::handshake(format!(
+                "write Trojan request to {}: {error}",
+                self.link.server
+            ))
+        })?;
+
+        Ok(Established::new(stream)
+            .with_local_port(local_port)
+            .with_socket(established.socket)
+            .with_alpn(established.alpn, established.alpn_protocol))
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this Trojan node.
@@ -371,35 +406,65 @@ impl TrojanConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
+        let deadline = Instant::now() + self.timeout;
         let (host, port) = split_authority(authority).map_err(NetError::Protocol)?;
         let addr_bytes = encode_address(host, port).map_err(NetError::Protocol)?;
         let header = request_header_udp(authority).map_err(NetError::Protocol)?;
         let credential = self.link.credential();
 
-        let target = Target::tls(&self.link.server, &self.link.server_name);
-        let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
+        let tcp_established = self
+            .base
+            .connect_within(&self.link.server, recorder, deadline)
             .await
-            .map_err(|_| NetError::Connect(format!("timeout connecting to {}", self.link.server)))?
-            .map_err(|error| NetError::Connect(error.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.link.server))?;
+        let local_port = tcp_established.local_port;
+        let established = crate::security::tls::wrap_profile(
+            tcp_established.stream,
+            &self.tls_profile,
+            &self.link.server_name,
+            self.link.allow_insecure,
+            recorder,
+            deadline,
+        )
+        .await
+        .map_err(|error| error.into_net_error(&self.link.server_name))?;
 
         let mut stream = established.stream;
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )
+        .map_err(|error| error.into_net_error(authority))?;
         let mut first_flight = Vec::with_capacity(credential.len() + header.len());
         first_flight.extend_from_slice(&credential);
         first_flight.extend_from_slice(&header);
-        stream
-            .write_all(&first_flight)
-            .await
-            .map_err(|error| NetError::Connect(error.to_string()))?;
-        stream
-            .flush()
-            .await
-            .map_err(|error| NetError::Connect(error.to_string()))?;
+        tokio::time::timeout(remaining, async {
+            stream.write_all(&first_flight).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| {
+            NetError::Connect(ConnectError::timeout(
+                DiagnosticPhase::Proxy,
+                &self.link.server,
+                "Trojan UDP handshake",
+                remaining,
+            ))
+        })?
+        .map_err(|error| {
+            NetError::Connect(ConnectError::io(
+                DiagnosticPhase::Proxy,
+                &self.link.server,
+                error,
+            ))
+        })?;
 
         let (read, write) = tokio::io::split(stream);
         let session = TrojanDatagramSession::new(read, write, addr_bytes);
         Ok(EstablishedDatagrams {
             datagrams: Box::new(session),
-            local_port: established.local_port,
+            local_port,
         })
     }
 }

@@ -325,9 +325,10 @@ action = "block"
     let stats = metrics.metrics().snapshot();
     assert_eq!(stats.accepted, 1, "{stats:?}");
     assert_eq!(
-        stats.failed, 1,
-        "the group/block path must be counted: {stats:?}"
+        stats.rejected, 1,
+        "the group/block path must be counted as rejected: {stats:?}"
     );
+    assert_eq!(stats.failed, 0, "{stats:?}");
 }
 
 #[tokio::test]

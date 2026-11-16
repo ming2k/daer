@@ -28,7 +28,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ("TcpListener::bind", "the CLI does not own an IP listener"),
     (
         "tokio_rustls",
-        "TLS handshakes belong to netune's TlsConnector",
+        "TLS handshakes belong to netune's TlsRouterConnector",
     ),
 ];
 

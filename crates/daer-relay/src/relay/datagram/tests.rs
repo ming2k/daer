@@ -311,6 +311,7 @@ async fn one_session_per_peer_and_the_table_is_capped() {
         .with_idle_timeout(Duration::from_secs(3600));
     let stats = Arc::new(DatagramStats::default());
     let peers: Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let negative_refusals = Arc::new(Mutex::new(NegativeRefusalCache::default()));
     let router: Arc<dyn DatagramRouter> = Arc::new(cooperative_router());
 
     let service = DatagramService {
@@ -327,9 +328,16 @@ async fn one_session_per_peer_and_the_table_is_capped() {
             client: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             destination,
         };
-        let peer = peer_for(&peers, key, daer_observe::FlowId::new(1), &[], &service)
-            .await
-            .expect("a direct session opens");
+        let peer = peer_for(
+            &peers,
+            &negative_refusals,
+            key,
+            daer_observe::FlowId::new(1),
+            &[],
+            &service,
+        )
+        .await
+        .expect("a direct session opens");
         assert!(Arc::ptr_eq(&peer, &peers.lock().await[&key]));
     }
     assert_eq!(peers.lock().await.len(), 2);
@@ -340,9 +348,16 @@ async fn one_session_per_peer_and_the_table_is_capped() {
         destination,
     };
     assert!(
-        peer_for(&peers, third, daer_observe::FlowId::new(1), &[], &service)
-            .await
-            .is_none(),
+        peer_for(
+            &peers,
+            &negative_refusals,
+            third,
+            daer_observe::FlowId::new(1),
+            &[],
+            &service
+        )
+        .await
+        .is_none(),
         "a full table must refuse, not evict"
     );
     assert_eq!(peers.lock().await.len(), 2);
@@ -357,6 +372,7 @@ async fn an_ipv6_peer_is_tracked_separately_from_an_ipv4_one() {
     let options = RelayOptions::default().with_idle_timeout(Duration::from_secs(3600));
     let stats = Arc::new(DatagramStats::default());
     let peers: Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let negative_refusals = Arc::new(Mutex::new(NegativeRefusalCache::default()));
     let router: Arc<dyn DatagramRouter> = Arc::new(cooperative_router());
 
     let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
@@ -372,9 +388,16 @@ async fn an_ipv6_peer_is_tracked_separately_from_an_ipv4_one() {
             client: address,
             destination,
         };
-        peer_for(&peers, key, daer_observe::FlowId::new(1), &[], &service)
-            .await
-            .expect("direct session opens");
+        peer_for(
+            &peers,
+            &negative_refusals,
+            key,
+            daer_observe::FlowId::new(1),
+            &[],
+            &service,
+        )
+        .await
+        .expect("direct session opens");
     }
     assert_eq!(peers.lock().await.len(), 2);
 }
@@ -538,4 +561,170 @@ async fn echo_origin() -> (SocketAddr, Arc<AtomicUsize>) {
         }
     });
     (address, seen)
+}
+
+#[derive(Debug)]
+struct CountingFailingRouter {
+    code: daer_observe::ErrorCode,
+    calls: AtomicUsize,
+}
+
+impl DatagramRouter for CountingFailingRouter {
+    fn open_datagram<'a>(
+        &'a self,
+        _facts: crate::inbound::FlowFacts,
+        _initial_payload: &'a [u8],
+    ) -> OpenDatagram<'a> {
+        let code = self.code;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            Err(DialFailure::new(
+                daer_observe::DialStage::Policy,
+                code,
+                "refused by test double",
+            ))
+        })
+    }
+}
+
+#[test]
+fn negative_refusal_cache_suppresses_persistent_codes_until_ttl_and_bounds_capacity() {
+    use daer_observe::diagnostic::codes;
+    let t0 = Instant::now();
+    let mut cache = NegativeRefusalCache::new(Duration::from_secs(10), 2);
+    let key1 = (
+        std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 443)),
+    );
+    let key2 = (
+        std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 443)),
+    );
+    let key3 = (
+        std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        SocketAddr::from((Ipv4Addr::new(9, 9, 9, 9), 443)),
+    );
+
+    cache.record(key1, codes::RELAY_DIAL_NO_DATAGRAM, t0);
+    assert!(cache.is_suppressed(key1, t0 + Duration::from_secs(5)));
+    // Falsifier for TTL expiry: once the TTL elapses, suppression stops and entry clears.
+    assert!(!cache.is_suppressed(key1, t0 + Duration::from_secs(10)));
+
+    // Capacity bound: adding three keys with cap = 2 retains only 2 entries.
+    cache.record(
+        key1,
+        codes::RELAY_DIAL_UNSUPPORTED,
+        t0 + Duration::from_secs(11),
+    );
+    cache.record(
+        key2,
+        codes::RELAY_DIAL_NO_NODE,
+        t0 + Duration::from_secs(12),
+    );
+    cache.record(
+        key3,
+        codes::RELAY_DIAL_UNKNOWN_ELECTION,
+        t0 + Duration::from_secs(13),
+    );
+    assert_eq!(cache.entries.len(), 2);
+    assert!(!cache.is_suppressed(key1, t0 + Duration::from_secs(13)));
+    assert!(cache.is_suppressed(key2, t0 + Duration::from_secs(13)));
+    assert!(cache.is_suppressed(key3, t0 + Duration::from_secs(13)));
+}
+
+#[test]
+fn negative_refusal_cache_never_suppresses_transient_errors() {
+    // Falsifier for error code filter: timeouts/connect errors are transient and must not
+    // enter the negative refusal cache.
+    use daer_observe::diagnostic::codes;
+    let now = Instant::now();
+    let mut cache = NegativeRefusalCache::new(Duration::from_secs(10), 16);
+    let key = (
+        std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 443)),
+    );
+    cache.record(key, codes::RELAY_DIAL_TIMEOUT, now);
+    cache.record(key, codes::RELAY_DIAL_CONNECT, now);
+    assert!(!cache.is_suppressed(key, now + Duration::from_millis(1)));
+}
+
+#[tokio::test]
+async fn repeated_persistent_refusals_short_circuit_router_while_transient_ones_retry() {
+    use daer_observe::diagnostic::codes;
+    let destination: SocketAddr = "1.1.1.1:443".parse().expect("addr");
+    let ingress = LoopbackIngress::bind(destination).await;
+    let ingress_dyn = as_ingress(&ingress);
+    let persistent_router = Arc::new(CountingFailingRouter {
+        code: codes::RELAY_DIAL_NO_DATAGRAM,
+        calls: AtomicUsize::new(0),
+    });
+    let stats = Arc::new(DatagramStats::default());
+    let peers: Arc<Mutex<HashMap<SessionKey, Arc<Peer>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let negative_refusals = Arc::new(Mutex::new(NegativeRefusalCache::default()));
+    let service = DatagramService {
+        ingress: Arc::clone(&ingress_dyn),
+        router: Arc::clone(&persistent_router) as Arc<dyn DatagramRouter>,
+        options: RelayOptions::default(),
+        stats: Arc::clone(&stats),
+    };
+
+    for port in [30001u16, 30002, 30003] {
+        let key = SessionKey {
+            client: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            destination,
+        };
+        assert!(
+            peer_for(
+                &peers,
+                &negative_refusals,
+                key,
+                daer_observe::FlowId::new(1),
+                b"quic",
+                &service,
+            )
+            .await
+            .is_none()
+        );
+    }
+    assert_eq!(
+        persistent_router.calls.load(Ordering::Relaxed),
+        1,
+        "repeated persistent refusals from the same client IP + destination must short-circuit"
+    );
+
+    // Falsifier: transient timeouts must continue invoking the router every time.
+    let transient_router = Arc::new(CountingFailingRouter {
+        code: codes::RELAY_DIAL_TIMEOUT,
+        calls: AtomicUsize::new(0),
+    });
+    let transient_service = DatagramService {
+        ingress: ingress_dyn,
+        router: Arc::clone(&transient_router) as Arc<dyn DatagramRouter>,
+        options: RelayOptions::default(),
+        stats,
+    };
+    let transient_cache = Arc::new(Mutex::new(NegativeRefusalCache::default()));
+    for port in [40001u16, 40002, 40003] {
+        let key = SessionKey {
+            client: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            destination,
+        };
+        assert!(
+            peer_for(
+                &peers,
+                &transient_cache,
+                key,
+                daer_observe::FlowId::new(2),
+                b"quic",
+                &transient_service,
+            )
+            .await
+            .is_none()
+        );
+    }
+    assert_eq!(
+        transient_router.calls.load(Ordering::Relaxed),
+        3,
+        "transient dial timeouts must never be suppressed by the negative cache"
+    );
 }

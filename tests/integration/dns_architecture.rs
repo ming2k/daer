@@ -3,7 +3,7 @@
 //! Enforces the transport boundary of the DNS crate.
 //!
 //! DNS upstreams are generic network clients and therefore belong to netune's
-//! `UdpConnector`/`TcpConnector`/`TlsConnector`/`Client`; the DNS *server* listener is the
+//! `UdpConnector`/`TcpConnector`/`TlsRouterConnector`/`Client`; the DNS *server* listener is the
 //! one deliberate exception because it is the transparent resolver's inbound role. A raw
 //! `UdpSocket` or `TcpStream` in a transport module would mean the daemon's `SocketConfig`
 //! and trace are no longer applied uniformly.
@@ -30,7 +30,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ),
     (
         "tokio_rustls",
-        "TLS handshakes belong to netune's TlsConnector",
+        "TLS handshakes belong to netune's TlsRouterConnector",
     ),
 ];
 

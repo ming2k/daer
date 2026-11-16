@@ -6,18 +6,17 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use netune::{
-    Connector, DatagramConnector, Established, EstablishedDatagrams, NetError, Target, TlsConnector,
-};
+use netune::{DatagramConnector, Established, EstablishedDatagrams, NetError, TlsProfile};
 use netune_trace::TraceCollector;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::anytls::auth::send_authentication;
 use crate::anytls::datagram::{AnyTlsDatagramConnector, AnyTlsDatagramSession, UOT_MAGIC_ADDRESS};
 use crate::anytls::session::AnyTlsSession;
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
-use crate::server::ServerConnector;
+use crate::server::ServerDialer;
 use crate::shadowsocks::connector::{encode_address, split_authority};
 
 /// An AnyTLS outbound connector.
@@ -29,7 +28,8 @@ pub struct AnyTlsConnector {
     allow_insecure: bool,
     idle_sessions: usize,
     timeout: Duration,
-    tls: Arc<TlsConnector<ServerConnector>>,
+    base: Arc<dyn ServerDialer>,
+    tls_profile: TlsProfile,
     sessions: Arc<Mutex<Vec<Arc<AnyTlsSession>>>>,
 }
 
@@ -57,9 +57,7 @@ impl AnyTlsConnector {
         options: DialerOptions,
     ) -> Result<Self, ProxyProtocolError> {
         let server_name = sni.unwrap_or(server).to_owned();
-        let config = crate::security::tls::profile_config(options.tls_profile, allow_insecure)?;
-        let tls = TlsConnector::new(ServerConnector::new(options.base().clone()), config)
-            .with_handshake_timeout(None);
+        let tls_profile = crate::security::tls::resolve_profile(options.tls_profile)?;
 
         Ok(Self {
             server: format!("{server}:{port}"),
@@ -68,7 +66,8 @@ impl AnyTlsConnector {
             allow_insecure,
             idle_sessions: idle_sessions.max(1),
             timeout: options.timeout,
-            tls: Arc::new(tls),
+            base: options.base().clone(),
+            tls_profile,
             sessions: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -114,11 +113,19 @@ impl AnyTlsConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let target = Target::plain(self.server.clone());
-        tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
+        self.connect_server_within(recorder, Instant::now() + self.timeout)
             .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))
+    }
+
+    /// Opens the bare TCP stream to this AnyTLS server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base
+            .connect_within(&self.server, recorder, deadline)
+            .await
     }
 
     /// Returns a shared datagram connector for this AnyTLS node.
@@ -132,7 +139,33 @@ impl AnyTlsConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<Arc<AnyTlsSession>, ProxyProtocolError> {
-        let mut pool = self.sessions.lock().await;
+        self.get_or_dial_session_within(recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Retrieves an active session from the pool or establishes a new authenticated session within `deadline`.
+    pub async fn get_or_dial_session_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Arc<AnyTlsSession>, ProxyProtocolError> {
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            &self.server,
+        )?;
+        let mut pool = tokio::time::timeout_at(deadline, self.sessions.lock())
+            .await
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Handshake,
+                    format!(
+                        "AnyTLS session dial to {} exceeded {} ms",
+                        self.server,
+                        remaining.as_millis()
+                    ),
+                )
+            })?;
 
         // Cull dead sessions
         pool.retain(|s| !s.is_closed());
@@ -142,21 +175,50 @@ impl AnyTlsConnector {
             return Ok(Arc::clone(existing));
         }
 
-        // Establish new session over TLS
-        let target = Target::tls(&self.server, &self.server_name);
-
-        let established = tokio::time::timeout(self.timeout, self.tls.connect(&target, recorder))
-            .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        let tcp_established = self
+            .base
+            .connect_within(&self.server, recorder, deadline)
+            .await?;
+        let established = crate::security::tls::wrap_profile(
+            tcp_established.stream,
+            &self.tls_profile,
+            &self.server_name,
+            self.allow_insecure,
+            recorder,
+            deadline,
+        )
+        .await?;
 
         let alpn_protocol = established.alpn_protocol;
         let mut stream = established.stream;
 
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            &self.server,
+        )?;
         // Perform AnyTLS client authentication flight
-        send_authentication(&mut stream, &self.password, 0)
-            .await
-            .map_err(|error| ProxyProtocolError::Connect(error.to_string()))?;
+        tokio::time::timeout(
+            remaining,
+            send_authentication(&mut stream, &self.password, 0),
+        )
+        .await
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "AnyTLS authentication with {} exceeded {} ms",
+                    self.server,
+                    remaining.as_millis()
+                ),
+            )
+        })?
+        .map_err(|error| {
+            ProxyProtocolError::handshake(format!(
+                "AnyTLS authentication with {}: {error}",
+                self.server
+            ))
+        })?;
 
         let session = AnyTlsSession::new(stream, alpn_protocol);
         pool.push(Arc::clone(&session));
@@ -170,20 +232,25 @@ impl AnyTlsConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let session = self.get_or_dial_session(recorder).await?;
-        let virtual_stream = session.open_stream(authority).await?;
+        self.connect_within(authority, recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Connects a TCP stream through this AnyTLS node to `authority` within `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        let session = self.get_or_dial_session_within(recorder, deadline).await?;
+        let virtual_stream = session.open_stream_within(authority, deadline).await?;
         let alpn_protocol = session.alpn_protocol().map(<[u8]>::to_vec);
         let alpn = alpn_protocol
             .as_deref()
             .map(|name| netune_trace::Alpn::from_name(Some(name)));
 
-        Ok(Established {
-            stream: Box::new(virtual_stream),
-            local_port: None,
-            socket: None,
-            alpn,
-            alpn_protocol,
-        })
+        Ok(Established::new(Box::new(virtual_stream)).with_alpn(alpn, alpn_protocol))
     }
 
     /// Connects a UDP datagram session through this AnyTLS node to `authority`.
@@ -192,16 +259,17 @@ impl AnyTlsConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
+        let deadline = Instant::now() + self.timeout;
         let session = self
-            .get_or_dial_session(recorder)
+            .get_or_dial_session_within(recorder, deadline)
             .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.server))?;
 
         // Open UoT tunnel stream
         let stream = session
-            .open_stream(UOT_MAGIC_ADDRESS)
+            .open_stream_within(UOT_MAGIC_ADDRESS, deadline)
             .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.server))?;
 
         let (host, port) = split_authority(authority).map_err(NetError::Protocol)?;
         let target_addr = encode_address(host, port).map_err(NetError::Protocol)?;

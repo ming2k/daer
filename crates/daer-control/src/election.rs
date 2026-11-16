@@ -86,11 +86,14 @@ impl ElectionOverrides {
                     path = %path.display(),
                     schema = state.schema,
                     expected = SCHEMA,
+                    error = "unknown schema",
                     "election state has an unknown schema; ignoring it"
                 ),
                 Err(error) => daer_observe::warn!(
                     daer_observe::EventCode::ElectionStateRejected,
                     path = %path.display(),
+                    schema = 0u32,
+                    expected = SCHEMA,
                     %error,
                     "election state is not readable JSON; ignoring it"
                 ),

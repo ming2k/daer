@@ -478,73 +478,31 @@ fn check_file(path: &Path, expected: &str) -> Result<(), String> {
     ))
 }
 
-/// Scans the workspace for raw `tracing` macros and call-site level mismatches.
+/// Scans the workspace for raw `tracing` macros, severity mismatches, and missing catalog fields.
 fn check_sources(root: &Path, catalog: &Catalog) -> Result<(), String> {
-    let levels: BTreeMap<&str, &str> = catalog
+    let spec_by_name: BTreeMap<&str, &Event> = catalog
         .events
         .iter()
-        .map(|event| (event.name.as_str(), event.level.as_str()))
+        .map(|event| (event.name.as_str(), event))
         .collect();
     let mut errors = Vec::new();
 
     for path in source_files(root) {
         let relative = path.strip_prefix(root).unwrap_or(&path);
         let relative = relative.to_string_lossy();
-        let allowed = relative.starts_with("crates/daer-observe/src/")
+        let allow_raw_tracing = relative.starts_with("crates/daer-observe/src/")
             || relative == "crates/daer-cli/src/main.rs"
             || relative.starts_with("crates/daer-cli/src/diagnostics/")
             || relative == "crates/xtask/src/events.rs";
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        for (index, line) in text.lines().enumerate() {
-            let line_number = index + 1;
-            if !allowed && line.contains("tracing::") {
-                // Comments are allowed to name the old mechanism; a macro invocation is not.
-                let code = line.split("//").next().unwrap_or("");
-                if code.contains("tracing::") {
-                    errors.push(format!(
-                        "{}:{line_number}: raw tracing macro; use daer_observe::EventCode",
-                        relative
-                    ));
-                }
-            }
-            for macro_name in ["trace", "debug", "info", "warn", "error"] {
-                let needle = format!("daer_observe::{macro_name}!(");
-                if line.contains(&needle) {
-                    // A call may put the code on the next line. Search the next few lines,
-                    // not the whole file: a missing code must not borrow the next event's.
-                    let window = text
-                        .lines()
-                        .skip(index)
-                        .take(6)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let Some(code_at) = window.find("EventCode::") else {
-                        errors.push(format!(
-                            "{}:{line_number}: daer_observe::{macro_name}! without an EventCode",
-                            relative
-                        ));
-                        continue;
-                    };
-                    let rest = &window[code_at + "EventCode::".len()..];
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    match levels.get(name.as_str()) {
-                        Some(level) if *level == macro_name => {}
-                        Some(level) => errors.push(format!(
-                            "{}:{line_number}: {name} is declared {level} but emitted with {macro_name}!",
-                            relative
-                        )),
-                        None => errors.push(format!(
-                            "{}:{line_number}: {name} is not in the event catalog",
-                            relative
-                        )),
-                    }
-                }
-            }
-        }
+        check_source_text(
+            &relative,
+            &text,
+            allow_raw_tracing,
+            &spec_by_name,
+            &mut errors,
+        );
     }
 
     if errors.is_empty() {
@@ -554,6 +512,363 @@ fn check_sources(root: &Path, catalog: &Catalog) -> Result<(), String> {
         errors.dedup();
         Err(errors.join("\n"))
     }
+}
+
+fn check_source_text(
+    relative: &str,
+    text: &str,
+    allow_raw_tracing: bool,
+    spec_by_name: &BTreeMap<&str, &Event>,
+    errors: &mut Vec<String>,
+) {
+    if !allow_raw_tracing {
+        for (index, line) in text.lines().enumerate() {
+            let line_number = index + 1;
+            if line.contains("tracing::") {
+                // Comments are allowed to name the old mechanism; a macro invocation is not.
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("tracing::") {
+                    errors.push(format!(
+                        "{relative}:{line_number}: raw tracing macro; use daer_observe::EventCode",
+                    ));
+                }
+            }
+        }
+    }
+
+    let invocations = scan_event_invocations(text);
+    for inv in invocations {
+        let line_number = inv.line;
+        let macro_name = inv.macro_name;
+        let args = split_top_level_args(&inv.args_body);
+        let Some(first_arg) = args.first() else {
+            errors.push(format!(
+                "{relative}:{line_number}: daer_observe::{macro_name}! without arguments",
+            ));
+            continue;
+        };
+        let Some(code_at) = first_arg.find("EventCode::") else {
+            errors.push(format!(
+                "{relative}:{line_number}: daer_observe::{macro_name}! without an EventCode",
+            ));
+            continue;
+        };
+        let rest = &first_arg[code_at + "EventCode::".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let Some(event) = spec_by_name.get(name.as_str()).copied() else {
+            errors.push(format!(
+                "{relative}:{line_number}: {name} is not in the event catalog",
+            ));
+            continue;
+        };
+        if event.level != macro_name {
+            errors.push(format!(
+                "{relative}:{line_number}: {name} is declared {} but emitted with {macro_name}!",
+                event.level
+            ));
+        }
+
+        let supplied = extract_supplied_fields(&args[1..]);
+        let missing: Vec<&str> = event
+            .fields
+            .iter()
+            .map(String::as_str)
+            .filter(|required| !supplied.contains(*required))
+            .collect();
+        if !missing.is_empty() {
+            errors.push(format!(
+                "{relative}:{line_number}: {name} is missing catalog field(s): {}",
+                missing.join(", ")
+            ));
+        }
+    }
+}
+
+struct EventInvocation {
+    line: usize,
+    macro_name: &'static str,
+    args_body: String,
+}
+
+fn scan_event_invocations(text: &str) -> Vec<EventInvocation> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut line = 1usize;
+
+    while i < bytes.len() {
+        if let Some((next, lines_added)) = skip_non_code_token(text, i) {
+            line += lines_added;
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if let Some((macro_name, open_paren_at)) = match_macro_at(text, i) {
+            let call_line = line;
+            if let Some((close_at, span_lines)) = find_matching_paren(text, open_paren_at) {
+                out.push(EventInvocation {
+                    line: call_line,
+                    macro_name,
+                    args_body: text[open_paren_at + 1..close_at].to_owned(),
+                });
+                line += span_lines;
+                i = close_at + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    out
+}
+
+fn match_macro_at(text: &str, at: usize) -> Option<(&'static str, usize)> {
+    // Require word/path boundary so e.g. `foo_daer_observe::warn!(` cannot match accidentally.
+    if at > 0 {
+        let prev = text.as_bytes()[at - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let tail = text.get(at..)?;
+    let rest = tail.strip_prefix("daer_observe::")?;
+    for macro_name in ["trace", "debug", "info", "warn", "error"] {
+        if let Some(after_name) = rest.strip_prefix(macro_name) {
+            let mut offset = "daer_observe::".len() + macro_name.len();
+            let after_ws = after_name.trim_start();
+            offset += after_name.len() - after_ws.len();
+            if let Some(after_bang) = after_ws.strip_prefix('!') {
+                offset += 1;
+                let after_bang_ws = after_bang.trim_start();
+                offset += after_bang.len() - after_bang_ws.len();
+                if after_bang_ws.starts_with('(') {
+                    return Some((macro_name, at + offset));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_matching_paren(text: &str, open_at: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = open_at + 1;
+    let mut depth = 1usize;
+    let mut lines = 0usize;
+
+    while i < bytes.len() {
+        if let Some((next, added)) = skip_non_code_token(text, i) {
+            lines += added;
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'\n' => lines += 1,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, lines));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skips strings, raw strings, line comments, and block comments starting at `at`.
+fn skip_non_code_token(text: &str, at: usize) -> Option<(usize, usize)> {
+    let tail = text.get(at..)?;
+    let bytes = tail.as_bytes();
+    if bytes.starts_with(b"//") {
+        let end = tail.find('\n').map_or(text.len(), |off| at + off);
+        return Some((end, 0));
+    }
+    if bytes.starts_with(b"/*") {
+        let mut depth = 1usize;
+        let mut idx = 2usize;
+        let mut lines = 0usize;
+        while idx < bytes.len() && depth > 0 {
+            if bytes[idx..].starts_with(b"/*") {
+                depth += 1;
+                idx += 2;
+            } else if bytes[idx..].starts_with(b"*/") {
+                depth -= 1;
+                idx += 2;
+            } else {
+                if bytes[idx] == b'\n' {
+                    lines += 1;
+                }
+                idx += 1;
+            }
+        }
+        return Some((at + idx, lines));
+    }
+    if bytes.starts_with(b"\"") || bytes.starts_with(b"b\"") {
+        let start = if bytes.starts_with(b"b\"") { 2 } else { 1 };
+        let mut idx = start;
+        let mut lines = 0usize;
+        while idx < bytes.len() {
+            if bytes[idx] == b'\\' {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+                    lines += 1;
+                }
+                idx = (idx + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[idx] == b'"' {
+                return Some((at + idx + 1, lines));
+            }
+            if bytes[idx] == b'\n' {
+                lines += 1;
+            }
+            idx += 1;
+        }
+        return Some((text.len(), lines));
+    }
+    if bytes.starts_with(b"r\"") || bytes.starts_with(b"r#") {
+        let mut hashes = 0usize;
+        let mut idx = 1usize;
+        while idx < bytes.len() && bytes[idx] == b'#' {
+            hashes += 1;
+            idx += 1;
+        }
+        if idx < bytes.len() && bytes[idx] == b'"' {
+            idx += 1;
+            let mut lines = 0usize;
+            while idx < bytes.len() {
+                if bytes[idx] == b'"'
+                    && bytes[idx + 1..].len() >= hashes
+                    && bytes[idx + 1..idx + 1 + hashes].iter().all(|&b| b == b'#')
+                {
+                    return Some((at + idx + 1 + hashes, lines));
+                }
+                if bytes[idx] == b'\n' {
+                    lines += 1;
+                }
+                idx += 1;
+            }
+            return Some((text.len(), lines));
+        }
+    }
+    None
+}
+
+fn split_top_level_args(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut depth = 0usize;
+
+    while i < bytes.len() {
+        if let Some((next, _)) = skip_non_code_token(body, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                args.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !body[start..].trim().is_empty() {
+        args.push(&body[start..]);
+    }
+    args
+}
+
+fn strip_leading_comments_and_ws(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("//") {
+            s = rest.split_once('\n').map_or("", |(_, after)| after);
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.split_once("*/").map_or("", |(_, after)| after);
+            continue;
+        }
+        return s;
+    }
+}
+
+fn extract_supplied_fields(args: &[&str]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for &raw in args {
+        let trimmed = strip_leading_comments_and_ws(raw).trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Once the trailing message format string literal starts, remaining args are format
+        // arguments rather than structured tracing fields.
+        if trimmed.starts_with('"') || trimmed.starts_with("r\"") || trimmed.starts_with("r#\"") {
+            break;
+        }
+        if let Some(eq_at) = find_top_level_assignment(trimmed) {
+            let lhs = strip_leading_comments_and_ws(&trimmed[..eq_at]).trim();
+            let normalized: String = lhs.chars().filter(|c| !c.is_whitespace()).collect();
+            if !normalized.is_empty() {
+                out.insert(normalized);
+            }
+            continue;
+        }
+        let shorthand = trimmed
+            .strip_prefix('%')
+            .or_else(|| trimmed.strip_prefix('?'))
+            .unwrap_or(trimmed);
+        let shorthand = strip_leading_comments_and_ws(shorthand);
+        let name: String = shorthand
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+fn find_top_level_assignment(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some((next, _)) = skip_non_code_token(expr, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'=' if depth == 0 => {
+                let prev = i.checked_sub(1).map(|idx| bytes[idx]);
+                let next = bytes.get(i + 1).copied();
+                if !matches!(prev, Some(b'=' | b'!' | b'<' | b'>'))
+                    && !matches!(next, Some(b'=' | b'>'))
+                {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn source_files(root: &Path) -> Vec<PathBuf> {
@@ -618,5 +933,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn event_fixture(name: &'static str, level: &'static str, fields: &[&'static str]) -> Event {
+        Event {
+            name: name.to_owned(),
+            code: format!("test.{name}"),
+            level: level.to_owned(),
+            message: name.to_owned(),
+            fields: fields.iter().map(|s| (*s).to_owned()).collect(),
+            counter: None,
+            rate: None,
+            remediation: None,
+        }
+    }
+
+    #[test]
+    fn check_source_text_accepts_valid_multiline_and_shorthand_fields() {
+        let ev = event_fixture(
+            "FlowClosed",
+            "debug",
+            &["flow_id", "destination", "outcome", "reaped"],
+        );
+        let specs = BTreeMap::from([(ev.name.as_str(), &ev)]);
+        let src = r#"
+            // daer_observe::warn!(EventCode::FlowClosed, "comment must be ignored");
+            daer_observe::debug!(
+                daer_observe::EventCode::FlowClosed,
+                flow_id = %id,
+                %destination,
+                outcome = "clean",
+                // field comment
+                reaped,
+                "flow closed: {}",
+                extra_fmt
+            );
+        "#;
+        let mut errors = Vec::new();
+        check_source_text("test.rs", src, false, &specs, &mut errors);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn check_source_text_rejects_missing_catalog_field() {
+        // Falsifier for field enforcement: omitting `error_code` must be caught even when
+        // severity and EventCode match.
+        let ev = event_fixture(
+            "FlowDialFailed",
+            "warn",
+            &["flow_id", "stage", "error_code", "detail"],
+        );
+        let specs = BTreeMap::from([(ev.name.as_str(), &ev)]);
+        let src = r#"
+            daer_observe::warn!(
+                daer_observe::EventCode::FlowDialFailed,
+                flow_id = %id,
+                stage = "tcp",
+                detail = %err,
+                "flow dial failed"
+            );
+        "#;
+        let mut errors = Vec::new();
+        check_source_text("test.rs", src, false, &specs, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("error_code"), "{errors:?}");
     }
 }

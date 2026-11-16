@@ -14,6 +14,7 @@
 //! * `best` is cached so the hot path does not scan.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use daer_config::TimeSpan;
 use daer_primitives::SelectionPolicy;
@@ -26,6 +27,11 @@ pub struct DialerId(pub u64);
 const INIT: isize = 1;
 const NOT_ALIVE: isize = 2;
 
+/// Default consecutive runtime dial failures before passive cooldown triggers.
+pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+/// Default duration a passively cooled-down candidate is skipped.
+pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// The latency a set uses before any dialer has been measured.
 const STARTING_SORTING_LATENCY: TimeSpan = TimeSpan::from_secs(3600);
 
@@ -33,6 +39,23 @@ const STARTING_SORTING_LATENCY: TimeSpan = TimeSpan::from_secs(3600);
 struct AliveEntry {
     dialer: DialerId,
     sorting_latency: TimeSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FailureState {
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+/// Outcome returned by [`AliveDialerSet::record_dial_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CooldownOutcome {
+    /// True only on the transition into cooldown (so concurrent failures emit one warning).
+    pub entered_cooldown: bool,
+    /// Current consecutive failure count recorded for the dialer.
+    pub consecutive_failures: u32,
+    /// Cooldown duration applied when [`Self::entered_cooldown`] is true.
+    pub cooldown: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,10 +70,13 @@ pub struct NotifyOutcome {
 pub struct AliveDialerSet {
     policy: SelectionPolicy,
     tolerance: TimeSpan,
+    failure_threshold: u32,
+    cooldown: Duration,
     /// `>= 0` is the index in `entries`; `-1` never seen; `-2` not alive.
     index: HashMap<DialerId, isize>,
     offsets: HashMap<DialerId, TimeSpan>,
     latencies: HashMap<DialerId, TimeSpan>,
+    failures: HashMap<DialerId, FailureState>,
     entries: Vec<AliveEntry>,
     best: Option<AliveEntry>,
 }
@@ -72,12 +98,25 @@ impl AliveDialerSet {
         Self {
             policy,
             tolerance,
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            cooldown: DEFAULT_COOLDOWN,
             index,
             offsets,
             latencies: HashMap::new(),
+            failures: HashMap::new(),
             entries: Vec::new(),
             best: None,
         }
+    }
+
+    /// Configures passive cooldown after `failure_threshold` consecutive dial failures.
+    ///
+    /// A threshold of `0` or a zero `cooldown` disables passive cooldown.
+    #[must_use]
+    pub fn with_passive_cooldown(mut self, failure_threshold: u32, cooldown: Duration) -> Self {
+        self.failure_threshold = failure_threshold;
+        self.cooldown = cooldown;
+        self
     }
 
     pub fn policy(&self) -> SelectionPolicy {
@@ -170,6 +209,8 @@ impl AliveDialerSet {
         let old_best = self.best;
 
         if alive {
+            // An active health probe confirming the node alive ends any passive cooldown.
+            self.failures.remove(&dialer);
             if current_index < 0 {
                 self.index.insert(dialer, self.entries.len() as isize);
                 self.entries.push(AliveEntry {
@@ -243,41 +284,146 @@ impl AliveDialerSet {
         }
     }
 
+    /// Records a successful data-path dial, resetting consecutive failure and cooldown state.
+    pub fn record_dial_success(&mut self, dialer: DialerId) {
+        self.failures.remove(&dialer);
+    }
+
+    /// Records a failed data-path dial and enters passive cooldown once `failure_threshold`
+    /// consecutive failures are reached.
+    pub fn record_dial_failure(&mut self, dialer: DialerId) -> CooldownOutcome {
+        self.record_dial_failure_at(dialer, Instant::now())
+    }
+
+    /// Deterministic clock form of [`Self::record_dial_failure`].
+    pub fn record_dial_failure_at(&mut self, dialer: DialerId, now: Instant) -> CooldownOutcome {
+        if !self.index.contains_key(&dialer) {
+            return CooldownOutcome::default();
+        }
+        let state = self.failures.entry(dialer).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if self.failure_threshold > 0
+            && !self.cooldown.is_zero()
+            && state.consecutive_failures >= self.failure_threshold
+        {
+            let was_cooling = state.cooldown_until.is_some_and(|until| until > now);
+            state.cooldown_until = Some(now + self.cooldown);
+            return CooldownOutcome {
+                entered_cooldown: !was_cooling,
+                consecutive_failures: state.consecutive_failures,
+                cooldown: self.cooldown,
+            };
+        }
+        CooldownOutcome {
+            entered_cooldown: false,
+            consecutive_failures: state.consecutive_failures,
+            cooldown: Duration::ZERO,
+        }
+    }
+
+    /// Whether `dialer` is currently suppressed by passive failure cooldown.
+    #[must_use]
+    pub fn is_in_cooldown(&self, dialer: DialerId) -> bool {
+        self.is_in_cooldown_at(dialer, Instant::now())
+    }
+
+    /// Deterministic clock form of [`Self::is_in_cooldown`].
+    #[must_use]
+    pub fn is_in_cooldown_at(&self, dialer: DialerId, now: Instant) -> bool {
+        self.failures
+            .get(&dialer)
+            .and_then(|state| state.cooldown_until)
+            .is_some_and(|until| until > now)
+    }
+
     /// Picks a dialer for a new connection.
     ///
     /// `fixed` and the latency policies never use randomness; `random` does a
-    /// reservoir sample so excluding a dialer stays uniform.
+    /// reservoir sample so excluding a dialer stays uniform. Cooled-down candidates
+    /// are skipped across all policies until their cooldown expires or an active
+    /// probe or successful dial clears them.
+    ///
+    /// When **every** candidate is cooling, selection falls back to the best candidate
+    /// instead of returning `None`: refusing every flow would turn a transient node
+    /// outage into a cooldown-long blackout even after the node recovered.
     pub fn select(&self, excluded: Option<DialerId>) -> Option<DialerId> {
+        self.select_at(excluded, Instant::now())
+    }
+
+    /// Deterministic clock form of [`Self::select`].
+    #[must_use]
+    pub fn select_at(&self, excluded: Option<DialerId>, now: Instant) -> Option<DialerId> {
+        let selected = match self.policy {
+            SelectionPolicy::Manual => self
+                .entries
+                .iter()
+                .find(|entry| {
+                    Some(entry.dialer) != excluded && !self.is_in_cooldown_at(entry.dialer, now)
+                })
+                .map(|entry| entry.dialer),
+            SelectionPolicy::Random => self.select_random(excluded, now),
+            _ => self.select_min(excluded, now),
+        };
+        selected.or_else(|| self.select_ignoring_cooldown(excluded))
+    }
+
+    /// Last-resort selection when every candidate is cooling.
+    ///
+    /// A cooled-down node is a hint, not a hard refusal: if there is no preferred
+    /// candidate left, trying one is strictly better than failing every flow until a
+    /// timer expires.
+    fn select_ignoring_cooldown(&self, excluded: Option<DialerId>) -> Option<DialerId> {
         match self.policy {
             SelectionPolicy::Manual => self
                 .entries
                 .iter()
                 .find(|entry| Some(entry.dialer) != excluded)
                 .map(|entry| entry.dialer),
-            SelectionPolicy::Random => self.select_random(excluded),
-            _ => self.select_min(excluded),
+            SelectionPolicy::Random => {
+                let mut chosen = None;
+                let mut candidates = 0usize;
+                for entry in &self.entries {
+                    if Some(entry.dialer) == excluded {
+                        continue;
+                    }
+                    candidates += 1;
+                    if fastrand::usize(..candidates) == 0 {
+                        chosen = Some(entry.dialer);
+                    }
+                }
+                chosen
+            }
+            _ => self
+                .entries
+                .iter()
+                .filter(|entry| Some(entry.dialer) != excluded)
+                .min_by_key(|entry| entry.sorting_latency)
+                .map(|entry| entry.dialer),
         }
     }
 
-    fn select_min(&self, excluded: Option<DialerId>) -> Option<DialerId> {
+    fn select_min(&self, excluded: Option<DialerId>, now: Instant) -> Option<DialerId> {
         if let Some(best) = self.best
             && Some(best.dialer) != excluded
+            && !self.is_in_cooldown_at(best.dialer, now)
         {
             return Some(best.dialer);
         }
 
         self.entries
             .iter()
-            .filter(|entry| Some(entry.dialer) != excluded)
+            .filter(|entry| {
+                Some(entry.dialer) != excluded && !self.is_in_cooldown_at(entry.dialer, now)
+            })
             .min_by_key(|entry| entry.sorting_latency)
             .map(|entry| entry.dialer)
     }
 
-    fn select_random(&self, excluded: Option<DialerId>) -> Option<DialerId> {
+    fn select_random(&self, excluded: Option<DialerId>, now: Instant) -> Option<DialerId> {
         let mut chosen = None;
         let mut candidates = 0usize;
         for entry in &self.entries {
-            if Some(entry.dialer) == excluded {
+            if Some(entry.dialer) == excluded || self.is_in_cooldown_at(entry.dialer, now) {
                 continue;
             }
             candidates += 1;
@@ -454,5 +600,115 @@ mod tests {
         let outcome = set.notify(DialerId(99), true, Some(ms(1)));
         assert!(!outcome.has_alive);
         assert_eq!(set.best(), None);
+    }
+
+    #[test]
+    fn passive_cooldown_trips_once_at_threshold_and_fails_over() {
+        let t0 = Instant::now();
+        let mut set = AliveDialerSet::presuming_alive(
+            SelectionPolicy::MinLastLatency,
+            TimeSpan::ZERO,
+            vec![(DialerId(1), TimeSpan::ZERO), (DialerId(2), TimeSpan::ZERO)],
+        )
+        .with_passive_cooldown(3, Duration::from_secs(30));
+        set.notify(DialerId(1), true, Some(ms(10)));
+        set.notify(DialerId(2), true, Some(ms(50)));
+        assert_eq!(set.select_at(None, t0), Some(DialerId(1)));
+
+        // Below threshold: incumbent stays selectable.
+        assert!(!set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        assert!(!set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        assert_eq!(set.select_at(None, t0), Some(DialerId(1)));
+
+        // Third failure crosses threshold -> enters cooldown once and fails over to DialerId(2).
+        let trip = set.record_dial_failure_at(DialerId(1), t0);
+        assert!(trip.entered_cooldown);
+        assert_eq!(trip.consecutive_failures, 3);
+        assert!(!set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        assert!(set.is_in_cooldown_at(DialerId(1), t0));
+        assert_eq!(set.select_at(None, t0), Some(DialerId(2)));
+
+        // Falsifier: once cooldown expires, DialerId(1) becomes eligible again.
+        let expired = t0 + Duration::from_secs(30);
+        assert!(!set.is_in_cooldown_at(DialerId(1), expired));
+        assert_eq!(set.select_at(None, expired), Some(DialerId(1)));
+
+        // When every alive candidate is cooling, selection falls back to the best one
+        // instead of blackholing traffic until a timer expires.
+        set.record_dial_failure_at(DialerId(1), expired);
+        set.record_dial_failure_at(DialerId(1), expired);
+        set.record_dial_failure_at(DialerId(1), expired);
+        set.record_dial_failure_at(DialerId(2), expired);
+        set.record_dial_failure_at(DialerId(2), expired);
+        set.record_dial_failure_at(DialerId(2), expired);
+        assert!(set.is_in_cooldown_at(DialerId(1), expired));
+        assert!(set.is_in_cooldown_at(DialerId(2), expired));
+        assert_eq!(set.select_at(None, expired), Some(DialerId(1)));
+    }
+
+    #[test]
+    fn all_candidates_cooling_falls_back_under_every_policy() {
+        // Falsifier for the fallback: without `select_ignoring_cooldown`, every policy
+        // would return None here and a single transient outage would stop all traffic.
+        let t0 = Instant::now();
+        for policy in [
+            SelectionPolicy::Manual,
+            SelectionPolicy::Random,
+            SelectionPolicy::MinLastLatency,
+            SelectionPolicy::MinAverage10,
+            SelectionPolicy::MinMovingAverage,
+        ] {
+            let mut set = AliveDialerSet::presuming_alive(
+                policy,
+                TimeSpan::ZERO,
+                vec![(DialerId(1), TimeSpan::ZERO), (DialerId(2), TimeSpan::ZERO)],
+            )
+            .with_passive_cooldown(1, Duration::from_secs(30));
+            assert!(set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+            assert!(set.record_dial_failure_at(DialerId(2), t0).entered_cooldown);
+            assert!(
+                set.select_at(None, t0).is_some(),
+                "{policy:?} must fall back instead of returning None when all candidates cool"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_cooldown_resets_on_dial_success_or_active_probe() {
+        let t0 = Instant::now();
+        let mut set = AliveDialerSet::presuming_alive(
+            SelectionPolicy::Random,
+            TimeSpan::ZERO,
+            vec![(DialerId(1), TimeSpan::ZERO), (DialerId(2), TimeSpan::ZERO)],
+        )
+        .with_passive_cooldown(2, Duration::from_secs(30));
+
+        // Falsifier 1: a successful dial resets consecutive failure streak.
+        set.record_dial_failure_at(DialerId(1), t0);
+        set.record_dial_success(DialerId(1));
+        assert!(!set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        assert!(!set.is_in_cooldown_at(DialerId(1), t0));
+
+        // Falsifier 2: an active health probe clears an active cooldown immediately.
+        assert!(set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        assert!(set.is_in_cooldown_at(DialerId(1), t0));
+        set.notify(DialerId(1), true, Some(ms(20)));
+        assert!(!set.is_in_cooldown_at(DialerId(1), t0));
+    }
+
+    #[test]
+    fn zero_threshold_or_duration_disables_passive_cooldown() {
+        // Falsifier for opt-out controls: 0 threshold or 0s cooldown never suppresses nodes.
+        let t0 = Instant::now();
+        let mut set = AliveDialerSet::presuming_alive(
+            SelectionPolicy::Manual,
+            TimeSpan::ZERO,
+            vec![(DialerId(1), TimeSpan::ZERO)],
+        )
+        .with_passive_cooldown(0, Duration::from_secs(30));
+        for _ in 0..5 {
+            assert!(!set.record_dial_failure_at(DialerId(1), t0).entered_cooldown);
+        }
+        assert_eq!(set.select_at(None, t0), Some(DialerId(1)));
     }
 }

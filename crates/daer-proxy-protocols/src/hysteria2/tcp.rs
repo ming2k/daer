@@ -19,7 +19,7 @@ pub async fn open_tcp_stream(
     let (mut send, mut recv) = conn
         .open_bi()
         .await
-        .map_err(|e| ProxyProtocolError::Connect(format!("quic open bi stream: {e}")))?;
+        .map_err(|e| ProxyProtocolError::handshake(format!("quic open bi stream: {e}")))?;
 
     // Frame type 0x401
     let mut req = Vec::with_capacity(64);
@@ -37,39 +37,39 @@ pub async fn open_tcp_stream(
 
     send.write_all(&req)
         .await
-        .map_err(|e| ProxyProtocolError::Connect(format!("write hysteria2 tcp req: {e}")))?;
+        .map_err(|e| ProxyProtocolError::handshake(format!("write hysteria2 tcp req: {e}")))?;
 
     // Read response: 1-byte status
     let mut status = [0u8; 1];
-    read_exact(&mut recv, &mut status)
-        .await
-        .map_err(|e| ProxyProtocolError::Connect(format!("read hysteria2 tcp resp status: {e}")))?;
+    read_exact(&mut recv, &mut status).await.map_err(|e| {
+        ProxyProtocolError::handshake(format!("read hysteria2 tcp resp status: {e}"))
+    })?;
 
     // Read message length and message
     let msg_len = read_varint(&mut recv).await.map_err(|e| {
-        ProxyProtocolError::Connect(format!("decode hysteria2 tcp resp msg len: {e}"))
+        ProxyProtocolError::handshake(format!("decode hysteria2 tcp resp msg len: {e}"))
     })?;
     let mut msg = vec![0u8; msg_len as usize];
     if msg_len > 0 {
         read_exact(&mut recv, &mut msg).await.map_err(|e| {
-            ProxyProtocolError::Connect(format!("read hysteria2 tcp resp msg: {e}"))
+            ProxyProtocolError::handshake(format!("read hysteria2 tcp resp msg: {e}"))
         })?;
     }
 
     // Read padding length and skip padding
     let pad_len = read_varint(&mut recv).await.map_err(|e| {
-        ProxyProtocolError::Connect(format!("decode hysteria2 tcp resp pad len: {e}"))
+        ProxyProtocolError::handshake(format!("decode hysteria2 tcp resp pad len: {e}"))
     })?;
     if pad_len > 0 {
         let mut pad_buf = vec![0u8; pad_len as usize];
         read_exact(&mut recv, &mut pad_buf).await.map_err(|e| {
-            ProxyProtocolError::Connect(format!("read hysteria2 tcp resp pad: {e}"))
+            ProxyProtocolError::handshake(format!("read hysteria2 tcp resp pad: {e}"))
         })?;
     }
 
     if status[0] != 0 {
         let err_msg = String::from_utf8_lossy(&msg);
-        return Err(ProxyProtocolError::Connect(format!(
+        return Err(ProxyProtocolError::handshake(format!(
             "hysteria2 server refused tcp connection: status {} ({err_msg})",
             status[0]
         )));

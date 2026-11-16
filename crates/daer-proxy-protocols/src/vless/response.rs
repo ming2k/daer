@@ -34,6 +34,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The response header's version byte. VLESS has exactly one.
@@ -99,6 +100,12 @@ impl<S: AsyncRead + Unpin> ResponseHeaderStream<S> {
                 }
             }
         }
+    }
+}
+
+impl<S: Transport> Transport for ResponseHeaderStream<S> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
     }
 }
 

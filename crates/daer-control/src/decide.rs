@@ -414,6 +414,8 @@ pub struct Router {
     /// Which generation this router serves. Every flow log carries it, so a log
     /// slice is self-explaining: which configuration made this decision.
     generation: GenerationId,
+    /// Pre-formatted generation tag shared with `ObservedDialer` so per-flow dials avoid allocating.
+    generation_label: Arc<str>,
     /// How this generation obtains a domain, and whether payload inspection is
     /// allowed. Built once from the lowered policy so TCP, UDP and diagnostics agree.
     domain: DomainResolver,
@@ -483,12 +485,22 @@ impl Router {
             &[&SortFunctionsOptimizer, &DeduplicateParamsOptimizer],
         )?;
 
+        let dial_timeout = config
+            .dial_timeout
+            .as_std()
+            .filter(|timeout| !timeout.is_zero())
+            .unwrap_or(DEFAULT_DIAL_TIMEOUT);
+        let tcp_keepalive = config
+            .tcp_keepalive
+            .as_std()
+            .filter(|keepalive| !keepalive.is_zero());
         // The mark daer's own dials carry. It is a process option because `SO_MARK` needs
         // `CAP_NET_ADMIN`: an unprivileged run must not mark, and a privileged one must
         // (see `RouterOptions::so_mark` for the loop it prevents).
         let so_mark = options.effective_so_mark();
         let dialer_options = {
-            let options = DialerOptions::new(so_mark, DEFAULT_DIAL_TIMEOUT);
+            let options =
+                DialerOptions::new(so_mark, dial_timeout).with_tcp_keepalive(tcp_keepalive);
             // `tls.profile`: unknown names are a load-time error. A silently defaulted
             // profile is a ClientHello the operator did not choose, and the handshake that fails
             // because of it reports nothing that points at the profile.
@@ -582,16 +594,15 @@ impl Router {
 
         Ok(Self {
             generation,
+            generation_label: Arc::from(generation.to_string()),
             domain,
             program,
             matches: sink.matches,
             fallback,
-            direct: DirectDialer::new(so_mark, DEFAULT_DIAL_TIMEOUT),
+            direct: DirectDialer::new(so_mark, dial_timeout).with_tcp_keepalive(tcp_keepalive),
             datagram_direct: UdpConnector::new()
-                .with_socket_config(
-                    DialerOptions::new(so_mark, DEFAULT_DIAL_TIMEOUT).socket_config(),
-                )
-                .with_connect_timeout(Some(DEFAULT_DIAL_TIMEOUT)),
+                .with_socket_config(dialer_options.socket_config())
+                .with_connect_timeout(Some(dial_timeout)),
             groups,
             node_names,
             node_catalog,
@@ -674,6 +685,7 @@ impl Router {
     /// has no selectable node, or when the dial fails. The flow is closed by the
     /// caller in every one of those cases.
     pub async fn resolve(&self, flow: &Accepted) -> Result<Upstream, RelayError> {
+        let started = std::time::Instant::now();
         if flow.destination.port() == crate::dns_intercept::DNS_PORT
             && let Some(resolver) = &self.dns_resolver
         {
@@ -696,8 +708,15 @@ impl Router {
             .await;
         self.log_domain(&flow.flow_id, flow.destination, &outcome);
         let verdict = self.verdict_for_flow(flow.source, flow.destination, outcome.domain());
-        self.dial_with_authority(flow, verdict, outcome.domain(), outcome.source())
-            .await
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.dial_with_authority(
+            flow,
+            verdict,
+            outcome.domain(),
+            outcome.source(),
+            elapsed_us,
+        )
+        .await
     }
 
     fn log_domain(
@@ -741,7 +760,7 @@ impl Router {
 
     /// Dials the outbound leg for a decided flow.
     pub async fn dial(&self, flow: &Accepted, verdict: Verdict) -> Result<Upstream, RelayError> {
-        self.dial_with_authority(flow, verdict, None, None).await
+        self.dial_with_authority(flow, verdict, None, None, 0).await
     }
 
     /// Resolves the concrete `SocketAddr` for a `direct` outbound.
@@ -763,12 +782,16 @@ impl Router {
             return Ok(destination);
         }
 
+        let started = std::time::Instant::now();
         let Some(name) = domain else {
             return Err(dial_error(
                 flow_id,
+                self.generation,
                 destination,
                 "direct",
-                OutboundError::Connect(format!(
+                "direct",
+                0,
+                OutboundError::dns(format!(
                     "fake-ip destination {destination} has no domain mapping for direct dial"
                 )),
             ));
@@ -776,11 +799,12 @@ impl Router {
         let Some(resolver) = &self.dns_resolver else {
             return Err(dial_error(
                 flow_id,
+                self.generation,
                 destination,
                 "direct",
-                OutboundError::Connect(
-                    "direct fake-ip unwrapping requires an active DNS resolver".to_owned(),
-                ),
+                "direct",
+                0,
+                OutboundError::dns("direct fake-ip unwrapping requires an active DNS resolver"),
             ));
         };
 
@@ -790,17 +814,23 @@ impl Router {
             .map_err(|error| {
                 dial_error(
                     flow_id,
+                    self.generation,
                     destination,
                     "direct",
-                    OutboundError::Connect(format!("direct dns lookup for {name} failed: {error}")),
+                    "direct",
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    OutboundError::dns(format!("direct dns lookup for {name} failed: {error}")),
                 )
             })?;
         let Some(real_ip) = ips.into_iter().next() else {
             return Err(dial_error(
                 flow_id,
+                self.generation,
                 destination,
                 "direct",
-                OutboundError::Connect(format!(
+                "direct",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                OutboundError::dns(format!(
                     "direct dns lookup for {name} returned no addresses"
                 )),
             ));
@@ -815,6 +845,7 @@ impl Router {
         verdict: Verdict,
         domain_override: Option<&str>,
         domain_source: Option<DomainSource>,
+        elapsed_us: u64,
     ) -> Result<Upstream, RelayError> {
         let outbound = &verdict.outbound;
         // One structured event per decision: the first thing anyone needs when
@@ -828,6 +859,9 @@ impl Router {
             outbound = %outbound.name,
             mark = outbound.mark,
             must = outbound.must,
+            domain = domain_override.unwrap_or("none"),
+            decision_source = domain_source.map_or("ip", DomainSource::as_str),
+            elapsed_us,
             "flow decided"
         );
 
@@ -847,25 +881,21 @@ impl Router {
                 )
                 .await?;
             let direct_authority = direct_dest.to_string();
+            let started = std::time::Instant::now();
             let established = self
                 .direct
                 .connect(&direct_authority)
                 .await
                 .map_err(|error| {
-                    let failure: daer_observe::DialFailure = error.into();
-                    daer_observe::warn!(
-                        daer_observe::EventCode::FlowDialFailed,
-                        flow_id = %flow.flow_id,
-                        destination = %direct_dest,
-                        election = "direct",
-                        stage = %failure.stage,
-                        error_code = %failure.code,
-                        "flow dial failed"
-                    );
-                    RelayError::Dial {
-                        destination: direct_dest,
-                        failure,
-                    }
+                    dial_error(
+                        flow.flow_id,
+                        self.generation,
+                        direct_dest,
+                        "direct",
+                        "direct",
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        error,
+                    )
                 })?;
             return Ok(established.stream);
         }
@@ -891,20 +921,70 @@ impl Router {
         election: &str,
         authority: &str,
     ) -> Result<daer_outbound::Established, RelayError> {
-        let node = self.select_node(flow_id, destination, election)?;
+        let selected = self.select_node(flow_id, destination, election)?;
         let observed = daer_outbound::ObservedDialer::new(
-            Arc::clone(&node),
+            Arc::clone(&selected.node),
             self.dial_observer.clone(),
             flow_id,
+            Arc::clone(&self.generation_label),
             election,
         );
-        observed
-            .connect(authority)
-            .await
-            .map_err(|error| RelayError::Dial {
-                destination,
-                failure: error.into(),
-            })
+        match observed.connect(authority).await {
+            Ok(established) => {
+                if !selected.pinned {
+                    self.record_dial_success(election, selected.id);
+                }
+                Ok(established)
+            }
+            Err(error) => {
+                // Only a transport-level failure says anything about the node's health.
+                // A local policy/configuration error must not cool down a healthy candidate.
+                let transient = error.is_transient_dial_failure();
+                let failure: daer_observe::DialFailure = error.into();
+                if !selected.pinned && transient {
+                    self.record_dial_failure(election, selected.id, &selected.name, failure.code);
+                }
+                Err(RelayError::Dial {
+                    destination,
+                    failure,
+                })
+            }
+        }
+    }
+
+    fn record_dial_success(&self, election: &str, id: DialerId) {
+        let mut elections = self.elections.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(route) = elections.get_mut(election) {
+            route.runtime.record_dial_success(id);
+        }
+    }
+
+    fn record_dial_failure(
+        &self,
+        election: &str,
+        id: DialerId,
+        node: &str,
+        error_code: daer_observe::ErrorCode,
+    ) {
+        let outcome = {
+            let mut elections = self.elections.write().unwrap_or_else(|e| e.into_inner());
+            elections
+                .get_mut(election)
+                .map(|route| route.runtime.record_dial_failure(id))
+        };
+        if let Some(outcome) = outcome
+            && outcome.entered_cooldown
+        {
+            daer_observe::warn!(
+                daer_observe::EventCode::ElectionNodeCooldown,
+                election = %election,
+                node = %node,
+                consecutive_failures = outcome.consecutive_failures,
+                cooldown_ms = u64::try_from(outcome.cooldown.as_millis()).unwrap_or(u64::MAX),
+                error_code = %error_code,
+                "node entered passive cooldown after consecutive dial failures"
+            );
+        }
     }
 
     /// Selects the node an election would return for `destination`.
@@ -917,32 +997,51 @@ impl Router {
         flow_id: daer_observe::FlowId,
         destination: SocketAddr,
         election: &str,
-    ) -> Result<Arc<NodeDialer>, RelayError> {
+    ) -> Result<SelectedNode, RelayError> {
         let elections = self.elections.read().unwrap_or_else(|e| e.into_inner());
         let Some(route) = elections.get(election) else {
             return Err(dial_error(
                 flow_id,
+                self.generation,
                 destination,
                 election,
+                "none",
+                0,
                 OutboundError::UnknownElection(election.to_owned()),
             ));
         };
-        let dialer = route
-            .effective(&self.overrides, election)
-            .and_then(|id| route.runtime.dialer(id))
+        let (dialer_id, pinned) = route
+            .effective_with_override(&self.overrides, election)
             .ok_or_else(|| {
                 dial_error(
                     flow_id,
+                    self.generation,
                     destination,
                     election,
+                    "none",
+                    0,
                     OutboundError::NoElectableNode(election.to_owned()),
                 )
             })?;
+        let dialer = route.runtime.dialer(dialer_id).ok_or_else(|| {
+            dial_error(
+                flow_id,
+                self.generation,
+                destination,
+                election,
+                "none",
+                0,
+                OutboundError::NoElectableNode(election.to_owned()),
+            )
+        })?;
         let node = route.node(dialer.id()).map(Arc::clone).ok_or_else(|| {
             dial_error(
                 flow_id,
+                self.generation,
                 destination,
                 election,
+                dialer.property().name.as_str(),
+                0,
                 OutboundError::NoElectableNode(election.to_owned()),
             )
         })?;
@@ -957,7 +1056,12 @@ impl Router {
             latency_us = ?dialer.last_latency().map(|latency| latency.as_nanos() / 1_000),
             "node selected"
         );
-        Ok(node)
+        Ok(SelectedNode {
+            id: dialer.id(),
+            node,
+            name: property.name.clone(),
+            pinned,
+        })
     }
 
     /// The routing verdict for a datagram flow, without dialing.
@@ -1078,13 +1182,16 @@ impl Router {
         };
 
         let group_name = outbound.name.clone();
-        let node = self.select_node(facts.flow_id, facts.destination, &group_name)?;
+        let selected = self.select_node(facts.flow_id, facts.destination, &group_name)?;
 
-        let connector = node.datagram().ok_or_else(|| {
+        let connector = selected.node.datagram().ok_or_else(|| {
             dial_error(
                 facts.flow_id,
+                self.generation,
                 facts.destination,
                 &group_name,
+                selected.node.label(),
+                0,
                 OutboundError::NoDatagramSupport(group_name.to_string()),
             )
         })?;
@@ -1577,18 +1684,34 @@ struct ElectionRoute {
     probe: ProbeSettings,
 }
 
+struct SelectedNode {
+    id: DialerId,
+    node: Arc<NodeDialer>,
+    name: String,
+    pinned: bool,
+}
+
 impl ElectionRoute {
     fn node(&self, id: DialerId) -> Option<&Arc<NodeDialer>> {
         self.nodes.get(usize::try_from(id.0).ok()?)
     }
 
     fn effective(&self, overrides: &ElectionOverrides, election: &str) -> Option<DialerId> {
+        self.effective_with_override(overrides, election)
+            .map(|(id, _)| id)
+    }
+
+    fn effective_with_override(
+        &self,
+        overrides: &ElectionOverrides,
+        election: &str,
+    ) -> Option<(DialerId, bool)> {
         if let Some(node) = overrides.get(election)
             && let Some(dialer) = self.runtime.select_named(&node)
         {
-            return Some(dialer.id());
+            return Some((dialer.id(), true));
         }
-        self.runtime.select(None).map(Dialer::id)
+        self.runtime.select(None).map(|dialer| (dialer.id(), false))
     }
 }
 
@@ -1780,18 +1903,25 @@ fn rule_boundaries(rules: &[daer_config::RoutingRule]) -> Vec<usize> {
 /// Builds a relay dial error and emits the one `warn` event that names its stage and code.
 fn dial_error(
     flow_id: daer_observe::FlowId,
+    generation: GenerationId,
     destination: SocketAddr,
     election: &str,
+    node: &str,
+    elapsed_ms: u64,
     error: OutboundError,
 ) -> RelayError {
     let failure: daer_observe::DialFailure = error.into();
     daer_observe::warn!(
         daer_observe::EventCode::FlowDialFailed,
         flow_id = %flow_id,
+        generation = %generation,
         destination = %destination,
         election = %election,
+        node = %node,
         stage = %failure.stage,
         error_code = %failure.code,
+        elapsed_ms,
+        detail = %failure.detail,
         "flow dial failed"
     );
     RelayError::Dial {
@@ -1971,12 +2101,18 @@ fn build_resources_and_elections(
         }
 
         let probe = election.resolved_probe();
+        let failure_threshold = election.effective_failure_threshold();
+        let cooldown = election
+            .effective_cooldown()
+            .as_std()
+            .unwrap_or(Duration::ZERO);
         let runtime = ElectionRuntime::new(
             election.name.clone(),
             election.kind.selection_policy(),
             election.effective_tolerance(),
             dialers,
-        );
+        )
+        .with_passive_cooldown(failure_threshold, cooldown);
         elections.insert(
             election.name.clone(),
             ElectionRoute {

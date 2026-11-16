@@ -170,12 +170,16 @@ async fn serve_one(mut stream: tokio::net::UnixStream, generations: &daer_contro
                 .await;
             };
             let router = generations.current().router_arc();
+            let previous = router
+                .node_identity(&election)
+                .map_or_else(|| "none".to_owned(), |id| id.node);
             match router.elect(&election, &node) {
                 Ok(()) => {
                     daer_observe::info!(
                         daer_observe::EventCode::ElectionPinned,
                         election = %election,
                         node = %node,
+                        previous = %previous,
                         peer_uid = peer.map_or(0, |cred| cred.uid()),
                         peer_pid = peer.map_or(0, |cred| cred.pid().unwrap_or(0)),
                         generation = %generations.current().describe(),
@@ -189,7 +193,7 @@ async fn serve_one(mut stream: tokio::net::UnixStream, generations: &daer_contro
                         daer_observe::EventCode::ElectionRejected,
                         election = %election,
                         node = %node,
-                        %message,
+                        error = %message,
                         peer_uid = peer.map_or(0, |cred| cred.uid()),
                         peer_pid = peer.map_or(0, |cred| cred.pid().unwrap_or(0)),
                         "election change rejected"
@@ -204,11 +208,15 @@ async fn serve_one(mut stream: tokio::net::UnixStream, generations: &daer_contro
                     .await;
             };
             let router = generations.current().router_arc();
+            let previous = router
+                .node_identity(&election)
+                .map_or_else(|| "none".to_owned(), |id| id.node);
             match router.reset_election(&election) {
                 Ok(()) => {
                     daer_observe::info!(
                         daer_observe::EventCode::ElectionReset,
                         election = %election,
+                        previous = %previous,
                         peer_uid = peer.map_or(0, |cred| cred.uid()),
                         peer_pid = peer.map_or(0, |cred| cred.pid().unwrap_or(0)),
                         generation = %generations.current().describe(),
@@ -221,7 +229,10 @@ async fn serve_one(mut stream: tokio::net::UnixStream, generations: &daer_contro
                     daer_observe::warn!(
                         daer_observe::EventCode::ElectionRejected,
                         election = %election,
-                        %message,
+                        node = "none",
+                        error = %message,
+                        peer_uid = peer.map_or(0, |cred| cred.uid()),
+                        peer_pid = peer.map_or(0, |cred| cred.pid().unwrap_or(0)),
                         "election reset rejected"
                     );
                     error("election_rejected", message)

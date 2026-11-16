@@ -188,6 +188,21 @@ fn check_host(config: &Config) -> Result<(), ConfigError> {
             "must be a tracing filter directive",
         ));
     }
+    if config.dial_timeout.as_nanos() <= 0 {
+        return Err(ConfigError::new(
+            "dial-timeout",
+            format!("must be positive (got \"{}\")", config.dial_timeout),
+        ));
+    }
+    if config.tcp_keepalive.is_negative() {
+        return Err(ConfigError::new(
+            "tcp-keepalive",
+            format!(
+                "must not be negative (got \"{}\"; use \"0s\" to disable)",
+                config.tcp_keepalive
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -338,6 +353,18 @@ fn check_elections(config: &Config) -> Result<(), ConfigError> {
                     "election {:?} sets `tolerance`, which only changes the switch threshold of \
                      type = \"min-moving-avg\"",
                     election.name
+                ),
+            ));
+        }
+
+        if let Some(cooldown) = election.cooldown
+            && cooldown.is_negative()
+        {
+            return Err(ConfigError::new(
+                "election.cooldown",
+                format!(
+                    "election {:?}: cooldown must not be negative (got \"{}\")",
+                    election.name, cooldown
                 ),
             ));
         }

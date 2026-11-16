@@ -49,6 +49,38 @@ pub trait ServerDialer: fmt::Debug + Send + Sync {
     /// Opens a TCP stream to `authority` (`host:port`).
     fn connect<'a>(&'a self, authority: &'a str, recorder: &'a TraceCollector) -> ServerFuture<'a>;
 
+    /// Opens a TCP stream to `authority` (`host:port`) before `deadline`.
+    fn connect_within<'a>(
+        &'a self,
+        authority: &'a str,
+        recorder: &'a TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> ServerFuture<'a> {
+        Box::pin(async move {
+            let Ok(remaining) = ProxyProtocolError::remaining_until(
+                deadline,
+                daer_observe::DialStage::Tcp,
+                authority,
+            ) else {
+                return Err(ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Tcp,
+                    format!("tcp connect to {authority}: dial deadline expired"),
+                ));
+            };
+            tokio::time::timeout(remaining, self.connect(authority, recorder))
+                .await
+                .map_err(|_| {
+                    ProxyProtocolError::timeout(
+                        daer_observe::DialStage::Tcp,
+                        format!(
+                            "tcp connect to {authority} exceeded {} ms",
+                            remaining.as_millis()
+                        ),
+                    )
+                })?
+        })
+    }
+
     /// The datagram connector to this server, when this dialer can carry datagrams.
     ///
     /// A protocol whose UDP is carried *inside* its own stream does not use this; it is for
@@ -76,24 +108,53 @@ pub trait ServerDialer: fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct DirectServerDialer {
     connector: TcpConnector,
+    unbounded_connector: TcpConnector,
     socket_config: SocketConfig,
+    so_mark: Option<u32>,
     timeout: Duration,
+}
+
+pub(crate) fn build_socket_config(
+    so_mark: Option<u32>,
+    tcp_keepalive: Option<Duration>,
+) -> SocketConfig {
+    let mut socket_config = SocketConfig::default();
+    if let Some(mark) = so_mark {
+        socket_config = socket_config.with_mark(mark);
+    }
+    if let Some(idle) = tcp_keepalive {
+        socket_config = socket_config.with_keepalive(idle);
+    }
+    socket_config
 }
 
 impl DirectServerDialer {
     #[must_use]
     pub fn new(so_mark: Option<u32>, timeout: Duration) -> Self {
-        let socket_config = match so_mark {
-            Some(mark) => SocketConfig::default().with_mark(mark),
-            None => SocketConfig::default(),
-        };
+        Self::new_with_keepalive(so_mark, timeout, None)
+    }
+
+    #[must_use]
+    pub fn new_with_keepalive(
+        so_mark: Option<u32>,
+        timeout: Duration,
+        tcp_keepalive: Option<Duration>,
+    ) -> Self {
+        let socket_config = build_socket_config(so_mark, tcp_keepalive);
+        let unbounded = TcpConnector::new().with_socket_config(socket_config.clone());
         Self {
-            connector: TcpConnector::new()
-                .with_socket_config(socket_config.clone())
-                .with_connect_timeout(Some(timeout)),
+            connector: unbounded.clone().with_connect_timeout(Some(timeout)),
+            unbounded_connector: unbounded.with_connect_timeout(None),
             socket_config,
+            so_mark,
             timeout,
         }
+    }
+
+    /// Configures or clears TCP `SO_KEEPALIVE` on outbound connections.
+    #[must_use]
+    pub fn with_tcp_keepalive(self, tcp_keepalive: Option<Duration>) -> Self {
+        Self::new_with_keepalive(self.so_mark, self.timeout, tcp_keepalive)
     }
 }
 
@@ -101,10 +162,32 @@ impl ServerDialer for DirectServerDialer {
     fn connect<'a>(&'a self, authority: &'a str, recorder: &'a TraceCollector) -> ServerFuture<'a> {
         Box::pin(async move {
             let target = Target::plain(authority);
-            tokio::time::timeout(self.timeout, self.connector.connect(&target, recorder))
+            self.connector
+                .connect(&target, recorder)
                 .await
-                .map_err(|_| ProxyProtocolError::Timeout)?
-                .map_err(|error| ProxyProtocolError::Connect(error.to_string()))
+                .map_err(|error| ProxyProtocolError::from_net_error(&error))
+        })
+    }
+
+    fn connect_within<'a>(
+        &'a self,
+        authority: &'a str,
+        recorder: &'a TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> ServerFuture<'a> {
+        Box::pin(async move {
+            let remaining = ProxyProtocolError::remaining_until(
+                deadline,
+                daer_observe::DialStage::Tcp,
+                authority,
+            )?;
+            let target = Target::plain(authority);
+            self.unbounded_connector
+                .clone()
+                .with_connect_timeout(Some(remaining))
+                .connect(&target, recorder)
+                .await
+                .map_err(|error| ProxyProtocolError::from_net_error(&error))
         })
     }
 
@@ -123,19 +206,29 @@ impl ServerDialer for DirectServerDialer {
 
 /// Adapts a [`ServerDialer`] to netune's generic [`Connector`] interface.
 ///
-/// `TlsConnector<C>` and `ProxyConnector<C>` are generic over a netune connector. They consume
+/// `TlsRouterConnector<C>` and `ProxyConnector<C>` are generic over a netune connector. They consume
 /// this adapter when their inner leg is a daer server dialer, which is what lets Trojan,
 /// AnyTLS, SOCKS5 and HTTP participate in a chain without a second TLS or CONNECT
 /// implementation.
 #[derive(Debug, Clone)]
 pub struct ServerConnector {
     dialer: Arc<dyn ServerDialer>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl ServerConnector {
     #[must_use]
     pub fn new(dialer: Arc<dyn ServerDialer>) -> Self {
-        Self { dialer }
+        Self {
+            dialer,
+            deadline: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 }
 
@@ -153,9 +246,14 @@ impl Connector for ServerConnector {
         target: &Target,
         recorder: &TraceCollector,
     ) -> Result<Established, NetError> {
-        self.dialer
-            .connect(&target.authority, recorder)
-            .await
-            .map_err(|error| NetError::Connect(error.to_string()))
+        let result = match self.deadline {
+            Some(deadline) => {
+                self.dialer
+                    .connect_within(&target.authority, recorder, deadline)
+                    .await
+            }
+            None => self.dialer.connect(&target.authority, recorder).await,
+        };
+        result.map_err(|error| error.into_net_error(&target.authority))
     }
 }

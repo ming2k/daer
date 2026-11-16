@@ -715,7 +715,7 @@ mod tests {
         let plan = fs::read_to_string(workspace_root().join("packaging/daer.plan.toml"))
             .expect("read the package plan");
         assert!(
-            plan.contains("cargo run --package xtask -- install"),
+            plan.contains("--package xtask -- install"),
             "the package staging step must call the install task"
         );
         for direct in [

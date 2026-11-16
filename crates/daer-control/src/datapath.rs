@@ -301,7 +301,7 @@ impl RouteTable {
                     // IPv6 table; failing the whole datapath for it would make the IPv4
                     // proxy unusable. The absence is logged, and IPv6 redirected traffic
                     // cannot be delivered without it.
-                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable,%error, "IPv6 policy routing is unavailable; IPv4 continues");
+                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable, component = "policy_rule", %error, "IPv6 policy routing is unavailable; IPv4 continues");
                     continue;
                 }
                 // Roll back what was installed: a half-configured table would send one
@@ -911,7 +911,7 @@ impl Sysctl {
                 // IPv6 has no /proc/sys/net/ipv6 tree; refusing to attach would turn a
                 // working IPv4 proxy into a startup failure.
                 if let Err(error) = guard.write(path, value, scope) {
-                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable,%error, "IPv6 sysctl is unavailable; continuing with IPv4");
+                    daer_observe::warn!(daer_observe::EventCode::DatapathIpv6Unavailable, component = "sysctl", %error, "IPv6 sysctl is unavailable; continuing with IPv4");
                 }
                 continue;
             }

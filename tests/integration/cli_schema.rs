@@ -24,6 +24,32 @@ fn schema_is_up_to_date() {
     }
 }
 
+/// The package plan generates two configurations; both must use the schema this build
+/// understands.
+///
+/// This is the gate for a packaging-only drift: the Rust code and `daer.schema.json` can be
+/// current while `packaging/daer.plan.toml` still writes `schema = 5`, which only fails when
+/// the package build runs `daer check` or when the installed unit starts.
+#[test]
+fn the_package_plan_generates_the_current_schema_version() {
+    let workspace_root = crate::common::workspace_root();
+    let plan = std::fs::read_to_string(workspace_root.join("packaging/daer.plan.toml"))
+        .expect("the package plan must exist");
+    let expected = format!("schema = {}", daer_config::SCHEMA_VERSION);
+    let declared = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with("schema = "))
+        .count();
+    assert_eq!(
+        declared, 2,
+        "the package plan must generate the check config and the installed config"
+    );
+    assert!(
+        plan.contains(&expected),
+        "the package plan must generate `{expected}`; found a different schema version"
+    );
+}
+
 /// Every TOML block in the reference documentation must actually load.
 ///
 /// The reference is the only description of the configuration schema an operator reads, and it

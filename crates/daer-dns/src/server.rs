@@ -177,7 +177,7 @@ pub async fn serve_udp_on(
             received = socket.recv_from(&mut buffer) => match received {
                 Ok(pair) => pair,
                 Err(error) if is_transient(&error) => {
-                    daer_observe::debug!(daer_observe::EventCode::DnsTransientError,%error, "transient udp receive error");
+                    daer_observe::debug!(daer_observe::EventCode::DnsTransientError, transport = "udp", phase = "recv", %error, "transient udp receive error");
                     continue;
                 }
                 Err(error) => return Err(ServerError::Accept(error)),
@@ -258,6 +258,7 @@ pub async fn resolve_datagram(
                 query_id = %context.id,
                 peer = %peer,
                 transport = "udp",
+                error = "timed out",
                 timeout = true,
                 "dns resolution timed out"
             );
@@ -303,7 +304,7 @@ pub async fn serve_tcp_on(
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
                 Err(error) if is_transient(&error) => {
-                    daer_observe::debug!(daer_observe::EventCode::DnsTransientError,%error, "transient tcp accept error");
+                    daer_observe::debug!(daer_observe::EventCode::DnsTransientError, transport = "tcp", phase = "accept", %error, "transient tcp accept error");
                     continue;
                 }
                 Err(error) => return Err(ServerError::Accept(error)),
@@ -399,6 +400,7 @@ where
                         query_id = %context.id,
                         peer = %peer,
                         transport = "tcp",
+                        error = "timed out",
                         timeout = true,
                         "dns resolution timed out"
                     );

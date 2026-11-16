@@ -47,7 +47,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
 
@@ -67,6 +67,9 @@ pub struct Supervisor {
 #[derive(Debug)]
 struct Inner {
     flows: AtomicUsize,
+    /// Set once graceful shutdown begins so task abortions from `runtime.shutdown_timeout`
+    /// do not pollute abnormal-end metrics or warning logs.
+    shutting_down: AtomicBool,
     /// Notified when `flows` reaches zero.
     idle: Notify,
     metrics: Metrics,
@@ -79,10 +82,26 @@ impl Supervisor {
         Self {
             inner: Arc::new(Inner {
                 flows: AtomicUsize::new(0),
+                shutting_down: AtomicBool::new(false),
                 idle: Notify::new(),
                 metrics: Metrics::default(),
             }),
         }
+    }
+
+    /// Marks the supervisor as entering graceful shutdown.
+    ///
+    /// Flows cancelled by executor teardown after a bounded drain are expected
+    /// shutdown aborts rather than unexpected crashes; this suppresses
+    /// `flow.abnormal_end` warnings and counters for non-panicking unwinds.
+    pub fn begin_shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::begin_shutdown`] has been called on this supervisor.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::Acquire)
     }
 
     /// The live counters.
@@ -190,15 +209,25 @@ struct FlowGuard {
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         if !self.completed {
-            // A join error, a panic, or a cancellation: all of them are "this flow
-            // did not finish its work", and all of them are worth counting.
-            self.inner.metrics.record_abnormal_end();
-            if let Some(flow_id) = self.flow_id {
-                daer_observe::warn!(
-                    daer_observe::EventCode::FlowAbnormalEnd,
-                    flow_id = %flow_id,
-                    "flow task ended abnormally"
-                );
+            if self.inner.shutting_down.load(Ordering::Acquire) && !std::thread::panicking() {
+                if let Some(flow_id) = self.flow_id {
+                    daer_observe::debug!(
+                        daer_observe::EventCode::FlowShutdownAborted,
+                        flow_id = %flow_id,
+                        "flow task aborted during shutdown"
+                    );
+                }
+            } else {
+                // A join error, a panic, or an unexpected cancellation: all of them are
+                // "this flow did not finish its work", and all of them are worth counting.
+                self.inner.metrics.record_abnormal_end();
+                if let Some(flow_id) = self.flow_id {
+                    daer_observe::warn!(
+                        daer_observe::EventCode::FlowAbnormalEnd,
+                        flow_id = %flow_id,
+                        "flow task ended abnormally"
+                    );
+                }
             }
         }
         if self.inner.flows.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -307,5 +336,75 @@ mod tests {
         supervisor.drain().await;
         // One service, one set of counters: the handle did not create its own.
         assert_eq!(supervisor.metrics().snapshot(), handle.metrics().snapshot());
+    }
+
+    #[test]
+    fn graceful_shutdown_suppresses_abnormal_end_for_aborted_flow() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = Supervisor::new();
+        rt.block_on(async {
+            supervisor.spawn_tracked(daer_observe::FlowId::new(1), std::future::pending());
+            tokio::task::yield_now().await;
+        });
+        assert_eq!(supervisor.in_flight(), 1);
+        supervisor.begin_shutdown();
+        assert!(supervisor.is_shutting_down());
+        rt.shutdown_timeout(Duration::from_millis(10));
+
+        assert_eq!(
+            supervisor.in_flight(),
+            0,
+            "aborted flow guard must decrement in-flight count on shutdown"
+        );
+        assert_eq!(
+            supervisor.metrics().snapshot().panicked,
+            0,
+            "expected cancellation after begin_shutdown() must not inflate panicked"
+        );
+    }
+
+    #[test]
+    fn non_shutdown_cancellation_still_records_abnormal_end() {
+        // Falsifier for graceful_shutdown_suppresses_abnormal_end_for_aborted_flow:
+        // without begin_shutdown(), aborting an in-flight task is still unexpected.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = Supervisor::new();
+        rt.block_on(async {
+            supervisor.spawn_tracked(daer_observe::FlowId::new(2), std::future::pending());
+            tokio::task::yield_now().await;
+        });
+        assert!(!supervisor.is_shutting_down());
+        rt.shutdown_timeout(Duration::from_millis(10));
+
+        assert_eq!(supervisor.in_flight(), 0);
+        assert_eq!(supervisor.metrics().snapshot().panicked, 1);
+    }
+
+    #[test]
+    fn panic_during_shutdown_still_records_abnormal_end() {
+        // Falsifier for `!std::thread::panicking()`: even after begin_shutdown(),
+        // a genuine task panic unwinds as an abnormal end and is still counted.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = Supervisor::new();
+        rt.block_on(async {
+            supervisor.begin_shutdown();
+            supervisor.spawn_tracked(daer_observe::FlowId::new(3), async {
+                panic!("intentional test panic during shutdown");
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        rt.shutdown_timeout(Duration::from_millis(10));
+
+        assert_eq!(supervisor.in_flight(), 0);
+        assert_eq!(supervisor.metrics().snapshot().panicked, 1);
     }
 }

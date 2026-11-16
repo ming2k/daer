@@ -164,6 +164,8 @@ mod tests {
             "lan-interface",
             "wan-interface",
             "disable-waiting-network",
+            "dial-timeout",
+            "tcp-keepalive",
             "tls",
             "subscription",
             "node",

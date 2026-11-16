@@ -5,6 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-16
+
+### Breaking
+
+- **The diagnostic event contract changed.** Several events now carry the fields their call
+  sites can actually supply, and the catalog no longer promises fields nothing emitted:
+  `daemon.datapath_attached`, `daemon.health_started`, `daemon.shutdown`, `dryrun.listen`,
+  `generation.reloaded`, `provider.updated`, `provider.refresh_published`,
+  `flow.rejected`, `flow.abnormal_end`, `flow.datagram_rejected`, `dns.transient_error`,
+  `dns.send_failed`, `datapath.object_missing` and `datapath.event` changed their field sets.
+  `flow.dial_failed` gained `detail`. Dashboards and alert rules that match on the removed
+  fields must be updated.
+
+### Added
+
+- **`dial-timeout` and `tcp-keepalive` process settings.** The outbound deadline now covers
+  DNS, TCP, TLS and the proxy protocol handshake as one budget; TCP keepalive is applied to
+  data-path outbound sockets (`"0s"` disables it).
+- **Passive failure cooldown for elections.** `failure-threshold` (default `3`) and
+  `cooldown` (default `30s`) skip a candidate after consecutive live-flow dial failures and
+  emit `election.node_cooldown`. A successful dial or healthy probe clears the cooldown. If
+  every candidate is cooling, selection falls back to the best candidate instead of refusing
+  all traffic until a timer expires.
+- **Structured dial failures.** `flow.dial_failed` now carries the failing stage, a stable
+  error code and a `detail` string; DNS, TCP, TLS and protocol-handshake failures are no
+  longer flattened into one "connect failed" message.
+- **Subscription and provider summaries** are emitted as `subscription.summary` and
+  `provider.summary` info events instead of being mixed into `daer check` warnings.
+- **New event-catalog entries** for `flow.relay_reset`, `flow.shutdown_aborted` and
+  `flow.datagram_refusal_suppressed`; suppressed repeated datagram refusals are bounded by a
+  short-TTL, capped negative cache.
+
+### Changed
+
+- **netune is upgraded to `v0.1.1`.** TLS profiles are applied through
+  `TlsRouterConnector`/the owned TLS connector, DoT uses the router connector, and the
+  outbound handshake budget is shared across the layers instead of restarting per phase.
+- **A peer reset ends a relay at `debug`,** not as a client-visible warning; shutdown
+  abort of an in-flight flow is recorded as `flow.shutdown_aborted` rather than
+  `flow.abnormal_end`.
+- **Packaging uses `--locked` and schema 6.** The package build and `scripts/install.sh`
+  no longer resolve a different lockfile, and the generated `/etc/daer/config.toml` matches
+  the current configuration schema.
+
+### Fixed
+
+- **Vision no longer switches to raw copy before a split `Direct` block is complete.** A
+  multi-record `Direct` downlink could stop decrypting outer TLS records too early and leak
+  ciphertext into the inner stream; the switch now waits for both content and padding.
+- **`daer check` on the packaged configuration no longer fails with
+  `unknown schema version 5`.**
+- **The `SIGTERM` lifecycle e2e assertion no longer mistakes the normal
+  `panicked=0` shutdown counter for a panic.**
+- **DNS upstream error codes are derived from typed errors** instead of matching English
+  message substrings.
+
 ## [0.1.1] - 2026-11-15
 
 ### Breaking

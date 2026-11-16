@@ -35,6 +35,8 @@ There is no `[global]` wrapper: the top level *is* the process scope.
 | `lan-interface` | list of string | `[]` | Ingress interfaces receiving client traffic. An interface cannot also appear in `wan-interface`; one role per interface is a hard invariant. |
 | `log-level` | string | `"info"` | `tracing` filter directive: `"info"`, `"debug"`, or `"daer=debug,netune=trace"`. An unparseable directive fails `daer check` and startup; it never silently falls back to `info`. |
 | `disable-waiting-network` | boolean | `false` | When true, fails immediately if the default route is missing rather than waiting up to 2 minutes. |
+| `dial-timeout` | duration | `"10s"` | Total deadline for opening a single outbound connection (DNS resolution, TCP connect, TLS handshake, and proxy protocol handshake). Must be greater than zero. |
+| `tcp-keepalive` | duration | `"30s"` | TCP `SO_KEEPALIVE` idle time applied to outbound sockets (`"0s"` disables keepalive). |
 
 The `SO_MARK` that keeps daer's own sockets out of its datapath is an internal
 constant (`0x64616572`, ASCII `daer`). It is not configurable: a value of `0` means
@@ -379,6 +381,8 @@ An election is the **routing target** and the rule that elects one node from its
 | `interval` | duration | `"30s"` | Probe cadence; `0s` disables probing. A latency election must keep probing enabled. |
 | `timeout` | duration | `"5s"` | Per-probe deadline. |
 | `tolerance` | duration | `"0s"` | Moving-average switch threshold; only valid for `type = "min-moving-avg"`. May be negative. |
+| `failure-threshold` | integer | `3` | Consecutive runtime dial failures before a candidate enters passive cooldown and traffic fails over (`0` disables passive cooldown). |
+| `cooldown` | duration | `"30s"` | How long a passively cooled-down candidate is skipped before being retried (`"0s"` disables passive cooldown). Cleared early by a successful dial or healthy probe. If every candidate is cooling, selection falls back to the best one rather than refusing all flows. |
 
 A **manual** election is never scheduled for probing, so it rejects all probe keys; use
 `daer probe node` for on-demand measurement. Probe settings belong to the election that

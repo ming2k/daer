@@ -24,7 +24,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ),
     (
         "tokio_rustls",
-        "TLS handshakes belong to netune's TlsConnector",
+        "TLS handshakes belong to netune's TlsRouterConnector",
     ),
 ];
 

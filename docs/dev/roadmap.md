@@ -43,7 +43,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | DNS: cache (TTL, stale-while-revalidate, negative answers, bounds) | ✅ |
 | DNS: answer pipeline (routing → cache → transport → response routing) | ✅ |
 | DNS: upstream syntax + DNS over TCP | ✅ |
-| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` uses netune's `UdpConnector`, `tcp` uses netune's `TcpConnector`, `tls` rides netune's `TlsConnector` as a byte pipe, `https` uses netune's client. Every connector carries the daemon's `SocketConfig`, so DNS egress is marked and traced like any other outbound |
+| DNS: UDP, DoT, DoH transports | ✅ all four upstream protocols real and verified against live resolvers; `udp` uses netune's `UdpConnector`, `tcp` uses netune's `TcpConnector`, `tls` rides netune's `TlsRouterConnector` as a byte pipe, `https` uses netune's client. Every connector carries the daemon's `SocketConfig`, so DNS egress is marked and traced like any other outbound |
 | DNS: UDP and TCP server sockets | ✅ |
 | DNS: served by `daer run`, upstream usability gated by `daer check` (ADR-0015) | ✅ |
 | DNS: bootstrap resolver | ⬜ |

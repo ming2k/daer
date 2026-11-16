@@ -33,6 +33,7 @@ use std::time::Duration;
 use netune::{DatagramConnector, Established, EstablishedDatagrams, NetError, Transport};
 use netune_trace::TraceCollector;
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
 
 use crate::error::ProxyProtocolError;
 use crate::options::DialerOptions;
@@ -169,8 +170,20 @@ impl VmessConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let (stream, session, local_port, alpn, alpn_protocol) =
-            self.open(authority, Command::Tcp, recorder).await?;
+        self.connect_within(authority, recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens a VMess TCP session to `authority` (`host:port`) within a shared `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        let (stream, session, local_port, alpn, alpn_protocol) = self
+            .open_until(authority, Command::Tcp, recorder, deadline)
+            .await?;
         // The response header is consumed on the first read, not here: the node buffers it until
         // the *target* produces data, so an eager read deadlocks a caller that has not sent its
         // payload yet (`vmess::response`).
@@ -183,13 +196,9 @@ impl VmessConnector {
             self.options,
             self.termination_signal,
         ));
-        Ok(Established {
-            stream,
-            local_port,
-            socket: None,
-            alpn,
-            alpn_protocol,
-        })
+        Ok(Established::new(stream)
+            .with_local_port(local_port)
+            .with_alpn(alpn, alpn_protocol))
     }
 
     /// Opens the bare TCP stream to this VMess server, before the protocol handshake.
@@ -197,7 +206,19 @@ impl VmessConnector {
         &self,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        self.base.connect(&self.server, recorder).await
+        self.connect_server_within(recorder, Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Opens the bare TCP stream to this VMess server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        self.base
+            .connect_within(&self.server, recorder, deadline)
+            .await
     }
 
     /// Returns a [`DatagramConnector`] that carries UDP over this VMess node.
@@ -215,10 +236,11 @@ impl VmessConnector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
+        let deadline = Instant::now() + self.timeout;
         let (stream, session, local_port, _alpn, _alpn_protocol) = self
-            .open(authority, Command::Udp, recorder)
+            .open_until(authority, Command::Udp, recorder, deadline)
             .await
-            .map_err(|error| NetError::Connect(error.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.server))?;
 
         let packets = PacketStream::new(
             Box::new(ResponseHeaderStream::new(stream, session.clone())),
@@ -234,12 +256,13 @@ impl VmessConnector {
         })
     }
 
-    /// Dials, applies the layers, and writes the sealed request header.
-    async fn open(
+    /// Dials, applies the layers, and writes the sealed request header within `deadline`.
+    async fn open_until(
         &self,
         authority: &str,
         command: Command,
         recorder: &TraceCollector,
+        deadline: Instant,
     ) -> Result<
         (
             BoundedStream,
@@ -268,62 +291,73 @@ impl VmessConnector {
         let nonce = random_eight();
         let sealed = seal_header(&self.cmd_key, &plain, auth_id, nonce);
 
-        let (opaque, local_port) = self.open_stream(recorder).await?;
+        let (opaque, local_port) = self.open_stream_until(recorder, deadline).await?;
         let alpn_protocol = opaque.alpn_protocol.clone();
         let alpn = alpn_protocol
             .as_deref()
             .map(|name| netune_trace::Alpn::from_name(Some(name)));
         let mut stream: BoundedStream = opaque.stream;
-        stream.write_all(&sealed).await.map_err(|error| {
-            ProxyProtocolError::Connect(format!(
-                "write the VMess request to {}: {error}",
-                self.server
-            ))
-        })?;
-        stream.flush().await.map_err(|error| {
-            ProxyProtocolError::Connect(format!(
-                "flush the VMess request to {}: {error}",
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
+        tokio::time::timeout(remaining, async {
+            stream.write_all(&sealed).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "write VMess request to {} exceeded {} ms",
+                    self.server,
+                    remaining.as_millis()
+                ),
+            )
+        })?
+        .map_err(|error| {
+            ProxyProtocolError::handshake(format!(
+                "write/flush VMess request to {}: {error}",
                 self.server
             ))
         })?;
         Ok((stream, session, local_port, alpn, alpn_protocol))
     }
 
-    /// Dials, upgrades the transport, and applies the security layer.
-    async fn open_stream(
+    /// Dials, upgrades the transport, and applies the security layer within `deadline`.
+    async fn open_stream_until(
         &self,
         recorder: &TraceCollector,
+        deadline: Instant,
     ) -> Result<(Opaque, Option<u16>), ProxyProtocolError> {
         let established = self
             .base
-            .connect(&self.server, recorder)
-            .await
-            .map_err(|error| match error {
-                ProxyProtocolError::Timeout => ProxyProtocolError::Timeout,
-                other => ProxyProtocolError::Connect(other.to_string()),
-            })?;
+            .connect_within(&self.server, recorder, deadline)
+            .await?;
         let local_port = established.local_port;
 
         // `tls.fragment` slices a handshake daer writes. VMess over plain TLS rides
-        // netune's rustls handshake, which daer cannot slice, and VMess has no REALITY layer at
+        // netune's TLS handshake, which daer cannot slice, and VMess has no REALITY layer at
         // all — so the setting cannot be honoured here. `DialerOptions::fragment` is documented
         // as applying only to a layer whose ClientHello daer owns, and the daemon reports which
         // nodes those are rather than half-applying the setting (`fragment.rs`'s module note).
         let opaque = self
             .security
-            .wrap(established.stream, &self.host, recorder, self.timeout)
+            .wrap_until(established.stream, &self.host, recorder, deadline)
             .await?;
 
         // Security then transport (ADR-0028): a `ws` upgrade is HTTP inside the secured stream.
         let raw_read = opaque.raw_read;
         let stream = self
             .transport
-            .wrap(
+            .wrap_until(
                 opaque.stream,
                 &self.host,
                 self.security.sni_hint(),
                 recorder,
-                self.timeout,
+                deadline,
             )
             .await?;
         Ok((

@@ -110,16 +110,30 @@ impl AnyTlsSession {
 
     /// Opens a virtual stream to the requested destination (`host:port`).
     pub async fn open_stream(&self, authority: &str) -> Result<AnyTlsStream, ProxyProtocolError> {
+        self.open_stream_within(authority, tokio::time::Instant::now() + SYNACK_TIMEOUT)
+            .await
+    }
+
+    /// Opens a virtual stream to `authority` (`host:port`) within `deadline`.
+    pub async fn open_stream_within(
+        &self,
+        authority: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<AnyTlsStream, ProxyProtocolError> {
         if self.is_closed() {
-            return Err(ProxyProtocolError::Connect(
-                "anytls session is closed".to_owned(),
-            ));
+            return Err(ProxyProtocolError::handshake("anytls session is closed"));
         }
 
         let (host, port) =
             split_authority(authority).map_err(ProxyProtocolError::UnsupportedLink)?;
         let dest_addr_bytes = crate::shadowsocks::connector::encode_address(host, port)
             .map_err(ProxyProtocolError::UnsupportedLink)?;
+
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
 
         // Allocate client stream ID (odd number)
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
@@ -145,8 +159,8 @@ impl AnyTlsSession {
         // Send Syn frame
         if self.outbound_tx.send(Frame::syn(stream_id)).is_err() {
             self.cleanup_stream(stream_id);
-            return Err(ProxyProtocolError::Connect(
-                "anytls session writer closed".to_owned(),
+            return Err(ProxyProtocolError::handshake(
+                "anytls session writer closed",
             ));
         }
 
@@ -157,13 +171,13 @@ impl AnyTlsSession {
             .is_err()
         {
             self.cleanup_stream(stream_id);
-            return Err(ProxyProtocolError::Connect(
-                "anytls session writer closed".to_owned(),
+            return Err(ProxyProtocolError::handshake(
+                "anytls session writer closed",
             ));
         }
 
         // Wait for server SYNACK
-        match tokio::time::timeout(SYNACK_TIMEOUT, synack_rx).await {
+        match tokio::time::timeout(remaining, synack_rx).await {
             Ok(Ok(Ok(()))) => Ok(AnyTlsStream::new(
                 stream_id,
                 inbound_rx,
@@ -171,19 +185,26 @@ impl AnyTlsSession {
             )),
             Ok(Ok(Err(err_msg))) => {
                 self.cleanup_stream(stream_id);
-                Err(ProxyProtocolError::Connect(format!(
+                Err(ProxyProtocolError::handshake(format!(
                     "anytls server rejected stream {stream_id}: {err_msg}"
                 )))
             }
             Ok(Err(_)) => {
                 self.cleanup_stream(stream_id);
-                Err(ProxyProtocolError::Connect(
-                    "anytls session dropped pending synack".to_owned(),
+                Err(ProxyProtocolError::handshake(
+                    "anytls session dropped pending synack",
                 ))
             }
             Err(_) => {
                 self.cleanup_stream(stream_id);
-                Err(ProxyProtocolError::Timeout)
+                let _ = self.outbound_tx.send(Frame::fin(stream_id));
+                Err(ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Handshake,
+                    format!(
+                        "anytls SYNACK for {authority} exceeded {} ms",
+                        remaining.as_millis()
+                    ),
+                ))
             }
         }
     }
@@ -278,7 +299,7 @@ impl AnyTlsSession {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session read error");
+                    daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError, phase = "read", error = %err, "anytls session read error");
                     break;
                 }
             }
@@ -314,11 +335,11 @@ impl AnyTlsSession {
             }
 
             if let Err(err) = writer.write_all(&write_buf).await {
-                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session write error");
+                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError, phase = "write", error = %err, "anytls session write error");
                 break;
             }
             if let Err(err) = writer.flush().await {
-                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError,error = %err, "anytls session flush error");
+                daer_observe::debug!(daer_observe::EventCode::ProtocolAnyTlsSessionError, phase = "flush", error = %err, "anytls session flush error");
                 break;
             }
         }

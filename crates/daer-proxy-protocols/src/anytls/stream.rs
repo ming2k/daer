@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
+use netune::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
@@ -58,6 +59,8 @@ impl AnyTlsStream {
         self.stream_id
     }
 }
+
+impl Transport for AnyTlsStream {}
 
 impl Drop for AnyTlsStream {
     fn drop(&mut self) {

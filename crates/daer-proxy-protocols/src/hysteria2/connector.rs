@@ -41,6 +41,7 @@ use netune_quic::{
 };
 use netune_trace::TraceCollector;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::Instant;
 
 use crate::error::ProxyProtocolError;
 use crate::hysteria2::auth::{self, H3Session};
@@ -327,7 +328,7 @@ impl Hysteria2Connector {
             let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
             let crypto = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
-                .map_err(|error| ProxyProtocolError::Connect(format!("TLS versions: {error}")))?
+                .map_err(|error| ProxyProtocolError::tls(format!("TLS versions: {error}")))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
                 .with_no_client_auth();
@@ -401,36 +402,64 @@ impl Hysteria2Connector {
     /// `collector` receives the QUIC handshake marks when an observer installed
     /// one; an unobserved dial passes the disabled collector and no trace is
     /// allocated.
-    pub(crate) async fn get_or_dial(
+    /// Gets an authenticated connection or establishes one within `deadline`.
+    pub(crate) async fn get_or_dial_within(
         &self,
         collector: &TraceCollector,
+        deadline: Instant,
     ) -> Result<Connection, ProxyProtocolError> {
-        let mut state = self.state.lock().await;
+        let authority = self.authority();
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Tcp,
+            &authority,
+        )?;
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
+            .await
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Tcp,
+                    format!(
+                        "quic connection to {authority} exceeded {} ms",
+                        remaining.as_millis()
+                    ),
+                )
+            })?;
         if let Some(connection) = state.as_ref()
             && !connection.connection.is_closed()
         {
             return Ok(connection.clone());
         }
 
-        let authority = self.authority();
         let schedule = HopSchedule::from_hopping(&self.hopping)
             .map_err(ProxyProtocolError::UnsupportedLink)?;
 
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Tcp,
+            &authority,
+        )?;
         let (connector, factory) = self.quic_connector()?;
         let trace = collector.is_enabled().then(|| collector.clone());
         let connect_fut = connector.connect_authority(&authority, &self.server_name, trace);
-        let quic = tokio::time::timeout(self.options.timeout, connect_fut)
+        let quic = tokio::time::timeout(remaining, connect_fut)
             .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
-            .map_err(|error| {
-                ProxyProtocolError::Connect(format!("quic connection failed: {error}"))
-            })?;
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Tls,
+                    format!(
+                        "quic connection to {authority} exceeded {} ms",
+                        remaining.as_millis()
+                    ),
+                )
+            })?
+            .map_err(|error| ProxyProtocolError::tcp(format!("quic connection failed: {error}")))?;
 
         let hopper = match schedule {
             Some(schedule) => {
                 let stack = factory.take().ok_or_else(|| {
-                    ProxyProtocolError::Connect(
-                        "the QUIC connector completed without creating its socket stack".to_owned(),
+                    ProxyProtocolError::tcp(
+                        "the QUIC connector completed without creating its socket stack",
                     )
                 })?;
                 Some(stack.start_hopper(schedule))
@@ -445,9 +474,26 @@ impl Hysteria2Connector {
         // `Hysteria-CC-RX` is this client's *receive* rate in bytes per second, which is the
         // download figure converted from megabits. `0` means "unknown", and the server then
         // uses congestion control against us.
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            &authority,
+        )?;
         let server_rx = self.down_mbps.saturating_mul(1_000_000) / 8;
-        let (outcome, h3) =
-            auth::authenticate(quic.connection(), &self.password, server_rx, collector).await?;
+        let (outcome, h3) = tokio::time::timeout(
+            remaining,
+            auth::authenticate(quic.connection(), &self.password, server_rx, collector),
+        )
+        .await
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "hysteria2 authentication with {authority} exceeded {} ms",
+                    remaining.as_millis()
+                ),
+            )
+        })??;
         let connection = quic.connection().clone();
         let opened = Connection {
             _quic: Arc::new(quic),
@@ -467,15 +513,38 @@ impl Hysteria2Connector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<Established, ProxyProtocolError> {
-        let connection = self.get_or_dial(recorder).await?;
-        let stream = open_tcp_stream(&connection.connection, authority).await?;
-        Ok(Established {
-            stream: Box::new(stream),
-            local_port: None,
-            socket: None,
-            alpn: None,
-            alpn_protocol: None,
-        })
+        self.connect_within(authority, recorder, Instant::now() + self.options.timeout)
+            .await
+    }
+
+    /// Connects a TCP stream through this Hysteria 2 node to `authority` within `deadline`.
+    pub async fn connect_within(
+        &self,
+        authority: &str,
+        recorder: &TraceCollector,
+        deadline: Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        let connection = self.get_or_dial_within(recorder, deadline).await?;
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Handshake,
+            authority,
+        )?;
+        let stream = tokio::time::timeout(
+            remaining,
+            open_tcp_stream(&connection.connection, authority),
+        )
+        .await
+        .map_err(|_| {
+            ProxyProtocolError::timeout(
+                daer_observe::DialStage::Handshake,
+                format!(
+                    "hysteria2 tcp request for {authority} exceeded {} ms",
+                    remaining.as_millis()
+                ),
+            )
+        })??;
+        Ok(Established::new(Box::new(stream)))
     }
 
     /// Connects a UDP datagram session through this Hysteria 2 node to `authority`.
@@ -489,10 +558,11 @@ impl Hysteria2Connector {
         authority: &str,
         recorder: &TraceCollector,
     ) -> Result<EstablishedDatagrams, NetError> {
+        let deadline = Instant::now() + self.options.timeout;
         let connection = self
-            .get_or_dial(recorder)
+            .get_or_dial_within(recorder, deadline)
             .await
-            .map_err(|error| NetError::Connect(error.to_string()))?;
+            .map_err(|error| error.into_net_error(&self.server))?;
         if !connection.udp_enabled {
             return Err(NetError::Protocol(format!(
                 "{} answered Hysteria-UDP: false during authentication, so it will not relay \
@@ -587,18 +657,17 @@ fn verify_pin(
     use sha2::{Digest as _, Sha256};
 
     let chain = connection.peer_certificates().ok_or_else(|| {
-        ProxyProtocolError::Connect(
+        ProxyProtocolError::tls(
             "hysteria2.pin-sha256 is set but the QUIC session exposed no peer certificate, so \
-             the pin cannot be checked"
-                .to_owned(),
+             the pin cannot be checked",
         )
     })?;
     let leaf = chain.first().ok_or_else(|| {
-        ProxyProtocolError::Connect("the QUIC peer presented an empty certificate chain".to_owned())
+        ProxyProtocolError::tls("the QUIC peer presented an empty certificate chain")
     })?;
     let digest: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
     if &digest != expected {
-        return Err(ProxyProtocolError::Connect(format!(
+        return Err(ProxyProtocolError::tls(format!(
             "hysteria2.pin-sha256 does not match: the leaf certificate hashes to {}",
             digest
                 .iter()

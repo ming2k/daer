@@ -3,6 +3,11 @@
   "title": "Config",
   "type": "object",
   "properties": {
+    "dial-timeout": {
+      "description": "Total deadline for opening a single outbound connection (DNS + TCP + TLS + handshake).",
+      "type": "string",
+      "default": "10s"
+    },
     "disable-waiting-network": {
       "type": "boolean",
       "default": false
@@ -92,6 +97,11 @@
       "items": {
         "$ref": "#/$defs/Subscription"
       }
+    },
+    "tcp-keepalive": {
+      "description": "`SO_KEEPALIVE` idle time applied to outbound TCP sockets (`\"0s\"` disables keepalive).",
+      "type": "string",
+      "default": "30s"
     },
     "tls": {
       "description": "Defaults for every outbound TLS leg, with per-node overrides.",
@@ -220,6 +230,22 @@
       "description": "One `[[election]]` entry: the routing target and the rule that elects one node.\n\nThe input is exactly one of `group` or `node`. A group is a set of candidates; a\nnode is a singleton candidate set. The output is always one node (or no node when\nthe input has no usable candidate).",
       "type": "object",
       "properties": {
+        "cooldown": {
+          "description": "Duration a cooled-down candidate is skipped before being retried (`\"0s\"` disables).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failure-threshold": {
+          "description": "Consecutive dial failures before entering passive cooldown (`0` disables cooldown).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "group": {
           "description": "The candidate set. Mutually exclusive with `node`.",
           "type": [

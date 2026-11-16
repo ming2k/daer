@@ -118,6 +118,12 @@ impl<T: AsyncRead + Unpin> ShadowSocksStream<T> {
     }
 }
 
+impl<T: Transport + AsyncRead + Unpin> Transport for ShadowSocksStream<T> {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
+    }
+}
+
 impl<T: AsyncRead + Unpin> AsyncRead for ShadowSocksStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,

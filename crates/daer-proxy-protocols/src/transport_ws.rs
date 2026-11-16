@@ -62,6 +62,12 @@ impl<S> WsByteStream<S> {
     }
 }
 
+impl<S: Transport> Transport for WsByteStream<S> {
+    // `WsStream` keeps its inner transport private and offers no tap accessor, so this
+    // adapter cannot forward the socket position. Reporting `None` is the honest answer:
+    // a trace above the upgrade has no byte timeline to claim.
+}
+
 impl<S: Transport> AsyncRead for WsByteStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,

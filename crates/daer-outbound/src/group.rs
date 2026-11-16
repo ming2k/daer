@@ -9,11 +9,12 @@
 //! program.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use daer_config::TimeSpan;
 use daer_primitives::SelectionPolicy;
 
-use crate::alive::{AliveDialerSet, DialerId, NotifyOutcome};
+use crate::alive::{AliveDialerSet, CooldownOutcome, DialerId, NotifyOutcome};
 use crate::dialer::Dialer;
 use crate::error::OutboundError;
 use crate::filter::FilterSet;
@@ -78,6 +79,15 @@ impl ElectionRuntime {
         Self::new(name, policy, tolerance, dialers)
     }
 
+    /// Configures passive failure cooldown thresholds for candidates in this election.
+    #[must_use]
+    pub fn with_passive_cooldown(mut self, failure_threshold: u32, cooldown: Duration) -> Self {
+        self.alive = self
+            .alive
+            .with_passive_cooldown(failure_threshold, cooldown);
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -140,6 +150,22 @@ impl ElectionRuntime {
         dialer.record(alive, latency);
         let sample = dialer.sorting_sample(self.policy);
         Ok(self.alive.notify(id, alive, sample))
+    }
+
+    /// Records a successful dial on `id`, clearing passive failure cooldown state.
+    pub fn record_dial_success(&mut self, id: DialerId) {
+        self.alive.record_dial_success(id);
+    }
+
+    /// Records a failed dial on `id`, returning whether it entered passive cooldown.
+    pub fn record_dial_failure(&mut self, id: DialerId) -> CooldownOutcome {
+        self.alive.record_dial_failure(id)
+    }
+
+    /// Whether `id` is currently suppressed by passive failure cooldown.
+    #[must_use]
+    pub fn is_in_cooldown(&self, id: DialerId) -> bool {
+        self.alive.is_in_cooldown(id)
     }
 
     /// Picks a node for a new connection.

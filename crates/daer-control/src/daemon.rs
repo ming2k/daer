@@ -426,6 +426,7 @@ impl Daemon {
             let signal = Arc::clone(&signal);
             signal.notified_owned()
         };
+        let port = self.port;
         let udp_task = AbortOnDrop::new(tokio::spawn(async move {
             let result = daer_relay::relay::serve_datagrams(
                 service.ingress,
@@ -436,7 +437,7 @@ impl Daemon {
             )
             .await;
             if let Err(error) = result {
-                daer_observe::warn!(daer_observe::EventCode::DaemonUdpUnavailable,%error, "the datagram relay stopped");
+                daer_observe::warn!(daer_observe::EventCode::DaemonUdpUnavailable,%error, port, "the datagram relay stopped");
             }
         }));
         let (stopped, ()) = tokio::join!(

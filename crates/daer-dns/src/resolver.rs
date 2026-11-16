@@ -63,7 +63,11 @@ use crate::wire::{Message, Name, RecordType, ResponseCode};
 pub enum UpstreamError {
     /// The transport is not implemented in this build.
     Missing(String),
-    /// The exchange failed: timeout, refused, malformed reply.
+    /// The exchange did not finish before its deadline.
+    Timeout(String),
+    /// The socket or TLS connection could not be established, or a write failed.
+    Connect(String),
+    /// The exchange completed but the answer was malformed or otherwise unusable.
     Failed(String),
 }
 
@@ -71,7 +75,9 @@ impl fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing(tag) => write!(f, "no transport for upstream {tag:?}"),
-            Self::Failed(message) => f.write_str(message),
+            Self::Timeout(message) | Self::Connect(message) | Self::Failed(message) => {
+                f.write_str(message)
+            }
         }
     }
 }
@@ -91,6 +97,11 @@ pub type ExchangeFuture<'a> = std::pin::Pin<
 pub trait Upstream: Send + Sync + fmt::Debug {
     /// Sends `query` and returns the reply.
     fn exchange<'a>(&'a self, query: &'a Message) -> ExchangeFuture<'a>;
+
+    /// Transport kind reported in upstream diagnostics.
+    fn transport(&self) -> &'static str {
+        "upstream"
+    }
 }
 
 /// What to do with a query.
@@ -655,13 +666,20 @@ impl Resolver {
         let answer = match self.ask(tag, query).await {
             Ok(answer) => answer,
             Err(error) => {
+                let transport = self
+                    .upstreams
+                    .get(tag)
+                    .map_or("missing", |upstream| upstream.transport());
+                let error_code = upstream_error_code(&error);
                 daer_observe::warn!(
                     daer_observe::EventCode::DnsUpstreamFailed,
                     query_id = %context.id,
                     peer = %context.peer,
                     question = %describe_question(query),
                     upstream = %tag,
+                    transport,
                     %error,
+                    error_code = %error_code,
                     elapsed_ms = started.elapsed().as_millis(),
                     "dns upstream failed"
                 );
@@ -902,6 +920,15 @@ fn describe_question(message: &Message) -> String {
 #[must_use]
 pub fn cached_name(key: &Key) -> &Name {
     &key.name
+}
+
+fn upstream_error_code(error: &UpstreamError) -> daer_observe::ErrorCode {
+    match error {
+        UpstreamError::Missing(_) => daer_observe::diagnostic::codes::DNS_UPSTREAM_UNSUPPORTED,
+        UpstreamError::Timeout(_) => daer_observe::diagnostic::codes::DNS_UPSTREAM_TIMEOUT,
+        UpstreamError::Connect(_) => daer_observe::diagnostic::codes::DNS_UPSTREAM_CONNECT,
+        UpstreamError::Failed(_) => daer_observe::diagnostic::codes::DNS_UPSTREAM_PROTOCOL,
+    }
 }
 
 #[cfg(test)]

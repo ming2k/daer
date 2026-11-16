@@ -171,12 +171,14 @@ pub struct ObservedDialer {
     dialer: Arc<crate::node_dialer::NodeDialer>,
     observer: ObserverSlot,
     flow_id: daer_observe::FlowId,
+    generation: Arc<str>,
     tag: Arc<str>,
 }
 
 impl std::fmt::Debug for ObservedDialer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObservedDialer")
+            .field("generation", &self.generation)
             .field("tag", &self.tag)
             .field("observed", &self.observer.is_some())
             .finish_non_exhaustive()
@@ -190,12 +192,14 @@ impl ObservedDialer {
         dialer: Arc<crate::node_dialer::NodeDialer>,
         observer: ObserverSlot,
         flow_id: daer_observe::FlowId,
+        generation: impl Into<Arc<str>>,
         tag: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             dialer,
             observer,
             flow_id,
+            generation: generation.into(),
             tag: tag.into(),
         }
     }
@@ -210,10 +214,13 @@ impl ObservedDialer {
         &self,
         authority: &str,
     ) -> Result<crate::Established, crate::error::OutboundError> {
-        let dial = self
-            .observer
-            .as_ref()
-            .map(|_| DialId::new(self.flow_id, Arc::clone(&self.tag), authority.to_owned()));
+        let dial = self.observer.as_ref().map(|_| {
+            DialId::new(
+                self.flow_id,
+                self.dialer.label().to_owned(),
+                authority.to_owned(),
+            )
+        });
         let collector = match (&self.observer, &dial) {
             (Some(observer), Some(dial)) => {
                 let sink = DialObserverSink::new(dial.clone(), Arc::clone(observer));
@@ -235,11 +242,14 @@ impl ObservedDialer {
             daer_observe::warn!(
                 daer_observe::EventCode::FlowDialFailed,
                 flow_id = %self.flow_id,
+                generation = %self.generation,
                 destination = %authority,
-                group = %self.tag,
+                election = %self.tag,
+                node = %self.dialer.label(),
                 stage = %failure.stage,
                 error_code = %failure.code,
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                detail = %failure.detail,
                 "flow dial failed"
             );
         }
@@ -266,30 +276,17 @@ impl ObservedDialer {
 /// netune's pure function over it. A phase netune did not record stays
 /// `not_applicable`/`not_estimable` rather than becoming a zero.
 fn trace_timings(log: EventLog) -> DerivedTimings {
-    let trace = netune_trace::RequestTrace {
-        meta: netune_trace::TraceMeta::new(
+    let trace = netune_trace::RequestTrace::new(
+        netune_trace::TraceMeta::new(
             netune_trace::TraceId::new("daer-dial"),
             netune_trace::Direction::Egress,
         ),
-        attempt: netune_trace::AttemptRef {
-            round: 1,
-            turn: 0,
-            attempt: 0,
-        },
-        endpoint: netune_trace::EndpointRef {
-            provider: "daer".to_owned(),
-            model: "dial".to_owned(),
-            authority: String::new(),
-        },
-        connection: netune_trace::ConnectionInfo::default(),
-        // A dial has no request wire identity of its own; the default identity and the
-        // current envelope version keep the derivation comparable with netune's.
-        identity: netune_trace::ConnectionIdentity::default(),
-        schema_version: netune_trace::TRACE_SCHEMA_VERSION,
-        fidelity: netune_trace::Fidelity::l0(),
+        "",
         log,
-        diagnostics: netune_trace::DiagnosticTable::default(),
-    };
+    )
+    // A dial has no request wire identity of its own; the default identity and the
+    // current envelope version keep the derivation comparable with netune's.
+    .with_fidelity(netune_trace::Fidelity::l0());
     derive(&trace)
 }
 

@@ -432,7 +432,93 @@ async fn a_rejected_flow_does_not_end_the_loop() {
 
     let stats = supervisor.metrics().snapshot();
     assert_eq!(stats.accepted, 1, "{stats:?}");
+    assert_eq!(stats.rejected, 1, "policy block is a rejection: {stats:?}");
+    assert_eq!(
+        stats.failed, 0,
+        "policy block must not inflate dial failures: {stats:?}"
+    );
+}
+
+struct FailingDecide;
+
+impl Decide for FailingDecide {
+    type Upstream = tokio::net::TcpStream;
+    type Future<'a> = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Upstream, RelayError>> + Send + 'a>,
+    >;
+
+    fn decide<'a>(&'a self, flow: &'a Accepted) -> Self::Future<'a> {
+        let destination = flow.destination;
+        Box::pin(async move {
+            Err(RelayError::Dial {
+                destination,
+                failure: daer_observe::DialFailure::new(
+                    daer_observe::DialStage::Tcp,
+                    daer_observe::diagnostic::codes::RELAY_DIAL_CONNECT,
+                    "connection refused",
+                ),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_failed_dial_flow_increments_failed_not_rejected() {
+    // Falsifier for handle_decision_error: unlike RelayError::Rejected, a genuine dial failure
+    // increments `failed` and leaves `rejected` at zero.
+    let listener = PlainListener(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("binds"),
+    );
+    let ingress_addr = listener.0.local_addr().expect("addr");
+
+    let supervisor = Supervisor::new();
+    let loop_task = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let shutdown = std::future::pending::<()>();
+        async move { serve_parallel(&listener, Arc::new(FailingDecide), &supervisor, shutdown).await }
+    });
+
+    let mut client = tokio::net::TcpStream::connect(ingress_addr)
+        .await
+        .expect("connects");
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut sink))
+        .await
+        .expect("failed flow must close promptly");
+
+    loop_task.abort();
+    let _ = loop_task.await;
+
+    let stats = supervisor.metrics().snapshot();
+    assert_eq!(stats.accepted, 1, "{stats:?}");
+    assert_eq!(stats.rejected, 0, "{stats:?}");
     assert_eq!(stats.failed, 1, "{stats:?}");
+}
+
+#[test]
+fn classifies_expected_peer_resets() {
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        assert!(
+            is_expected_peer_reset(&std::io::Error::from(kind)),
+            "{kind:?}"
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::InvalidData,
+        std::io::ErrorKind::UnexpectedEof,
+    ] {
+        assert!(
+            !is_expected_peer_reset(&std::io::Error::from(kind)),
+            "{kind:?} is not a routine peer reset"
+        );
+    }
 }
 
 #[test]

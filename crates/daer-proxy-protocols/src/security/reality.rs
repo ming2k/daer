@@ -26,7 +26,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use netune::Transport;
 
 use crate::error::ProxyProtocolError;
 use crate::reality::tls13::RealityAuth;
@@ -77,10 +77,28 @@ impl RealitySecurity {
     ///
     /// `deadline` bounds the whole handshake, not each write: a node that accepts the
     /// connection and then trickles bytes must fail like a node that refuses it.
-    pub async fn wrap<S>(&self, stream: S, deadline: Duration) -> Result<Opaque, ProxyProtocolError>
+    pub async fn wrap<S>(&self, stream: S, timeout: Duration) -> Result<Opaque, ProxyProtocolError>
     where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        S: Transport + 'static,
     {
+        self.wrap_until(stream, tokio::time::Instant::now() + timeout)
+            .await
+    }
+
+    /// Wraps `stream` in a REALITY handshake within `deadline`.
+    pub async fn wrap_until<S>(
+        &self,
+        stream: S,
+        deadline: tokio::time::Instant,
+    ) -> Result<Opaque, ProxyProtocolError>
+    where
+        S: Transport + 'static,
+    {
+        let remaining = ProxyProtocolError::remaining_until(
+            deadline,
+            daer_observe::DialStage::Tls,
+            &self.params.server_name,
+        )?;
         let auth = RealityAuth::new(
             &self.params.public_key,
             &self.params.short_id,
@@ -90,11 +108,20 @@ impl RealitySecurity {
 
         let handshake =
             Tls13Connection::handshake(stream, &self.params.server_name, &auth, &self.params.alpn);
-        let connection = tokio::time::timeout(deadline, handshake)
+        let connection = tokio::time::timeout(remaining, handshake)
             .await
-            .map_err(|_| ProxyProtocolError::Timeout)?
+            .map_err(|_| {
+                ProxyProtocolError::timeout(
+                    daer_observe::DialStage::Tls,
+                    format!(
+                        "REALITY handshake impersonating {} exceeded {} ms",
+                        self.params.server_name,
+                        remaining.as_millis()
+                    ),
+                )
+            })?
             .map_err(|error| {
-                ProxyProtocolError::Connect(format!(
+                ProxyProtocolError::tls(format!(
                     "REALITY handshake impersonating {} failed: {error}",
                     self.params.server_name
                 ))

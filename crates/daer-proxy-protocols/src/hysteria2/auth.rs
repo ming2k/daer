@@ -65,7 +65,7 @@ pub async fn authenticate(
     let trace = collector.is_enabled().then(|| collector.clone());
     let mut h3 = H3Client::new(conn, trace)
         .await
-        .map_err(|error| ProxyProtocolError::Connect(format!("h3 handshake failed: {error}")))?;
+        .map_err(|error| ProxyProtocolError::handshake(format!("h3 handshake failed: {error}")))?;
 
     // A random padding length, from the reference's `authRequestPadding` range. It exists to
     // stop a prober fingerprinting the request by its size.
@@ -85,17 +85,19 @@ pub async fn authenticate(
         .header("Hysteria-Padding", padding)
         .header("Content-Length", "0")
         .body(bytes::Bytes::new())
-        .map_err(|error| ProxyProtocolError::Connect(format!("build the auth request: {error}")))?;
+        .map_err(|error| {
+            ProxyProtocolError::handshake(format!("build the auth request: {error}"))
+        })?;
 
     let stream = h3
         .send(request)
         .await
-        .map_err(|error| ProxyProtocolError::Connect(format!("send auth request: {error}")))?;
+        .map_err(|error| ProxyProtocolError::handshake(format!("send auth request: {error}")))?;
 
     let response = stream.head().clone();
     let status = response.status().as_u16();
     if status != STATUS_AUTH_SUCCESS {
-        return Err(ProxyProtocolError::Connect(format!(
+        return Err(ProxyProtocolError::handshake(format!(
             "hysteria2 authentication failed: the server answered {status}. A non-233 answer \
              is either a rejected credential or the server's masquerade page — the protocol \
              makes the two indistinguishable to a prober, so check the password and the SNI \

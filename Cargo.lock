@@ -195,9 +195,22 @@ version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
- "aws-lc-sys",
+ "aws-lc-sys 0.46.0",
  "untrusted 0.7.1",
  "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -543,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "daer-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -566,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "daer-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "daer-primitives",
  "glob",
@@ -578,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "daer-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -602,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "daer-dns"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "daer-config",
@@ -617,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "daer-drb"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -627,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "daer-ebpf"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aya",
  "aya-obj",
@@ -638,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "daer-observe"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fastrand",
  "tracing",
@@ -646,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "daer-outbound"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "daer-config",
  "daer-observe",
@@ -663,11 +676,11 @@ dependencies = [
 
 [[package]]
 name = "daer-primitives"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "daer-proxy-protocols"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -688,6 +701,7 @@ dependencies = [
  "netune-http1",
  "netune-http3",
  "netune-quic",
+ "netune-tls",
  "netune-trace",
  "netune-ws",
  "rand_core",
@@ -705,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "daer-relay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "daer-observe",
  "libc",
@@ -717,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "daer-routing"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "daer-config",
  "daer-ebpf",
@@ -729,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "daer-rule-ast"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -737,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "daer-sniff"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -747,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "daer-tests"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1210,8 +1224,8 @@ dependencies = [
 
 [[package]]
 name = "netune"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "base64",
  "brotli",
@@ -1224,6 +1238,7 @@ dependencies = [
  "netune-http3",
  "netune-io",
  "netune-quic",
+ "netune-tls",
  "netune-trace",
  "netune-ws",
  "rustls",
@@ -1235,13 +1250,13 @@ dependencies = [
 
 [[package]]
 name = "netune-egress"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 
 [[package]]
 name = "netune-http1"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "bytes",
  "http",
@@ -1250,8 +1265,8 @@ dependencies = [
 
 [[package]]
 name = "netune-http3"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "bytes",
  "http",
@@ -1263,8 +1278,8 @@ dependencies = [
 
 [[package]]
 name = "netune-io"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "netune-trace",
  "tokio",
@@ -1272,8 +1287,8 @@ dependencies = [
 
 [[package]]
 name = "netune-quic"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1287,17 +1302,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "netune-tls"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
+dependencies = [
+ "aws-lc-rs",
+ "aws-lc-sys 0.45.0",
+ "brotli",
+ "flate2",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "webpki-root-certs",
+]
+
+[[package]]
 name = "netune-trace"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "netune-ws"
-version = "0.0.28"
-source = "git+https://github.com/ming2k/netune.git?tag=v0.0.28#26a5ae604409ef14da1a00819b5b1181916f5b39"
+version = "0.1.1"
+source = "git+https://github.com/ming2k/netune.git?tag=v0.1.1#ef90537875aabcfc41fb933a24b205fb906f9ff2"
 dependencies = [
  "base64",
  "bytes",
@@ -1924,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "thiserror"
@@ -2448,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "toml",

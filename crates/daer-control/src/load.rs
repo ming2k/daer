@@ -142,11 +142,12 @@ pub async fn load_resolved_with_socket_config(
         resolve_subscriptions_with(&mut config, &directory, timeout, socket_config.clone()).await;
     if !subscriptions.subscriptions.is_empty() {
         if subscriptions.all_usable() {
-            warnings.push(format!(
-                "subscriptions: {} ({} node(s) added)",
-                subscriptions.describe(),
-                subscriptions.from_subscription
-            ));
+            daer_observe::info!(
+                daer_observe::EventCode::SubscriptionSummary,
+                summary = %subscriptions.describe(),
+                nodes = subscriptions.from_subscription,
+                "subscriptions resolved"
+            );
         } else {
             let failed = subscriptions.failed().len();
             let total = subscriptions.subscriptions.len();
@@ -165,7 +166,11 @@ pub async fn load_resolved_with_socket_config(
         resolve_rule_providers_with(&config, &directory, timeout, socket_config).await;
     if !rule_providers.providers.is_empty() {
         if rule_providers.all_usable() {
-            warnings.push(format!("rule providers: {}", rule_providers.describe()));
+            daer_observe::info!(
+                daer_observe::EventCode::ProviderSummary,
+                summary = %rule_providers.describe(),
+                "rule providers resolved"
+            );
         } else {
             let failed = rule_providers.failed().len();
             let total = rule_providers.providers.len();

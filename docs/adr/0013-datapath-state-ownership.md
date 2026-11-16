@@ -153,7 +153,7 @@ object, and it is the only place a verifier rejection is visible.
 
 ## The netune version boundary
 
-`daer` pins `netune` at a tag (`v0.0.28`) and verifies the lock with `--locked`. The transport
+`daer` pins `netune` at a tag (`v0.1.1`) and verifies the lock with `--locked`. The transport
 observability this change consumes is carried by that release:
 
 * `TraceCollector` is the one cold-path handle (netune ADR-0018); `Recorder` is no longer

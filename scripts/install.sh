@@ -16,10 +16,10 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
 fi
 
 echo "==> building release binaries"
-cargo build --release -p daer-cli -p daer-drb --bins
+cargo build --release --locked -p daer-cli -p daer-drb --bins
 
 echo "==> building the kernel datapath object"
-cargo xtask ebpf
+cargo run --locked --package xtask -- ebpf
 
 echo "==> staging the install tree"
 # Stage as you, never as root: the staging binary is a build artifact, and a compromised

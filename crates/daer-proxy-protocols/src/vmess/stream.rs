@@ -119,6 +119,12 @@ impl ChunkStream {
     }
 }
 
+impl Transport for ChunkStream {
+    fn socket_tap(&mut self) -> Option<&mut netune_trace::SocketTap> {
+        self.inner.socket_tap()
+    }
+}
+
 impl AsyncRead for ChunkStream {
     fn poll_read(
         self: Pin<&mut Self>,

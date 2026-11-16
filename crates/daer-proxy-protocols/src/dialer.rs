@@ -200,6 +200,23 @@ impl ProxyDialer {
         }
     }
 
+    /// Connects to `authority` (`host:port`) with the given trace collector within `deadline`.
+    pub async fn connect_with_collector_within(
+        &self,
+        authority: &str,
+        collector: &TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        match self {
+            Self::ShadowSocks(c) => c.connect_within(authority, collector, deadline).await,
+            Self::Trojan(c) => c.connect_within(authority, collector, deadline).await,
+            Self::AnyTls(c) => c.connect_within(authority, collector, deadline).await,
+            Self::Hysteria2(c) => c.connect_within(authority, collector, deadline).await,
+            Self::Vless(c) => c.connect_within(authority, collector, deadline).await,
+            Self::Vmess(c) => c.connect_within(authority, collector, deadline).await,
+        }
+    }
+
     /// Opens the bare stream to this protocol's server, before the protocol handshake.
     ///
     /// Used by detour chains and health probes. It never speaks the proxy protocol, so no
@@ -215,6 +232,22 @@ impl ProxyDialer {
             Self::Hysteria2(c) => c.connect_server(),
             Self::Vless(c) => c.connect_server(collector).await,
             Self::Vmess(c) => c.connect_server(collector).await,
+        }
+    }
+
+    /// Opens the bare stream to this protocol's server within `deadline`.
+    pub async fn connect_server_within(
+        &self,
+        collector: &TraceCollector,
+        deadline: tokio::time::Instant,
+    ) -> Result<Established, ProxyProtocolError> {
+        match self {
+            Self::ShadowSocks(c) => c.connect_server_within(collector, deadline).await,
+            Self::Trojan(c) => c.connect_server_within(collector, deadline).await,
+            Self::AnyTls(c) => c.connect_server_within(collector, deadline).await,
+            Self::Hysteria2(c) => c.connect_server(),
+            Self::Vless(c) => c.connect_server_within(collector, deadline).await,
+            Self::Vmess(c) => c.connect_server_within(collector, deadline).await,
         }
     }
 

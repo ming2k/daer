@@ -7,7 +7,7 @@ use netune::{Preset, SocketConfig};
 
 use crate::error::ProxyProtocolError;
 use crate::fragment::Fragment;
-use crate::server::{DirectServerDialer, ServerDialer};
+use crate::server::{DirectServerDialer, ServerDialer, build_socket_config};
 
 /// Socket options and deadlines shared by every node dialer.
 #[derive(Debug, Clone)]
@@ -15,6 +15,8 @@ pub struct DialerOptions {
     /// `SO_MARK`, applied before `connect(2)`.
     pub so_mark: Option<u32>,
     pub timeout: Duration,
+    /// Optional TCP `SO_KEEPALIVE` idle timeout applied to outbound connections.
+    pub tcp_keepalive: Option<Duration>,
     /// `[tls] profile`: a netune preset name, used by every outbound that rides netune's
     /// TLS stack (`trojan`, and any future TLS-based connector).
     ///
@@ -39,10 +41,25 @@ impl DialerOptions {
         Self {
             so_mark,
             timeout,
+            tcp_keepalive: None,
             tls_profile: None,
             fragment: None,
             base: Arc::new(DirectServerDialer::new(so_mark, timeout)),
         }
+    }
+
+    /// Sets the TCP `SO_KEEPALIVE` idle timeout applied to outbound sockets.
+    #[must_use]
+    pub fn with_tcp_keepalive(mut self, tcp_keepalive: Option<Duration>) -> Self {
+        self.tcp_keepalive = tcp_keepalive;
+        if !self.is_detoured() {
+            self.base = Arc::new(DirectServerDialer::new_with_keepalive(
+                self.so_mark,
+                self.timeout,
+                tcp_keepalive,
+            ));
+        }
+        self
     }
 
     /// Replaces the server leg with another outbound.
@@ -90,6 +107,15 @@ impl DialerOptions {
         Ok(self)
     }
 
+    /// Builds socket options directly from mark and keepalive knobs without constructing a dialer.
+    #[must_use]
+    pub fn socket_config_for(
+        so_mark: Option<u32>,
+        tcp_keepalive: Option<Duration>,
+    ) -> SocketConfig {
+        build_socket_config(so_mark, tcp_keepalive)
+    }
+
     /// The socket options this dialer would apply.
     ///
     /// Public because a datagram leg has to be configured identically: a mark or a
@@ -97,9 +123,6 @@ impl DialerOptions {
     /// two legs of the same proxy behave differently.
     #[must_use]
     pub fn socket_config(&self) -> SocketConfig {
-        match self.so_mark {
-            Some(mark) => SocketConfig::default().with_mark(mark),
-            None => SocketConfig::default(),
-        }
+        Self::socket_config_for(self.so_mark, self.tcp_keepalive)
     }
 }

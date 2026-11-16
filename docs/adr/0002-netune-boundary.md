@@ -34,7 +34,7 @@ difference decides how both projects evolve.
 | Health probes (HTTP and bare TCP) | yes, via the above | netune |
 | TCP/UDP proxying for arbitrary destinations | TCP yes; **UDP transport yes** (netune ADR-0008), the *relay* is daer's | daer (relay) |
 | DNS **server** role + cache + DNS message semantics | no (client resolver only) | daer |
-| DNS upstream transports (UDP/TCP/DoT/DoH) | yes (`UdpConnector`, `TcpConnector`, `TlsConnector`, `Client`) | netune |
+| DNS upstream transports (UDP/TCP/DoT/DoH) | yes (`UdpConnector`, `TcpConnector`, `TlsRouterConnector`, `Client`) | netune |
 | Transparent-proxy accept path: `IP_TRANSPARENT`, original destination | no | daer |
 | eBPF map access, event ring, routing epochs | no | daer |
 | Prefix sniffing (TLS SNI, HTTP `Host`, QUIC) before dialing | partial (`netune-trace` parses ClientHello / JA4) | daer (thin layer over netune-trace) |
@@ -103,7 +103,7 @@ difference decides how both projects evolve.
      *outside* that policy stack. Phases 3 and 4 use netune through
      `daer-outbound`.
 4. **The upstream dependency is locked.** `Cargo.toml` specifies the exact
-   release tag (`tag = "v0.0.28"`), and `Cargo.lock` records the exact Git commit SHA.
+   release tag (`tag = "v0.1.1"`), and `Cargo.lock` records the exact Git commit SHA.
    CI verifies the lock file using `--locked`. Local co-development may point the
    same package names at a sibling working tree with a `[patch]`; that override is
    development scaffolding and must not decide the released combination.

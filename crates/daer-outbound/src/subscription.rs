@@ -181,11 +181,9 @@ pub async fn fetch_body_conditional(
         .with_socket_config(socket_config)
         .with_connect_timeout(Some(timeout));
     let connector = TlsRouterConnector::new(connector);
-    let mut config = ClientConfig {
-        max_redirects: 5,
-        ..ClientConfig::default()
-    };
-    config.user_agent = format!("daer/{}", env!("CARGO_PKG_VERSION"));
+    let config = ClientConfig::default()
+        .with_max_redirects(5)
+        .with_user_agent(format!("daer/{}", env!("CARGO_PKG_VERSION")));
     let client = Client::new(connector, Pool::default(), config);
 
     let target = match scheme.to_ascii_lowercase().as_str() {

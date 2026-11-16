@@ -193,8 +193,10 @@ fn every_configuration_key_has_a_consumer() {
     // global sniff knobs into `[routing.sniff]` (one policy key plus its timeout), and schema 5
     // flattened `[global]` into `Config`, removed `ProbeSettings.tolerance`, and made the
     // socket mark internal rather than a configuration key. ADR-0054 added `Dns.intercept`.
+    // Hardening added `Config.dial_timeout`, `Config.tcp_keepalive`, `Election.failure_threshold`,
+    // and `Election.cooldown`.
     assert_eq!(
-        total, 129,
-        "expected exactly 129 configuration fields to be verified"
+        total, 133,
+        "expected exactly 133 configuration fields to be verified"
     );
 }

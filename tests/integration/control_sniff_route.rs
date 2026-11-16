@@ -185,7 +185,11 @@ action = "direct"
     let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut sink)).await;
     let stats = supervisor.metrics().snapshot();
     assert_eq!(stats.accepted, 1);
-    assert_eq!(stats.failed, 1, "the fallback blocked it: {stats:?}");
+    assert_eq!(stats.rejected, 1, "the fallback blocked it: {stats:?}");
+    assert_eq!(
+        stats.failed, 0,
+        "policy block must not count as failed: {stats:?}"
+    );
 }
 
 #[tokio::test]

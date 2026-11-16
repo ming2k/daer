@@ -423,10 +423,10 @@ impl IngressNamespace {
             PEER,
             "nodad",
         ]) {
-            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress address is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable, component = "address", %error, "IPv6 ingress address is unavailable");
         }
         if let Err(error) = self.ip(&["route", "add", "default", "via", HOST_IPV6, "dev", PEER]) {
-            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress route is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable, component = "route", %error, "IPv6 ingress route is unavailable");
         }
         if let Err(error) = self.ip(&[
             "neigh",
@@ -439,7 +439,7 @@ impl IngressNamespace {
             "nud",
             "permanent",
         ]) {
-            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 ingress neighbor is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable, component = "neighbor", %error, "IPv6 ingress neighbor is unavailable");
         }
         Ok(())
     }
@@ -520,9 +520,13 @@ pub(crate) fn remove_ingress_namespace() {
             libc::umount2(path_c.as_ptr(), libc::MNT_DETACH);
         }
     }
-    let _ = std::fs::remove_file(&path);
+    let remove_result = std::fs::remove_file(&path);
     if path.exists() {
+        let error = remove_result
+            .err()
+            .map_or_else(|| "stale mount remains".to_owned(), |err| err.to_string());
         daer_observe::warn!(daer_observe::EventCode::NetnsCleanupFailed,
+            %error,
             path = %path.display(),
             "could not remove the ingress namespace mount; a stale mount may remain"
         );
@@ -574,7 +578,7 @@ impl PreparedIngress {
         datapath::link_up(DEVICE)?;
 
         if let Err(error) = datapath::add_ipv6_link_local(DEVICE) {
-            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable,%error, "IPv6 host-side next hop is unavailable");
+            daer_observe::warn!(daer_observe::EventCode::NetnsIpv6Unavailable, component = "host_nexthop", %error, "IPv6 host-side next hop is unavailable");
         }
         namespace.configure_peer(device_mac)?;
 

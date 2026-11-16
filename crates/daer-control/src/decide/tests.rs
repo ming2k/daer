@@ -561,3 +561,198 @@ default = "direct"
         .expect_err("fake-ip without domain must fail");
     assert!(err.to_string().contains("no domain mapping"), "{err}");
 }
+
+async fn minimal_socks5_server() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("socks5 binds");
+    let addr = listener.local_addr().expect("socks5 addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut hdr = [0u8; 2];
+                if stream.read_exact(&mut hdr).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; hdr[1] as usize];
+                if stream.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                // Reply: version 5, no auth.
+                if stream.write_all(&[5, 0]).await.is_err() {
+                    return;
+                }
+                let mut req = [0u8; 4];
+                if stream.read_exact(&mut req).await.is_err() {
+                    return;
+                }
+                let rest_len = match req[3] {
+                    1 => 4 + 2,
+                    4 => 16 + 2,
+                    3 => {
+                        let mut len = [0u8; 1];
+                        if stream.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        len[0] as usize + 2
+                    }
+                    _ => return,
+                };
+                let mut rest = vec![0u8; rest_len];
+                if stream.read_exact(&mut rest).await.is_err() {
+                    return;
+                }
+                // Reply: succeeded, IPv4 0.0.0.0:0.
+                let _ = stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn router_passive_cooldown_fails_over_after_threshold_and_respects_zero_disable() {
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds dead port");
+    let dead_addr = dead_listener.local_addr().expect("addr");
+    drop(dead_listener);
+
+    let live_addr = minimal_socks5_server().await;
+    let config_for = |threshold: u32| {
+        format!(
+            r#"
+schema = 6
+dial-timeout = "2s"
+tcp-keepalive = "15s"
+
+[[node]]
+name = "dead"
+type = "socks5"
+server = "{}"
+port = {}
+
+[[node]]
+name = "live"
+type = "socks5"
+server = "{}"
+port = {}
+
+[[group]]
+name = "pool"
+
+[[election]]
+name = "proxy"
+group = "pool"
+type = "min"
+interval = "30s"
+failure-threshold = {threshold}
+cooldown = "30s"
+
+[routing]
+default = "proxy"
+"#,
+            dead_addr.ip(),
+            dead_addr.port(),
+            live_addr.ip(),
+            live_addr.port(),
+        )
+    };
+
+    let dest: SocketAddr = "93.184.216.34:443".parse().expect("dest");
+
+    // 1. threshold = 2 -> two failures trip cooldown and fail over cleanly to "live".
+    let r = router(&config_for(2));
+    assert!(
+        r.record(
+            "proxy",
+            DialerId(0),
+            true,
+            Some(daer_config::TimeSpan::from_millis(1))
+        )
+        .is_ok()
+    );
+    assert!(
+        r.record(
+            "proxy",
+            DialerId(1),
+            true,
+            Some(daer_config::TimeSpan::from_millis(50))
+        )
+        .is_ok()
+    );
+    assert!(
+        r.connect_through_election(
+            daer_observe::FlowId::new(1),
+            dest,
+            "proxy",
+            "93.184.216.34:443"
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        r.connect_through_election(
+            daer_observe::FlowId::new(2),
+            dest,
+            "proxy",
+            "93.184.216.34:443"
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        r.node_identity("proxy").map(|n| n.node),
+        Some("live".to_owned()),
+        "dead node in cooldown must yield to healthy candidate"
+    );
+    r.connect_through_election(
+        daer_observe::FlowId::new(3),
+        dest,
+        "proxy",
+        "93.184.216.34:443",
+    )
+    .await
+    .expect("3rd flow fails over to healthy node");
+
+    // 2. Falsifier: failure-threshold = 0 disables cooldown, so 3rd attempt still picks "dead".
+    let disabled = router(&config_for(0));
+    assert!(
+        disabled
+            .record(
+                "proxy",
+                DialerId(0),
+                true,
+                Some(daer_config::TimeSpan::from_millis(1))
+            )
+            .is_ok()
+    );
+    assert!(
+        disabled
+            .record(
+                "proxy",
+                DialerId(1),
+                true,
+                Some(daer_config::TimeSpan::from_millis(50))
+            )
+            .is_ok()
+    );
+    for i in 1..=3 {
+        assert!(
+            disabled
+                .connect_through_election(
+                    daer_observe::FlowId::new(i),
+                    dest,
+                    "proxy",
+                    "93.184.216.34:443"
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        disabled.node_identity("proxy").map(|n| n.node),
+        Some("dead".to_owned())
+    );
+}
