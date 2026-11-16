@@ -6,7 +6,7 @@ feature list. A build that passes unit tests is not automatically a production b
 > **Current verdict (2026-11-16): release candidate for staging; not certified for general
 > traffic.**
 >
-> `0.1.2` is the current patch release; `0.1.0` was the first tagged release
+> `0.1.3` is the current patch release; `0.1.0` was the first tagged release
 > candidate. The build and unprivileged contract is green, and the userspace ingress,
 > private-ingress lifecycle and restart behaviour pass inside a disposable user namespace.
 > The privileged delivery, `SIGKILL`, systemd lifecycle, UDP
